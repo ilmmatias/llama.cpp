@@ -9510,10 +9510,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // Correctness regression for duplicate expert IDs within a token. Keep this in the eval suite
-    // (the production-shape duplicate case below lives in the perf suite).
+    // Correctness regression for duplicate expert IDs within a token. Keep these in the eval suite
+    // (the production-shape duplicate cases below also live in the perf suite).
     test_cases.emplace_back(new test_mul_mat_id_duplicates(
         GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 192, 6, true, 256, 32, 256));
+    test_cases.emplace_back(new test_mul_mat_id_duplicates(
+        GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 192, 6, true, 256, 64, 256));
 
     for (int bs : {1, 4, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
@@ -10468,6 +10470,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // n=32 is enough to exercise the routed MMQ helper on RDNA2.
     test_cases.emplace_back(new test_mul_mat_id_duplicates(
         GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 192, 6, true, 256, 32, 256));
+
+    // Cross the 192-expert boundary in the compact routed-row permutation. This catches
+    // compact-MMQ implementations that accidentally reinterpret ids_dst values as expert IDs.
+    test_cases.emplace_back(new test_mul_mat_id_duplicates(
+        GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 192, 6, true, 256, 64, 256));
 
 
     // gpt-oss-20b
