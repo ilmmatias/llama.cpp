@@ -2569,6 +2569,18 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 #endif
             }
         }
+#ifdef GGML_USE_HIP
+        if ((node->op == GGML_OP_ARGSORT || node->op == GGML_OP_TOP_K) &&
+                node->src[0]->ne[0] > 1024) {
+            // hipCUB's segmented radix sort returns hipErrorStreamCaptureUnsupported
+            // when launched during stream capture. Smaller sorts use the native
+            // bitonic kernel and remain graph-compatible.
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs for large HIP radix sort\n", __func__);
+#endif
+        }
+#endif
 
         if (!use_cuda_graph) {
             break;
@@ -5260,7 +5272,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_TOP_K:
         case GGML_OP_ARGSORT:
-#ifndef GGML_CUDA_USE_CUB
+#if !defined(GGML_CUDA_USE_CUB) && !defined(GGML_USE_HIP)
             return op->src[0]->ne[0] <= 1024;
 #else
             return true;
