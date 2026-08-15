@@ -397,6 +397,25 @@ static __global__ void lightning_indexer_kernel_vec(
         );                                                                                  \
     } else
 
+#define LIGHTNING_INDEXER_VEC_LAUNCH(n_head, k_vecs_per_warp)                               \
+    do {                                                                                    \
+        constexpr int K_VECS_PER_WARP  = (k_vecs_per_warp);                                \
+        constexpr int WARPS_PER_BLOCK   = 8;                                                \
+        constexpr int K_VECS_PER_BLOCK  = K_VECS_PER_WARP * WARPS_PER_BLOCK;                \
+        dim3 block(32, WARPS_PER_BLOCK);                                                     \
+        const int num_kv_blocks = (n_kv + K_VECS_PER_BLOCK - 1) / K_VECS_PER_BLOCK;          \
+        dim3 grid(num_kv_blocks, n_batch, n_stream);                                        \
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, n_head, k, GGML_TYPE_F16) \
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, n_head, k, GGML_TYPE_Q4_0)\
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, n_head, k, GGML_TYPE_Q4_1)\
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, n_head, k, GGML_TYPE_Q5_0)\
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, n_head, k, GGML_TYPE_Q5_1)\
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, n_head, k, GGML_TYPE_Q8_0)\
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, n_head, k, GGML_TYPE_BF16)\
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, n_head, k, GGML_TYPE_F32) \
+        GGML_ABORT("fatal error");                                                          \
+    } while (0)
+
 void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
@@ -446,6 +465,26 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int device = ggml_cuda_get_device();
     const int cc     = ggml_cuda_info().devices[device].cc;
 
+    int vec_k_per_warp = 8;
+#ifdef GGML_USE_HIP
+    if (GGML_CUDA_CC_IS_RDNA2(cc)) {
+        // The Vulkan DSV4 kernel maps one K vector to one wave. The generic
+        // CUDA/HIP vector kernel maps eight K vectors to a wave, which saves Q
+        // reloads but creates a much larger live VGPR set. Keep the historical
+        // value as the default and expose 1/2/4 as cheap A/B points on RDNA2.
+        // Once a card-specific winner is measured it can become the default.
+        if (const char * env = getenv("GGML_HIP_LIGHTNING_KVECS_PER_WARP")) {
+            const int value = atoi(env);
+            if (value == 1 || value == 2 || value == 4 || value == 8) {
+                vec_k_per_warp = value;
+            } else {
+                GGML_LOG_WARN("%s: ignoring GGML_HIP_LIGHTNING_KVECS_PER_WARP=%s; expected 1, 2, 4, or 8\n",
+                    __func__, env);
+            }
+        }
+    }
+#endif
+
     if (n_embd == 128 && n_head == 64) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
@@ -469,23 +508,13 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         {
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             // use vector kernel
-            constexpr int K_VECS_PER_WARP = 8;
-            constexpr int WARPS_PER_BLOCK = 8;
-            constexpr int K_VECS_PER_BLOCK = K_VECS_PER_WARP * WARPS_PER_BLOCK;
-
-            dim3 block(32, WARPS_PER_BLOCK);
-            int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
-            dim3 grid(num_kv_blocks, n_batch, n_stream);
-
-            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_F16)
-            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_Q4_0)
-            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_Q4_1)
-            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_Q5_0)
-            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_Q5_1)
-            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_Q8_0)
-            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_BF16)
-            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_F32)
-            GGML_ABORT("fatal error");
+            switch (vec_k_per_warp) {
+                case 1: LIGHTNING_INDEXER_VEC_LAUNCH(64, 1); break;
+                case 2: LIGHTNING_INDEXER_VEC_LAUNCH(64, 2); break;
+                case 4: LIGHTNING_INDEXER_VEC_LAUNCH(64, 4); break;
+                case 8: LIGHTNING_INDEXER_VEC_LAUNCH(64, 8); break;
+                default: GGML_ABORT("fatal error");
+            }
         }
     } else if (n_embd == 128 && n_head == 32) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -510,28 +539,21 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         {
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             // use vector kernel
-            constexpr int K_VECS_PER_WARP = 8;
-            constexpr int WARPS_PER_BLOCK = 8;
-            constexpr int K_VECS_PER_BLOCK = K_VECS_PER_WARP * WARPS_PER_BLOCK;
-
-            dim3 block(32, WARPS_PER_BLOCK);
-            int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
-            dim3 grid(num_kv_blocks, n_batch, n_stream);
-
-            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_F16)
-            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_Q4_0)
-            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_Q4_1)
-            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_Q5_0)
-            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_Q5_1)
-            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_Q8_0)
-            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_BF16)
-            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_F32)
-            GGML_ABORT("fatal error");
+            switch (vec_k_per_warp) {
+                case 1: LIGHTNING_INDEXER_VEC_LAUNCH(32, 1); break;
+                case 2: LIGHTNING_INDEXER_VEC_LAUNCH(32, 2); break;
+                case 4: LIGHTNING_INDEXER_VEC_LAUNCH(32, 4); break;
+                case 8: LIGHTNING_INDEXER_VEC_LAUNCH(32, 8); break;
+                default: GGML_ABORT("fatal error");
+            }
         }
     } else {
         GGML_ABORT("fatal error");
     }
 }
+
+#undef LIGHTNING_INDEXER_VEC_LAUNCH
+#undef LIGHTNING_INDEXER_CASE
 
 bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst) {
     GGML_UNUSED(device);
