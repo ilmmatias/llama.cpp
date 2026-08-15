@@ -4805,6 +4805,39 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT_ID with duplicate expert IDs in a token. Hash-routed/pruned MoE tables may
+// legitimately map multiple route slots to the same retained expert.
+struct test_mul_mat_id_duplicates : public test_mul_mat_id {
+    test_mul_mat_id_duplicates(ggml_type type_a, ggml_type type_b,
+            int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat_id(type_a, type_b, n_mats, n_used, b, m, n, k, true) {}
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + ",dups=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat_id::initialize_tensors(ctx);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+
+            for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (int32_t i = 0; i < t->ne[0]; ++i) {
+                    data[i] = i % n_mats;
+                }
+                if (n_used > 1) {
+                    data[1] = data[0];
+                }
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+        }
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -10425,6 +10458,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id(
             GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 192, 6, false, 2048, bs, 4096, true));
     }
+
+    // Duplicate-route regression for compact DeepSeek-V4 hash routing. Keep the matrix small;
+    // n=32 is enough to exercise the routed MMQ helper on RDNA2.
+    test_cases.emplace_back(new test_mul_mat_id_duplicates(
+        GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 192, 6, true, 256, 32, 256));
 
 
     // gpt-oss-20b
