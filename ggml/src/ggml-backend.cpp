@@ -14,6 +14,7 @@
 #include "ggml-impl.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -21,6 +22,12 @@
 #include <string.h>
 #include <algorithm>
 #include <vector>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -1603,6 +1610,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    static const bool prefetch_moe_offload = [] {
+        const char * env = getenv("GGML_MOE_OFFLOAD_PREFETCH");
+        return env != nullptr && atoi(env) != 0;
+    }();
+#if defined(__linux__)
+    static const size_t moe_page_size = [] {
+        const long page_size = sysconf(_SC_PAGESIZE);
+        return page_size > 0 ? (size_t) page_size : (size_t) 4096;
+    }();
+#endif
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -1685,6 +1703,58 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
 
                         prev_ids_tensor = ids_tensor;
+                    }
+
+                    // Pageable copies from a file-backed mmap can block in the HIP runtime while Linux
+                    // faults the selected expert pages into the page cache.  Once routing is known, tell
+                    // the kernel about all ranges before starting the copies so those reads can be issued
+                    // ahead of the first blocking H2D transfer.
+                    if (prefetch_moe_offload) {
+#if defined(__linux__)
+                        auto prefetch_experts = [&](int32_t first_id, int32_t last_id) {
+                            const size_t expert_offset = first_id * expert_size;
+                            const size_t expert_size_copy = (last_id - first_id + 1) * expert_size;
+                            const size_t padding = std::min<size_t>(expert_size, 512);
+                            const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+                            const size_t copy_size = expert_size_copy + padding_end;
+                            const uint8_t * src = (const uint8_t *) input->data + expert_offset;
+
+                            const uintptr_t src_begin = (uintptr_t) src;
+                            const uintptr_t page_begin = src_begin - src_begin % moe_page_size;
+                            const size_t advise_size = (src_begin + copy_size) - page_begin;
+
+                            madvise((void *) page_begin, advise_size, MADV_WILLNEED);
+                        };
+
+                        int id = 0;
+                        while (!ggml_bitset_get(used_ids.data(), id)) {
+                            id++;
+                        }
+                        int32_t first_id = id;
+                        int32_t last_id = first_id;
+
+                        for (++id; id < n_expert; ++id) {
+                            if (!ggml_bitset_get(used_ids.data(), id)) {
+                                continue;
+                            }
+
+                            if (id == last_id + 1) {
+                                last_id = id;
+                                continue;
+                            }
+
+                            prefetch_experts(first_id, last_id);
+                            first_id = id;
+                            last_id = id;
+                        }
+                        prefetch_experts(first_id, last_id);
+#else
+                        static bool warned_prefetch_unsupported = false;
+                        if (!warned_prefetch_unsupported) {
+                            GGML_LOG_WARN("%s: GGML_MOE_OFFLOAD_PREFETCH is only supported on Linux\n", __func__);
+                            warned_prefetch_unsupported = true;
+                        }
+#endif
                     }
 
                     // group consecutive experts and copy them together
