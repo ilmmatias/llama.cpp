@@ -4677,6 +4677,63 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
     }
 }
 
+// Large routed-expert perf tests can spend tens of seconds generating and quantizing
+// a full multi-expert tensor before the backend operation runs. For perf-only shape
+// coverage, quantize one valid row, repeat it through one expert, then repeat that
+// expert across the tensor. The device allocation and MMID memory geometry remain
+// identical while setup stays small and deterministic.
+static void init_mul_mat_id_tensors_repeated_expert(ggml_context * ctx, int n_mats) {
+    std::random_device rd;
+    std::default_random_engine rng(rd());
+
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->type == GGML_TYPE_I32) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    data[i] = i % n_mats;
+                }
+                std::shuffle(data.begin(), data.end(), rng);
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+            continue;
+        }
+
+        if (strcmp(t->name, "as") != 0) {
+            init_tensor_uniform(t);
+            continue;
+        }
+
+        GGML_ASSERT(ggml_is_quantized(t->type));
+        GGML_ASSERT(t->ne[2] == n_mats);
+        GGML_ASSERT(t->nb[2] == t->nb[1] * (size_t) t->ne[1]);
+
+        const int64_t k = t->ne[0];
+        std::vector<float> row(k);
+        for (int64_t i = 0; i < k; i++) {
+            row[i] = ((int) (i % 31) - 15) / 16.0f;
+        }
+
+        std::vector<float> imatrix(k, 1.0f);
+        std::vector<uint8_t> row_q(t->nb[1]);
+        const size_t row_bytes = ggml_quantize_chunk(
+            t->type, row.data(), row_q.data(), 0, 1, k, imatrix.data());
+        GGML_ASSERT(row_bytes == t->nb[1]);
+
+        std::vector<uint8_t> expert(t->nb[2]);
+        for (int64_t r = 0; r < t->ne[1]; r++) {
+            memcpy(expert.data() + r * t->nb[1], row_q.data(), row_bytes);
+        }
+
+        for (int e = 0; e < n_mats; e++) {
+            ggml_backend_tensor_set(t, expert.data(), (size_t) e * t->nb[2], expert.size());
+        }
+    }
+}
+
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
@@ -4687,6 +4744,7 @@ struct test_mul_mat_id : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const bool repeated_expert_init;
 
     std::string vars() override {
         return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
@@ -4711,9 +4769,9 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32, bool repeated_expert_init = false)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k) {
+            m(m), n(n), k(k), repeated_expert_init(repeated_expert_init) {
             GGML_ASSERT(n_used <= n_mats);
         }
 
@@ -4739,7 +4797,11 @@ struct test_mul_mat_id : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, n_mats);
+        if (repeated_expert_init) {
+            init_mul_mat_id_tensors_repeated_expert(ctx, n_mats);
+        } else {
+            init_mul_mat_id_tensors(ctx, n_mats);
+        }
     }
 };
 
@@ -10361,7 +10423,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // tested independently of the scheduler's default batch-32 dynamic-offload threshold.
     for (int bs : {1, 31, 32}) {
         test_cases.emplace_back(new test_mul_mat_id(
-            GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 192, 6, false, 2048, bs, 4096));
+            GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 192, 6, false, 2048, bs, 4096, true));
     }
 
 
