@@ -10556,6 +10556,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // DeepSeek-V4 single-stream decode sweep for RDNA2 lightning-indexer tuning.
+    // The generic perf grid above deliberately samples only 256/4096/65536;
+    // these intermediate points locate the K-vectors-per-wave crossover without
+    // multiplying the full type/head/batch matrix.
+    for (int kv : { 512, 1024, 2048, 8192, 16384, 32768 }) {
+        test_cases.emplace_back(new test_lightning_indexer(
+            128, 64, kv, 1, 1, 1, GGML_TYPE_F16));
+    }
+
     return test_cases;
 }
 
