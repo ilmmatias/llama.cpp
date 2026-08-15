@@ -10357,6 +10357,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // DeepSeek-V4 routed gate-expert shape.  Keep 31/32 adjacent so RDNA2 MMQ can be
+    // tested independently of the scheduler's default batch-32 dynamic-offload threshold.
+    for (int bs : {1, 31, 32}) {
+        test_cases.emplace_back(new test_mul_mat_id(
+            GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 192, 6, false, 2048, bs, 4096));
+    }
+
 
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
