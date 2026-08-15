@@ -10565,6 +10565,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             128, 64, kv, 1, 1, 1, GGML_TYPE_F16));
     }
 
+    // DeepSeek-V4 hyperconnection kernels. HC_COMB uses 20 Sinkhorn iterations
+    // in production; batch sizes cover decode, the 512-token microbatch, and
+    // nearby workgroup boundaries. PRE/POST use the representative 4096-wide
+    // hidden dimension already exercised by the correctness suite.
+    for (int64_t n_tokens : { 1, 256, 336, 512, 513, 1024, 2048 }) {
+        test_cases.emplace_back(new test_dsv4_hc_comb(n_tokens, 20));
+    }
+    for (int64_t n_tokens : { 1, 21, 256, 512, 1024, 2048 }) {
+        test_cases.emplace_back(new test_dsv4_hc_pre (4096, n_tokens));
+        test_cases.emplace_back(new test_dsv4_hc_post(4096, n_tokens));
+    }
+
     return test_cases;
 }
 
