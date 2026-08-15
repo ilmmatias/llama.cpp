@@ -468,19 +468,12 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
     int vec_k_per_warp = 8;
 #ifdef GGML_USE_HIP
     if (GGML_CUDA_CC_IS_RDNA2(cc)) {
-        // The Vulkan DSV4 kernel maps one K vector to one wave. The generic
-        // CUDA/HIP vector kernel maps eight K vectors to a wave, which saves Q
-        // reloads but creates a much larger live VGPR set. Keep the historical
-        // value as the default and expose 1/2/4 as cheap A/B points on RDNA2.
-        // Once a card-specific winner is measured it can become the default.
-        if (const char * env = getenv("GGML_HIP_LIGHTNING_KVECS_PER_WARP")) {
-            const int value = atoi(env);
-            if (value == 1 || value == 2 || value == 4 || value == 8) {
-                vec_k_per_warp = value;
-            } else {
-                GGML_LOG_WARN("%s: ignoring GGML_HIP_LIGHTNING_KVECS_PER_WARP=%s; expected 1, 2, 4, or 8\n",
-                    __func__, env);
-            }
+        // Reduce K vectors per wave for short-context decode on RDNA2.
+        // The 8-vector variant has high register pressure and poor occupancy
+        // for this workload at small n_kv.
+        if (n_batch == 1 && n_stream == 1 &&
+                k->type == GGML_TYPE_F16 && n_kv <= 512) {
+            vec_k_per_warp = 1;
         }
     }
 #endif
