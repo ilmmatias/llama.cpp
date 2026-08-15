@@ -9746,6 +9746,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2049, 2, 1, 3}, k));
     }
 
+    // DeepSeek-V4 lightning indexer: top-512 over a potentially very long KV
+    // dimension. HIP has a dedicated hierarchical path for these shapes.
+    for (int cols : {1025, 2048, 4096, 65536}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, 2, 1, 1}, 512));
+    }
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {4096, 2, 1, 1}, 512, true));
+
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {
     //    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {i, 2, 1, 3}, rand() % i + 1));
@@ -10482,6 +10489,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (auto cols : {k, 1000, 65000, 200000}) {
                 test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, k));
             }
+        }
+    }
+
+
+    // DSV4 lightning-indexer selection. Keep row counts modest here; the full
+    // model benchmark exercises the 512-token prefill case.
+    for (auto nrows : {1, 64}) {
+        for (auto cols : {4096, 16384, 65536, 131072}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 512));
         }
     }
 

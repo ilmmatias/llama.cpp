@@ -2570,11 +2570,11 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             }
         }
 #ifdef GGML_USE_HIP
-        if ((node->op == GGML_OP_ARGSORT || node->op == GGML_OP_TOP_K) &&
-                node->src[0]->ne[0] > 1024) {
+        if ((node->op == GGML_OP_ARGSORT && node->src[0]->ne[0] > 1024) ||
+                (node->op == GGML_OP_TOP_K && ggml_cuda_top_k_hip_uses_radix(node))) {
             // hipCUB's segmented radix sort returns hipErrorStreamCaptureUnsupported
-            // when launched during stream capture. Smaller sorts use the native
-            // bitonic kernel and remain graph-compatible.
+            // when launched during stream capture. Smaller sorts and the DSV4
+            // hierarchical top-512 path remain graph-compatible.
             use_cuda_graph = false;
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: disabling CUDA graphs for large HIP radix sort\n", __func__);
