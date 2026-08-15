@@ -251,7 +251,10 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12};
+        // With unique routing IDs, an expert can receive at most ne12 rows. Duplicate routes can make an expert
+        // receive more than one row per token, so ne12 is no longer a valid launch bound. Use the total compact
+        // row count as a conservative bound; kernels still use expert_bounds to skip tiles outside each expert.
+        ne_get_rows};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }

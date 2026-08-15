@@ -9510,6 +9510,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Correctness regression for duplicate expert IDs within a token. Keep this in the eval suite
+    // (the production-shape duplicate case below lives in the perf suite).
+    test_cases.emplace_back(new test_mul_mat_id_duplicates(
+        GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 192, 6, true, 256, 32, 256));
+
     for (int bs : {1, 4, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
