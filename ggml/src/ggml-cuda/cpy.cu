@@ -97,6 +97,96 @@ static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const 
         nb12, nb13);
 }
 
+// Tiled copy for a layout with dim2 contiguous in the source and dim0
+// contiguous in the destination. This is the access pattern produced by
+// ggml_cont(ggml_permute(x, 2, 1, 0, 3)): lanes read adjacent src dim2
+// elements, transpose through shared memory, then write adjacent dst dim0
+// elements. The generic scalar copy instead makes adjacent lanes read with
+// the src dim0 stride, which is especially costly for DSV4 indexer tensors.
+static __global__ void cpy_f32_transpose_02(
+        const float * src, float * dst,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
+        const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13) {
+    __shared__ float tile[CUDA_CPY_TILE_DIM_2D][CUDA_CPY_TILE_DIM_2D + 1];
+
+    const int64_t tiles0 = (ne00 + CUDA_CPY_TILE_DIM_2D - 1) / CUDA_CPY_TILE_DIM_2D;
+    const int64_t tiles2 = (ne02 + CUDA_CPY_TILE_DIM_2D - 1) / CUDA_CPY_TILE_DIM_2D;
+    const int64_t nmat   = ne01 * ne03;
+
+    ggml_cuda_pdl_sync();
+
+    for (int64_t imat = blockIdx.z; imat < nmat; imat += gridDim.z) {
+        const int64_t i01 = imat % ne01;
+        const int64_t i03 = imat / ne01;
+
+        for (int64_t it2 = blockIdx.y; it2 < tiles2; it2 += gridDim.y) {
+            for (int64_t it0 = blockIdx.x; it0 < tiles0; it0 += gridDim.x) {
+#pragma unroll
+                for (int j = 0; j < CUDA_CPY_TILE_DIM_2D; j += CUDA_CPY_BLOCK_ROWS) {
+                    const int64_t i00 = it0 * CUDA_CPY_TILE_DIM_2D + threadIdx.y + j;
+                    const int64_t i02 = it2 * CUDA_CPY_TILE_DIM_2D + threadIdx.x;
+                    if (i00 < ne00 && i02 < ne02) {
+                        tile[threadIdx.y + j][threadIdx.x] =
+                            src[i00 * nb00 + i01 * nb01 + i02 * nb02 + i03 * nb03];
+                    }
+                }
+
+                __syncthreads();
+
+#pragma unroll
+                for (int j = 0; j < CUDA_CPY_TILE_DIM_2D; j += CUDA_CPY_BLOCK_ROWS) {
+                    const int64_t i10 = it0 * CUDA_CPY_TILE_DIM_2D + threadIdx.x;
+                    const int64_t i12 = it2 * CUDA_CPY_TILE_DIM_2D + threadIdx.y + j;
+                    if (i10 < ne00 && i12 < ne02) {
+                        dst[i10 * nb10 + i01 * nb11 + i12 * nb12 + i03 * nb13] =
+                            tile[threadIdx.x][threadIdx.y + j];
+                    }
+                }
+
+                // The tile is reused if a grid dimension was capped. Keep the
+                // next load from racing the previous transposed read.
+                __syncthreads();
+            }
+        }
+    }
+}
+
+static void ggml_cpy_f32_transpose_02_cuda(
+        const char * cx, char * cdst,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
+        const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13,
+        cudaStream_t stream) {
+    GGML_ASSERT(nb00 % sizeof(float) == 0);
+    GGML_ASSERT(nb01 % sizeof(float) == 0);
+    GGML_ASSERT(nb02 % sizeof(float) == 0);
+    GGML_ASSERT(nb03 % sizeof(float) == 0);
+    GGML_ASSERT(nb10 % sizeof(float) == 0);
+    GGML_ASSERT(nb11 % sizeof(float) == 0);
+    GGML_ASSERT(nb12 % sizeof(float) == 0);
+    GGML_ASSERT(nb13 % sizeof(float) == 0);
+
+    const int64_t tiles0 = (ne00 + CUDA_CPY_TILE_DIM_2D - 1) / CUDA_CPY_TILE_DIM_2D;
+    const int64_t tiles2 = (ne02 + CUDA_CPY_TILE_DIM_2D - 1) / CUDA_CPY_TILE_DIM_2D;
+    const int64_t nmat   = ne01 * ne03;
+
+    GGML_ASSERT(tiles0 <= INT_MAX);
+    const unsigned int grid_x = (unsigned int) tiles0;
+    const unsigned int grid_y = (unsigned int) (tiles2 > USHRT_MAX ? USHRT_MAX : tiles2);
+    const unsigned int grid_z = (unsigned int) (nmat   > USHRT_MAX ? USHRT_MAX : nmat);
+
+    const dim3 dim_grid(grid_x, grid_y, grid_z);
+    const dim3 dim_block(CUDA_CPY_TILE_DIM_2D, CUDA_CPY_BLOCK_ROWS, 1);
+    const ggml_cuda_kernel_launch_params launch_params(dim_grid, dim_block, 0, stream);
+
+    ggml_cuda_kernel_launch(cpy_f32_transpose_02, launch_params,
+        reinterpret_cast<const float *>(cx), reinterpret_cast<float *>(cdst),
+        ne00, ne01, ne02, ne03,
+        nb00 / sizeof(float), nb01 / sizeof(float), nb02 / sizeof(float), nb03 / sizeof(float),
+        nb10 / sizeof(float), nb11 / sizeof(float), nb12 / sizeof(float), nb13 / sizeof(float));
+}
+
 static __device__ void cpy_blck_q8_0_f32(const char * cxi, char * cdsti) {
     float * cdstf = (float *)(cdsti);
 
@@ -433,6 +523,7 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
     const int64_t ne02 = src0->ne[2];
+    const int64_t ne03 = src0->ne[3];
 
     //GGML_ASSERT(src0->ne[3] == 1);
 
@@ -460,6 +551,9 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     const bool contiguous_srcs = ggml_is_contiguous(src0) && ggml_is_contiguous(src1);
     const bool can_be_transposed = nb01 == (int64_t)ggml_element_size(src0) &&
         src0->ne[3] == 1 && nb02 == ne00 * ne01 * (int64_t)ggml_element_size(src0);
+    const bool can_be_transposed_02 = !contiguous_srcs &&
+        nb02 == (int64_t)ggml_element_size(src0) &&
+        ggml_is_contiguous(src1) && ggml_are_same_shape(src0, src1);
 
     size_t mc_width = 0, mc_height = 0, mc_spitch = 0, mc_dpitch = 0;
 
@@ -477,7 +571,11 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
                                      mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
-        if (can_be_transposed) {
+        if (can_be_transposed_02) {
+            ggml_cpy_f32_transpose_02_cuda(
+                src0_ddc, src1_ddc, ne00, ne01, ne02, ne03,
+                nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, main_stream);
+        } else if (can_be_transposed) {
             ggml_cpy_scalar_cuda<float, float, true>
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
         } else {
