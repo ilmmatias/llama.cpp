@@ -1364,8 +1364,8 @@ UseGgmlGemm1:;
 
     ggml_barrier(params->threadpool);
 
-    // transient "Q8 panel" gemm for the grid based IQ quants (see iqp.h) - must come after the
-    // barrier above, it consumes the q8_K rows of src1 from the work buffer
+    // IQ panel gemm (see iqp.h) - must come after the barrier above, it consumes the q8_K rows
+    // of src1 from the work buffer
     if (ggml_cpu_iqp_supported_mul_mat(dst) && !params->use_ref) {
         ggml_compute_forward_mul_mat_iqp(params, dst);
         return;
@@ -1588,9 +1588,8 @@ static void ggml_compute_forward_mul_mat_id(
     char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
         incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
 
-    // transient "Q8 panel" gemm for the grid based IQ quants (see iqp.h). Whether an expert actually
-    // takes it is decided per expert below; the work buffer is reserved for the whole node.
-    // ggml_graph_plan sizes the buffer without params, so use_ref only skips the dispatch.
+    // IQ panel gemm (see iqp.h); per expert eligibility is decided below, but the work buffer is
+    // reserved for the whole node (ggml_graph_plan sizes it without params, use_ref only skips the dispatch)
     const bool iqp = ggml_cpu_iqp_supported_mul_mat_id(dst) && !params->use_ref;
 
     char * iqp_panels = NULL;
@@ -1671,8 +1670,6 @@ static void ggml_compute_forward_mul_mat_id(
         }
 
         if (iqp && ggml_cpu_iqp_expert_eligible(cne1)) {
-            // the panel gemm reads this expert's routed q8_K rows straight out of the conversion area
-            // through the mmid row table, no packing pass in between
             ggml_compute_forward_mul_mat_id_iqp(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0),
                                                 iqp_panels);
 

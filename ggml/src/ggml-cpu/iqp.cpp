@@ -8,25 +8,40 @@
 #include "simd-mappings.h"
 #include "traits.h"
 
+#include <cassert>
 #include <cstdlib>
 #include <cstring>
 
-#include "repack.h"
-
 #include "iqp.h"
 
-// ---------------------------------------------------------------------------------------------
-// transient "Q8 panel" path for the grid based IQ quants (see iqp.h and block_iqp_x8 in repack.h)
-// ---------------------------------------------------------------------------------------------
+#define UNUSED GGML_UNUSED
 
 // src0 rows interleaved per panel
 #define IQP_NB_ROWS 8
 
-// decode primitives: all the grid based types share one inner shape, gather grid entries and negate the bytes selected by a sign byte, 32 values at a time.
-// The scalar bodies are the reference and what non x86 builds compile.
+#define IQP_SB_SIZE 16                    // weights per sub-block
+#define IQP_NSB     (QK_K / IQP_SB_SIZE)  // sub-blocks per super-block
 
-// the low 7 bits of v are the first 7 signs and the 8th is their parity - which is all the 128 entry ksigns_iq2xs table stores, so it can be computed instead of loaded (cf. unpack_ksigns in the CUDA backend).
-// Folding the parity with shifts keeps this portable and off the popcount feature macros.
+// one super-block of a grid based IQ type decoded to int8, 8 rows interleaved:
+// dfac[row] * iscales[sb*8 + row] * qs is bit identical to dequantize_row_iq*
+struct block_iqp_x8 {
+    float   dfac[8];               // f32 super-block scale, d * 2^-k
+    int32_t bias[8];               // 128 * sum(qs * iscale), see GGML_IQP_USE_BIAS
+    int8_t  iscales[IQP_NSB * 8];  // integer sub-block scales, in [-32, 31]
+    int8_t  qs[QK_K * 8];          // qs[sb*128 + g*32 + row*4 + k] = column sb*16 + g*4 + k
+};
+
+static_assert(sizeof(block_iqp_x8) == 8 * sizeof(float) + 8 * sizeof(int32_t) + IQP_NSB * 8 + QK_K * 8,
+              "wrong iqp_x8 block size/padding");
+
+// feed the activations to VNNI as unsigned bytes (y + 128) and correct with bias[]; without VNNI the kernels use the maddubs sign trick instead and bias[] is not filled
+#if defined(__AVX2__) && ((defined(__AVX512VNNI__) && defined(__AVX512VL__)) || defined(__AVXVNNI__))
+#    define GGML_IQP_USE_BIAS 1
+#else
+#    define GGML_IQP_USE_BIAS 0
+#endif
+
+// the low 7 bits of v are the first 7 signs and the 8th is their parity (cf. unpack_ksigns in the CUDA backend)
 static inline uint8_t iqp_unpack_ksigns(uint32_t v) {
     uint32_t p = v ^ (v >> 4);
 
@@ -38,12 +53,12 @@ static inline uint8_t iqp_unpack_ksigns(uint32_t v) {
 
 #if defined(__AVX2__)
 
-// 0xFF in every byte whose sign bit is set. sv must hold each sign byte broadcast over the 8 bytes it governs; the selector is kmask_iq2xs, one vector wide.
+// 0xFF in every byte whose sign bit is set; sv holds each sign byte broadcast over the 8 bytes it governs
 static inline __m256i iqp_sign_mask(__m256i sv) {
     const __m256i sel = _mm256_set1_epi64x((int64_t) 0x8040201008040201ULL);
 
 #    if defined(__GFNI__)
-    // gf2p8affine gives bit j of result byte i as parity(sel.byte[i] & sv.byte[j]); with sv.byte[j] constant over the qword every bit of byte i comes out as bit i of the sign byte, i.e. 0 or 0xFF - the whole and + compare in one instruction
+    // computes the and + compare in one instruction
     return _mm256_gf2p8affine_epi64_epi8(sel, sv, 0);
 #    else
     return _mm256_cmpeq_epi8(_mm256_and_si256(sv, sel), sel);
@@ -58,7 +73,7 @@ static inline __m256i iqp_sign_bytes(uint32_t signs) {
     return _mm256_shuffle_epi8(_mm256_set1_epi32((int32_t) signs), bcast);
 }
 
-// x ^ m - m negates the lanes of x whose mask byte m is 0xFF and leaves the others alone
+// x ^ m - m negates the lanes where m is 0xFF
 static inline __m256i iqp_apply_signs(__m256i x, __m256i m) {
     return _mm256_sub_epi8(_mm256_xor_si256(x, m), m);
 }
@@ -135,7 +150,7 @@ static inline void iqp_store_iq1_x8(int8_t * GGML_RESTRICT dst,
 #if defined(__AVX2__)
     __m256i g = _mm256_set_epi64x((int64_t) g3, (int64_t) g2, (int64_t) g1, (int64_t) g0);
 
-    // no byte shift on AVX2, and the grid bytes are tiny, so three doublings are the cheap way
+    // no byte shift in AVX2
     g = _mm256_add_epi8(g, g);
     g = _mm256_add_epi8(g, g);
     g = _mm256_add_epi8(g, g);
@@ -174,7 +189,7 @@ static inline void iqp_store_iq4_x32(int8_t * GGML_RESTRICT dst, const uint8_t *
 
 #if GGML_IQP_USE_BIAS
 
-// sum of weight * integer sub-block scale over one decoded super-block. Bounded by 256 * 127 * 32 = 1.04e6, and 128 times that is 1.33e8, so the int32 result cannot overflow the kernel accumulator (see the bounds in iqp_acc_block).
+// sum of qs * iscale over one super-block, at most 256 * 127 * 32 = 1.04e6
 static inline int32_t iqp_weighted_sum(const int8_t * GGML_RESTRICT vals, const int8_t * GGML_RESTRICT iscales) {
 #if defined(__AVX2__)
     static_assert(IQP_SB_SIZE == 16, "the vector path folds two sub-blocks per 32 byte load");
@@ -185,7 +200,7 @@ static inline int32_t iqp_weighted_sum(const int8_t * GGML_RESTRICT vals, const 
     __m256i acc = _mm256_setzero_si256();
 
     for (int i = 0; i < QK_K / 32; ++i) {
-        // maddubs against ones sums byte pairs, madd against ones sums those in fours: eight int32, the low four covering sub-block 2*i and the high four sub-block 2*i + 1
+        // sum groups of 4 bytes into int32, the low four lanes cover sub-block 2*i and the high four 2*i + 1
         const __m256i v = _mm256_loadu_si256((const __m256i *) (vals + 32 * i));
         const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, v), ones16);
 
@@ -287,7 +302,6 @@ static void iqp_decode_iq2_s(const void * GGML_RESTRICT vx,
         iscales[2 * ib32 + 0] = (int8_t) (2 * (x->scales[ib32] & 0xf) + 1);
         iscales[2 * ib32 + 1] = (int8_t) (2 * (x->scales[ib32] >> 4) + 1);
 
-        // the sign bytes are stored whole here, so there is no parity to recover
         const uint32_t sbits =
             (uint32_t) signs[0] | (uint32_t) signs[1] << 8 | (uint32_t) signs[2] << 16 | (uint32_t) signs[3] << 24;
 
@@ -356,7 +370,6 @@ static void iqp_decode_iq3_s(const void * GGML_RESTRICT vx,
         iscales[2 * ib32 + 2] = db2;
         iscales[2 * ib32 + 3] = db2;
 
-        // the two halves of the 64 weights differ only in which qh byte supplies the 9th bit of each grid index
         for (int h = 0; h < 2; ++h) {
             const uint32_t sbits =
                 (uint32_t) signs[0] | (uint32_t) signs[1] << 8 | (uint32_t) signs[2] << 16 | (uint32_t) signs[3] << 24;
@@ -375,8 +388,7 @@ static void iqp_decode_iq3_s(const void * GGML_RESTRICT vx,
     }
 }
 
-// the two iq1 types do not dequantize as scale * value: dequantize_row_iq1_* computes y = dl * (grid[j] + delta) with grid[j] in {-1, 0, 1} and delta = +-1/8, so scaling dl down by 8 gives y = (dl / 8) * (8 * grid[j] +- 1), which fits int8.
-// This is bit identical and not merely close: dl is d (fp16) times a small odd integer, so the product is exact in f32, and dividing it by the power of two 8 stays exact.
+// dequantize_row_iq1_* computes y = dl * (grid[j] + delta) with delta = +-1/8, so the panel stores 8 * grid[j] +- 1 and folds the /8 into dfac
 static void iqp_decode_iq1_s(const void * GGML_RESTRICT vx,
                              int8_t * GGML_RESTRICT     vals,
                              int8_t * GGML_RESTRICT     iscales,
@@ -386,11 +398,10 @@ static void iqp_decode_iq1_s(const void * GGML_RESTRICT vx,
     const uint8_t *  qs = x->qs;
     const uint16_t * qh = x->qh;
 
-    // dl = d * (2 * ls + 1) * 0.125, ls 3 bit - the /8 of the delta trick is the 2^-k
+    // dl = d * (2 * ls + 1) * 0.125, ls 3 bit
     *dfac = GGML_CPU_FP16_TO_FP32(x->d) * 0.125f;
 
     for (int ib = 0; ib < QK_K / 32; ++ib) {
-        // one scale and one delta sign per 32 weights, so both sub-blocks share them
         const int8_t dl    = (int8_t) (2 * ((qh[ib] >> 12) & 7) + 1);
         const int8_t delta = qh[ib] & 0x8000 ? -1 : 1;
 
@@ -422,7 +433,6 @@ static void iqp_decode_iq1_m(const void * GGML_RESTRICT vx,
     const uint8_t * qh = x->qh;
 
     for (int ib = 0; ib < QK_K / 32; ++ib) {
-        // 3 bit scales are per 16 weights here, i.e. one per sub-block, and the delta signs are per group of 8 - the +-1 is folded per value, so that is free
         iscales[2 * ib + 0] = (int8_t) (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 0)) & 0x7) + 1);
         iscales[2 * ib + 1] = (int8_t) (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) + 1);
 
@@ -466,7 +476,7 @@ static void iqp_decode_iq4_xs(const void * GGML_RESTRICT vx,
     }
 }
 
-// every supported grid type in one place: the eligibility test and the decode dispatch both expand this list, so a type cannot be enabled without a decoder
+// expanded by the eligibility test and the decode dispatch
 #define IQP_TYPE_LIST(T) \
     T(IQ2_XXS, iq2_xxs)  \
     T(IQ2_XS, iq2_xs)    \
@@ -477,8 +487,6 @@ static void iqp_decode_iq4_xs(const void * GGML_RESTRICT vx,
     T(IQ1_M, iq1_m)      \
     T(IQ4_XS, iq4_xs)
 
-// decode one super-block into QK_K signed values, IQP_NSB integer sub-block scales and the one float factor they share.
-// The expressions mirror dequantize_row_iq* from ggml-quants.c, split so that (*dfac * iscales[sb]) * value is bit identical to the reference dequantized weight - see block_iqp_x8 in repack.h for why the split is exact.
 static bool iqp_decode_superblock(enum ggml_type             type,
                                   const void * GGML_RESTRICT vx,
                                   int8_t * GGML_RESTRICT     vals,
@@ -498,7 +506,7 @@ static bool iqp_decode_superblock(enum ggml_type             type,
 
 #if defined(__AVX2__)
 
-// interleave the 32 column group starting at column off of the IQP_NB_ROWS staged rows. Seen as int32 that group is 8 dwords per row, and the panel wants dword i of row r at dst[i * 32 + r * 4], i.e. an 8x8 int32 transpose whose rows are eight contiguous 32 byte stores
+// 8x8 int32 transpose of the 32 column group starting at column off
 static inline void iqp_interleave_x8(int8_t * GGML_RESTRICT dst, const int8_t (*vals)[QK_K], int off) {
     static_assert(IQP_NB_ROWS == 8, "the transpose is 8x8");
 
@@ -559,7 +567,7 @@ static void iqp_decode_panel_8(enum ggml_type               type,
             GGML_ASSERT(ok);
 
 #ifdef GGML_IQP_VERIFY
-            // debug aid: assert that the panel reproduces the reference dequantization bit exactly
+            // check that the panel reproduces the reference dequantization bit exactly
             float ref[QK_K];
             ggml_get_type_traits(type)->to_float(blk, ref, QK_K);
             for (int j = 0; j < QK_K; j++) {
@@ -577,12 +585,10 @@ static void iqp_decode_panel_8(enum ggml_type               type,
             }
 
 #if GGML_IQP_USE_BIAS
-            // the gemm feeds the activations as unsigned bytes, see block_iqp_x8. Builds whose kernels never read bias[] skip the sweep and leave the field uninitialized
             dst->bias[r] = 128 * iqp_weighted_sum(vals[r], iscales[r]);
 #endif
         }
 
-        // the values interleave as an 8x8 int32 transpose per group of 32 columns: both sides are contiguous over k, so a source row is 8 dwords and a transposed row is one 32 byte store
 #if defined(__AVX2__)
         for (int grp = 0; grp < QK_K / 32; grp++) {
             iqp_interleave_x8(dst->qs + grp * 256, vals, grp * 32);
@@ -601,6 +607,424 @@ static void iqp_decode_panel_8(enum ggml_type               type,
     }
 }
 
+// gemm/gemv kernels: vx points at block_iqp_x8, vy at plain (non interleaved) block_q8_K rows
+
+static void iqp_gemv_8x8_q8_K_generic(int                        n,
+                                      float * GGML_RESTRICT      s,
+                                      size_t                     bs,
+                                      const void * GGML_RESTRICT vx,
+                                      const void * GGML_RESTRICT vy,
+                                      int                        nr,
+                                      int                        nc) {
+    const int nb                = n / QK_K;
+    const int ncols_interleaved = 8;
+
+    assert(n % QK_K == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    UNUSED(bs);
+    UNUSED(nr);
+
+    const block_iqp_x8 * b_ptr_start = (const block_iqp_x8 *) vx;
+    const block_q8_K *   a_ptr       = (const block_q8_K *) vy;
+
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_iqp_x8 * b_ptr = b_ptr_start + x * nb;
+
+        float sumf[8] = { 0 };
+
+        for (int l = 0; l < nb; l++) {
+            int32_t sumi[8] = { 0 };
+
+            for (int sb = 0; sb < IQP_NSB; sb++) {
+                int32_t isum[8] = { 0 };
+
+                for (int g = 0; g < 4; g++) {
+                    for (int j = 0; j < ncols_interleaved; j++) {
+                        for (int k = 0; k < 4; k++) {
+                            isum[j] += b_ptr[l].qs[sb * 128 + g * 32 + j * 4 + k] * a_ptr[l].qs[sb * 16 + g * 4 + k];
+                        }
+                    }
+                }
+
+                for (int j = 0; j < ncols_interleaved; j++) {
+                    sumi[j] += isum[j] * b_ptr[l].iscales[sb * 8 + j];
+                }
+            }
+
+            for (int j = 0; j < ncols_interleaved; j++) {
+                sumf[j] += (float) sumi[j] * (b_ptr[l].dfac[j] * a_ptr[l].d);
+            }
+        }
+
+        for (int j = 0; j < ncols_interleaved; j++) {
+            s[x * ncols_interleaved + j] = sumf[j];
+        }
+    }
+}
+
+// one 4 row x nc column tile; s points at the first of the four output rows, bs floats apart
+static void iqp_gemm_tile_4_generic(int                                nb,
+                                    float * GGML_RESTRICT              s,
+                                    size_t                             bs,
+                                    const block_iqp_x8 * GGML_RESTRICT b_ptr_start,
+                                    const block_q8_K * const           a_ptr[4],
+                                    int                                nc) {
+    const int ncols_interleaved = 8;
+
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_iqp_x8 * b_ptr = b_ptr_start + x * nb;
+
+        float sumf[4][8];
+        for (int m = 0; m < 4; m++) {
+            for (int j = 0; j < ncols_interleaved; j++) {
+                sumf[m][j] = 0.0f;
+            }
+        }
+
+        for (int l = 0; l < nb; l++) {
+            for (int m = 0; m < 4; m++) {
+                int32_t sumi[8] = { 0 };
+
+                for (int sb = 0; sb < IQP_NSB; sb++) {
+                    int32_t isum[8] = { 0 };
+
+                    for (int g = 0; g < 4; g++) {
+                        for (int j = 0; j < ncols_interleaved; j++) {
+                            for (int k = 0; k < 4; k++) {
+                                isum[j] +=
+                                    b_ptr[l].qs[sb * 128 + g * 32 + j * 4 + k] * a_ptr[m][l].qs[sb * 16 + g * 4 + k];
+                            }
+                        }
+                    }
+
+                    for (int j = 0; j < ncols_interleaved; j++) {
+                        sumi[j] += isum[j] * b_ptr[l].iscales[sb * 8 + j];
+                    }
+                }
+
+                for (int j = 0; j < ncols_interleaved; j++) {
+                    sumf[m][j] += (float) sumi[j] * (b_ptr[l].dfac[j] * a_ptr[m][l].d);
+                }
+            }
+        }
+
+        for (int m = 0; m < 4; m++) {
+            for (int j = 0; j < ncols_interleaved; j++) {
+                s[m * bs + x * ncols_interleaved + j] = sumf[m][j];
+            }
+        }
+    }
+}
+
+static void iqp_gemm_8x8_q8_K_generic(int                        n,
+                                      float * GGML_RESTRICT      s,
+                                      size_t                     bs,
+                                      const void * GGML_RESTRICT vx,
+                                      const void * GGML_RESTRICT vy,
+                                      int                        nr,
+                                      int                        nc) {
+    const int nb = n / QK_K;
+
+    assert(n % QK_K == 0);
+    assert(nr % 4 == 0);
+    assert(nc % 8 == 0);
+
+    const block_iqp_x8 * b_ptr_start = (const block_iqp_x8 *) vx;
+    const block_q8_K *   a_ptr_start = (const block_q8_K *) vy;
+
+    for (int y = 0; y < nr / 4; y++) {
+        const block_q8_K * a_ptr[4];
+        for (int m = 0; m < 4; m++) {
+            a_ptr[m] = a_ptr_start + (y * 4 + m) * nb;
+        }
+
+        iqp_gemm_tile_4_generic(nb, s + y * 4 * bs, bs, b_ptr_start, a_ptr, nc);
+    }
+}
+
+static void iqp_gemm_8x8_q8_K_p4_generic(int                                n,
+                                         float * GGML_RESTRICT              s,
+                                         size_t                             bs,
+                                         const void * GGML_RESTRICT         vx,
+                                         const void * const * GGML_RESTRICT vy,
+                                         int                                nc) {
+    const int nb = n / QK_K;
+
+    assert(n % QK_K == 0);
+    assert(nc % 8 == 0);
+
+    const block_q8_K * a_ptr[4];
+    for (int m = 0; m < 4; m++) {
+        a_ptr[m] = (const block_q8_K *) vy[m];
+    }
+
+    iqp_gemm_tile_4_generic(nb, s, bs, (const block_iqp_x8 *) vx, a_ptr, nc);
+}
+
+#if defined(__AVX2__)
+
+// add int16_t pairwise and return as 256 bit int vector, then add the accumulator
+static inline __m256i sum_i16_pairs_acc_int32x8(const __m256i acc, const __m256i x) {
+    const __m256i ones = _mm256_set1_epi16(1);
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(ones, x));
+}
+
+static inline __m256i mul_sum_us8_pairs_acc_int32x8(const __m256i acc, const __m256i ax, const __m256i sy) {
+#    if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    return _mm256_dpbusd_epi32(acc, ax, sy);
+#    elif defined(__AVXVNNI__)
+    return _mm256_dpbusd_avx_epi32(acc, ax, sy);
+#    else
+    // Perform multiplication and create 16-bit values
+    const __m256i dot = _mm256_maddubs_epi16(ax, sy);
+    return sum_i16_pairs_acc_int32x8(acc, dot);
+#    endif
+}
+
+// Integer variant of the function defined in ggml-quants.c
+// multiply int8_t, add results pairwise twice and return as 256 bit int vector, then add the accumulator
+static inline __m256i mul_sum_i8_pairs_acc_int32x8(const __m256i acc, const __m256i x, const __m256i y) {
+#    if defined(__AVXVNNIINT8__)
+    return _mm256_dpbssd_epi32(acc, x, y);
+#    else
+    // Get absolute values of x vectors
+    const __m256i ax = _mm256_sign_epi8(x, x);
+    // Sign the values of the y vectors
+    const __m256i sy = _mm256_sign_epi8(y, x);
+    return mul_sum_us8_pairs_acc_int32x8(acc, ax, sy);
+#    endif
+}
+
+// load the 16 activations of one sub-block, offset by 128 when they are fed to dpbusd as unsigned bytes
+static inline __m256i iqp_load_y(const int8_t * GGML_RESTRICT qs) {
+    __m128i y = _mm_loadu_si128((const __m128i *) qs);
+#    if GGML_IQP_USE_BIAS
+    y = _mm_xor_si128(y, _mm_set1_epi8((char) 0x80));
+#    endif
+    return _mm256_broadcastsi128_si256(y);
+}
+
+// xv: 8 rows x 4 signed weights, yb: the matching 4 activation bytes broadcast to all 8 lanes
+static inline __m256i iqp_dot4(const __m256i acc, const __m256i xv, const __m256i yb) {
+#    if GGML_IQP_USE_BIAS
+    return mul_sum_us8_pairs_acc_int32x8(acc, yb, xv);
+#    else
+    return mul_sum_i8_pairs_acc_int32x8(acc, xv, yb);
+#    endif
+}
+
+static inline __m256i iqp_load_iscales(const int8_t * GGML_RESTRICT iscales) {
+    return _mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *) iscales));
+}
+
+// accumulate one super-block of 8 interleaved rows against one q8_K row in int32; worst case 16 * 32 * 16 * 255 * 127 = 2.65e8 plus a bias of at most 1.33e8 does not overflow
+static inline __m256i iqp_acc_block(const block_iqp_x8 * GGML_RESTRICT b, const block_q8_K * GGML_RESTRICT a) {
+    __m256i sumi = _mm256_setzero_si256();
+
+    for (int sb = 0; sb < IQP_NSB; sb++) {
+        const int8_t * qs = b->qs + sb * 128;
+
+        const __m256i yv = iqp_load_y(a->qs + sb * 16);
+
+        __m256i isum = _mm256_setzero_si256();
+
+        isum = iqp_dot4(isum, _mm256_loadu_si256((const __m256i *) (qs + 0)), _mm256_shuffle_epi32(yv, 0x00));
+        isum = iqp_dot4(isum, _mm256_loadu_si256((const __m256i *) (qs + 32)), _mm256_shuffle_epi32(yv, 0x55));
+        isum = iqp_dot4(isum, _mm256_loadu_si256((const __m256i *) (qs + 64)), _mm256_shuffle_epi32(yv, 0xAA));
+        isum = iqp_dot4(isum, _mm256_loadu_si256((const __m256i *) (qs + 96)), _mm256_shuffle_epi32(yv, 0xFF));
+
+        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(isum, iqp_load_iscales(b->iscales + sb * 8)));
+    }
+
+#    if GGML_IQP_USE_BIAS
+    sumi = _mm256_sub_epi32(sumi, _mm256_loadu_si256((const __m256i *) b->bias));
+#    endif
+
+    return sumi;
+}
+
+// one 4 row x nc column tile; s points at the first of the four output rows, bs floats apart
+static inline void iqp_gemm_tile_4(int                                nb,
+                                   float * GGML_RESTRICT              s,
+                                   size_t                             bs,
+                                   const block_iqp_x8 * GGML_RESTRICT b_ptr_start,
+                                   const block_q8_K * const           a_ptr[4],
+                                   int                                nc) {
+    const int ncols_interleaved = 8;
+
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_iqp_x8 * b_ptr = b_ptr_start + x * nb;
+
+        __m256 sumf[4];
+        for (int m = 0; m < 4; m++) {
+            sumf[m] = _mm256_setzero_ps();
+        }
+
+        for (int l = 0; l < nb; l++) {
+            __m256i sumi[4];
+            for (int m = 0; m < 4; m++) {
+                sumi[m] = _mm256_setzero_si256();
+            }
+
+            for (int sb = 0; sb < IQP_NSB; sb++) {
+                const int8_t * qs = b_ptr[l].qs + sb * 128;
+
+                __m256i yv[4];
+                __m256i isum[4];
+                for (int m = 0; m < 4; m++) {
+                    yv[m]   = iqp_load_y(a_ptr[m][l].qs + sb * 16);
+                    isum[m] = _mm256_setzero_si256();
+                }
+
+                const __m256i xv0 = _mm256_loadu_si256((const __m256i *) (qs + 0));
+                const __m256i xv1 = _mm256_loadu_si256((const __m256i *) (qs + 32));
+                const __m256i xv2 = _mm256_loadu_si256((const __m256i *) (qs + 64));
+                const __m256i xv3 = _mm256_loadu_si256((const __m256i *) (qs + 96));
+
+                for (int m = 0; m < 4; m++) {
+                    isum[m] = iqp_dot4(isum[m], xv0, _mm256_shuffle_epi32(yv[m], 0x00));
+                    isum[m] = iqp_dot4(isum[m], xv1, _mm256_shuffle_epi32(yv[m], 0x55));
+                    isum[m] = iqp_dot4(isum[m], xv2, _mm256_shuffle_epi32(yv[m], 0xAA));
+                    isum[m] = iqp_dot4(isum[m], xv3, _mm256_shuffle_epi32(yv[m], 0xFF));
+                }
+
+                const __m256i isc = iqp_load_iscales(b_ptr[l].iscales + sb * 8);
+                for (int m = 0; m < 4; m++) {
+                    sumi[m] = _mm256_add_epi32(sumi[m], _mm256_mullo_epi32(isum[m], isc));
+                }
+            }
+
+#    if GGML_IQP_USE_BIAS
+            const __m256i bias = _mm256_loadu_si256((const __m256i *) b_ptr[l].bias);
+            for (int m = 0; m < 4; m++) {
+                sumi[m] = _mm256_sub_epi32(sumi[m], bias);
+            }
+#    endif
+
+            const __m256 dfac = _mm256_loadu_ps(b_ptr[l].dfac);
+            for (int m = 0; m < 4; m++) {
+                sumf[m] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi[m]),
+                                          _mm256_mul_ps(dfac, _mm256_set1_ps(a_ptr[m][l].d)), sumf[m]);
+            }
+        }
+
+        for (int m = 0; m < 4; m++) {
+            _mm256_storeu_ps(s + m * bs + x * ncols_interleaved, sumf[m]);
+        }
+    }
+}
+
+#endif  // __AVX2__
+
+static void iqp_gemv_8x8_q8_K(int                        n,
+                              float * GGML_RESTRICT      s,
+                              size_t                     bs,
+                              const void * GGML_RESTRICT vx,
+                              const void * GGML_RESTRICT vy,
+                              int                        nr,
+                              int                        nc) {
+    const int nb                = n / QK_K;
+    const int ncols_interleaved = 8;
+
+    assert(n % QK_K == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    UNUSED(bs);
+    UNUSED(nr);
+    UNUSED(nb);
+    UNUSED(ncols_interleaved);
+
+#if defined(__AVX2__)
+    const block_iqp_x8 * b_ptr_start = (const block_iqp_x8 *) vx;
+    const block_q8_K *   a_ptr       = (const block_q8_K *) vy;
+
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_iqp_x8 * b_ptr = b_ptr_start + x * nb;
+
+        __m256 sumf = _mm256_setzero_ps();
+
+        for (int l = 0; l < nb; l++) {
+            const __m256 dv = _mm256_mul_ps(_mm256_loadu_ps(b_ptr[l].dfac), _mm256_set1_ps(a_ptr[l].d));
+
+            sumf = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iqp_acc_block(b_ptr + l, a_ptr + l)), dv, sumf);
+        }
+
+        _mm256_storeu_ps(s + x * ncols_interleaved, sumf);
+    }
+
+    return;
+#endif
+
+    iqp_gemv_8x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+static void iqp_gemm_8x8_q8_K(int                        n,
+                              float * GGML_RESTRICT      s,
+                              size_t                     bs,
+                              const void * GGML_RESTRICT vx,
+                              const void * GGML_RESTRICT vy,
+                              int                        nr,
+                              int                        nc) {
+    const int nb                = n / QK_K;
+    const int ncols_interleaved = 8;
+
+    assert(n % QK_K == 0);
+    assert(nr % 4 == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    UNUSED(nb);
+    UNUSED(ncols_interleaved);
+
+#if defined(__AVX2__)
+    const block_iqp_x8 * b_ptr_start = (const block_iqp_x8 *) vx;
+    const block_q8_K *   a_ptr_start = (const block_q8_K *) vy;
+
+    for (int y = 0; y < nr / 4; y++) {
+        const block_q8_K * a_ptr[4];
+        for (int m = 0; m < 4; m++) {
+            a_ptr[m] = a_ptr_start + (y * 4 + m) * nb;
+        }
+
+        iqp_gemm_tile_4(nb, s + y * 4 * bs, bs, b_ptr_start, a_ptr, nc);
+    }
+
+    return;
+#endif
+
+    iqp_gemm_8x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+// same as iqp_gemm_8x8_q8_K with nr = 4, but the activation rows are passed as separate pointers (for the scattered rows of MUL_MAT_ID)
+static void iqp_gemm_8x8_q8_K_p4(int                                n,
+                                 float * GGML_RESTRICT              s,
+                                 size_t                             bs,
+                                 const void * GGML_RESTRICT         vx,
+                                 const void * const * GGML_RESTRICT vy,
+                                 int                                nc) {
+    const int nb                = n / QK_K;
+    const int ncols_interleaved = 8;
+
+    assert(n % QK_K == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    UNUSED(nb);
+    UNUSED(ncols_interleaved);
+
+#if defined(__AVX2__)
+    const block_q8_K * a_ptr[4];
+    for (int m = 0; m < 4; m++) {
+        a_ptr[m] = (const block_q8_K *) vy[m];
+    }
+
+    iqp_gemm_tile_4(nb, s, bs, (const block_iqp_x8 *) vx, a_ptr, nc);
+
+    return;
+#endif
+
+    iqp_gemm_8x8_q8_K_p4_generic(n, s, bs, vx, vy, nc);
+}
+
 static bool iqp_type_supported(enum ggml_type type) {
     switch (type) {
 #define IQP_CASE(E, name) case GGML_TYPE_##E:
@@ -612,7 +1036,6 @@ static bool iqp_type_supported(enum ggml_type type) {
     }
 }
 
-// the checks MUL_MAT and MUL_MAT_ID have in common; each caller adds its own batch size test and its own src0 shape test on top
 static bool iqp_supported_common(const struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -621,10 +1044,10 @@ static bool iqp_supported_common(const struct ggml_tensor * dst) {
         return false;
     }
 
-    // the whole path (the routed row addressing included) assumes the src1 conversion is q8_K
+    // the path assumes the src1 conversion type is q8_K
     GGML_ASSERT(ggml_get_type_traits_cpu(src0->type)->vec_dot_type == GGML_TYPE_Q8_K);
 
-    // escape hatch to A/B the panel against the plain vec_dot path without rebuilding, read once (this path is not a repack buffer, so --no-repack does not cover it, and llama-bench has no equivalent flag at all)
+    // escape hatch to A/B the panel against the plain vec_dot path without rebuilding (--no-repack does not cover this path)
     static const bool disabled = getenv("GGML_NO_IQ_PANEL") != nullptr;
     if (disabled) {
         return false;
@@ -661,7 +1084,6 @@ bool ggml_cpu_iqp_supported_mul_mat(const struct ggml_tensor * dst) {
         return false;
     }
 
-    // small batches stay on the vec_dot path - the decode would not pay for itself
     if (src1->ne[1] < GGML_IQP_MIN_BATCH) {
         return false;
     }
@@ -675,14 +1097,13 @@ bool ggml_cpu_iqp_supported_mul_mat(const struct ggml_tensor * dst) {
 }
 
 bool ggml_cpu_iqp_supported_mul_mat_id(const struct ggml_tensor * dst) {
-    // src0 is the 3D expert stack here, one matrix per expert, so ne[2] is not constrained
     const struct ggml_tensor * ids = dst->src[2];
 
     if (!iqp_supported_common(dst)) {
         return false;
     }
 
-    // no expert can clear the per expert threshold if the whole node routes fewer rows than that, and checking it here keeps token generation off the path entirely, work buffer included
+    // skip the node entirely (work buffer included) if no expert can reach the per expert threshold
     if (!ggml_cpu_iqp_expert_eligible(ids->ne[0] * ids->ne[1])) {
         return false;
     }
@@ -718,7 +1139,6 @@ void ggml_compute_forward_mul_mat_id_iqp(const struct ggml_compute_params * para
 
     const char * src0_cur = (const char *) src0->data + cur_a * nb02;
 
-    // static split: every 8 row group is multiplied against all of this expert's routed rows, so the result does not depend on how the groups are handed out
     const int64_t ngroups = ne01 / IQP_NB_ROWS;
 
     const int64_t g0 = (ngroups * ith) / nth;
@@ -729,13 +1149,13 @@ void ggml_compute_forward_mul_mat_id_iqp(const struct ggml_compute_params * para
 
         iqp_decode_panel_8(src0->type, src0_cur + r * nb01, nb01, nblocks, panel);
 
-        // the dst columns of the routed rows are scattered (one per (expert slot, token) pair), so the gemm writes its 4 row tile here and it is copied out row by row
+        // the dst rows are scattered, so the gemm writes into tmp and it is copied out row by row
         float tmp[4 * IQP_NB_ROWS];
 
         for (int64_t k = 0; k < cne1; k += 4) {
             const int64_t nrows = MIN(4, cne1 - k);
 
-            // a short tail tile duplicates its last real row into the unused slots: the four rows accumulate independently, so the padding just recomputes that row and is never copied out
+            // a short tail tile duplicates its last row into the unused slots; the padding is never copied out
             const void * rows[4];
 
             for (int64_t m = 0; m < 4; m++) {
@@ -745,7 +1165,7 @@ void ggml_compute_forward_mul_mat_id_iqp(const struct ggml_compute_params * para
                           ((expert_rows[2 * kk + 0] % ne11) + expert_rows[2 * kk + 1] * ne11) * nbw1;
             }
 
-            ggml_gemm_iqp_8x8_q8_K_p4(ne00, tmp, IQP_NB_ROWS, panel, rows, IQP_NB_ROWS);
+            iqp_gemm_8x8_q8_K_p4(ne00, tmp, IQP_NB_ROWS, panel, rows, IQP_NB_ROWS);
 
             for (int64_t m = 0; m < nrows; m++) {
                 float * dst_col = (float *) ((char *) dst->data + expert_rows[2 * (k + m) + 0] * nb1 +
@@ -756,7 +1176,7 @@ void ggml_compute_forward_mul_mat_id_iqp(const struct ggml_compute_params * para
     }
 }
 
-// the panel scratch lives past the q8_K conversion of src1 in the work buffer, and ggml_graph_plan sizes the buffer with these two helpers while the compute pass addresses it with them, so the two cannot drift
+// ggml_graph_plan sizes the work buffer with these two helpers and the compute pass addresses it with them, so the two cannot drift
 size_t ggml_cpu_iqp_scratch_offset(const struct ggml_tensor * dst) {
     return GGML_PAD(ggml_cpu_iqp_src1_conv_size(dst), 64);
 }
@@ -776,7 +1196,6 @@ void ggml_compute_forward_mul_mat_iqp(const struct ggml_compute_params * params,
 
     const int64_t nblocks = ne00 / QK_K;
 
-    // src1 has already been converted to plain (non interleaved) q8_K rows in the work buffer
     const size_t nbw1 = ggml_row_size(GGML_TYPE_Q8_K, ne10);
     const size_t nbw2 = nbw1 * ne11;
 
@@ -787,12 +1206,11 @@ void ggml_compute_forward_mul_mat_iqp(const struct ggml_compute_params * params,
     block_iqp_x8 * panel =
         (block_iqp_x8 *) ((char *) params->wdata + ggml_cpu_iqp_scratch_offset(dst) + (size_t) ith * scratch_size);
 
-    // every row group is multiplied against the whole src1 batch, so the gemm / gemv split - and with it the per output element operation sequence - does not depend on the chunking
     const int64_t nrows = ne11;
 
     const int64_t ngroups = ne01 / IQP_NB_ROWS;
 
-    // aim for 4 chunks per thread; the caller has already reset the chunk counter to nth and synchronized the threads
+    // aim for 4 chunks per thread; the caller has already reset the chunk counter
     const int64_t groups_per_chunk = MAX(1, (ngroups + nth * 4 - 1) / (nth * 4));
     const int64_t nchunk           = (ngroups + groups_per_chunk - 1) / groups_per_chunk;
 
@@ -805,21 +1223,19 @@ void ggml_compute_forward_mul_mat_iqp(const struct ggml_compute_params * params,
         for (int64_t g = g0; g < g1; g++) {
             const int64_t r = g * IQP_NB_ROWS;
 
-            // src0 is 2D here, so one decode of the row group serves every src1 batch
             iqp_decode_panel_8(src0->type, (const char *) src0->data + r * nb01, nb01, nblocks, panel);
 
             for (int64_t i12 = 0; i12 < ne12; i12++) {
                 const char * src1_ptr = (const char *) params->wdata + i12 * nbw2;
                 char *       dst_ptr  = (char *) dst->data + i12 * nb2;
 
-                // If there are more than three rows in src1, use gemm; otherwise, use gemv.
                 if (nrows > 3) {
-                    ggml_gemm_iqp_8x8_q8_K(ne00, (float *) dst_ptr + r, nb1 / nb0, panel, src1_ptr, nrows - (nrows % 4),
-                                           IQP_NB_ROWS);
+                    iqp_gemm_8x8_q8_K(ne00, (float *) dst_ptr + r, nb1 / nb0, panel, src1_ptr, nrows - (nrows % 4),
+                                      IQP_NB_ROWS);
                 }
                 for (int64_t iter = nrows - (nrows % 4); iter < nrows; iter++) {
-                    ggml_gemv_iqp_8x8_q8_K(ne00, (float *) (dst_ptr + iter * nb1) + r, ne01, panel,
-                                           src1_ptr + nbw1 * iter, 1 /* nrows */, IQP_NB_ROWS);
+                    iqp_gemv_8x8_q8_K(ne00, (float *) (dst_ptr + iter * nb1) + r, ne01, panel, src1_ptr + nbw1 * iter,
+                                      1 /* nrows */, IQP_NB_ROWS);
                 }
             }
         }
