@@ -526,17 +526,8 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
             ggml_backend_dev_t device_fused = backend_fused ? ggml_backend_get_device(backend_fused) : nullptr;
 
-            // TODO: make this descriptor-specific; model.dev_layer() preserves the current behavior,
-            // but is still wrong for cases like --no-kv-offload.
-            ggml_backend_dev_t device_layer = model.dev_layer(node.il);
-
-            if (device_fused != device_layer) {
-                LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
-                        "is assigned to device %s (usually due to missing support)\n",
-                        func, node.il,
-                        device_layer ? ggml_backend_dev_name(device_layer) : "none",
-                        probe.name,
-                        device_fused ? ggml_backend_dev_name(device_fused) : "none");
+            if (!device_fused) {
+                LLAMA_LOG_WARN("%s: fused op %s has no valid device (usually due to missing support)\n", func, probe.name);
                 device_mismatch = true;
                 break;
             }
