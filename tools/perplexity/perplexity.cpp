@@ -745,6 +745,10 @@ static void hellaswag_score(llama_context * ctx, const common_params & params) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
+    char model_arch[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", model_arch, sizeof(model_arch));
+    const bool share_prefix = strcmp(model_arch, "deepseek4") != 0;
+
     // Calculates hellaswag score (acc_norm) from prompt
     //
     // Data extracted from the HellaSwag validation dataset (MIT license) https://github.com/rowanz/hellaswag/blob/master/data/hellaswag_val.jsonl
@@ -838,11 +842,17 @@ static void hellaswag_score(llama_context * ctx, const common_params & params) {
             }
             hs_cur.common_prefix++;
         }
-        hs_cur.required_tokens = hs_cur.common_prefix +
-            hs_cur.seq_tokens[0].size() - hs_cur.common_prefix +
-            hs_cur.seq_tokens[1].size() - hs_cur.common_prefix +
-            hs_cur.seq_tokens[2].size() - hs_cur.common_prefix +
-            hs_cur.seq_tokens[3].size() - hs_cur.common_prefix;
+        if (share_prefix) {
+            hs_cur.required_tokens = hs_cur.common_prefix;
+            for (const auto & seq : hs_cur.seq_tokens) {
+                hs_cur.required_tokens += seq.size() - hs_cur.common_prefix;
+            }
+        } else {
+            hs_cur.required_tokens = 0;
+            for (const auto & seq : hs_cur.seq_tokens) {
+                hs_cur.required_tokens += seq.size();
+            }
+        }
 
         //GGML_ASSERT(hs_cur.common_prefix >= ::llama_tokenize(ctx, hs_cur.context, true).size());
 
@@ -852,7 +862,7 @@ static void hellaswag_score(llama_context * ctx, const common_params & params) {
         }
     }
 
-    LOG_INF("%s : calculating hellaswag score over selected tasks.\n", __func__);
+    LOG_INF("%s : calculating hellaswag score over selected tasks with %s prefixes.\n", __func__, share_prefix ? "shared" : "independent");
 
     LOG("\ntask\tacc_norm\t95%% confidence interval\n");
 
@@ -897,19 +907,31 @@ static void hellaswag_score(llama_context * ctx, const common_params & params) {
                 break;
             }
 
-            for (size_t i = 0; i < hs_cur.common_prefix; ++i) {
-                common_batch_add(batch, hs_cur.seq_tokens[0][i], i, { s0 + 0, s0 + 1, s0 + 2, s0 + 3 }, false);
-            }
-            batch.logits[batch.n_tokens - 1] = true; // we need logits for the last token of the common prefix
-            n_logits += 1;
+            if (share_prefix) {
+                for (size_t i = 0; i < hs_cur.common_prefix; ++i) {
+                    common_batch_add(batch, hs_cur.seq_tokens[0][i], i, { s0 + 0, s0 + 1, s0 + 2, s0 + 3 }, false);
+                }
+                batch.logits[batch.n_tokens - 1] = true; // we need logits for the last token of the common prefix
+                n_logits += 1;
 
-            for (int s = 0; s < 4; ++s) {
-                const size_t seq_tokens_size = hs_cur.seq_tokens[s].size();
-                // TODO: don't evaluate the last token of each sequence
-                for (size_t i = hs_cur.common_prefix; i < seq_tokens_size; ++i) {
-                    const bool needs_logits = i < seq_tokens_size - 1;
-                    common_batch_add(batch, hs_cur.seq_tokens[s][i], i, { s0 + s }, needs_logits);
-                    n_logits += needs_logits;
+                for (int s = 0; s < 4; ++s) {
+                    const size_t seq_tokens_size = hs_cur.seq_tokens[s].size();
+                    // TODO: don't evaluate the last token of each sequence
+                    for (size_t i = hs_cur.common_prefix; i < seq_tokens_size; ++i) {
+                        const bool needs_logits = i < seq_tokens_size - 1;
+                        common_batch_add(batch, hs_cur.seq_tokens[s][i], i, { s0 + s }, needs_logits);
+                        n_logits += needs_logits;
+                    }
+                }
+            } else {
+                GGML_ASSERT(hs_cur.common_prefix > 0);
+                for (int s = 0; s < 4; ++s) {
+                    const size_t seq_tokens_size = hs_cur.seq_tokens[s].size();
+                    for (size_t i = 0; i < seq_tokens_size; ++i) {
+                        const bool needs_logits = i >= hs_cur.common_prefix - 1 && i < seq_tokens_size - 1;
+                        common_batch_add(batch, hs_cur.seq_tokens[s][i], i, { s0 + s }, needs_logits);
+                        n_logits += needs_logits;
+                    }
                 }
             }
 
@@ -940,9 +962,10 @@ static void hellaswag_score(llama_context * ctx, const common_params & params) {
         eval_pairs.clear();
         for (size_t i = i0; i < i1; ++i) {
             auto & hs_cur = hs_data[i];
-            size_t li = 1; // skip the last logit of the common prefix (computed separately below)
+            size_t li = share_prefix ? 1 : 0; // shared-prefix logits are computed separately below
             for (int s = 0; s < 4; ++s) {
-                for (size_t j = hs_cur.common_prefix; j < hs_cur.seq_tokens[s].size() - 1; j++) {
+                const size_t first = share_prefix ? hs_cur.common_prefix : hs_cur.common_prefix - 1;
+                for (size_t j = first; j < hs_cur.seq_tokens[s].size() - 1; j++) {
                     eval_pairs.emplace_back(hs_cur.i_logits + li++, hs_cur.seq_tokens[s][j + 1]);
                 }
             }
@@ -956,19 +979,31 @@ static void hellaswag_score(llama_context * ctx, const common_params & params) {
         for (size_t i = i0; i < i1; ++i) {
             auto & hs_cur = hs_data[i];
 
-            // get the logits of the last token of the common prefix
-            std::memcpy(tok_logits.data(), batch_logits.data() + hs_cur.i_logits*n_vocab, n_vocab*sizeof(float));
+            if (share_prefix) {
+                // get the logits of the last token of the common prefix
+                std::memcpy(tok_logits.data(), batch_logits.data() + hs_cur.i_logits*n_vocab, n_vocab*sizeof(float));
 
-            const auto first_probs = softmax(tok_logits);
+                const auto first_probs = softmax(tok_logits);
 
-            for (int s = 0; s < 4; ++s) {
-                hs_cur.ending_logprob_count[s] = 1;
-                hs_cur.ending_logprob[s] = std::log(first_probs[hs_cur.seq_tokens[s][hs_cur.common_prefix]]);
-                for (size_t j = hs_cur.common_prefix; j < hs_cur.seq_tokens[s].size() - 1; j++) {
-                    hs_cur.ending_logprob[s] += eval_results[ir++];
-                    hs_cur.ending_logprob_count[s]++;
+                for (int s = 0; s < 4; ++s) {
+                    hs_cur.ending_logprob_count[s] = 1;
+                    hs_cur.ending_logprob[s] = std::log(first_probs[hs_cur.seq_tokens[s][hs_cur.common_prefix]]);
+                    for (size_t j = hs_cur.common_prefix; j < hs_cur.seq_tokens[s].size() - 1; j++) {
+                        hs_cur.ending_logprob[s] += eval_results[ir++];
+                        hs_cur.ending_logprob_count[s]++;
+                    }
+                    hs_cur.ending_logprob[s] /= hs_cur.ending_logprob_count[s];
                 }
-                hs_cur.ending_logprob[s] /= hs_cur.ending_logprob_count[s];
+            } else {
+                for (int s = 0; s < 4; ++s) {
+                    hs_cur.ending_logprob_count[s] = 0;
+                    hs_cur.ending_logprob[s] = 0.0;
+                    for (size_t j = hs_cur.common_prefix - 1; j < hs_cur.seq_tokens[s].size() - 1; j++) {
+                        hs_cur.ending_logprob[s] += eval_results[ir++];
+                        hs_cur.ending_logprob_count[s]++;
+                    }
+                    hs_cur.ending_logprob[s] /= hs_cur.ending_logprob_count[s];
+                }
             }
 
             // Find the ending with maximum logprob
