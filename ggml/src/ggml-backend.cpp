@@ -1709,7 +1709,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // faults the selected expert pages into the page cache.  Once routing is known, tell
                     // the kernel about all ranges before starting the copies so those reads can be issued
                     // ahead of the first blocking H2D transfer.
-                    if (prefetch_moe_offload) {
+                    // Readahead is useful for multi-token prompt batches, but issuing it for every
+                    // single-token decode step adds syscall and speculative-I/O overhead.
+                    if (prefetch_moe_offload && ids_tensor->ne[1] > 1) {
 #if defined(__linux__)
                         auto prefetch_experts = [&](int32_t first_id, int32_t last_id) {
                             const size_t expert_offset = first_id * expert_size;
