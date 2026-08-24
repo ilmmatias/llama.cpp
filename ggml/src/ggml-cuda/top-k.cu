@@ -219,11 +219,11 @@ bool ggml_cuda_top_k_hip_uses_radix(const ggml_tensor * dst) {
         return false;
     }
 
-    // hipCUB is substantially faster on gfx1030 for the multi-row/prefill
-    // cases and for ordinary decode context lengths. The hierarchical top-512
-    // reducer only wins in the measured single-row 131072-column case, where
-    // it also has the advantage of remaining compatible with stream capture.
-    // Keep explicit overrides so this policy can be retuned on other GPUs.
+    // hipCUB is substantially faster on gfx1030 for prefill and ordinary
+    // context lengths. At long contexts the hierarchical top-512 reducer also
+    // wins for a few simultaneous decode rows: its crossover is approximately
+    // ncols > nrows * 65536, with a hard floor at 131072 columns. Keep explicit
+    // overrides so this measured workload policy can be retuned on other GPUs.
     if (getenv("GGML_HIP_TOPK_RADIX") != nullptr) {
         return true;
     }
@@ -234,7 +234,14 @@ bool ggml_cuda_top_k_hip_uses_radix(const ggml_tensor * dst) {
         return false;
     }
 
-    return ggml_nrows(src0) != 1 || src0->ne[0] < 131072;
+    const int64_t nrows = ggml_nrows(src0);
+    const int device = ggml_cuda_get_device();
+    const int cc     = ggml_cuda_info().devices[device].cc;
+    if (!GGML_CUDA_CC_IS_RDNA2(cc)) {
+        return nrows != 1 || src0->ne[0] < 131072;
+    }
+
+    return src0->ne[0] < 131072 || src0->ne[0] <= nrows * 65536;
 }
 
 #endif // GGML_USE_HIP

@@ -9855,6 +9855,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {4096, 2, 1, 1}, 512, true));
 
+    for (int nrows : {1, 2, 3}) {
+        for (int cols : {196608, 262144, 393216}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 512));
+        }
+    }
+    for (int nrows : {4, 5, 6}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {393216, nrows, 1, 1}, 512));
+    }
+
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {
     //    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {i, 2, 1, 3}, rand() % i + 1));
@@ -10616,6 +10625,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // model benchmark exercises the 512-token prefill case.
     for (auto nrows : {1, 64}) {
         for (auto cols : {4096, 16384, 65536, 131072}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 512));
+        }
+    }
+
+    // Production DeepSeek-V4 context ceiling and parallel-session decode rows.
+    // These exercise the HIP radix/hierarchical policy above its 131K crossover.
+    for (auto nrows : {1, 2, 3}) {
+        for (auto cols : {196608, 262144, 393216}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 512));
+        }
+    }
+
+    for (auto nrows : {2, 4, 8}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {131072, nrows, 1, 1}, 512));
+    }
+    for (auto nrows : {4, 5, 6, 8}) {
+        for (auto cols : {196608, 262144, 393216}) {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 512));
         }
     }
