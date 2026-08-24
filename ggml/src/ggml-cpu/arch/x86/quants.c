@@ -936,7 +936,6 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_fp4);
     const __m128i m4b  = _mm_set1_epi8(0x0f);
-    const __m256i mone = _mm256_set1_epi16(1);
 
     __m256 accum1 = _mm256_setzero_ps();
     __m256 accum2 = _mm256_setzero_ps();
@@ -950,14 +949,12 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                                               _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_1, m4b)));
         const __m256i q4b_2 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_2, 4), m4b)),
                                               _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_2, m4b)));
-        const __m256i p16_1 = mul_add_epi8(q4b_1, q8b_1);
-        const __m256i p16_2 = mul_add_epi8(q4b_2, q8b_2);
-        const __m256i p_1 = _mm256_madd_epi16(p16_1, mone);
-        const __m256i p_2 = _mm256_madd_epi16(p16_2, mone);
+        const __m256 p_1 = mul_sum_i8_pairs_float(q4b_1, q8b_1);
+        const __m256 p_2 = mul_sum_i8_pairs_float(q4b_2, q8b_2);
         const __m256 scale0 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y[ib + 0].d)*GGML_CPU_E8M0_TO_FP32_HALF(x[ib + 0].e));
         const __m256 scale1 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y[ib + 1].d)*GGML_CPU_E8M0_TO_FP32_HALF(x[ib + 1].e));
-        accum1 = _mm256_fmadd_ps(scale0, _mm256_cvtepi32_ps(p_1), accum1);
-        accum2 = _mm256_fmadd_ps(scale1, _mm256_cvtepi32_ps(p_2), accum2);
+        accum1 = _mm256_fmadd_ps(scale0, p_1, accum1);
+        accum2 = _mm256_fmadd_ps(scale1, p_2, accum2);
     }
 
     sumf = hsum_float_8(_mm256_add_ps(accum1, accum2));
@@ -2894,10 +2891,22 @@ void ggml_vec_dot_iq2_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
             const __m256i sc3 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(ib32+2)));
             const __m256i sc4 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(ib32+3)));
 
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+            sumi1 = _mm256_dpwssd_epi32(sumi1, dot1, sc1);
+            sumi2 = _mm256_dpwssd_epi32(sumi2, dot2, sc2);
+            sumi1 = _mm256_dpwssd_epi32(sumi1, dot3, sc3);
+            sumi2 = _mm256_dpwssd_epi32(sumi2, dot4, sc4);
+#elif defined(__AVXVNNI__)
+            sumi1 = _mm256_dpwssd_avx_epi32(sumi1, dot1, sc1);
+            sumi2 = _mm256_dpwssd_avx_epi32(sumi2, dot2, sc2);
+            sumi1 = _mm256_dpwssd_avx_epi32(sumi1, dot3, sc3);
+            sumi2 = _mm256_dpwssd_avx_epi32(sumi2, dot4, sc4);
+#else
             sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(dot1, sc1));
             sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(dot2, sc2));
             sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(dot3, sc3));
             sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(dot4, sc4));
+#endif
         }
 
         accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
@@ -3145,10 +3154,18 @@ void ggml_vec_dot_iq2_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
             const __m256i dot1  = _mm256_maddubs_epi16(q2_1, q8s_1); // blocks 2*ib32+0, 2*ib32+1
             const __m256i dot2  = _mm256_maddubs_epi16(q2_2, q8s_2); // blocks 2*ib32+2, 2*ib32+3
 
-            const __m256i p1 = _mm256_madd_epi16(dot1, _mm256_shuffle_epi8(scales16, get_scale_shuffle_k4(ib32+0)));
-            const __m256i p2 = _mm256_madd_epi16(dot2, _mm256_shuffle_epi8(scales16, get_scale_shuffle_k4(ib32+1)));
-            sumi1 = _mm256_add_epi32(sumi1, p1);
-            sumi2 = _mm256_add_epi32(sumi2, p2);
+            const __m256i scale1 = _mm256_shuffle_epi8(scales16, get_scale_shuffle_k4(ib32+0));
+            const __m256i scale2 = _mm256_shuffle_epi8(scales16, get_scale_shuffle_k4(ib32+1));
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+            sumi1 = _mm256_dpwssd_epi32(sumi1, dot1, scale1);
+            sumi2 = _mm256_dpwssd_epi32(sumi2, dot2, scale2);
+#elif defined(__AVXVNNI__)
+            sumi1 = _mm256_dpwssd_avx_epi32(sumi1, dot1, scale1);
+            sumi2 = _mm256_dpwssd_avx_epi32(sumi2, dot2, scale2);
+#else
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(dot1, scale1));
+            sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(dot2, scale2));
+#endif
         }
 
         accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
