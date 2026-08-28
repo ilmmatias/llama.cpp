@@ -54,7 +54,7 @@ static void fill_tensor(struct ggml_tensor * t, const float * src, int64_t rows,
     free(q);
 }
 
-void test_matmul(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_type quant_type) {
+static void test_matmul(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_type quant_type) {
     srand(0xBEEF);
 
     float * src1_ref = gen_rand_f32(M * N);
@@ -62,7 +62,7 @@ void test_matmul(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_t
     float * dst_out = (float *) malloc(M * K * sizeof(float));
     float * dst_tiled = (float *) malloc(M * K * sizeof(float));
 
-    struct ggml_init_params ip = { .mem_size = 1024*1024*1024, .no_alloc = true };
+    struct ggml_init_params ip = { 1024*1024*1024, nullptr, true };
     struct ggml_context * ctx = ggml_init(ip);
 
     // ggml_mul_mat(t0, t1) computes t1 * t0^T: t0 (src0, quant) is N wide x
@@ -119,7 +119,7 @@ void test_matmul(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_t
 // src1 (F32)  : [N, M, src1_2, src1_3]   ne0=N (reduction), ne1=M (out0)
 // src0 (quant): [N, K, src0_2, src0_3]   ne0=N (reduction), ne1=K (out1)
 // dst = ggml_mul_mat(src0, src1) : [K, M, src1_2, src1_3]
-void test_matmul_highdim(ggml_backend_t backend, int64_t M, int64_t N, int64_t K,
+static void test_matmul_highdim(ggml_backend_t backend, int64_t M, int64_t N, int64_t K,
                          int64_t src1_2, int64_t src1_3,
                          int64_t src0_2, int64_t src0_3,
                          ggml_type quant_type) {
@@ -134,7 +134,7 @@ void test_matmul_highdim(ggml_backend_t backend, int64_t M, int64_t N, int64_t K
     float * dst_std   = (float *) malloc(n_dst * sizeof(float));
     float * dst_tiled = (float *) malloc(n_dst * sizeof(float));
 
-    struct ggml_init_params ip = { .mem_size = 1024*1024*1024, .no_alloc = true };
+    struct ggml_init_params ip = { 1024*1024*1024, nullptr, true };
     struct ggml_context * ctx = ggml_init(ip);
 
     int64_t ne_src1[4] = { N, M, src1_2, src1_3 };
@@ -258,7 +258,7 @@ static bench_row bench_three_way(ggml_backend_t backend, int64_t M, int64_t N, i
     row.max_err_repack = row.rmse_repack = row.max_err_tiled = row.rmse_tiled = 0.0f;
     row.have_repack = false;
 
-    struct ggml_init_params ip = { .mem_size = 1024*1024*1024, .no_alloc = true };
+    struct ggml_init_params ip = { 1024*1024*1024, nullptr, true };
     struct ggml_context * ctx = ggml_init(ip);
 
     struct ggml_tensor * src1     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, M);
@@ -363,7 +363,7 @@ static void print_bench_table(int64_t M, int64_t N, int64_t K, const bench_row *
     }
 }
 
-int main(int argc, char ** argv) {
+int main() {
     // Enable tiled MM, also force tiled MM even when unprofitable for benchmarks
     setenv("GGML_CPU_TILED_MM", "1", 1);
     setenv("GGML_CPU_TILED_MM_FORCE", "1", 1);
