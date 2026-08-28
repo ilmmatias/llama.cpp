@@ -8052,6 +8052,7 @@ size_t ggml_quantize_chunk(
         default:
             assert(false);
     }
+
     GGML_ASSERT(result == nrows * row_size);
 
     return result;
