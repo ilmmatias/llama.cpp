@@ -496,6 +496,25 @@ struct llama_mmap::impl {
             }
         };
 
+#ifdef __linux__
+        // Keep normal file-backed model weights eligible for transparent huge pages.
+        // Lazy random-gather tensors (for example Qwen PLE) are deliberately excluded: their
+        // access pattern is sparse/random and they have their own MADV_RANDOM + row prefetch policy.
+        if (!numa) {
+            const size_t page_size = sysconf(_SC_PAGESIZE);
+            for (const auto & range : ranges_complement(lazy_ranges, file->size())) {
+                // Align inward so a boundary page shared with a lazy range remains governed by
+                // the lazy policy rather than accidentally receiving MADV_HUGEPAGE.
+                const size_t beg = (range.first + page_size - 1) & ~(page_size - 1);
+                const size_t end = range.second & ~(page_size - 1);
+                if (beg < end && madvise((char *) addr + beg, end - beg, MADV_HUGEPAGE)) {
+                    LLAMA_LOG_DEBUG("note: madvise(.., MADV_HUGEPAGE) not applied: %s\n",
+                            strerror(errno));
+                }
+            }
+        }
+#endif
+
         if (prefetch > 0) {
             for (const auto & range : ranges_complement(lazy_ranges, std::min(file->size(), prefetch))) {
                 advise(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
