@@ -1467,7 +1467,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
             conv_states_all->nb[1],
             kv_head * row_size);
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
 
     return conv_input;
 }
