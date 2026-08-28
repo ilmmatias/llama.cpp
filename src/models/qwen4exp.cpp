@@ -1536,10 +1536,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
             model.layers[il].ple_norm_conv);
     normalized = ggml_reshape_2d(ctx0, normalized, hc_dim, n_tokens);
 
-    // depthwise causal conv, dilated by the n-gram size, as a sum of shifted copies
-    // ggml_conv_1d_dw is documented as unreliable:
-    //   out[c, t] = sum_k w[k, c] * x[c, t - (K-1-k)*dilation]
-    // The history of the earlier ubatches is prepended, so a chunked prefill matches a single-shot one.
+    // The history of earlier ubatches is prepended to the dilated depthwise convolution.
     const int64_t kern = hparams.ple_conv_kernel;
     const int64_t dil  = hparams.ple_ngram_size;
     const int64_t hist = (kern - 1) * dil;
@@ -1553,33 +1550,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
             ggml_reshape_3d(ctx0, normalized, hc_dim, n_seq_tokens, n_seqs),
             hist, hc_dim, il);
 
-    ggml_tensor * conv_out = nullptr;
-    for (int64_t k = 0; k < kern; ++k) {
-        // tap k reads (kern-1-k)*dilation positions back
-        const int64_t start = hist - (kern - 1 - k) * dil;
+    ggml_tensor * weight = model.layers[il].ple_conv1d;
+    if (weight->type != GGML_TYPE_F32) {
+        weight = ggml_cast(ctx0, weight, GGML_TYPE_F32);
+    }
+    weight = ggml_reshape_3d(ctx0, weight, kern, 1, hc_dim);
 
-        ggml_tensor * shifted = ggml_cont(ctx0,
-                ggml_transpose(ctx0,
-                        ggml_view_3d(ctx0, padded, n_seq_tokens, hc_dim, n_seqs,
-                                padded->nb[1], padded->nb[2],
-                                ggml_row_size(padded->type, start))));
-
-        // column k of the [kern, hc_dim] kernel is one weight per channel
-        ggml_tensor * wk = ggml_cont(ctx0,
-                ggml_view_2d(ctx0, model.layers[il].ple_conv1d, 1, hc_dim,
-                        model.layers[il].ple_conv1d->nb[1],
-                        k * model.layers[il].ple_conv1d->nb[0]));
-        // this kernel keeps the file type, so cast it before it multiplies an f32 activation
-        wk = ggml_reshape_1d(ctx0, wk, hc_dim);
-        if (wk->type != GGML_TYPE_F32) {
-            wk = ggml_cast(ctx0, wk, GGML_TYPE_F32);
-        }
-
-        ggml_tensor * term = ggml_mul(ctx0, shifted, wk);
-        conv_out = conv_out ? ggml_add(ctx0, conv_out, term) : term;
+    std::vector<ggml_tensor *> outputs;
+    outputs.reserve(n_seqs);
+    for (int64_t is = 0; is < n_seqs; ++is) {
+        ggml_tensor * seq_input = ggml_view_2d(
+                ctx0, padded, padded->ne[0], hc_dim, padded->nb[1], is*padded->nb[2]);
+        ggml_tensor * output = ggml_conv_1d_dw(ctx0, weight, seq_input, 1, 0, dil);
+        outputs.push_back(ggml_cont(ctx0, ggml_transpose(ctx0, output)));
     }
 
-    conv_out = ggml_silu(ctx0, conv_out);
+    ggml_tensor * conv_out = outputs[0];
+    for (int64_t is = 1; is < n_seqs; ++is) {
+        conv_out = ggml_concat(ctx0, conv_out, outputs[is], 1);
+    }
+    conv_out = ggml_silu(ctx0, ggml_reshape_2d(ctx0, conv_out, hc_dim, n_tokens));
     conv_out = ggml_reshape_3d(ctx0, ggml_cont(ctx0, conv_out), n_embd, hc, n_tokens);
     cb(conv_out, "ple_conv_out", il);
 
