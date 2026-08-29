@@ -1327,6 +1327,11 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    // TENSOR_READ_LAZY keeps the PLE table file-backed and marks its range random-access.
+    // Queue all pages this ubatch will gather before the graph starts so NVMe latency overlaps
+    // instead of becoming one synchronous mmap fault per row.
+    pmodel.prefetch_rows(pmodel.per_layer_tok_embd, idx.data(), idx.size());
+
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 

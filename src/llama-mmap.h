@@ -55,6 +55,15 @@ struct llama_mmap {
 
     void unmap_fragment(size_t first, size_t last);
 
+    // true if [ptr, ptr + len) lies inside this mapping
+    bool contains(const void * ptr, size_t len) const;
+
+    // Start reading the pages backing these rows before the gather executes. The implementation
+    // deduplicates page hits and merges adjacent pages so sparse lazy-tensor gathers do not
+    // serialize on one page fault per row.
+    void prefetch_rows(const void * base, size_t stride, size_t row_size,
+                       const int32_t * rows, size_t n_rows) const;
+
     static const bool SUPPORTED;
 
 private:

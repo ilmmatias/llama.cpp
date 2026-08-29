@@ -750,6 +750,10 @@ struct llama_model {
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
+    // Start reading the file-backed pages for rows of an mmap-resident tensor before a sparse
+    // gather executes. This is a no-op for copied/offloaded tensors and non-mmap load modes.
+    void prefetch_rows(const struct ggml_tensor * t, const int32_t * rows, size_t n_rows) const;
+
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
 

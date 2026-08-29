@@ -1821,6 +1821,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     return true;
 }
 
+void llama_model::prefetch_rows(const struct ggml_tensor * t, const int32_t * rows, size_t n_rows) const {
+    if (t == nullptr || t->data == nullptr || rows == nullptr || n_rows == 0 || pimpl->mappings.empty()) {
+        return;
+    }
+
+    const size_t len = ggml_nbytes(t);
+    for (const auto & mapping : pimpl->mappings) {
+        if (mapping->contains(t->data, len)) {
+            mapping->prefetch_rows(t->data, t->nb[1], ggml_row_size(t->type, t->ne[0]), rows, n_rows);
+            return;
+        }
+    }
+}
+
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
     return ml.create_tensor(

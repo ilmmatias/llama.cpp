@@ -4,6 +4,7 @@
 #include "llama-cparams.h"
 
 #include <bit>
+#include <bitset>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -324,19 +325,28 @@ public:
     // note: used by n-gram input embeddings to recover the tokens preceding a ubatch
     template<typename F>
     void for_each_token_in(const std::bitset<LLAMA_MAX_SEQ> & seqs, llama_pos p0, llama_pos p1, F && f) const {
-        for (const auto & i : used) {
-            if (pos[i] < p0 || pos[i] >= p1) {
-                continue;
-            }
+        for (size_t w = 0; w < used_bits.size(); ++w) {
+            uint64_t mask = used_bits[w];
+            while (mask) {
+                const int bit = llama_bits::countr_zero64(mask);
+                const uint32_t i = (uint32_t) (w * 64 + bit);
+                mask &= mask - 1;
 
-            const auto m = seq[i] & seqs;
-            if (m.none()) {
-                continue;
-            }
+                if (i >= pos.size() || pos[i] < p0 || pos[i] >= p1) {
+                    continue;
+                }
 
-            for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                if (m.test(s)) {
-                    f(s, pos[i], ext[i].tok);
+                for (int k = 0; k < N_SEQ_WORDS; ++k) {
+                    uint64_t seq_mask = seq[i].w[k];
+                    while (seq_mask) {
+                        const int bit_seq = llama_bits::countr_zero64(seq_mask);
+                        const llama_seq_id seq_id = k * 64 + bit_seq;
+                        seq_mask &= seq_mask - 1;
+
+                        if (seqs.test(seq_id)) {
+                            f(seq_id, pos[i], ext[i].tok);
+                        }
+                    }
                 }
             }
         }
