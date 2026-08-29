@@ -257,7 +257,7 @@ public:
         assert(seq_id >= 0);
 
         seq[i].reset(seq_id);
-        seq_pos_dec(seq_id, pos[i]);
+        seq_pos_dec(seq_id, pos[i], i);
 
         if (seq[i].none()) {
             pos[i] = -1;
@@ -281,7 +281,7 @@ public:
             seq[i].reset();
 
             seq[i].set(seq_id);
-            seq_pos_inc(seq_id, pos[i]);
+            seq_pos_inc(seq_id, pos[i], i);
 
             return false;
         }
@@ -359,7 +359,7 @@ public:
         assert(!seq[i].test(seq_id));
 
         seq[i].set(seq_id);
-        seq_pos_inc(seq_id, pos[i]);
+        seq_pos_inc(seq_id, pos[i], i);
     }
 
     // return the sequence id of this cell
@@ -388,6 +388,41 @@ public:
         assert(seq_id < LLAMA_MAX_SEQ);
         const auto & v = seq_pos[seq_id];
         return v.total > 0 ? v.max() : -1;
+    }
+
+    // the token of the newest cell (largest row) at the largest position <= p for the given sequence
+    // this reproduces the result of an ascending scan over all cells building a (seq, pos) -> token map, where
+    // the last cell written for a (seq, pos) pair wins - see llama_kv_cache::get_prev_tokens()
+    // return values:
+    //  +1: found, *tok is set
+    //   0: the sequence has no cell at or before p
+    int seq_pos_token_le(llama_seq_id seq_id, llama_pos p, llama_token * tok) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+        assert(tok);
+
+        const auto & v = seq_pos[seq_id];
+        if (v.total == 0 || p < v.min()) {
+            return 0;
+        }
+
+        int64_t idx = std::min<int64_t>((int64_t) v.tail, (int64_t) p - (int64_t) v.base);
+        while (idx >= (int64_t) v.head && v.cnt[(size_t) idx] == 0) {
+            --idx;
+        }
+
+        if (idx < (int64_t) v.head) {
+            return 0;
+        }
+
+        const uint32_t row = v.row_max[(size_t) idx];
+        assert(row != UINT32_MAX);
+        assert(row < pos.size());
+        assert(seq[row].test(seq_id));
+        assert(pos[row] == v.base + (llama_pos) idx);
+
+        *tok = ext[row].tok;
+        return 1;
     }
 
     // note: call only if the cell is not empty
@@ -543,20 +578,29 @@ public:
     std::vector<seq_set_t> seq;
 
     struct seq_pos_t {
-        llama_pos          base  = 0;
-        std::vector<int32_t> cnt;
-        int64_t            total = 0;
-        uint32_t           head  = 0;
-        uint32_t           tail  = 0;
+        llama_pos             base  = 0;
+        std::vector<int32_t>  cnt;
+        std::vector<uint32_t> row_max;
+        int64_t               total = 0;
+        uint32_t              head  = 0;
+        uint32_t              tail  = 0;
 
-        void clear() { base = 0; cnt.clear(); total = 0; head = 0; tail = 0; }
+        void clear() {
+            base = 0;
+            cnt.clear();
+            row_max.clear();
+            total = 0;
+            head = 0;
+            tail = 0;
+        }
+
         llama_pos min() const { return base + (llama_pos)head; }
         llama_pos max() const { return base + (llama_pos)tail; }
     };
 
     seq_pos_t seq_pos[LLAMA_MAX_SEQ];
 
-     void used_insert(uint32_t i) {
+    void used_insert(uint32_t i) {
         assert(i < pos.size());
         const uint64_t bit = 1ull << (i & 63);
         if (!(used_bits[i >> 6] & bit)) {
@@ -575,16 +619,16 @@ public:
     }
 
     // O(1)
-    void seq_pos_inc(llama_seq_id s, llama_pos p);
+    void seq_pos_inc(llama_seq_id s, llama_pos p, uint32_t i);
 
     // O(1) amort
-    void seq_pos_dec(llama_seq_id s, llama_pos p);
+    void seq_pos_dec(llama_seq_id s, llama_pos p, uint32_t i);
 
     // remove cell i
     void seq_pos_rm(uint32_t i) {
          for (int k = 0; k < N_SEQ_WORDS; ++k) {
              for (auto m = seq[i].w[k]; m; m &= m - 1) {
-                 seq_pos_dec(k * 64 + llama_bits::countr_zero64(m), pos[i]);
+                 seq_pos_dec(k * 64 + llama_bits::countr_zero64(m), pos[i], i);
              }
          }
     }
@@ -593,7 +637,7 @@ public:
     void seq_pos_add(uint32_t i) {
          for (int k = 0; k < N_SEQ_WORDS; ++k) {
              for (auto m = seq[i].w[k]; m; m &= m - 1) {
-                 seq_pos_inc(k * 64 + llama_bits::countr_zero64(m), pos[i]);
+                 seq_pos_inc(k * 64 + llama_bits::countr_zero64(m), pos[i], i);
              }
          }
     }
