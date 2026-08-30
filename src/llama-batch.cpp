@@ -780,7 +780,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         }
 
         if (batch.embd) {
-            auto src = batch.embd + (int64_t) idxs[1] * n_embd;
+            auto src = batch.embd + (int64_t) idxs[i] * n_embd;
             // use safe method for auto increase size
             // next improvements - write own vector without automatic filling float)
             udata->embd.insert(udata->embd.end(), src, src + n_embd);
