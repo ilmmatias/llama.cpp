@@ -101,6 +101,18 @@ static void test(void) {
         assert(draft.n_outputs_max_per_seq == 1);
     }
 
+    {
+        common_params base;
+        base.n_batch  = 2048;
+        base.n_ubatch = 2048;
+        base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        base.speculative.draft.n_max = 2;
+
+        const auto draft = common_base_params_to_speculative(base);
+        assert(draft.n_batch  == base.n_batch);
+        assert(draft.n_ubatch == base.n_ubatch);
+    }
+
     // ngram-cache keeps per-sequence state across requests; begin() must reset it
     {
         common_params_speculative spec;

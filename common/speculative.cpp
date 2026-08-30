@@ -2544,11 +2544,16 @@ common_params common_base_params_to_speculative(const common_params & params) {
         }
     }
 
-    // cap the inherited batch sizes before fitting so the fit probe does not reserve a
-    // phantom full-batch draft graph that runtime immediately shrinks (see common_speculative_init_result)
-    const uint64_t n_required = (uint64_t) std::max(1, params.n_parallel) * std::max(1, params_spec.n_max + 1);
-    result.n_batch  = (int32_t) std::min<uint64_t>(result.n_batch, std::max<uint64_t>(512, n_required));
-    result.n_ubatch = std::min(result.n_ubatch, result.n_batch);
+    // MTP mirrors target batches into its draft context.
+    const bool has_mtp = std::find(
+        params.speculative.types.begin(), params.speculative.types.end(),
+        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    if (!has_mtp) {
+        const uint64_t n_required = (uint64_t) std::max(1, params.n_parallel) * std::max(1, params_spec.n_max + 1);
+        result.n_batch  = (int32_t) std::min<uint64_t>(result.n_batch, std::max<uint64_t>(512, n_required));
+        result.n_ubatch = std::min(result.n_ubatch, result.n_batch);
+    }
+
     return result;
 }
 
