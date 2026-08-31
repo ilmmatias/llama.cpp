@@ -406,6 +406,8 @@ uint32_t llama_memory_hybrid_idx_context::get_qsa_update_capacity(
 
 void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * cell_blk,
+        ggml_tensor * block_cells,
+        ggml_tensor * block_cell_bias,
         ggml_tensor * bias,
         ggml_tensor * block_key_cells,
         ggml_tensor * update_cells,
@@ -417,7 +419,17 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    // The generic path uploads cell -> block. The compact decode path uploads
+    // block -> cell instead, so do not pay for both O(n_kv) maps on every token.
+    GGML_ASSERT((cell_blk == nullptr) != (block_cells == nullptr));
+    if (cell_blk != nullptr) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+        GGML_ASSERT(block_cell_bias == nullptr);
+    } else {
+        GGML_ASSERT(block_cells != nullptr && block_cell_bias != nullptr);
+        GGML_ASSERT(ggml_backend_buffer_is_host(block_cells->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(block_cell_bias->buffer));
+    }
     GGML_ASSERT(ggml_backend_buffer_is_host(bias->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(block_key_cells->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(update_cells->buffer));
@@ -425,8 +437,11 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     GGML_ASSERT(ggml_backend_buffer_is_host(update_idxs->buffer));
 
     const auto * mem_idx = mem->get_mem_idx();
-    const int64_t n_kv      = cell_blk->ne[0];
-    const int64_t n_ns      = cell_blk->ne[1];        // streams in this ubatch
+    const auto * idx_ctx = get_idx();
+    GGML_ASSERT(idx_ctx != nullptr);
+
+    const int64_t n_kv      = idx_ctx->get_n_kv();
+    const int64_t n_ns      = get_n_stream();
     const int64_t n_tokens  = ubatch->n_tokens;
     const int64_t n_updates = update_idxs->ne[0];
     const int64_t r         = ratio;
@@ -440,10 +455,22 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     GGML_ASSERT(update_cells->ne[0] == r && update_cells->ne[1] == n_updates);
     GGML_ASSERT(update_pos->type == GGML_TYPE_I32 && update_pos->ne[0] == 4*n_updates);
     GGML_ASSERT(update_idxs->type == GGML_TYPE_I64);
+    if (cell_blk != nullptr) {
+        GGML_ASSERT(cell_blk->type == GGML_TYPE_I32);
+        GGML_ASSERT(cell_blk->ne[0] == n_kv && cell_blk->ne[1] == n_ns);
+    } else {
+        GGML_ASSERT(n_ns == 1); // stage-3 fast path is intentionally single-stream
+        GGML_ASSERT(block_cells->type == GGML_TYPE_I32);
+        GGML_ASSERT(block_cells->ne[0] == r && block_cells->ne[1] == n_blocks && block_cells->ne[2] == n_ns);
+        GGML_ASSERT(block_cell_bias->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_are_same_shape(block_cells, block_cell_bias));
+    }
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
-
-    int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
+    int32_t * dst_cell_blk = cell_blk != nullptr ? (int32_t *) cell_blk->data : nullptr;
     float   * dst_bias      = (float   *) bias->data;
+    int32_t * dst_block_cells = block_cells != nullptr ? (int32_t *) block_cells->data : nullptr;
+    float * dst_block_cell_bias = block_cell_bias != nullptr ? (float *) block_cell_bias->data : nullptr;
+
     int32_t * dst_block_key_cell = (int32_t *) block_key_cells->data;
     int32_t * dst_update_cells   = (int32_t *) update_cells->data;
     int32_t * dst_update_pos     = (int32_t *) update_pos->data;
@@ -471,14 +498,12 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
         const auto & cells = mem_idx->get_cells(seq_of_stream);
-
-        int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
-
+        int32_t * cur_cell_blk = dst_cell_blk != nullptr ? dst_cell_blk + s*n_kv : nullptr;
         // an incomplete block cannot be pooled; the bias below forces those tail cells in
         // -1 means no usable block, and block 0 only keeps the gather in range
         std::fill(blk_of.begin(),  blk_of.end(),  -1);
         std::fill(filled.begin(),  filled.end(),   0);
-        std::fill(cur_blk_cells.begin(), cur_blk_cells.end(), 0);
+        std::fill(cur_blk_cells.begin(), cur_blk_cells.end(), -1);
         // a cell no block covers needs its own -inf, which a per-block bias cannot carry
         // every cache path keeps the position below the cell window, so this stays false
         bool oor = false;
@@ -568,13 +593,25 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             dst_update_idxs[n_update++] = global_dst;
         }
 
+        if (dst_block_cells != nullptr) {
+            int32_t * out_cells = dst_block_cells + s*(r*n_blocks);
+            float * out_bias = dst_block_cell_bias + s*(r*n_blocks);
+            for (int64_t bi = 0; bi < r*n_blocks; ++bi) {
+                const int32_t cell = cur_blk_cells[bi];
+                out_cells[bi] = cell >= 0 ? cell : 0;
+                out_bias[bi] = cell >= 0 ? 0.0f : -INFINITY;
+            }
+        }
+
         // per-block mode keeps an unpooled cell's real block, so the block's own -inf reaches it
         // per-cell mode carries that -inf itself and only needs the gather in range
         for (int64_t j = 0; j < n_kv; ++j) {
             if (blk_of[j] >= 0 && filled[blk_of[j]] < r && !blk_bias) {
                 blk_of[j] = -1;
             }
-            cur_cell_blk[j] = blk_of[j] < 0 ? 0 : blk_of[j];
+            if (cur_cell_blk != nullptr) {
+                cur_cell_blk[j] = blk_of[j] < 0 ? 0 : blk_of[j];
+            }
         }
 
         for (int64_t ii = 0; ii < n_tps; ++ii) {
