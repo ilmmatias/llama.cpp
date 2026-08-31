@@ -1045,7 +1045,9 @@ static bool iqp_supported_common(const struct ggml_tensor * dst) {
     }
 
     // the path assumes the src1 conversion type is q8_K
-    GGML_ASSERT(ggml_get_type_traits_cpu(src0->type)->vec_dot_type == GGML_TYPE_Q8_K);
+    if (ggml_get_type_traits_cpu(src0->type)->vec_dot_type != GGML_TYPE_Q8_K) {
+        return false;
+    }
 
     // escape hatch to A/B the panel against the plain vec_dot path without rebuilding (--no-repack does not cover this path)
     static const bool disabled = getenv("GGML_NO_IQ_PANEL") != nullptr;
@@ -1076,7 +1078,7 @@ static bool iqp_supported_common(const struct ggml_tensor * dst) {
     return true;
 }
 
-bool ggml_cpu_iqp_supported_mul_mat(const struct ggml_tensor * dst) {
+bool ggml_cpu_iqp_supports_mul_mat(const struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
@@ -1096,7 +1098,7 @@ bool ggml_cpu_iqp_supported_mul_mat(const struct ggml_tensor * dst) {
     return true;
 }
 
-bool ggml_cpu_iqp_supported_mul_mat_id(const struct ggml_tensor * dst) {
+bool ggml_cpu_iqp_supports_mul_mat_id(const struct ggml_tensor * dst) {
     const struct ggml_tensor * ids = dst->src[2];
 
     if (!iqp_supported_common(dst)) {
@@ -1104,7 +1106,7 @@ bool ggml_cpu_iqp_supported_mul_mat_id(const struct ggml_tensor * dst) {
     }
 
     // skip the node entirely (work buffer included) if no expert can reach the per expert threshold
-    if (!ggml_cpu_iqp_expert_eligible(ids->ne[0] * ids->ne[1])) {
+    if (!ggml_cpu_iqp_mul_mat_id_min_batch(ids->ne[0] * ids->ne[1])) {
         return false;
     }
 
@@ -1211,8 +1213,9 @@ void ggml_compute_forward_mul_mat_iqp(const struct ggml_compute_params * params,
     const int64_t ngroups = ne01 / IQP_NB_ROWS;
 
     // aim for 4 chunks per thread; the caller has already reset the chunk counter
-    const int64_t groups_per_chunk = MAX(1, (ngroups + nth * 4 - 1) / (nth * 4));
-    const int64_t nchunk           = (ngroups + groups_per_chunk - 1) / groups_per_chunk;
+    const int64_t chunks_per_thread = ggml_is_numa() ? 1 : 4;
+    const int64_t groups_per_chunk  = MAX(1, (ngroups + nth * chunks_per_thread - 1) / (nth * chunks_per_thread));
+    const int64_t nchunk            = (ngroups + groups_per_chunk - 1) / groups_per_chunk;
 
     int current_chunk = ith;
 
