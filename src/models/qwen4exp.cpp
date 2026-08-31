@@ -860,10 +860,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     ggml_build_forward_expand(gf, k_blocks);
     k_blocks = ggml_reshape_2d(ctx0, k_blocks, idx_dim, k_blocks->ne[1]*k_blocks->ne[2]);
 
-    ggml_tensor * pooled = ggml_get_rows(ctx0, k_blocks,
-            ggml_reshape_1d(ctx0, inp->block_key_cells, n_blocks*n_stream));
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
-    cb(pooled, "indexer_k", il);
+
 
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
@@ -874,27 +871,45 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     cb(q, "indexer_q", il);
 
     // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
-    // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
-    ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
-            ggml_reshape_3d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h*n_tps, n_stream));
-    score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
-    score = ggml_relu(ctx0, score);
+    ggml_tensor * score = nullptr;
 
-    // the heads sit side by side on ne[1] and there are few of them, so summing slices beats a
-    // transpose that would carry the whole block by token surface twice over
-    ggml_tensor * summed = nullptr;
-    for (int64_t h = 0; h < n_idx_h; ++h) {
-        ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
-                score->nb[2], score->nb[3], h*score->nb[1]);
-        summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
-    }
+    // Decode fast path: gather cached block keys and perform the four rectified
+    // head dots, head reduction and block bias in one backend op.  Keep the
+    // existing graph for multi-token/prefill so this stage measures decode only.
+    if (blk_bias && n_tps == 1 && q->type == GGML_TYPE_F32) {
+        ggml_tensor * q_score = ggml_reshape_4d(ctx0, ggml_cont(ctx0, q),
+                idx_dim, n_idx_h, n_tps, n_stream);
+        score = ggml_qsa_block_score(ctx0, q_score, k_blocks,
+                inp->block_key_cells, inp->bias, 1.0f);
+        cb(score, "indexer_score", il);
+    } else {
+        ggml_tensor * pooled = ggml_get_rows(ctx0, k_blocks,
+                ggml_reshape_1d(ctx0, inp->block_key_cells, n_blocks*n_stream));
+        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
+        cb(pooled, "indexer_k", il);
 
-    score = summed;
-    cb(score, "indexer_score", il);
+        // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
+        score = ggml_mul_mat(ctx0, pooled,
+                ggml_reshape_3d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h*n_tps, n_stream));
+        score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
+        score = ggml_relu(ctx0, score);
 
-    // one value per block, so it is cheaper to bias here than after the cells are expanded
-    if (blk_bias) {
-        score = ggml_add(ctx0, score, inp->bias);
+        // the heads sit side by side on ne[1] and there are few of them, so summing slices beats a
+        // transpose that would carry the whole block by token surface twice over
+        ggml_tensor * summed = nullptr;
+        for (int64_t h = 0; h < n_idx_h; ++h) {
+            ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
+                    score->nb[2], score->nb[3], h*score->nb[1]);
+            summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+        }
+
+        score = summed;
+        cb(score, "indexer_score", il);
+
+        // one value per block, so it is cheaper to bias here than after the cells are expanded
+        if (blk_bias) {
+            score = ggml_add(ctx0, score, inp->bias);
+        }
     }
 
     // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary

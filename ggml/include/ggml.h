@@ -574,6 +574,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_QSA_BLOCK_SCORE,
 
         GGML_OP_UNARY,
 
@@ -2660,6 +2661,20 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // Qwen4Exp sparse-attention block score.
+    // q:     F32 [n_embd, n_head, n_query, n_stream]
+    // k:     F32 [n_embd, n_cache]
+    // cells: I32 [n_blocks, n_stream] - cached block-key row per stream
+    // mask:  F32 [n_blocks, n_query, n_stream]
+    // res:   F32 [n_blocks, n_query, n_stream]
+    GGML_API struct ggml_tensor * ggml_qsa_block_score(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * cells,
+            struct ggml_tensor  * mask,
+            float                 scale);
 
     // custom operators
 

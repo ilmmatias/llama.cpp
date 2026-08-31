@@ -1111,6 +1111,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "QSA_BLOCK_SCORE",
 
     "UNARY",
 
@@ -1128,7 +1129,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1226,6 +1227,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "qsa_block_score(q, k, cells, mask)",
 
     "unary(x)",
 
@@ -1243,7 +1245,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6546,6 +6548,47 @@ struct ggml_tensor * ggml_dsv4_hc_post(
 
     return result;
 }
+
+// ggml_qsa_block_score
+
+struct ggml_tensor * ggml_qsa_block_score(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * cells,
+        struct ggml_tensor  * mask,
+        float                 scale) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(k->ne[2] == 1 && k->ne[3] == 1);
+    GGML_ASSERT(cells->ne[0] == mask->ne[0]);
+    GGML_ASSERT(cells->ne[1] == q->ne[3]);
+    GGML_ASSERT(cells->ne[2] == 1 && cells->ne[3] == 1);
+    GGML_ASSERT(mask->ne[1] == q->ne[2]);
+    GGML_ASSERT(mask->ne[2] == q->ne[3]);
+    GGML_ASSERT(mask->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous(cells));
+    GGML_ASSERT(ggml_is_contiguous(mask));
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F32, cells->ne[0], q->ne[2], q->ne[3]);
+
+    result->op     = GGML_OP_QSA_BLOCK_SCORE;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = cells;
+    result->src[3] = mask;
+
+    ggml_set_op_params_f32(result, 0, scale);
+
+    return result;
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////
 
