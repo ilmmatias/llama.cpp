@@ -77,7 +77,10 @@ struct cpuid_x86 {
     bool _3DNOW(void) { return is_amd && f_81_edx[31]; }
 
     bool AVX512_VBMI(void) { return f_7_ecx[1]; }
+    bool AVX512_VBMI2(void) { return f_7_ecx[6]; }
+    bool GFNI(void) { return f_7_ecx[8]; }
     bool AVX512_VNNI(void) { return f_7_ecx[11]; }
+    bool AVX512_BITALG(void) { return f_7_ecx[12]; }
     bool AVX512_FP16(void) { return f_7_edx[23]; }
     bool AVX512_BF16(void) { return f_7_1_eax[5]; }
     bool AVX_VNNI(void) { return f_7_1_eax[4]; }
@@ -250,7 +253,10 @@ void test_x86_is() {
     printf("3dnowext: %d\n", is._3DNOWEXT());
     printf("3dnow: %d\n", is._3DNOW());
     printf("avx512_vbmi: %d\n", is.AVX512_VBMI());
+    printf("avx512_vbmi2: %d\n", is.AVX512_VBMI2());
+    printf("gfni: %d\n", is.GFNI());
     printf("avx512_vnni: %d\n", is.AVX512_VNNI());
+    printf("avx512_bitalg: %d\n", is.AVX512_BITALG());
     printf("avx512_fp16: %d\n", is.AVX512_FP16());
     printf("avx512_bf16: %d\n", is.AVX512_BF16());
     printf("amx_tile: %d\n", is.AMX_TILE());
@@ -306,17 +312,33 @@ static int ggml_backend_cpu_x86_score() {
     if (!is.AVX512_VBMI()) { return 0; }
     score += 1<<8;
 #endif
+#ifdef GGML_AVX512_VBMI2
+    if (!is.AVX512_VBMI2()) { return 0; }
+    score += 1<<9;
+#endif
+#ifdef GGML_GFNI
+    if (!is.GFNI()) { return 0; }
+    score += 1<<10;
+#endif
+#ifdef GGML_AVX512_BITALG
+    if (!is.AVX512_BITALG()) { return 0; }
+    score += 1<<11;
+#endif
 #ifdef GGML_AVX512_BF16
     if (!is.AVX512_BF16()) { return 0; }
-    score += 1<<9;
+    score += 1<<12;
 #endif
 #ifdef GGML_AVX512_VNNI
     if (!is.AVX512_VNNI()) { return 0; }
-    score += 1<<10;
+    score += 1<<13;
+#endif
+#ifdef GGML_AVX512_FP16
+    if (!is.AVX512_FP16()) { return 0; }
+    score += 1<<14;
 #endif
 #ifdef GGML_AMX_INT8
     if (!is.AMX_INT8()) { return 0; }
-    score += 1<<11;
+    score += 1<<15;
 #endif
 
     return score;

@@ -3952,6 +3952,167 @@ void ggml_vec_dot_iq1_m_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 #endif
 }
 
+static inline float znq4_x86_ufp8_to_fp32(uint8_t code) {
+    const uint32_t e = code >> 3;
+    const uint32_t m = code & 7u;
+    if (e == 0) {
+        return (float) m * (1.0f / 131072.0f);
+    }
+    const uint32_t u = ((e + 112u) << 23) | (m << 20);
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+static inline __m128i znq4_x86_codes_lo(__m128i packed) {
+    const __m128i m4 = _mm_set1_epi8(0x0f);
+    const __m128i lo = _mm_and_si128(packed, m4);
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), m4);
+    return _mm_unpacklo_epi8(lo, hi);
+}
+
+static inline __m128i znq4_x86_codes_hi(__m128i packed) {
+    const __m128i m4 = _mm_set1_epi8(0x0f);
+    const __m128i lo = _mm_and_si128(packed, m4);
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), m4);
+    return _mm_unpackhi_epi8(lo, hi);
+}
+
+void ggml_vec_dot_znq4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+        size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_ZNQ == 0);
+    static_assert(QK_ZNQ == QK8_0, "QK_ZNQ and QK8_0 must be the same");
+
+    const block_znq4 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    const int nb = n / QK_ZNQ;
+
+    int ib = 0;
+    float sumf = 0.0f;
+
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    // Zen 5 path: reconstruct four independently-booked 16-value groups with
+    // one VPERMB, then consume two QK32 blocks with 512-bit VNNI.
+    const __m512i offsets = _mm512_set_epi32(
+            0x30303030, 0x30303030, 0x30303030, 0x30303030,
+            0x20202020, 0x20202020, 0x20202020, 0x20202020,
+            0x10101010, 0x10101010, 0x10101010, 0x10101010,
+            0x00000000, 0x00000000, 0x00000000, 0x00000000);
+    const __m512i bias = _mm512_set1_epi8((char) 0x80);
+    __m512 accum = _mm512_setzero_ps();
+
+    for (; ib + 1 < nb; ib += 2) {
+        const __m128i packed0 = _mm_loadu_si128((const __m128i *) x[ib + 0].qs);
+        const __m128i packed1 = _mm_loadu_si128((const __m128i *) x[ib + 1].qs);
+
+        const __m128i c00 = znq4_x86_codes_lo(packed0);
+        const __m128i c01 = znq4_x86_codes_hi(packed0);
+        const __m128i c10 = znq4_x86_codes_lo(packed1);
+        const __m128i c11 = znq4_x86_codes_hi(packed1);
+
+        __m512i indices = _mm512_castsi128_si512(c00);
+        indices = _mm512_inserti32x4(indices, c01, 1);
+        indices = _mm512_inserti32x4(indices, c10, 2);
+        indices = _mm512_inserti32x4(indices, c11, 3);
+        indices = _mm512_add_epi8(indices, offsets);
+
+        const uint8_t b00 = x[ib + 0].books & 0x0f;
+        const uint8_t b01 = x[ib + 0].books >> 4;
+        const uint8_t b10 = x[ib + 1].books & 0x0f;
+        const uint8_t b11 = x[ib + 1].books >> 4;
+
+        __m512i table = _mm512_castsi128_si512(
+                _mm_loadu_si128((const __m128i *) (kvalues_znq4 + 16*b00)));
+        table = _mm512_inserti32x4(table,
+                _mm_loadu_si128((const __m128i *) (kvalues_znq4 + 16*b01)), 1);
+        table = _mm512_inserti32x4(table,
+                _mm_loadu_si128((const __m128i *) (kvalues_znq4 + 16*b10)), 2);
+        table = _mm512_inserti32x4(table,
+                _mm_loadu_si128((const __m128i *) (kvalues_znq4 + 16*b11)), 3);
+
+        const __m512i weights = _mm512_permutexvar_epi8(indices, table);
+
+        __m512i q8 = _mm512_castsi256_si512(
+                _mm256_loadu_si256((const __m256i *) y[ib + 0].qs));
+        q8 = _mm512_inserti64x4(q8,
+                _mm256_loadu_si256((const __m256i *) y[ib + 1].qs), 1);
+
+        // VPDPBUSD is unsigned*signed. Bias signed ZNQ weights by 128 and
+        // subtract the matching 128*sum(q8) correction. Both operations are
+        // exact int32 dot products over four-byte groups.
+        const __m512i unsigned_weights = _mm512_xor_si512(weights, bias);
+        const __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), unsigned_weights, q8);
+        const __m512i correction = _mm512_dpbusd_epi32(_mm512_setzero_si512(), bias, q8);
+        const __m512i sumi = _mm512_sub_epi32(dot, correction);
+
+        const float d0 = znq4_x86_ufp8_to_fp32(x[ib + 0].d) * GGML_CPU_FP16_TO_FP32(y[ib + 0].d);
+        const float d1 = znq4_x86_ufp8_to_fp32(x[ib + 1].d) * GGML_CPU_FP16_TO_FP32(y[ib + 1].d);
+        const __m512 scales = _mm512_mask_blend_ps(0xff00, _mm512_set1_ps(d0), _mm512_set1_ps(d1));
+        accum = _mm512_fmadd_ps(scales, _mm512_cvtepi32_ps(sumi), accum);
+    }
+
+    sumf = _mm512_reduce_add_ps(accum);
+
+#elif defined(__AVX2__)
+    // Portable x86 SIMD path. PSHUFB performs the 16-entry book lookup and the
+    // existing helper selects VNNI automatically when the compiler target has it.
+    __m256 accum0 = _mm256_setzero_ps();
+    __m256 accum1 = _mm256_setzero_ps();
+
+    for (; ib + 1 < nb; ib += 2) {
+        const __m128i packed0 = _mm_loadu_si128((const __m128i *) x[ib + 0].qs);
+        const __m128i packed1 = _mm_loadu_si128((const __m128i *) x[ib + 1].qs);
+
+        const __m128i b00 = _mm_loadu_si128((const __m128i *)
+                (kvalues_znq4 + 16*(x[ib + 0].books & 0x0f)));
+        const __m128i b01 = _mm_loadu_si128((const __m128i *)
+                (kvalues_znq4 + 16*(x[ib + 0].books >> 4)));
+        const __m128i b10 = _mm_loadu_si128((const __m128i *)
+                (kvalues_znq4 + 16*(x[ib + 1].books & 0x0f)));
+        const __m128i b11 = _mm_loadu_si128((const __m128i *)
+                (kvalues_znq4 + 16*(x[ib + 1].books >> 4)));
+
+        const __m256i w0 = MM256_SET_M128I(
+                _mm_shuffle_epi8(b01, znq4_x86_codes_hi(packed0)),
+                _mm_shuffle_epi8(b00, znq4_x86_codes_lo(packed0)));
+        const __m256i w1 = MM256_SET_M128I(
+                _mm_shuffle_epi8(b11, znq4_x86_codes_hi(packed1)),
+                _mm_shuffle_epi8(b10, znq4_x86_codes_lo(packed1)));
+
+        const __m256 p0 = mul_sum_i8_pairs_float(w0,
+                _mm256_loadu_si256((const __m256i *) y[ib + 0].qs));
+        const __m256 p1 = mul_sum_i8_pairs_float(w1,
+                _mm256_loadu_si256((const __m256i *) y[ib + 1].qs));
+
+        const float d0 = znq4_x86_ufp8_to_fp32(x[ib + 0].d) * GGML_CPU_FP16_TO_FP32(y[ib + 0].d);
+        const float d1 = znq4_x86_ufp8_to_fp32(x[ib + 1].d) * GGML_CPU_FP16_TO_FP32(y[ib + 1].d);
+        accum0 = _mm256_fmadd_ps(_mm256_set1_ps(d0), p0, accum0);
+        accum1 = _mm256_fmadd_ps(_mm256_set1_ps(d1), p1, accum1);
+    }
+
+    sumf = hsum_float_8(_mm256_add_ps(accum0, accum1));
+#endif
+
+    // Odd-block tail and non-AVX2 x86 fallback. Keeping this local also makes
+    // the optimized implementation independently checkable against the generic dot.
+    for (; ib < nb; ++ib) {
+        int32_t sumi = 0;
+        for (int j = 0; j < QK_ZNQ; ++j) {
+            const int book = (x[ib].books >> (4*(j/16))) & 0x0f;
+            const int code = (x[ib].qs[j/2] >> (4*(j & 1))) & 0x0f;
+            sumi += kvalues_znq4[16*book + code] * y[ib].qs[j];
+        }
+        sumf += znq4_x86_ufp8_to_fp32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d) * sumi;
+    }
+
+    *s = sumf;
+}
+
 void ggml_vec_dot_iq4_nl_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);

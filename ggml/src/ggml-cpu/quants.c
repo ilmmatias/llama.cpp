@@ -26,6 +26,85 @@ void quantize_row_q1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
     quantize_row_q1_0_ref(x, y, k);
 }
 
+// ZNQ correctness-first CPU path. Keep this near the stable declarations
+// rather than beside any particular quant family so local IQ/NL additions do
+// not create patch conflicts.
+void quantize_row_znq2(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_znq2_ref(x, y, k);
+}
+void quantize_row_znq3(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_znq3_ref(x, y, k);
+}
+void quantize_row_znq4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_znq4_ref(x, y, k);
+}
+
+static inline float znq_cpu_ufp8_to_fp32(uint8_t code) {
+    const uint32_t e = code >> 3;
+    const uint32_t m = code & 7u;
+    if (e == 0) {
+        return (float) m * (1.0f / 131072.0f);
+    }
+    // Exact IEEE-754 construction for (1 + m/8) * 2^(e - 15).
+    const uint32_t u = ((e + 112u) << 23) | (m << 20);
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+static inline uint8_t znq_cpu_unpack_code(const uint8_t * qs, int bits, int j) {
+    if (bits == 2) return (qs[j/4] >> (2*(j & 3))) & 3u;
+    if (bits == 3) {
+        const int bit = 3*j;
+        const int byte = bit >> 3;
+        const int shift = bit & 7;
+        uint16_t v = qs[byte] >> shift;
+        if (shift > 5) v |= (uint16_t) qs[byte + 1] << (8 - shift);
+        return v & 7u;
+    }
+    return (qs[j/2] >> (4*(j & 1))) & 15u;
+}
+
+static void ggml_vec_dot_znq_q8_0_generic_impl(int n, float * GGML_RESTRICT s,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int bits) {
+    GGML_ASSERT(n % QK_ZNQ == 0);
+    const int nb = n / QK_ZNQ;
+    const size_t xbs = 2 + (size_t) bits*QK_ZNQ/8;
+    const uint8_t * x = (const uint8_t *) vx;
+    const block_q8_0 * y = (const block_q8_0 *) vy;
+    const int nlevels = 1 << bits;
+    const int8_t * values = bits == 2 ? kvalues_znq2 : bits == 3 ? kvalues_znq3 : kvalues_znq4;
+    float sumf = 0.0f;
+    for (int ib = 0; ib < nb; ++ib) {
+        const uint8_t * xb = x + ib*xbs;
+        const uint8_t books = xb[1];
+        const uint8_t * qs = xb + 2;
+        int32_t sumi = 0;
+        for (int j = 0; j < QK_ZNQ; ++j) {
+            const int book = (books >> (4*(j/16))) & 15;
+            const int code = znq_cpu_unpack_code(qs, bits, j);
+            sumi += values[book*nlevels + code] * y[ib].qs[j];
+        }
+        sumf += znq_cpu_ufp8_to_fp32(xb[0]) * GGML_CPU_FP16_TO_FP32(y[ib].d) * sumi;
+    }
+    *s = sumf;
+}
+
+#define ZNQ_DOT(BITS) \
+    GGML_ASSERT(nrc == 1); \
+    UNUSED(bs); UNUSED(bx); UNUSED(by); UNUSED(nrc); \
+    ggml_vec_dot_znq_q8_0_generic_impl(n, s, vx, vy, BITS)
+
+void ggml_vec_dot_znq2_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+        size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) { ZNQ_DOT(2); }
+void ggml_vec_dot_znq3_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+        size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) { ZNQ_DOT(3); }
+void ggml_vec_dot_znq4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+        size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) { ZNQ_DOT(4); }
+
+#undef ZNQ_DOT
+
+
 void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q2_0_ref(x, y, k);
 }

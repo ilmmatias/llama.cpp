@@ -156,6 +156,10 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+        // 42 and 43 are intentionally left free for IQ2_NL / IQ3_NL from upstream PR #27983.
+        LLAMA_FTYPE_MOSTLY_ZNQ2          = 44, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_ZNQ3          = 45, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_ZNQ4          = 46, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };

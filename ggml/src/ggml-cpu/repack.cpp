@@ -15,6 +15,7 @@
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
+#include <cstdlib>
 
 #include "repack.h"
 
@@ -3822,6 +3823,182 @@ static int repack_iq4_nl_to_iq4_nl_8_bl(struct ggml_tensor * t, int interleave_b
     GGML_UNUSED(data_size);
 }
 
+static inline uint8_t znq2_repack_code(const uint8_t * qs, int j) {
+    return (uint8_t) ((qs[j / 4] >> (2 * (j & 3))) & 3u);
+}
+
+static block_znq2x8 make_block_znq2x8(const block_znq2 * in) {
+    block_znq2x8 out = {};
+
+    for (int r = 0; r < 8; ++r) {
+        out.d[r] = in[r].d;
+        out.books[r] = in[r].books;
+    }
+
+    for (int g = 0; g < QK_ZNQ / 4; ++g) {
+        uint32_t p0 = 0;
+        uint32_t p1 = 0;
+        for (int r = 0; r < 8; ++r) {
+            for (int j = 0; j < 4; ++j) {
+                const uint8_t code = znq2_repack_code(in[r].qs, 4*g + j);
+                const int pos = 4*r + j;
+                p0 |= (uint32_t) ((code >> 0) & 1u) << pos;
+                p1 |= (uint32_t) ((code >> 1) & 1u) << pos;
+            }
+        }
+        out.planes[g][0] = p0;
+        out.planes[g][1] = p1;
+    }
+
+    return out;
+}
+
+static int repack_znq2_to_znq2_8_bl(struct ggml_tensor * t, const void * GGML_RESTRICT data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_ZNQ2);
+
+    const block_znq2 * src = (const block_znq2 *) data;
+          block_znq2x8 * dst = (block_znq2x8 *) t->data;
+
+    const int nrow = ggml_nrows(t);
+    const int nblocks = t->ne[0] / QK_ZNQ;
+
+    GGML_ASSERT(t->ne[0] % QK_ZNQ == 0);
+    GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(block_znq2));
+
+    if (t->ne[1] % 8 != 0) {
+        return -1;
+    }
+
+    block_znq2 tmp[8];
+    for (int b = 0; b < nrow; b += 8) {
+        for (int64_t x = 0; x < nblocks; ++x) {
+            for (int r = 0; r < 8; ++r) {
+                tmp[r] = src[x + r * nblocks];
+            }
+            *dst++ = make_block_znq2x8(tmp);
+        }
+        src += 8 * nblocks;
+    }
+    return 0;
+}
+
+static inline uint8_t znq3_repack_code(const uint8_t * qs, int j) {
+    const int bit = 3*j;
+    const int byte = bit >> 3;
+    const int shift = bit & 7;
+    uint16_t v = (uint16_t) qs[byte] >> shift;
+    if (shift > 5) {
+        v |= (uint16_t) qs[byte + 1] << (8 - shift);
+    }
+    return (uint8_t) (v & 7u);
+}
+
+static block_znq3x8 make_block_znq3x8(const block_znq3 * in) {
+    block_znq3x8 out = {};
+
+    for (int r = 0; r < 8; ++r) {
+        out.d[r] = in[r].d;
+        out.books[r] = in[r].books;
+    }
+
+    for (int g = 0; g < QK_ZNQ / 4; ++g) {
+        uint32_t p0 = 0;
+        uint32_t p1 = 0;
+        uint32_t p2 = 0;
+        for (int r = 0; r < 8; ++r) {
+            for (int j = 0; j < 4; ++j) {
+                const uint8_t code = znq3_repack_code(in[r].qs, 4*g + j);
+                const int pos = 4*r + j;
+                p0 |= (uint32_t) ((code >> 0) & 1u) << pos;
+                p1 |= (uint32_t) ((code >> 1) & 1u) << pos;
+                p2 |= (uint32_t) ((code >> 2) & 1u) << pos;
+            }
+        }
+        out.planes[g][0] = p0;
+        out.planes[g][1] = p1;
+        out.planes[g][2] = p2;
+    }
+
+    return out;
+}
+
+static int repack_znq3_to_znq3_8_bl(struct ggml_tensor * t, const void * GGML_RESTRICT data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_ZNQ3);
+
+    const block_znq3 * src = (const block_znq3 *) data;
+          block_znq3x8 * dst = (block_znq3x8 *) t->data;
+
+    const int nrow = ggml_nrows(t);
+    const int nblocks = t->ne[0] / QK_ZNQ;
+
+    GGML_ASSERT(t->ne[0] % QK_ZNQ == 0);
+    GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(block_znq3));
+
+    if (t->ne[1] % 8 != 0) {
+        return -1;
+    }
+
+    block_znq3 tmp[8];
+    for (int b = 0; b < nrow; b += 8) {
+        for (int64_t x = 0; x < nblocks; ++x) {
+            for (int r = 0; r < 8; ++r) {
+                tmp[r] = src[x + r * nblocks];
+            }
+            *dst++ = make_block_znq3x8(tmp);
+        }
+        src += 8 * nblocks;
+    }
+    return 0;
+}
+
+static block_znq4x8 make_block_znq4x8(const block_znq4 * in) {
+    block_znq4x8 out = {};
+
+    for (int r = 0; r < 8; ++r) {
+        out.d[r] = in[r].d;
+        out.books[r] = in[r].books;
+    }
+
+    // Two packed bytes are four weights. Store those two-byte groups across
+    // eight rows so a 16-byte load expands directly to 8 rows x 4 weights.
+    for (int g = 0; g < QK_ZNQ / 4; ++g) {
+        for (int r = 0; r < 8; ++r) {
+            memcpy(out.qs + g * 16 + r * 2, in[r].qs + g * 2, 2);
+        }
+    }
+
+    return out;
+}
+
+static int repack_znq4_to_znq4_8_bl(struct ggml_tensor * t, const void * GGML_RESTRICT data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_ZNQ4);
+
+    const block_znq4 * src = (const block_znq4 *) data;
+          block_znq4x8 * dst = (block_znq4x8 *) t->data;
+
+    const int nrow = ggml_nrows(t);
+    const int nblocks = t->ne[0] / QK_ZNQ;
+
+    GGML_ASSERT(t->ne[0] % QK_ZNQ == 0);
+    GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(block_znq4));
+
+    if (t->ne[1] % 8 != 0) {
+        return -1;
+    }
+
+    block_znq4 tmp[8];
+    for (int b = 0; b < nrow; b += 8) {
+        for (int64_t x = 0; x < nblocks; ++x) {
+            for (int r = 0; r < 8; ++r) {
+                tmp[r] = src[x + r * nblocks];
+            }
+            *dst++ = make_block_znq4x8(tmp);
+        }
+        src += 8 * nblocks;
+    }
+    return 0;
+}
+
 static block_iq4_nlx16 make_block_iq4_nlx16(block_iq4_nl * in, unsigned int blck_size_interleave) {
     block_iq4_nlx16 out;
 
@@ -4052,6 +4229,20 @@ template <> int repack<block_iq4_nl, 8, 8>(struct ggml_tensor * t, const void * 
     return repack_iq4_nl_to_iq4_nl_8_bl(t, 8, data, data_size);
 }
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+template <> int repack<block_znq2, 8, 8>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_znq2_to_znq2_8_bl(t, data, data_size);
+}
+
+template <> int repack<block_znq3, 8, 8>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_znq3_to_znq3_8_bl(t, data, data_size);
+}
+
+template <> int repack<block_znq4, 8, 8>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_znq4_to_znq4_8_bl(t, data, data_size);
+}
+#endif
+
 template <> int repack<block_mxfp4, 4, 4>(struct ggml_tensor * t, const void * data, size_t data_size) {
     return repack_mxfp4_to_mxfp4_4_bl(t, 4, data, data_size);
 }
@@ -4148,6 +4339,20 @@ template <> void gemv<block_iq4_nl, 4, 4, GGML_TYPE_Q8_0>(int n, float * s, size
 template <> void gemv<block_iq4_nl, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemv_iq4_nl_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
+
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+template <> void gemv<block_znq2, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_znq2_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemv<block_znq3, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_znq3_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemv<block_znq4, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_znq4_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+#endif
 
 template <> void gemv<block_mxfp4, 4, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemv_mxfp4_4x4_q8_0(n, s, bs, vx, vy, nr, nc);
@@ -4246,6 +4451,20 @@ template <> void gemm<block_iq4_nl, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size
     ggml_gemm_iq4_nl_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+template <> void gemm<block_znq2, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_znq2_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemm<block_znq3, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_znq3_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemm<block_znq4, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_znq4_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+#endif
+
 template <> void gemm<block_mxfp4, 4, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemm_mxfp4_4x4_q8_0(n, s, bs, vx, vy, nr, nc);
 }
@@ -4301,11 +4520,31 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 }
             case GGML_OP_MUL_MAT_ID:
                 {
-                    size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
-                    size = GGML_PAD(size, sizeof(int64_t)); // + padding for next block.
-
                     const int64_t ne02 = op->src[0]->ne[2]; // n_as, n_expert
                     const int64_t ne12 = op->src[1]->ne[2]; // n_tokens
+
+                    // Generic MUL_MAT_ID only needs one quantized row per row in
+                    // src1. ZNQ2/3/4 MoE prompt processing additionally materializes the
+                    // routed rows in expert order so all workers can consume the
+                    // same block_q8_0x4 stream. With top-k routing this can be kx
+                    // larger than the generic src1 buffer (Qwen3-30B-A3B: k=8).
+                    size_t activation_size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
+
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+                    if constexpr (PARAM_TYPE == GGML_TYPE_Q8_0 && INTER_SIZE == 8 && NB_COLS == 8) {
+                        const ggml_type src0_type = op->src[0]->type;
+                        if ((src0_type == GGML_TYPE_ZNQ2 ||
+                             src0_type == GGML_TYPE_ZNQ3 ||
+                             src0_type == GGML_TYPE_ZNQ4) && ne12 > 1) {
+                            const int64_t n_ids = op->src[2]->ne[0];
+                            const size_t row_size = ggml_row_size(PARAM_TYPE, op->src[1]->ne[0]);
+                            const size_t routed_size = row_size * (size_t) n_ids * (size_t) ne12;
+                            activation_size = MAX(activation_size, routed_size);
+                        }
+                    }
+#endif
+
+                    size = GGML_PAD(activation_size, sizeof(int64_t)); // + padding for next block.
 
                     const size_t sizeof_mmid_row_mapping = sizeof(int64_t);
 
@@ -4550,6 +4789,15 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int n_ids = ids->ne[0]; // n_expert_used
         const int n_as  = ne02;       // n_expert
 
+        bool use_znq_moe = false;
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+        if constexpr (PARAM_TYPE == GGML_TYPE_Q8_0 && INTER_SIZE == 8 && NB_COLS == 8) {
+            use_znq_moe = (src0->type == GGML_TYPE_ZNQ2 ||
+                            src0->type == GGML_TYPE_ZNQ3 ||
+                            src0->type == GGML_TYPE_ZNQ4) && ne12 > 1;
+        }
+#endif
+
         const size_t nbw1 = ggml_row_size(PARAM_TYPE, ne10);
         const size_t nbw2 = nbw1*ne11;
         const size_t nbw3 = nbw2*ne12;
@@ -4558,25 +4806,39 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             int32_t i1;
             int32_t i2;
         };
+        static_assert(sizeof(mmid_row_mapping) == 2 * sizeof(int32_t), "unexpected MUL_MAT_ID row-map padding");
+
+        // 0035 originally placed the expert-grouped stream in nbw3, which is
+        // only the generic src1 quantization area. In the common MoE layout
+        // ne11 == 1 while n_ids > 1, so that overwrote the row mapping and then
+        // the end of params->wdata. Reserve/address the routed footprint here.
+        const size_t routed_q8_size = nbw1 * (size_t) n_ids * (size_t) ne12;
+        const size_t activation_size = use_znq_moe ? MAX(nbw3, routed_q8_size) : nbw3;
 
         GGML_ASSERT(params->wsize >=
-                (GGML_PAD(nbw3, sizeof(int64_t)) +
+                (GGML_PAD(activation_size, sizeof(int64_t)) +
                  n_as*(ne12 + 1)*sizeof(mmid_row_mapping))
                 );
 
         auto * wdata          = (char *)params->wdata;
-        auto * wdata_src1_end = (char *)wdata + GGML_PAD(nbw3, sizeof(int64_t));
+        auto * wdata_src1_end = (char *)wdata + GGML_PAD(activation_size, sizeof(int64_t));
 
         // total of [n_as][ne12 + 1] elements of type mmid_row_mapping (2*int32_t = int64_t)
         auto * matrix_row_counts = (int64_t *) (wdata_src1_end);                                        // [n_as]
         struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *) (matrix_row_counts + n_as); // [n_as][ne12]
 
+        // ZNQ2/3/4 MoE use a different activation layout from the generic
+        // MUL_MAT_ID implementation. Route first, then quantize directly into
+        // expert-grouped block_q8_0x4 groups so the work is done once and the
+        // existing 16-row / 64+-row GEMM kernels can reuse decoded weights.
         // src1: float32 => param type
-        for (int64_t i12 = 0; i12 < ne12; ++i12) {
-            for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
-                from_float((float *)((char *) src1->data + i12 * nb12 + i11 * nb11),
-                           (void *)               (wdata + i12 * nbw2 + i11 * nbw1),
-                           ne10);
+        if (!use_znq_moe) {
+            for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+                    from_float((float *)((char *) src1->data + i12 * nb12 + i11 * nb11),
+                               (void *)               (wdata + i12 * nbw2 + i11 * nbw1),
+                               ne10);
+                }
             }
         }
 
@@ -4602,7 +4864,184 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         ggml_barrier(params->threadpool);
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+        if (use_znq_moe) {
+            static_assert(QK8_0 == 32, "ZNQ MoE Q8 packing assumes QK8_0 == 32");
+            GGML_ASSERT(ne00 % QK8_0 == 0);
+
+            // Pack activation rows directly into expert order. Four-row jobs are
+            // spread across workers globally, so Mixtral's small expert count does
+            // not leave half the machine idle during activation quantization.
+            int64_t qtask = 0;
+            int64_t expert_row_base = 0;
+            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                const int64_t cne1 = matrix_row_counts[cur_a];
+                int64_t ir1 = 0;
+                for (; ir1 + 3 < cne1; ir1 += 4) {
+                    const int64_t task = qtask++;
+                    if (task % nth != ith) {
+                        continue;
+                    }
+
+                    const float * xr[4];
+                    for (int r = 0; r < 4; ++r) {
+                        const mmid_row_mapping row = MMID_MATRIX_ROW(cur_a, ir1 + r);
+                        const int64_t i11 = row.i1 % ne11;
+                        const int64_t i12 = row.i2;
+                        xr[r] = (const float *) ((const char *) src1->data + i12*nb12 + i11*nb11);
+                    }
+                    ggml_quantize_mat_znq4_q8_0_4x8(
+                        xr[0], xr[1], xr[2], xr[3],
+                        wdata + (expert_row_base + ir1)*nbw1, ne10);
+                }
+                for (; ir1 < cne1; ++ir1) {
+                    const int64_t task = qtask++;
+                    if (task % nth != ith) {
+                        continue;
+                    }
+                    const mmid_row_mapping row = MMID_MATRIX_ROW(cur_a, ir1);
+                    const int64_t i11 = row.i1 % ne11;
+                    const int64_t i12 = row.i2;
+                    from_float(
+                        (float *) ((char *) src1->data + i12*nb12 + i11*nb11),
+                        wdata + (expert_row_base + ir1)*nbw1, ne10);
+                }
+                expert_row_base += cne1;
+            }
+
+            // All consumers must see the expert-grouped packed rows before GEMM.
+            ggml_barrier(params->threadpool);
+
+        }
+#endif
+
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+        auto znq_moe_gemm = [&](int n, float * out, size_t dst_bs1, size_t dst_bs2,
+                                const int32_t * row_map, const void * weights,
+                                const void * activations, int nr, int nc) {
+            switch (src0->type) {
+                case GGML_TYPE_ZNQ2:
+                    ggml_gemm_znq2_8x8_q8_0_moe(n, out, dst_bs1, dst_bs2, row_map, weights, activations, nr, nc);
+                    break;
+                case GGML_TYPE_ZNQ3:
+                    ggml_gemm_znq3_8x8_q8_0_moe(n, out, dst_bs1, dst_bs2, row_map, weights, activations, nr, nc);
+                    break;
+                case GGML_TYPE_ZNQ4:
+                    ggml_gemm_znq4_8x8_q8_0_moe(n, out, dst_bs1, dst_bs2, row_map, weights, activations, nr, nc);
+                    break;
+                default:
+                    GGML_ABORT("invalid ZNQ MoE type");
+            }
+        };
+
+        if (use_znq_moe) {
+            // Schedule ZNQ2/3/4 MoE work as (expert, output-tile) jobs instead
+            // of making every worker walk every expert with a fixed column slice.
+            //
+            // Sweep variant: use eight adjacent x32 output panels per task.
+            // This strongly amortizes scheduler/GEMM-entry overhead, trading
+            // away output-column granularity and potentially some load balance.
+            // Keep the sub-32 tail shaped as 16+8 rather than 24 so it reaches
+            // the 16x16 kernel instead of demoting all 24 columns to the x8 path.
+            constexpr int64_t znq_moe_task_cols = 256;
+            GGML_ASSERT(ne01 > 0 && ne01 % NB_COLS == 0);
+            GGML_ASSERT(ids->ne[1] == ne12);
+
+            const int64_t n_full_tiles = ne01 / znq_moe_task_cols;
+            const int64_t tail_cols = ne01 % znq_moe_task_cols;
+            const int64_t tail_tasks = tail_cols == 0 ? 0 : (tail_cols == 24 ? 2 : 1);
+            const int64_t tasks_per_expert = n_full_tiles + tail_tasks;
+            const int64_t n_routed_rows = (int64_t) n_ids * ne12;
+
+            // Packing above has consumed the counts. Convert the same scratch
+            // array in-place to expert start offsets, avoiding another allocation
+            // or a prefix scan in every scheduled tile.
+            if (ith == 0) {
+                int64_t row_offset = 0;
+                for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                    const int64_t count = matrix_row_counts[cur_a];
+                    matrix_row_counts[cur_a] = row_offset;
+                    row_offset += count;
+                }
+                GGML_ASSERT(row_offset == n_routed_rows);
+
+                // Give each worker one initial task without an atomic fetch;
+                // subsequent tasks come from the shared chunk counter.
+                ggml_threadpool_chunk_set(params->threadpool, nth);
+            }
+            ggml_barrier(params->threadpool);
+
+            const size_t dst_bs1 = nb1 / sizeof(float);
+            const size_t dst_bs2 = nb2 / sizeof(float);
+            const int64_t total_tasks = (int64_t) n_as * tasks_per_expert;
+
+            int64_t current_task = ith;
+            while (current_task < total_tasks) {
+                const int cur_a = (int) (current_task / tasks_per_expert);
+                const int64_t local_task = current_task - (int64_t) cur_a * tasks_per_expert;
+
+                int64_t col;
+                int tile;
+                if (local_task < n_full_tiles) {
+                    col = local_task * znq_moe_task_cols;
+                    tile = (int) znq_moe_task_cols;
+                } else {
+                    const int64_t tail_task = local_task - n_full_tiles;
+                    col = n_full_tiles * znq_moe_task_cols;
+                    if (tail_cols == 24) {
+                        tile = tail_task == 0 ? 16 : 8;
+                        if (tail_task != 0) {
+                            col += 16;
+                        }
+                    } else {
+                        GGML_ASSERT(tail_task == 0 && tail_cols > 0);
+                        tile = (int) tail_cols;
+                    }
+                }
+
+                const int64_t expert_row_begin = matrix_row_counts[cur_a];
+                const int64_t expert_row_end = cur_a + 1 < n_as
+                    ? matrix_row_counts[cur_a + 1]
+                    : n_routed_rows;
+                const int64_t nr1 = expert_row_end - expert_row_begin;
+
+                if (nr1 > 0) {
+                    const char * src0_cur = (const char *) src0->data + cur_a*nb02;
+                    const char * expert_q8 = wdata + expert_row_begin*nbw1;
+                    const int64_t gemm_rows = nr1 - nr1 % 4;
+
+                    if (gemm_rows > 0) {
+                        const int32_t * row_map =
+                            reinterpret_cast<const int32_t *>(&MMID_MATRIX_ROW(cur_a, 0));
+                        znq_moe_gemm(
+                            ne00, (float *) dst->data + col, dst_bs1, dst_bs2, row_map,
+                            src0_cur + col*nb01, expert_q8, (int) gemm_rows, tile);
+                    }
+
+                    // At most three rows remain outside block_q8_0x4. Process
+                    // only this task's columns, so tail work is dynamically
+                    // balanced along with the main GEMM rather than serialized.
+                    for (int64_t ir1 = gemm_rows; ir1 < nr1; ++ir1) {
+                        const mmid_row_mapping row = MMID_MATRIX_ROW(cur_a, ir1);
+                        const char * src1_col = expert_q8 + ir1*nbw1;
+                        float * out = (float *) ((char *) dst->data + row.i1*nb1 + row.i2*nb2);
+                        gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                            ne00, out + col, ne01,
+                            src0_cur + col*nb01, src1_col, 1, tile);
+                    }
+                }
+
+                current_task = ggml_threadpool_chunk_add(params->threadpool, 1);
+            }
+
+            // Counts were converted to prefix offsets, so do not fall through
+            // to the generic per-expert loop below.
+            return;
+        }
+#endif
+
         // compute each matrix multiplication in sequence
+        int64_t expert_row_base = 0;
         for (int cur_a = 0; cur_a < n_as; ++cur_a) {
             const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -4615,6 +5054,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             //const int64_t nr0 = ne01; // src0 rows
             const int64_t nr1 = cne1; // src1 rows
 
+            const char * expert_q8 = use_znq_moe ? wdata + expert_row_base*nbw1 : nullptr;
+
             int64_t src0_cur_start = (ith * ne01) / nth;
             int64_t src0_cur_end   = ((ith + 1) * ne01) / nth;
 
@@ -4626,10 +5067,42 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
 
             if (src0_cur_start >= src0_cur_end) {
-                return;
+                break;
             }
 
-            for (int ir1 = 0; ir1 < nr1; ir1++) {
+            int64_t ir1 = 0;
+
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+            if (use_znq_moe) {
+                const int64_t gemm_rows = nr1 - nr1 % 4;
+
+                if (gemm_rows > 0) {
+                    // Store GEMM results directly into the final routed dst rows.
+                    // This removes the per-worker contiguous float tile and its
+                    // full write/read/memcpy pass without changing activation
+                    // packing or the 16-row / x32 decoded-weight kernels.
+                    const int32_t * row_map = reinterpret_cast<const int32_t *>(&MMID_MATRIX_ROW(cur_a, 0));
+                    const size_t dst_bs1 = nb1 / sizeof(float);
+                    const size_t dst_bs2 = nb2 / sizeof(float);
+
+                    for (int64_t col = src0_cur_start; col < src0_cur_end; ) {
+                        const int64_t remaining = src0_cur_end - col;
+                        const int tile = remaining >= 32 ? 32 : remaining >= 16 ? 16 : 8;
+                        GGML_ASSERT(tile <= remaining && tile % NB_COLS == 0);
+
+                        znq_moe_gemm(
+                            ne00, (float *) dst->data + col, dst_bs1, dst_bs2, row_map,
+                            src0_cur + col*nb01, expert_q8, (int) gemm_rows, tile);
+                        col += tile;
+                    }
+                    ir1 = gemm_rows;
+                }
+            }
+#endif
+
+            // The expert-grouped tail remains ordinary Q8_0 blocks, so 0..3
+            // routed rows use the existing GEMV. TG therefore remains unchanged.
+            for (; ir1 < nr1; ++ir1) {
                 struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
 
                 const int id = row_mapping.i1;  // selected expert index
@@ -4640,13 +5113,18 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 const int64_t i1 = id;               // selected expert index
                 const int64_t i2 = i12;              // row
 
-                const auto * src1_col = (const char *) wdata + (i11 * nbw1 + i12 * nbw2);
+                const auto * src1_col = use_znq_moe
+                    ? expert_q8 + ir1*nbw1
+                    : (const char *) wdata + (i11*nbw1 + i12*nbw2);
 
                 gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
                     ne00, (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, ne01,
                     src0_cur + src0_cur_start * nb01, src1_col, 1, src0_cur_end - src0_cur_start);
             }
+
+            expert_row_base += cne1;
         }
+
 #undef MMID_MATRIX_ROW
     }
 
@@ -4683,6 +5161,12 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     // instance for IQ4
     static const ggml::cpu::repack::tensor_traits<block_iq4_nl, 4, 4, GGML_TYPE_Q8_0> iq4_nl_4x4_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_iq4_nl, 8, 8, GGML_TYPE_Q8_0> iq4_nl_8x8_q8_0;
+
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+    static const ggml::cpu::repack::tensor_traits<block_znq2, 8, 8, GGML_TYPE_Q8_0> znq2_8x8_q8_0;
+    static const ggml::cpu::repack::tensor_traits<block_znq3, 8, 8, GGML_TYPE_Q8_0> znq3_8x8_q8_0;
+    static const ggml::cpu::repack::tensor_traits<block_znq4, 8, 8, GGML_TYPE_Q8_0> znq4_8x8_q8_0;
+#endif
 
     // instance for MXFP4
     static const ggml::cpu::repack::tensor_traits<block_mxfp4, 4, 4, GGML_TYPE_Q8_0> mxfp4_4x4_q8_0;
@@ -4819,6 +5303,26 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
             }
             #endif
         }
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+    } else if (cur->type == GGML_TYPE_ZNQ2) {
+        if (ggml_cpu_has_avx512_vbmi() && ggml_cpu_has_avx512_vnni()) {
+            if (cur->ne[1] % 8 == 0) {
+                return &znq2_8x8_q8_0;
+            }
+        }
+    } else if (cur->type == GGML_TYPE_ZNQ3) {
+        if (ggml_cpu_has_avx512_vbmi() && ggml_cpu_has_avx512_vnni()) {
+            if (cur->ne[1] % 8 == 0) {
+                return &znq3_8x8_q8_0;
+            }
+        }
+    } else if (cur->type == GGML_TYPE_ZNQ4) {
+        if (ggml_cpu_has_avx512_vbmi() && ggml_cpu_has_avx512_vnni()) {
+            if (cur->ne[1] % 8 == 0) {
+                return &znq4_8x8_q8_0;
+            }
+        }
+#endif
     } else if (cur->type == GGML_TYPE_MXFP4) {
         if (ggml_cpu_has_avx2()) {
             if (cur->ne[1] % 8 == 0) {

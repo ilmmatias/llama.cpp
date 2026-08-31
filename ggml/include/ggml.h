@@ -430,7 +430,11 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        // 43 and 44 are intentionally left free for IQ2_NL / IQ3_NL from upstream PR #27983.
+        GGML_TYPE_ZNQ2    = 45,
+        GGML_TYPE_ZNQ3    = 46,
+        GGML_TYPE_ZNQ4    = 47,
+        GGML_TYPE_COUNT   = 48,
     };
 
     // precision

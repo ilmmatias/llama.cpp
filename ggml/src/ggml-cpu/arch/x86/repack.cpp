@@ -6618,3 +6618,1478 @@ void ggml_gemm_iqp_8x8_q8_K_p4(int n, float * GGML_RESTRICT s, size_t bs, const 
 
     ggml_gemm_iqp_8x8_q8_K_p4_generic(n, s, bs, vx, vy, nc);
 }
+
+static inline float znq4x8_ufp8_to_fp32(uint8_t code) {
+    const uint32_t e = code >> 3;
+    const uint32_t m = code & 7u;
+    if (e == 0) {
+        return (float) m * (1.0f / 131072.0f);
+    }
+    const uint32_t u = ((e + 112u) << 23) | (m << 20);
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+// Q8_0 activation packing for MUL_MAT_ID. The generic repack path normally
+// quantizes each routed row independently and ZNQ4 0034 then re-reads those
+// blocks in every worker to build block_q8_0x4. Do the final layout directly
+// instead, once, after rows have been grouped by expert.
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__)
+static inline __m256i znq4_moe_quantize_q8_0_block(const float * x, ggml_half * d_out) {
+    __m512 v0 = _mm512_loadu_ps(x +  0);
+    __m512 v1 = _mm512_loadu_ps(x + 16);
+
+    const __m512 sign_bit = _mm512_set1_ps(-0.0f);
+    __m512 max_abs = _mm512_andnot_ps(sign_bit, v0);
+    max_abs = _mm512_max_ps(max_abs, _mm512_andnot_ps(sign_bit, v1));
+    const float max_scalar = _mm512_reduce_max_ps(max_abs);
+
+    const float d = max_scalar / 127.0f;
+    *d_out = GGML_CPU_FP32_TO_FP16(d);
+    const __m512 mul = _mm512_set1_ps(max_scalar != 0.0f ? 127.0f / max_scalar : 0.0f);
+
+    v0 = _mm512_roundscale_ps(_mm512_mul_ps(v0, mul), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    v1 = _mm512_roundscale_ps(_mm512_mul_ps(v1, mul), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+
+    const __m128i q0 = _mm512_cvtsepi32_epi8(_mm512_cvtps_epi32(v0));
+    const __m128i q1 = _mm512_cvtsepi32_epi8(_mm512_cvtps_epi32(v1));
+    return _mm256_inserti128_si256(_mm256_castsi128_si256(q0), q1, 1);
+}
+#elif defined(__AVX2__)
+static inline __m256i znq4_moe_quantize_q8_0_block(const float * x, ggml_half * d_out) {
+    __m256 v0 = _mm256_loadu_ps(x +  0);
+    __m256 v1 = _mm256_loadu_ps(x +  8);
+    __m256 v2 = _mm256_loadu_ps(x + 16);
+    __m256 v3 = _mm256_loadu_ps(x + 24);
+
+    const __m256 sign_bit = _mm256_set1_ps(-0.0f);
+    __m256 max_abs = _mm256_andnot_ps(sign_bit, v0);
+    max_abs = _mm256_max_ps(max_abs, _mm256_andnot_ps(sign_bit, v1));
+    max_abs = _mm256_max_ps(max_abs, _mm256_andnot_ps(sign_bit, v2));
+    max_abs = _mm256_max_ps(max_abs, _mm256_andnot_ps(sign_bit, v3));
+
+    __m128 max4 = _mm_max_ps(_mm256_extractf128_ps(max_abs, 1), _mm256_castps256_ps128(max_abs));
+    max4 = _mm_max_ps(max4, _mm_movehl_ps(max4, max4));
+    max4 = _mm_max_ss(max4, _mm_movehdup_ps(max4));
+    const float max_scalar = _mm_cvtss_f32(max4);
+
+    const float d = max_scalar / 127.0f;
+    *d_out = GGML_CPU_FP32_TO_FP16(d);
+    const __m256 mul = _mm256_set1_ps(max_scalar != 0.0f ? 127.0f / max_scalar : 0.0f);
+
+    v0 = _mm256_round_ps(_mm256_mul_ps(v0, mul), _MM_ROUND_NEAREST);
+    v1 = _mm256_round_ps(_mm256_mul_ps(v1, mul), _MM_ROUND_NEAREST);
+    v2 = _mm256_round_ps(_mm256_mul_ps(v2, mul), _MM_ROUND_NEAREST);
+    v3 = _mm256_round_ps(_mm256_mul_ps(v3, mul), _MM_ROUND_NEAREST);
+
+    __m256i i0 = _mm256_cvtps_epi32(v0);
+    __m256i i1 = _mm256_cvtps_epi32(v1);
+    __m256i i2 = _mm256_cvtps_epi32(v2);
+    __m256i i3 = _mm256_cvtps_epi32(v3);
+    i0 = _mm256_packs_epi32(i0, i1);
+    i2 = _mm256_packs_epi32(i2, i3);
+    i0 = _mm256_packs_epi16(i0, i2);
+    const __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+    return _mm256_permutevar8x32_epi32(i0, perm);
+}
+#endif
+
+void ggml_quantize_mat_znq4_q8_0_4x8(const float * x0, const float * x1,
+        const float * x2, const float * x3, void * vy, int64_t k) {
+    assert(QK8_0 == 32);
+    assert(k % QK8_0 == 0);
+    const int nb = k / QK8_0;
+    block_q8_0x4 * y = (block_q8_0x4 *) vy;
+
+#if (defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__)) || defined(__AVX2__)
+    for (int ib = 0; ib < nb; ++ib) {
+        const __m256i q0 = znq4_moe_quantize_q8_0_block(x0 + ib*QK8_0, &y[ib].d[0]);
+        const __m256i q1 = znq4_moe_quantize_q8_0_block(x1 + ib*QK8_0, &y[ib].d[1]);
+        const __m256i q2 = znq4_moe_quantize_q8_0_block(x2 + ib*QK8_0, &y[ib].d[2]);
+        const __m256i q3 = znq4_moe_quantize_q8_0_block(x3 + ib*QK8_0, &y[ib].d[3]);
+
+        // Transpose four 32-byte row vectors at 8-byte granularity into the
+        // 4x8 layout: [r0.0, r1.0, r2.0, r3.0, r0.1, ...].
+        const __m256i lo01 = _mm256_unpacklo_epi64(q0, q1);
+        const __m256i lo23 = _mm256_unpacklo_epi64(q2, q3);
+        const __m256i hi01 = _mm256_unpackhi_epi64(q0, q1);
+        const __m256i hi23 = _mm256_unpackhi_epi64(q2, q3);
+        const __m256i o0 = _mm256_permute2x128_si256(lo01, lo23, 0x20);
+        const __m256i o1 = _mm256_permute2x128_si256(hi01, hi23, 0x20);
+        const __m256i o2 = _mm256_permute2x128_si256(lo01, lo23, 0x31);
+        const __m256i o3 = _mm256_permute2x128_si256(hi01, hi23, 0x31);
+        _mm256_storeu_si256((__m256i *) (y[ib].qs +  0), o0);
+        _mm256_storeu_si256((__m256i *) (y[ib].qs + 32), o1);
+        _mm256_storeu_si256((__m256i *) (y[ib].qs + 64), o2);
+        _mm256_storeu_si256((__m256i *) (y[ib].qs + 96), o3);
+    }
+#else
+    const float * rows[4] = { x0, x1, x2, x3 };
+    for (int ib = 0; ib < nb; ++ib) {
+        float inv[4];
+        for (int r = 0; r < 4; ++r) {
+            float amax = 0.0f;
+            for (int j = 0; j < QK8_0; ++j) {
+                amax = MAX(amax, fabsf(rows[r][ib*QK8_0 + j]));
+            }
+            const float d = amax / 127.0f;
+            y[ib].d[r] = GGML_CPU_FP32_TO_FP16(d);
+            inv[r] = amax != 0.0f ? 127.0f / amax : 0.0f;
+        }
+        for (int j = 0; j < QK8_0; ++j) {
+            const int chunk = j >> 3;
+            const int within = j & 7;
+            for (int r = 0; r < 4; ++r) {
+                y[ib].qs[chunk*32 + r*8 + within] =
+                    (int8_t) roundf(rows[r][ib*QK8_0 + j] * inv[r]);
+            }
+        }
+    }
+#endif
+}
+
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
+static inline __m256 znq4x8_ufp8x8_to_fp32(const uint8_t * p) {
+    const __m128i c8 = _mm_loadl_epi64((const __m128i *) p);
+    const __m256i c = _mm256_cvtepu8_epi32(c8);
+    const __m256i e = _mm256_srli_epi32(c, 3);
+    const __m256i m = _mm256_and_si256(c, _mm256_set1_epi32(7));
+    const __m256i bits = _mm256_or_si256(
+            _mm256_slli_epi32(_mm256_add_epi32(e, _mm256_set1_epi32(112)), 23),
+            _mm256_slli_epi32(m, 20));
+    const __m256 normal = _mm256_castsi256_ps(bits);
+    const __m256 subnormal = _mm256_mul_ps(_mm256_cvtepi32_ps(m), _mm256_set1_ps(1.0f / 131072.0f));
+    const __m256 is_subnormal = _mm256_castsi256_ps(_mm256_cmpeq_epi32(e, _mm256_setzero_si256()));
+    return _mm256_blendv_ps(normal, subnormal, is_subnormal);
+}
+
+static inline __m256i znq4x8_book_repeat4(const uint8_t * p, bool high) {
+    __m128i books = _mm_loadl_epi64((const __m128i *) p);
+    if (high) {
+        books = _mm_srli_epi16(books, 4);
+    }
+    books = _mm_and_si128(books, _mm_set1_epi8(0x0f));
+    const __m256i dwords = _mm256_cvtepu8_epi32(books);
+    return _mm256_mullo_epi32(dwords, _mm256_set1_epi32(0x01010101));
+}
+
+static inline __m256i znq4x8_unpack_group(const uint8_t * p) {
+    // The repack stores two nibble bytes per row. Expanding each source byte to
+    // a uint16 lane lets low/high nibbles become adjacent bytes, producing
+    // [row0 w0..w3, row1 w0..w3, ... row7 w0..w3].
+    const __m128i packed = _mm_loadu_si128((const __m128i *) p);
+    const __m256i words = _mm256_cvtepu8_epi16(packed);
+    const __m256i lo = _mm256_and_si256(words, _mm256_set1_epi16(0x000f));
+    const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(words, 4), _mm256_set1_epi16(0x000f));
+    return _mm256_or_si256(lo, _mm256_slli_epi16(hi, 8));
+}
+
+static inline __m256i znq4x8_lookup_group(
+        __m256i codes, __m256i books,
+        __m512i table03, __m512i table47, __m512i table8b, __m512i tablecf) {
+    // Each VPERMI2B chooses from two adjacent 64-byte groups of four books.
+    // books&7 selects within books 0..7 (or 8..15), then bit 3 chooses the
+    // lower or upper pair. This avoids eight dynamic 16-byte table loads.
+    const __m256i low3 = _mm256_and_si256(books, _mm256_set1_epi8(7));
+    const __m256i indices256 = _mm256_add_epi8(codes, _mm256_slli_epi16(low3, 4));
+    const __m512i indices = _mm512_inserti64x4(_mm512_setzero_si512(), indices256, 0);
+
+    const __m256i a = _mm512_castsi512_si256(_mm512_permutex2var_epi8(table03, indices, table47));
+    const __m256i b = _mm512_castsi512_si256(_mm512_permutex2var_epi8(table8b, indices, tablecf));
+    const __m256i high = _mm256_cmpgt_epi8(
+            _mm256_and_si256(books, _mm256_set1_epi8(8)), _mm256_setzero_si256());
+    return _mm256_blendv_epi8(a, b, high);
+}
+
+static inline uint32_t znq4x8_load_u32(const void * p) {
+    uint32_t v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+static inline __m512 znq4x8_ufp8x16_to_fp32(const uint8_t * p0, const uint8_t * p1) {
+    __m512 out = _mm512_castps256_ps512(znq4x8_ufp8x8_to_fp32(p0));
+    return _mm512_insertf32x8(out, znq4x8_ufp8x8_to_fp32(p1), 1);
+}
+
+static inline __m512i znq4x8_combine_ymm(__m256i lo, __m256i hi) {
+    __m512i out = _mm512_castsi256_si512(lo);
+    return _mm512_inserti64x4(out, hi, 1);
+}
+
+// Transient prompt-processing panel for 32 output rows. The on-disk / CPU_REPACK
+// representation remains 4.5 bpw; this expands only one K-panel per worker so
+// the nonlinear book lookup is paid once and then reused across all prompt rows.
+struct znq4x32_panel_block {
+    int8_t  weights[2][QK_ZNQ / 4][64];
+    int32_t correction[2][16];
+    float   weight_scale[2][16];
+};
+
+static_assert(sizeof(znq4x32_panel_block) == 1280, "wrong ZNQ4 x32 panel size/padding");
+#endif
+
+void ggml_gemv_znq4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+        const void * GGML_RESTRICT vy, int nr, int nc) {
+    assert(n % QK_ZNQ == 0);
+    assert(nc % 8 == 0);
+
+    const int nb = n / QK_ZNQ;
+    const block_znq4x8 * b_ptr_start = (const block_znq4x8 *) vx;
+    const block_q8_0 * a_ptr_start = (const block_q8_0 *) vy;
+
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
+    const __m512i table03 = _mm512_loadu_si512((const void *) (kvalues_znq4 +   0));
+    const __m512i table47 = _mm512_loadu_si512((const void *) (kvalues_znq4 +  64));
+    const __m512i table8b = _mm512_loadu_si512((const void *) (kvalues_znq4 + 128));
+    const __m512i tablecf = _mm512_loadu_si512((const void *) (kvalues_znq4 + 192));
+
+    for (int y = 0; y < nr; ++y) {
+        const block_q8_0 * a_ptr = a_ptr_start + y * nb;
+        for (int x = 0; x < nc / 8; ++x) {
+            const block_znq4x8 * b_ptr = b_ptr_start + x * nb;
+            __m256 acc = _mm256_setzero_ps();
+
+            for (int ib = 0; ib < nb; ++ib) {
+                const __m256i books_lo = znq4x8_book_repeat4(b_ptr[ib].books, false);
+                const __m256i books_hi = znq4x8_book_repeat4(b_ptr[ib].books, true);
+                __m256i iacc = _mm256_setzero_si256();
+
+                for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                    const __m256i weights = znq4x8_lookup_group(
+                            znq4x8_unpack_group(b_ptr[ib].qs + 16 * g),
+                            g < 4 ? books_lo : books_hi, table03, table47, table8b, tablecf);
+                    const __m256i act = _mm256_set1_epi32((int) znq4x8_load_u32(a_ptr[ib].qs + 4 * g));
+                    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, weights, act);
+                }
+
+                const __m256 scales = _mm256_mul_ps(
+                        znq4x8_ufp8x8_to_fp32(b_ptr[ib].d),
+                        _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[ib].d)));
+                acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc), scales, acc);
+            }
+
+            _mm256_storeu_ps(s + y * bs + x * 8, acc);
+        }
+    }
+    return;
+#endif
+
+    // Link-safe scalar fallback for x86 build variants without VBMI+VNNI.
+    for (int y = 0; y < nr; ++y) {
+        const block_q8_0 * a_ptr = a_ptr_start + y * nb;
+        for (int x = 0; x < nc / 8; ++x) {
+            const block_znq4x8 * b_ptr = b_ptr_start + x * nb;
+            float out[8] = {};
+            for (int ib = 0; ib < nb; ++ib) {
+                const float da = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d);
+                for (int r = 0; r < 8; ++r) {
+                    int32_t dot = 0;
+                    for (int j = 0; j < QK_ZNQ; ++j) {
+                        const int g = j / 4;
+                        const int jb = j & 3;
+                        const uint8_t packed = b_ptr[ib].qs[g * 16 + r * 2 + jb / 2];
+                        const int code = (packed >> (4 * (jb & 1))) & 0x0f;
+                        const int book = (b_ptr[ib].books[r] >> (4 * (j / 16))) & 0x0f;
+                        dot += kvalues_znq4[16 * book + code] * a_ptr[ib].qs[j];
+                    }
+                    out[r] += znq4x8_ufp8_to_fp32(b_ptr[ib].d[r]) * da * dot;
+                }
+            }
+            memcpy(s + y * bs + x * 8, out, sizeof(out));
+        }
+    }
+}
+
+static inline float * znq4x8_gemm_dst_row(
+        float * s, size_t bs, const int32_t * row_map, size_t dst_bs1, size_t dst_bs2, int row) {
+    if (row_map != nullptr) {
+        return s + (size_t) row_map[2 * row + 0] * dst_bs1 + (size_t) row_map[2 * row + 1] * dst_bs2;
+    }
+    return s + (size_t) row * bs;
+}
+
+static void ggml_gemm_znq4_8x8_q8_0_impl(
+        int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+        const void * GGML_RESTRICT vy, int nr, int nc,
+        const int32_t * row_map, size_t dst_bs1, size_t dst_bs2) {
+    assert(n % QK_ZNQ == 0);
+    assert(nr % 4 == 0);
+    assert(nc % 8 == 0);
+
+    const int nb = n / QK_ZNQ;
+    const block_znq4x8 * b_ptr_start = (const block_znq4x8 *) vx;
+    const block_q8_0x4 * a_ptr_start = (const block_q8_0x4 *) vy;
+
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
+    const __m512i table03 = _mm512_loadu_si512((const void *) (kvalues_znq4 +   0));
+    const __m512i table47 = _mm512_loadu_si512((const void *) (kvalues_znq4 +  64));
+    const __m512i table8b = _mm512_loadu_si512((const void *) (kvalues_znq4 + 128));
+    const __m512i tablecf = _mm512_loadu_si512((const void *) (kvalues_znq4 + 192));
+
+    // Large-prompt fast path: decode two adjacent x8 repack pairs (32 output
+    // rows) once into an int8 panel, then reuse it over every activation row.
+    //
+    // The 4x32 microkernel keeps only eight persistent FP accumulators live,
+    // avoiding the register-pressure/spill cliff seen with the 8-row tile while
+    // preserving the same two 16-column VNNI halves and the same decoded panel.
+    //
+    // For pp4096 and K=14336 the panel is 560 KiB per worker. It is transient,
+    // reused for every 4-row prompt tile, and does not inflate the model buffer.
+    //
+    // CPU_REPACK only guarantees output chunks aligned to the physical x8
+    // repack width. Do not require the entire scheduler chunk to be a multiple
+    // of 32: use the panel kernel for the full x32 prefix and route only the
+    // final 0/8/16/24 columns through the existing smaller kernels. Otherwise
+    // thread counts whose chunk boundaries are not x32-aligned can demote the
+    // whole chunk to the old narrow GEMM path.
+    if (nr >= 64 && nr % 4 == 0 && nc >= 32) {
+        const size_t panel_size = (size_t) nb * sizeof(znq4x32_panel_block);
+        auto * panel = (znq4x32_panel_block *) std::malloc(panel_size);
+
+        if (panel != nullptr) {
+            const __m512i ones = _mm512_set1_epi8(1);
+
+            for (int x32 = 0; x32 < nc / 32; ++x32) {
+                const block_znq4x8 * b_ptrs[4] = {
+                    b_ptr_start + (4 * x32 + 0) * nb,
+                    b_ptr_start + (4 * x32 + 1) * nb,
+                    b_ptr_start + (4 * x32 + 2) * nb,
+                    b_ptr_start + (4 * x32 + 3) * nb,
+                };
+
+                // One-time nonlinear decode for this 32-column K-panel.
+                for (int ib = 0; ib < nb; ++ib) {
+                    for (int h = 0; h < 2; ++h) {
+                        const block_znq4x8 & b0 = b_ptrs[2 * h + 0][ib];
+                        const block_znq4x8 & b1 = b_ptrs[2 * h + 1][ib];
+                        const __m256i b0_lo = znq4x8_book_repeat4(b0.books, false);
+                        const __m256i b0_hi = znq4x8_book_repeat4(b0.books, true);
+                        const __m256i b1_lo = znq4x8_book_repeat4(b1.books, false);
+                        const __m256i b1_hi = znq4x8_book_repeat4(b1.books, true);
+                        __m512i sumw = _mm512_setzero_si512();
+
+                        for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                            const __m256i w0 = znq4x8_lookup_group(
+                                    znq4x8_unpack_group(b0.qs + 16 * g),
+                                    g < 4 ? b0_lo : b0_hi, table03, table47, table8b, tablecf);
+                            const __m256i w1 = znq4x8_lookup_group(
+                                    znq4x8_unpack_group(b1.qs + 16 * g),
+                                    g < 4 ? b1_lo : b1_hi, table03, table47, table8b, tablecf);
+                            const __m512i weights = znq4x8_combine_ymm(w0, w1);
+                            _mm512_storeu_si512((void *) panel[ib].weights[h][g], weights);
+                            sumw = _mm512_dpbusd_epi32(sumw, ones, weights);
+                        }
+
+                        _mm512_storeu_si512((void *) panel[ib].correction[h], _mm512_slli_epi32(sumw, 7));
+                        _mm512_storeu_ps(panel[ib].weight_scale[h], znq4x8_ufp8x16_to_fp32(b0.d, b1.d));
+                    }
+                }
+
+                for (int y4 = 0; y4 < nr / 4; ++y4) {
+                    const block_q8_0x4 * a_ptr = a_ptr_start + y4 * nb;
+
+                    __m512 a0 = _mm512_setzero_ps(); __m512 b0 = _mm512_setzero_ps();
+                    __m512 a1 = _mm512_setzero_ps(); __m512 b1 = _mm512_setzero_ps();
+                    __m512 a2 = _mm512_setzero_ps(); __m512 b2 = _mm512_setzero_ps();
+                    __m512 a3 = _mm512_setzero_ps(); __m512 b3 = _mm512_setzero_ps();
+
+                    for (int ib = 0; ib < nb; ++ib) {
+                        const __m512i corr0 = _mm512_loadu_si512((const void *) panel[ib].correction[0]);
+                        const __m512i corr1 = _mm512_loadu_si512((const void *) panel[ib].correction[1]);
+                        const __m512 wd0 = _mm512_loadu_ps(panel[ib].weight_scale[0]);
+                        const __m512 wd1 = _mm512_loadu_ps(panel[ib].weight_scale[1]);
+
+                        __m512i d00 = _mm512_setzero_si512(); __m512i d10 = _mm512_setzero_si512();
+                        __m512i d01 = _mm512_setzero_si512(); __m512i d11 = _mm512_setzero_si512();
+                        __m512i d02 = _mm512_setzero_si512(); __m512i d12 = _mm512_setzero_si512();
+                        __m512i d03 = _mm512_setzero_si512(); __m512i d13 = _mm512_setzero_si512();
+                        const int8_t * qbase = a_ptr[ib].qs;
+
+                        // Four activation rows x two output halves give eight independent
+                        // VNNI chains without carrying a second 4-row FP accumulator set.
+                        for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                            const __m512i w0 = _mm512_loadu_si512((const void *) panel[ib].weights[0][g]);
+                            const __m512i w1 = _mm512_loadu_si512((const void *) panel[ib].weights[1][g]);
+                            const int chunk = g >> 1;
+                            const int within = (g & 1) * 4;
+                            const int off = chunk * 32 + within;
+
+                            const __m512i q0 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  0) ^ 0x80808080u));
+                            const __m512i q1 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  8) ^ 0x80808080u));
+                            const __m512i q2 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 16) ^ 0x80808080u));
+                            const __m512i q3 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 24) ^ 0x80808080u));
+
+                            d00 = _mm512_dpbusd_epi32(d00, q0, w0); d10 = _mm512_dpbusd_epi32(d10, q0, w1);
+                            d01 = _mm512_dpbusd_epi32(d01, q1, w0); d11 = _mm512_dpbusd_epi32(d11, q1, w1);
+                            d02 = _mm512_dpbusd_epi32(d02, q2, w0); d12 = _mm512_dpbusd_epi32(d12, q2, w1);
+                            d03 = _mm512_dpbusd_epi32(d03, q3, w0); d13 = _mm512_dpbusd_epi32(d13, q3, w1);
+                        }
+
+                        d00 = _mm512_sub_epi32(d00, corr0); d10 = _mm512_sub_epi32(d10, corr1);
+                        d01 = _mm512_sub_epi32(d01, corr0); d11 = _mm512_sub_epi32(d11, corr1);
+                        d02 = _mm512_sub_epi32(d02, corr0); d12 = _mm512_sub_epi32(d12, corr1);
+                        d03 = _mm512_sub_epi32(d03, corr0); d13 = _mm512_sub_epi32(d13, corr1);
+
+                        const float sd0 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[0]);
+                        const float sd1 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[1]);
+                        const float sd2 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[2]);
+                        const float sd3 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[3]);
+                        a0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d00), _mm512_mul_ps(wd0, _mm512_set1_ps(sd0)), a0);
+                        b0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d10), _mm512_mul_ps(wd1, _mm512_set1_ps(sd0)), b0);
+                        a1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d01), _mm512_mul_ps(wd0, _mm512_set1_ps(sd1)), a1);
+                        b1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d11), _mm512_mul_ps(wd1, _mm512_set1_ps(sd1)), b1);
+                        a2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d02), _mm512_mul_ps(wd0, _mm512_set1_ps(sd2)), a2);
+                        b2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d12), _mm512_mul_ps(wd1, _mm512_set1_ps(sd2)), b2);
+                        a3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d03), _mm512_mul_ps(wd0, _mm512_set1_ps(sd3)), a3);
+                        b3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d13), _mm512_mul_ps(wd1, _mm512_set1_ps(sd3)), b3);
+                    }
+
+                    const int row = 4 * y4;
+                    float * d0 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 0) + 32 * x32;
+                    float * d1 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 1) + 32 * x32;
+                    float * d2 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 2) + 32 * x32;
+                    float * d3 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 3) + 32 * x32;
+                    _mm512_storeu_ps(d0,      a0); _mm512_storeu_ps(d0 + 16, b0);
+                    _mm512_storeu_ps(d1,      a1); _mm512_storeu_ps(d1 + 16, b1);
+                    _mm512_storeu_ps(d2,      a2); _mm512_storeu_ps(d2 + 16, b2);
+                    _mm512_storeu_ps(d3,      a3); _mm512_storeu_ps(d3 + 16, b3);
+                }
+            }
+
+            const int nc32 = nc - nc % 32;
+            std::free(panel);
+
+            // Preserve the widest available tail kernel. A 24-column tail is
+            // split as 16+8 so the first part reaches the 0029 16x16 path
+            // instead of forcing all 24 columns through the 4x8 fallback.
+            int done = nc32;
+            if (nc - done >= 16) {
+                ggml_gemm_znq4_8x8_q8_0_impl(
+                        n, s + done, bs,
+                        b_ptr_start + (done / 8) * nb,
+                        vy, nr, 16, row_map, dst_bs1, dst_bs2);
+                done += 16;
+            }
+            if (done < nc) {
+                GGML_ASSERT(nc - done == 8);
+                ggml_gemm_znq4_8x8_q8_0_impl(
+                        n, s + done, bs,
+                        b_ptr_start + (done / 8) * nb,
+                        vy, nr, 8, row_map, dst_bs1, dst_bs2);
+            }
+            return;
+        }
+    }
+
+    // Prompt processing has many activation rows. Work on 16x16 output tiles so
+    // the expensive nonlinear book decode is shared across 16 tokens, and use
+    // full-width VNNI for 16 output columns at once. Cache the eight decoded
+    // 4-weight groups for one QK32 block, then consume them row-by-row; this
+    // keeps register pressure below the 16 simultaneous integer accumulators
+    // used by the straightforward formulation.
+    //
+    // VPDPBUSD wants unsigned activations and signed weights. xor 0x80 maps each
+    // signed Q8 byte q to q+128, then 128*sum(weight) is removed once per block.
+    int y4 = 0;
+    if (nc % 16 == 0) {
+        const __m512i ones = _mm512_set1_epi8(1);
+        for (; y4 + 3 < nr / 4; y4 += 4) {
+            const block_q8_0x4 * a_ptrs[4] = {
+                a_ptr_start + (y4 + 0) * nb,
+                a_ptr_start + (y4 + 1) * nb,
+                a_ptr_start + (y4 + 2) * nb,
+                a_ptr_start + (y4 + 3) * nb,
+            };
+
+            for (int x16 = 0; x16 < nc / 16; ++x16) {
+                const block_znq4x8 * b_ptr_0 = b_ptr_start + (2 * x16 + 0) * nb;
+                const block_znq4x8 * b_ptr_1 = b_ptr_start + (2 * x16 + 1) * nb;
+                __m512 acc[16];
+                for (int r = 0; r < 16; ++r) {
+                    acc[r] = _mm512_setzero_ps();
+                }
+
+                for (int ib = 0; ib < nb; ++ib) {
+                    const __m256i b0_lo = znq4x8_book_repeat4(b_ptr_0[ib].books, false);
+                    const __m256i b0_hi = znq4x8_book_repeat4(b_ptr_0[ib].books, true);
+                    const __m256i b1_lo = znq4x8_book_repeat4(b_ptr_1[ib].books, false);
+                    const __m256i b1_hi = znq4x8_book_repeat4(b_ptr_1[ib].books, true);
+
+                    __m512i weights[QK_ZNQ / 4];
+                    __m512i sumw = _mm512_setzero_si512();
+                    for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                        const __m256i w0 = znq4x8_lookup_group(
+                                znq4x8_unpack_group(b_ptr_0[ib].qs + 16 * g),
+                                g < 4 ? b0_lo : b0_hi, table03, table47, table8b, tablecf);
+                        const __m256i w1 = znq4x8_lookup_group(
+                                znq4x8_unpack_group(b_ptr_1[ib].qs + 16 * g),
+                                g < 4 ? b1_lo : b1_hi, table03, table47, table8b, tablecf);
+                        weights[g] = znq4x8_combine_ymm(w0, w1);
+                        sumw = _mm512_dpbusd_epi32(sumw, ones, weights[g]);
+                    }
+                    const __m512i correction = _mm512_slli_epi32(sumw, 7);
+                    const __m512 wd = znq4x8_ufp8x16_to_fp32(b_ptr_0[ib].d, b_ptr_1[ib].d);
+
+                    for (int p = 0; p < 4; ++p) {
+                        for (int r = 0; r < 4; ++r) {
+                            const int rr = 4 * p + r;
+                            __m512i dot = _mm512_setzero_si512();
+                            for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                                const int chunk = g >> 1;
+                                const int within = (g & 1) * 4;
+                                const uint32_t q = znq4x8_load_u32(
+                                        a_ptrs[p][ib].qs + chunk * 32 + r * 8 + within) ^ 0x80808080u;
+                                dot = _mm512_dpbusd_epi32(
+                                        dot, _mm512_set1_epi32((int) q), weights[g]);
+                            }
+                            dot = _mm512_sub_epi32(dot, correction);
+                            const __m512 scale = _mm512_mul_ps(
+                                    wd, _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptrs[p][ib].d[r])));
+                            acc[rr] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dot), scale, acc[rr]);
+                        }
+                    }
+                }
+
+                for (int r = 0; r < 16; ++r) {
+                    float * dst_row = znq4x8_gemm_dst_row(
+                            s, bs, row_map, dst_bs1, dst_bs2, 4 * y4 + r);
+                    _mm512_storeu_ps(dst_row + 16 * x16, acc[r]);
+                }
+            }
+        }
+    }
+
+    // 4-row tail, and the complete fallback when a chunk has only 8 columns.
+    for (int y = y4; y < nr / 4; ++y) {
+        const block_q8_0x4 * a_ptr = a_ptr_start + y * nb;
+        for (int x = 0; x < nc / 8; ++x) {
+            const block_znq4x8 * b_ptr = b_ptr_start + x * nb;
+            __m256 acc[4] = {
+                _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+            };
+
+            for (int ib = 0; ib < nb; ++ib) {
+                const __m256i books_lo = znq4x8_book_repeat4(b_ptr[ib].books, false);
+                const __m256i books_hi = znq4x8_book_repeat4(b_ptr[ib].books, true);
+                __m256i iacc[4] = {
+                    _mm256_setzero_si256(), _mm256_setzero_si256(),
+                    _mm256_setzero_si256(), _mm256_setzero_si256(),
+                };
+
+                for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                    const __m256i weights = znq4x8_lookup_group(
+                            znq4x8_unpack_group(b_ptr[ib].qs + 16 * g),
+                            g < 4 ? books_lo : books_hi, table03, table47, table8b, tablecf);
+                    const int chunk = g >> 1;
+                    const int within = (g & 1) * 4;
+                    for (int r = 0; r < 4; ++r) {
+                        const uint32_t q = znq4x8_load_u32(a_ptr[ib].qs + chunk * 32 + r * 8 + within);
+                        iacc[r] = mul_sum_i8_pairs_acc_int32x8(
+                                iacc[r], weights, _mm256_set1_epi32((int) q));
+                    }
+                }
+
+                const __m256 wd = znq4x8_ufp8x8_to_fp32(b_ptr[ib].d);
+                for (int r = 0; r < 4; ++r) {
+                    const __m256 scales = _mm256_mul_ps(
+                            wd, _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[r])));
+                    acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc[r]), scales, acc[r]);
+                }
+            }
+
+            for (int r = 0; r < 4; ++r) {
+                float * dst_row = znq4x8_gemm_dst_row(
+                        s, bs, row_map, dst_bs1, dst_bs2, y * 4 + r);
+                _mm256_storeu_ps(dst_row + x * 8, acc[r]);
+            }
+        }
+    }
+    return;
+#endif
+
+    for (int y = 0; y < nr / 4; ++y) {
+        const block_q8_0x4 * a_ptr = a_ptr_start + y * nb;
+        for (int x = 0; x < nc / 8; ++x) {
+            const block_znq4x8 * b_ptr = b_ptr_start + x * nb;
+            float out[4][8] = {};
+            for (int ib = 0; ib < nb; ++ib) {
+                for (int r = 0; r < 4; ++r) {
+                    const float da = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[r]);
+                    for (int wr = 0; wr < 8; ++wr) {
+                        int32_t dot = 0;
+                        for (int j = 0; j < QK_ZNQ; ++j) {
+                            const int g = j / 4;
+                            const int jb = j & 3;
+                            const uint8_t packed = b_ptr[ib].qs[g * 16 + wr * 2 + jb / 2];
+                            const int code = (packed >> (4 * (jb & 1))) & 0x0f;
+                            const int book = (b_ptr[ib].books[wr] >> (4 * (j / 16))) & 0x0f;
+                            const int chunk = j / 8;
+                            const int offset = j & 7;
+                            const int8_t act = a_ptr[ib].qs[chunk * 32 + r * 8 + offset];
+                            dot += kvalues_znq4[16 * book + code] * act;
+                        }
+                        out[r][wr] += znq4x8_ufp8_to_fp32(b_ptr[ib].d[wr]) * da * dot;
+                    }
+                }
+            }
+            for (int r = 0; r < 4; ++r) {
+                float * dst_row = znq4x8_gemm_dst_row(
+                        s, bs, row_map, dst_bs1, dst_bs2, y * 4 + r);
+                memcpy(dst_row + x * 8, out[r], sizeof(out[r]));
+            }
+        }
+    }
+}
+
+void ggml_gemm_znq4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+        const void * GGML_RESTRICT vy, int nr, int nc) {
+    ggml_gemm_znq4_8x8_q8_0_impl(n, s, bs, vx, vy, nr, nc, nullptr, 0, 0);
+}
+
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
+static inline __m256i znq2x8_unpack_group(const uint32_t planes[2]) {
+    const __m256i b0 = _mm256_maskz_set1_epi8((__mmask32) planes[0], 1);
+    const __m256i b1 = _mm256_maskz_set1_epi8((__mmask32) planes[1], 2);
+    return _mm256_or_si256(b0, b1);
+}
+
+static inline __m256i znq2x8_lookup_group(__m256i codes, __m256i books, __m512i table) {
+    // 16 books x 4 entries = exactly 64 bytes. book*4 + code is a direct
+    // VPERMB index, so ZNQ2 needs one table register and one permutation.
+    const __m256i indices256 = _mm256_add_epi8(codes, _mm256_slli_epi16(books, 2));
+    const __m512i indices = _mm512_inserti64x4(_mm512_setzero_si512(), indices256, 0);
+    return _mm512_castsi512_si256(_mm512_permutexvar_epi8(indices, table));
+}
+
+// Same post-decode layout as ZNQ3/ZNQ4. The panel deliberately expands only
+// transient prompt-processing weights; model storage remains exactly 2.5 bpw.
+struct znq2x32_panel_block {
+    int8_t  weights[2][QK_ZNQ / 4][64];
+    int32_t correction[2][16];
+    float   weight_scale[2][16];
+};
+
+static_assert(sizeof(znq2x32_panel_block) == 1280, "wrong ZNQ2 x32 panel size/padding");
+#endif
+
+void ggml_gemv_znq2_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+        const void * GGML_RESTRICT vy, int nr, int nc) {
+    assert(n % QK_ZNQ == 0);
+    assert(nc % 8 == 0);
+
+    const int nb = n / QK_ZNQ;
+    const block_znq2x8 * b_ptr_start = (const block_znq2x8 *) vx;
+    const block_q8_0 * a_ptr_start = (const block_q8_0 *) vy;
+
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
+    const __m512i table = _mm512_loadu_si512((const void *) kvalues_znq2);
+
+    for (int y = 0; y < nr; ++y) {
+        const block_q8_0 * a_ptr = a_ptr_start + y * nb;
+        for (int x = 0; x < nc / 8; ++x) {
+            const block_znq2x8 * b_ptr = b_ptr_start + x * nb;
+            __m256 acc = _mm256_setzero_ps();
+
+            for (int ib = 0; ib < nb; ++ib) {
+                const __m256i books_lo = znq4x8_book_repeat4(b_ptr[ib].books, false);
+                const __m256i books_hi = znq4x8_book_repeat4(b_ptr[ib].books, true);
+                __m256i iacc = _mm256_setzero_si256();
+
+                for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                    const __m256i weights = znq2x8_lookup_group(
+                            znq2x8_unpack_group(b_ptr[ib].planes[g]),
+                            g < 4 ? books_lo : books_hi, table);
+                    const __m256i act = _mm256_set1_epi32((int) znq4x8_load_u32(a_ptr[ib].qs + 4 * g));
+                    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, weights, act);
+                }
+
+                const __m256 scales = _mm256_mul_ps(
+                        znq4x8_ufp8x8_to_fp32(b_ptr[ib].d),
+                        _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[ib].d)));
+                acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc), scales, acc);
+            }
+
+            _mm256_storeu_ps(s + y * bs + x * 8, acc);
+        }
+    }
+    return;
+#endif
+
+    for (int y = 0; y < nr; ++y) {
+        const block_q8_0 * a_ptr = a_ptr_start + y * nb;
+        for (int x = 0; x < nc / 8; ++x) {
+            const block_znq2x8 * b_ptr = b_ptr_start + x * nb;
+            float out[8] = {};
+            for (int ib = 0; ib < nb; ++ib) {
+                const float da = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d);
+                for (int r = 0; r < 8; ++r) {
+                    int32_t dot = 0;
+                    for (int j = 0; j < QK_ZNQ; ++j) {
+                        const int g = j / 4;
+                        const int pos = 4*r + (j & 3);
+                        const int code =
+                            ((b_ptr[ib].planes[g][0] >> pos) & 1u) |
+                            (((b_ptr[ib].planes[g][1] >> pos) & 1u) << 1);
+                        const int book = (b_ptr[ib].books[r] >> (4 * (j / 16))) & 0x0f;
+                        dot += kvalues_znq2[4 * book + code] * a_ptr[ib].qs[j];
+                    }
+                    out[r] += znq4x8_ufp8_to_fp32(b_ptr[ib].d[r]) * da * dot;
+                }
+            }
+            memcpy(s + y * bs + x * 8, out, sizeof(out));
+        }
+    }
+}
+
+static void ggml_gemm_znq2_8x8_q8_0_impl(
+        int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+        const void * GGML_RESTRICT vy, int nr, int nc,
+        const int32_t * row_map, size_t dst_bs1, size_t dst_bs2) {
+    assert(n % QK_ZNQ == 0);
+    assert(nr % 4 == 0);
+    assert(nc % 8 == 0);
+
+    const int nb = n / QK_ZNQ;
+    const block_znq2x8 * b_ptr_start = (const block_znq2x8 *) vx;
+    const block_q8_0x4 * a_ptr_start = (const block_q8_0x4 *) vy;
+
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
+    const __m512i table = _mm512_loadu_si512((const void *) kvalues_znq2);
+
+    // Decode 32 output rows across K once, then reuse the expanded int8 panel
+    // across every four-row activation tile. After decode this is the same
+    // register-balanced Zen5 VNNI engine used by ZNQ3 and ZNQ4.
+    if (nr >= 64 && nc >= 32) {
+        const size_t panel_size = (size_t) nb * sizeof(znq2x32_panel_block);
+        auto * panel = (znq2x32_panel_block *) std::malloc(panel_size);
+
+        if (panel != nullptr) {
+            const __m512i ones = _mm512_set1_epi8(1);
+
+            for (int x32 = 0; x32 < nc / 32; ++x32) {
+                const block_znq2x8 * b_ptrs[4] = {
+                    b_ptr_start + (4 * x32 + 0) * nb,
+                    b_ptr_start + (4 * x32 + 1) * nb,
+                    b_ptr_start + (4 * x32 + 2) * nb,
+                    b_ptr_start + (4 * x32 + 3) * nb,
+                };
+
+                for (int ib = 0; ib < nb; ++ib) {
+                    for (int h = 0; h < 2; ++h) {
+                        const block_znq2x8 & b0 = b_ptrs[2 * h + 0][ib];
+                        const block_znq2x8 & b1 = b_ptrs[2 * h + 1][ib];
+                        const __m256i b0_lo = znq4x8_book_repeat4(b0.books, false);
+                        const __m256i b0_hi = znq4x8_book_repeat4(b0.books, true);
+                        const __m256i b1_lo = znq4x8_book_repeat4(b1.books, false);
+                        const __m256i b1_hi = znq4x8_book_repeat4(b1.books, true);
+                        __m512i sumw = _mm512_setzero_si512();
+
+                        for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                            const __m256i w0 = znq2x8_lookup_group(
+                                    znq2x8_unpack_group(b0.planes[g]),
+                                    g < 4 ? b0_lo : b0_hi, table);
+                            const __m256i w1 = znq2x8_lookup_group(
+                                    znq2x8_unpack_group(b1.planes[g]),
+                                    g < 4 ? b1_lo : b1_hi, table);
+                            const __m512i weights = znq4x8_combine_ymm(w0, w1);
+                            _mm512_storeu_si512((void *) panel[ib].weights[h][g], weights);
+                            sumw = _mm512_dpbusd_epi32(sumw, ones, weights);
+                        }
+
+                        _mm512_storeu_si512((void *) panel[ib].correction[h], _mm512_slli_epi32(sumw, 7));
+                        _mm512_storeu_ps(panel[ib].weight_scale[h], znq4x8_ufp8x16_to_fp32(b0.d, b1.d));
+                    }
+                }
+
+                for (int y4 = 0; y4 < nr / 4; ++y4) {
+                    const block_q8_0x4 * a_ptr = a_ptr_start + y4 * nb;
+
+                    __m512 a0 = _mm512_setzero_ps(); __m512 b0 = _mm512_setzero_ps();
+                    __m512 a1 = _mm512_setzero_ps(); __m512 b1 = _mm512_setzero_ps();
+                    __m512 a2 = _mm512_setzero_ps(); __m512 b2 = _mm512_setzero_ps();
+                    __m512 a3 = _mm512_setzero_ps(); __m512 b3 = _mm512_setzero_ps();
+
+                    for (int ib = 0; ib < nb; ++ib) {
+                        const __m512i corr0 = _mm512_loadu_si512((const void *) panel[ib].correction[0]);
+                        const __m512i corr1 = _mm512_loadu_si512((const void *) panel[ib].correction[1]);
+                        const __m512 wd0 = _mm512_loadu_ps(panel[ib].weight_scale[0]);
+                        const __m512 wd1 = _mm512_loadu_ps(panel[ib].weight_scale[1]);
+
+                        __m512i d00 = _mm512_setzero_si512(); __m512i d10 = _mm512_setzero_si512();
+                        __m512i d01 = _mm512_setzero_si512(); __m512i d11 = _mm512_setzero_si512();
+                        __m512i d02 = _mm512_setzero_si512(); __m512i d12 = _mm512_setzero_si512();
+                        __m512i d03 = _mm512_setzero_si512(); __m512i d13 = _mm512_setzero_si512();
+                        const int8_t * qbase = a_ptr[ib].qs;
+
+                        for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                            const __m512i w0 = _mm512_loadu_si512((const void *) panel[ib].weights[0][g]);
+                            const __m512i w1 = _mm512_loadu_si512((const void *) panel[ib].weights[1][g]);
+                            const int chunk = g >> 1;
+                            const int within = (g & 1) * 4;
+                            const int off = chunk * 32 + within;
+
+                            const __m512i q0 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  0) ^ 0x80808080u));
+                            const __m512i q1 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  8) ^ 0x80808080u));
+                            const __m512i q2 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 16) ^ 0x80808080u));
+                            const __m512i q3 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 24) ^ 0x80808080u));
+
+                            d00 = _mm512_dpbusd_epi32(d00, q0, w0); d10 = _mm512_dpbusd_epi32(d10, q0, w1);
+                            d01 = _mm512_dpbusd_epi32(d01, q1, w0); d11 = _mm512_dpbusd_epi32(d11, q1, w1);
+                            d02 = _mm512_dpbusd_epi32(d02, q2, w0); d12 = _mm512_dpbusd_epi32(d12, q2, w1);
+                            d03 = _mm512_dpbusd_epi32(d03, q3, w0); d13 = _mm512_dpbusd_epi32(d13, q3, w1);
+                        }
+
+                        d00 = _mm512_sub_epi32(d00, corr0); d10 = _mm512_sub_epi32(d10, corr1);
+                        d01 = _mm512_sub_epi32(d01, corr0); d11 = _mm512_sub_epi32(d11, corr1);
+                        d02 = _mm512_sub_epi32(d02, corr0); d12 = _mm512_sub_epi32(d12, corr1);
+                        d03 = _mm512_sub_epi32(d03, corr0); d13 = _mm512_sub_epi32(d13, corr1);
+
+                        const float sd0 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[0]);
+                        const float sd1 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[1]);
+                        const float sd2 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[2]);
+                        const float sd3 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[3]);
+                        a0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d00), _mm512_mul_ps(wd0, _mm512_set1_ps(sd0)), a0);
+                        b0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d10), _mm512_mul_ps(wd1, _mm512_set1_ps(sd0)), b0);
+                        a1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d01), _mm512_mul_ps(wd0, _mm512_set1_ps(sd1)), a1);
+                        b1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d11), _mm512_mul_ps(wd1, _mm512_set1_ps(sd1)), b1);
+                        a2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d02), _mm512_mul_ps(wd0, _mm512_set1_ps(sd2)), a2);
+                        b2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d12), _mm512_mul_ps(wd1, _mm512_set1_ps(sd2)), b2);
+                        a3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d03), _mm512_mul_ps(wd0, _mm512_set1_ps(sd3)), a3);
+                        b3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d13), _mm512_mul_ps(wd1, _mm512_set1_ps(sd3)), b3);
+                    }
+
+                    const int row = 4 * y4;
+                    float * d0 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 0) + 32 * x32;
+                    float * d1 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 1) + 32 * x32;
+                    float * d2 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 2) + 32 * x32;
+                    float * d3 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 3) + 32 * x32;
+                    _mm512_storeu_ps(d0,      a0); _mm512_storeu_ps(d0 + 16, b0);
+                    _mm512_storeu_ps(d1,      a1); _mm512_storeu_ps(d1 + 16, b1);
+                    _mm512_storeu_ps(d2,      a2); _mm512_storeu_ps(d2 + 16, b2);
+                    _mm512_storeu_ps(d3,      a3); _mm512_storeu_ps(d3 + 16, b3);
+                }
+            }
+
+            const int nc32 = nc - nc % 32;
+            std::free(panel);
+
+            int done = nc32;
+            if (nc - done >= 16) {
+                ggml_gemm_znq2_8x8_q8_0_impl(
+                        n, s + done, bs,
+                        b_ptr_start + (done / 8) * nb,
+                        vy, nr, 16, row_map, dst_bs1, dst_bs2);
+                done += 16;
+            }
+            if (done < nc) {
+                GGML_ASSERT(nc - done == 8);
+                ggml_gemm_znq2_8x8_q8_0_impl(
+                        n, s + done, bs,
+                        b_ptr_start + (done / 8) * nb,
+                        vy, nr, 8, row_map, dst_bs1, dst_bs2);
+            }
+            return;
+        }
+    }
+
+    // 16 activation rows x 16 output columns. Decode each compressed QK32
+    // block once and reuse it across all 16 activation rows.
+    int y4 = 0;
+    if (nc % 16 == 0) {
+        const __m512i ones = _mm512_set1_epi8(1);
+        for (; y4 + 3 < nr / 4; y4 += 4) {
+            const block_q8_0x4 * a_ptrs[4] = {
+                a_ptr_start + (y4 + 0) * nb,
+                a_ptr_start + (y4 + 1) * nb,
+                a_ptr_start + (y4 + 2) * nb,
+                a_ptr_start + (y4 + 3) * nb,
+            };
+
+            for (int x16 = 0; x16 < nc / 16; ++x16) {
+                const block_znq2x8 * b_ptr_0 = b_ptr_start + (2 * x16 + 0) * nb;
+                const block_znq2x8 * b_ptr_1 = b_ptr_start + (2 * x16 + 1) * nb;
+                __m512 acc[16];
+                for (int r = 0; r < 16; ++r) {
+                    acc[r] = _mm512_setzero_ps();
+                }
+
+                for (int ib = 0; ib < nb; ++ib) {
+                    const __m256i b0_lo = znq4x8_book_repeat4(b_ptr_0[ib].books, false);
+                    const __m256i b0_hi = znq4x8_book_repeat4(b_ptr_0[ib].books, true);
+                    const __m256i b1_lo = znq4x8_book_repeat4(b_ptr_1[ib].books, false);
+                    const __m256i b1_hi = znq4x8_book_repeat4(b_ptr_1[ib].books, true);
+
+                    __m512i weights[QK_ZNQ / 4];
+                    __m512i sumw = _mm512_setzero_si512();
+                    for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                        const __m256i w0 = znq2x8_lookup_group(
+                                znq2x8_unpack_group(b_ptr_0[ib].planes[g]),
+                                g < 4 ? b0_lo : b0_hi, table);
+                        const __m256i w1 = znq2x8_lookup_group(
+                                znq2x8_unpack_group(b_ptr_1[ib].planes[g]),
+                                g < 4 ? b1_lo : b1_hi, table);
+                        weights[g] = znq4x8_combine_ymm(w0, w1);
+                        sumw = _mm512_dpbusd_epi32(sumw, ones, weights[g]);
+                    }
+                    const __m512i correction = _mm512_slli_epi32(sumw, 7);
+                    const __m512 wd = znq4x8_ufp8x16_to_fp32(b_ptr_0[ib].d, b_ptr_1[ib].d);
+
+                    for (int p = 0; p < 4; ++p) {
+                        for (int r = 0; r < 4; ++r) {
+                            const int rr = 4 * p + r;
+                            __m512i dot = _mm512_setzero_si512();
+                            for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                                const int chunk = g >> 1;
+                                const int within = (g & 1) * 4;
+                                const uint32_t q = znq4x8_load_u32(
+                                        a_ptrs[p][ib].qs + chunk * 32 + r * 8 + within) ^ 0x80808080u;
+                                dot = _mm512_dpbusd_epi32(
+                                        dot, _mm512_set1_epi32((int) q), weights[g]);
+                            }
+                            dot = _mm512_sub_epi32(dot, correction);
+                            const __m512 scale = _mm512_mul_ps(
+                                    wd, _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptrs[p][ib].d[r])));
+                            acc[rr] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dot), scale, acc[rr]);
+                        }
+                    }
+                }
+
+                for (int r = 0; r < 16; ++r) {
+                    float * dst_row = znq4x8_gemm_dst_row(
+                            s, bs, row_map, dst_bs1, dst_bs2, 4 * y4 + r);
+                    _mm512_storeu_ps(dst_row + 16 * x16, acc[r]);
+                }
+            }
+        }
+    }
+
+    // Four-row tail, and the complete path for an 8-column chunk.
+    for (int y = y4; y < nr / 4; ++y) {
+        const block_q8_0x4 * a_ptr = a_ptr_start + y * nb;
+        for (int x = 0; x < nc / 8; ++x) {
+            const block_znq2x8 * b_ptr = b_ptr_start + x * nb;
+            __m256 acc[4] = {
+                _mm256_setzero_ps(), _mm256_setzero_ps(),
+                _mm256_setzero_ps(), _mm256_setzero_ps(),
+            };
+
+            for (int ib = 0; ib < nb; ++ib) {
+                const __m256i books_lo = znq4x8_book_repeat4(b_ptr[ib].books, false);
+                const __m256i books_hi = znq4x8_book_repeat4(b_ptr[ib].books, true);
+                __m256i iacc[4] = {
+                    _mm256_setzero_si256(), _mm256_setzero_si256(),
+                    _mm256_setzero_si256(), _mm256_setzero_si256(),
+                };
+
+                for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                    const __m256i weights = znq2x8_lookup_group(
+                            znq2x8_unpack_group(b_ptr[ib].planes[g]),
+                            g < 4 ? books_lo : books_hi, table);
+                    const int chunk = g >> 1;
+                    const int within = (g & 1) * 4;
+                    for (int r = 0; r < 4; ++r) {
+                        const uint32_t q = znq4x8_load_u32(a_ptr[ib].qs + chunk * 32 + r * 8 + within);
+                        iacc[r] = mul_sum_i8_pairs_acc_int32x8(
+                                iacc[r], weights, _mm256_set1_epi32((int) q));
+                    }
+                }
+
+                const __m256 wd = znq4x8_ufp8x8_to_fp32(b_ptr[ib].d);
+                for (int r = 0; r < 4; ++r) {
+                    const __m256 scales = _mm256_mul_ps(
+                            wd, _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[r])));
+                    acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc[r]), scales, acc[r]);
+                }
+            }
+
+            for (int r = 0; r < 4; ++r) {
+                float * dst_row = znq4x8_gemm_dst_row(
+                        s, bs, row_map, dst_bs1, dst_bs2, y * 4 + r);
+                _mm256_storeu_ps(dst_row + x * 8, acc[r]);
+            }
+        }
+    }
+    return;
+#endif
+
+    for (int y = 0; y < nr / 4; ++y) {
+        const block_q8_0x4 * a_ptr = a_ptr_start + y * nb;
+        for (int x = 0; x < nc / 8; ++x) {
+            const block_znq2x8 * b_ptr = b_ptr_start + x * nb;
+            float out[4][8] = {};
+            for (int ib = 0; ib < nb; ++ib) {
+                for (int r = 0; r < 4; ++r) {
+                    const float da = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[r]);
+                    for (int wr = 0; wr < 8; ++wr) {
+                        int32_t dot = 0;
+                        for (int j = 0; j < QK_ZNQ; ++j) {
+                            const int g = j / 4;
+                            const int pos = 4*wr + (j & 3);
+                            const int code =
+                                ((b_ptr[ib].planes[g][0] >> pos) & 1u) |
+                                (((b_ptr[ib].planes[g][1] >> pos) & 1u) << 1);
+                            const int book = (b_ptr[ib].books[wr] >> (4 * (j / 16))) & 0x0f;
+                            const int chunk = j / 8;
+                            const int offset = j & 7;
+                            const int8_t act = a_ptr[ib].qs[chunk * 32 + r * 8 + offset];
+                            dot += kvalues_znq2[4 * book + code] * act;
+                        }
+                        out[r][wr] += znq4x8_ufp8_to_fp32(b_ptr[ib].d[wr]) * da * dot;
+                    }
+                }
+            }
+            for (int r = 0; r < 4; ++r) {
+                float * dst_row = znq4x8_gemm_dst_row(
+                        s, bs, row_map, dst_bs1, dst_bs2, y * 4 + r);
+                memcpy(dst_row + x * 8, out[r], sizeof(out[r]));
+            }
+        }
+    }
+}
+
+void ggml_gemm_znq2_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+        const void * GGML_RESTRICT vy, int nr, int nc) {
+    ggml_gemm_znq2_8x8_q8_0_impl(n, s, bs, vx, vy, nr, nc, nullptr, 0, 0);
+}
+
+void ggml_gemm_znq2_8x8_q8_0_moe(
+        int n, float * GGML_RESTRICT s, size_t dst_bs1, size_t dst_bs2, const int32_t * row_map,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    GGML_ASSERT(row_map != nullptr);
+    ggml_gemm_znq2_8x8_q8_0_impl(n, s, 0, vx, vy, nr, nc, row_map, dst_bs1, dst_bs2);
+}
+
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
+static inline __m256i znq3x8_unpack_group(const uint32_t planes[3]) {
+    const __m256i b0 = _mm256_maskz_set1_epi8((__mmask32) planes[0], 1);
+    const __m256i b1 = _mm256_maskz_set1_epi8((__mmask32) planes[1], 2);
+    const __m256i b2 = _mm256_maskz_set1_epi8((__mmask32) planes[2], 4);
+    return _mm256_ternarylogic_epi32(b0, b1, b2, 0xfe);
+}
+
+static inline __m256i znq3x8_lookup_group(
+        __m256i codes, __m256i books, __m512i table07, __m512i table8f) {
+    // 16 books x 8 entries = 128 bytes. A single VPERMI2B can address the
+    // whole table: low six index bits select a byte, bit 6 selects table8f.
+    // books is repeated four times per output row, so book*8 + code forms the
+    // direct 0..127 lookup index for all 8 rows x 4 weights in parallel.
+    const __m256i indices256 = _mm256_add_epi8(codes, _mm256_slli_epi16(books, 3));
+    const __m512i indices = _mm512_inserti64x4(_mm512_setzero_si512(), indices256, 0);
+    return _mm512_castsi512_si256(_mm512_permutex2var_epi8(table07, indices, table8f));
+}
+
+// Transient decoded panel for 32 ZNQ3 output rows. This deliberately has the
+// same post-decode layout as the ZNQ4 panel: once 3-bit codes have been
+// expanded to int8 weights, both formats share the exact same Zen5 VNNI core.
+struct znq3x32_panel_block {
+    int8_t  weights[2][QK_ZNQ / 4][64];
+    int32_t correction[2][16];
+    float   weight_scale[2][16];
+};
+
+static_assert(sizeof(znq3x32_panel_block) == 1280, "wrong ZNQ3 x32 panel size/padding");
+#endif
+
+void ggml_gemv_znq3_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+        const void * GGML_RESTRICT vy, int nr, int nc) {
+    assert(n % QK_ZNQ == 0);
+    assert(nc % 8 == 0);
+
+    const int nb = n / QK_ZNQ;
+    const block_znq3x8 * b_ptr_start = (const block_znq3x8 *) vx;
+    const block_q8_0 * a_ptr_start = (const block_q8_0 *) vy;
+
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
+    const __m512i table07 = _mm512_loadu_si512((const void *) (kvalues_znq3 +  0));
+    const __m512i table8f = _mm512_loadu_si512((const void *) (kvalues_znq3 + 64));
+
+    for (int y = 0; y < nr; ++y) {
+        const block_q8_0 * a_ptr = a_ptr_start + y * nb;
+        for (int x = 0; x < nc / 8; ++x) {
+            const block_znq3x8 * b_ptr = b_ptr_start + x * nb;
+            __m256 acc = _mm256_setzero_ps();
+
+            for (int ib = 0; ib < nb; ++ib) {
+                const __m256i books_lo = znq4x8_book_repeat4(b_ptr[ib].books, false);
+                const __m256i books_hi = znq4x8_book_repeat4(b_ptr[ib].books, true);
+                __m256i iacc = _mm256_setzero_si256();
+
+                for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                    const __m256i weights = znq3x8_lookup_group(
+                            znq3x8_unpack_group(b_ptr[ib].planes[g]),
+                            g < 4 ? books_lo : books_hi, table07, table8f);
+                    const __m256i act = _mm256_set1_epi32((int) znq4x8_load_u32(a_ptr[ib].qs + 4 * g));
+                    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, weights, act);
+                }
+
+                const __m256 scales = _mm256_mul_ps(
+                        znq4x8_ufp8x8_to_fp32(b_ptr[ib].d),
+                        _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[ib].d)));
+                acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc), scales, acc);
+            }
+
+            _mm256_storeu_ps(s + y * bs + x * 8, acc);
+        }
+    }
+    return;
+#endif
+
+    for (int y = 0; y < nr; ++y) {
+        const block_q8_0 * a_ptr = a_ptr_start + y * nb;
+        for (int x = 0; x < nc / 8; ++x) {
+            const block_znq3x8 * b_ptr = b_ptr_start + x * nb;
+            float out[8] = {};
+            for (int ib = 0; ib < nb; ++ib) {
+                const float da = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d);
+                for (int r = 0; r < 8; ++r) {
+                    int32_t dot = 0;
+                    for (int j = 0; j < QK_ZNQ; ++j) {
+                        const int g = j / 4;
+                        const int jb = j & 3;
+                        const int pos = 4*r + jb;
+                        const int code =
+                            ((b_ptr[ib].planes[g][0] >> pos) & 1u) |
+                            (((b_ptr[ib].planes[g][1] >> pos) & 1u) << 1) |
+                            (((b_ptr[ib].planes[g][2] >> pos) & 1u) << 2);
+                        const int book = (b_ptr[ib].books[r] >> (4 * (j / 16))) & 0x0f;
+                        dot += kvalues_znq3[8 * book + code] * a_ptr[ib].qs[j];
+                    }
+                    out[r] += znq4x8_ufp8_to_fp32(b_ptr[ib].d[r]) * da * dot;
+                }
+            }
+            memcpy(s + y * bs + x * 8, out, sizeof(out));
+        }
+    }
+}
+
+static void ggml_gemm_znq3_8x8_q8_0_impl(
+        int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+        const void * GGML_RESTRICT vy, int nr, int nc,
+        const int32_t * row_map, size_t dst_bs1, size_t dst_bs2) {
+    assert(n % QK_ZNQ == 0);
+    assert(nr % 4 == 0);
+    assert(nc % 8 == 0);
+
+    const int nb = n / QK_ZNQ;
+    const block_znq3x8 * b_ptr_start = (const block_znq3x8 *) vx;
+    const block_q8_0x4 * a_ptr_start = (const block_q8_0x4 *) vy;
+
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
+    const __m512i table07 = _mm512_loadu_si512((const void *) (kvalues_znq3 +  0));
+    const __m512i table8f = _mm512_loadu_si512((const void *) (kvalues_znq3 + 64));
+
+    // Large-prompt path. Decode 32 output rows across K once, then reuse the
+    // expanded int8 panel for every 4-row activation tile. ZNQ3's compressed
+    // decode is cheaper than ZNQ4 after unpack: all 16x8 book entries fit in
+    // two ZMM tables and require just one VPERMI2B per x8 group.
+    if (nr >= 64 && nc >= 32) {
+        const size_t panel_size = (size_t) nb * sizeof(znq3x32_panel_block);
+        auto * panel = (znq3x32_panel_block *) std::malloc(panel_size);
+
+        if (panel != nullptr) {
+            const __m512i ones = _mm512_set1_epi8(1);
+
+            for (int x32 = 0; x32 < nc / 32; ++x32) {
+                const block_znq3x8 * b_ptrs[4] = {
+                    b_ptr_start + (4 * x32 + 0) * nb,
+                    b_ptr_start + (4 * x32 + 1) * nb,
+                    b_ptr_start + (4 * x32 + 2) * nb,
+                    b_ptr_start + (4 * x32 + 3) * nb,
+                };
+
+                for (int ib = 0; ib < nb; ++ib) {
+                    for (int h = 0; h < 2; ++h) {
+                        const block_znq3x8 & b0 = b_ptrs[2 * h + 0][ib];
+                        const block_znq3x8 & b1 = b_ptrs[2 * h + 1][ib];
+                        const __m256i b0_lo = znq4x8_book_repeat4(b0.books, false);
+                        const __m256i b0_hi = znq4x8_book_repeat4(b0.books, true);
+                        const __m256i b1_lo = znq4x8_book_repeat4(b1.books, false);
+                        const __m256i b1_hi = znq4x8_book_repeat4(b1.books, true);
+                        __m512i sumw = _mm512_setzero_si512();
+
+                        for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                            const __m256i w0 = znq3x8_lookup_group(
+                                    znq3x8_unpack_group(b0.planes[g]),
+                                    g < 4 ? b0_lo : b0_hi, table07, table8f);
+                            const __m256i w1 = znq3x8_lookup_group(
+                                    znq3x8_unpack_group(b1.planes[g]),
+                                    g < 4 ? b1_lo : b1_hi, table07, table8f);
+                            const __m512i weights = znq4x8_combine_ymm(w0, w1);
+                            _mm512_storeu_si512((void *) panel[ib].weights[h][g], weights);
+                            sumw = _mm512_dpbusd_epi32(sumw, ones, weights);
+                        }
+
+                        _mm512_storeu_si512((void *) panel[ib].correction[h], _mm512_slli_epi32(sumw, 7));
+                        _mm512_storeu_ps(panel[ib].weight_scale[h], znq4x8_ufp8x16_to_fp32(b0.d, b1.d));
+                    }
+                }
+
+                for (int y4 = 0; y4 < nr / 4; ++y4) {
+                    const block_q8_0x4 * a_ptr = a_ptr_start + y4 * nb;
+
+                    __m512 a0 = _mm512_setzero_ps(); __m512 b0 = _mm512_setzero_ps();
+                    __m512 a1 = _mm512_setzero_ps(); __m512 b1 = _mm512_setzero_ps();
+                    __m512 a2 = _mm512_setzero_ps(); __m512 b2 = _mm512_setzero_ps();
+                    __m512 a3 = _mm512_setzero_ps(); __m512 b3 = _mm512_setzero_ps();
+
+                    for (int ib = 0; ib < nb; ++ib) {
+                        const __m512i corr0 = _mm512_loadu_si512((const void *) panel[ib].correction[0]);
+                        const __m512i corr1 = _mm512_loadu_si512((const void *) panel[ib].correction[1]);
+                        const __m512 wd0 = _mm512_loadu_ps(panel[ib].weight_scale[0]);
+                        const __m512 wd1 = _mm512_loadu_ps(panel[ib].weight_scale[1]);
+
+                        __m512i d00 = _mm512_setzero_si512(); __m512i d10 = _mm512_setzero_si512();
+                        __m512i d01 = _mm512_setzero_si512(); __m512i d11 = _mm512_setzero_si512();
+                        __m512i d02 = _mm512_setzero_si512(); __m512i d12 = _mm512_setzero_si512();
+                        __m512i d03 = _mm512_setzero_si512(); __m512i d13 = _mm512_setzero_si512();
+                        const int8_t * qbase = a_ptr[ib].qs;
+
+                        for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                            const __m512i w0 = _mm512_loadu_si512((const void *) panel[ib].weights[0][g]);
+                            const __m512i w1 = _mm512_loadu_si512((const void *) panel[ib].weights[1][g]);
+                            const int chunk = g >> 1;
+                            const int within = (g & 1) * 4;
+                            const int off = chunk * 32 + within;
+
+                            const __m512i q0 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  0) ^ 0x80808080u));
+                            const __m512i q1 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  8) ^ 0x80808080u));
+                            const __m512i q2 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 16) ^ 0x80808080u));
+                            const __m512i q3 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 24) ^ 0x80808080u));
+
+                            d00 = _mm512_dpbusd_epi32(d00, q0, w0); d10 = _mm512_dpbusd_epi32(d10, q0, w1);
+                            d01 = _mm512_dpbusd_epi32(d01, q1, w0); d11 = _mm512_dpbusd_epi32(d11, q1, w1);
+                            d02 = _mm512_dpbusd_epi32(d02, q2, w0); d12 = _mm512_dpbusd_epi32(d12, q2, w1);
+                            d03 = _mm512_dpbusd_epi32(d03, q3, w0); d13 = _mm512_dpbusd_epi32(d13, q3, w1);
+                        }
+
+                        d00 = _mm512_sub_epi32(d00, corr0); d10 = _mm512_sub_epi32(d10, corr1);
+                        d01 = _mm512_sub_epi32(d01, corr0); d11 = _mm512_sub_epi32(d11, corr1);
+                        d02 = _mm512_sub_epi32(d02, corr0); d12 = _mm512_sub_epi32(d12, corr1);
+                        d03 = _mm512_sub_epi32(d03, corr0); d13 = _mm512_sub_epi32(d13, corr1);
+
+                        const float sd0 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[0]);
+                        const float sd1 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[1]);
+                        const float sd2 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[2]);
+                        const float sd3 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[3]);
+                        a0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d00), _mm512_mul_ps(wd0, _mm512_set1_ps(sd0)), a0);
+                        b0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d10), _mm512_mul_ps(wd1, _mm512_set1_ps(sd0)), b0);
+                        a1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d01), _mm512_mul_ps(wd0, _mm512_set1_ps(sd1)), a1);
+                        b1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d11), _mm512_mul_ps(wd1, _mm512_set1_ps(sd1)), b1);
+                        a2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d02), _mm512_mul_ps(wd0, _mm512_set1_ps(sd2)), a2);
+                        b2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d12), _mm512_mul_ps(wd1, _mm512_set1_ps(sd2)), b2);
+                        a3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d03), _mm512_mul_ps(wd0, _mm512_set1_ps(sd3)), a3);
+                        b3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d13), _mm512_mul_ps(wd1, _mm512_set1_ps(sd3)), b3);
+                    }
+
+                    const int row = 4 * y4;
+                    float * d0 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 0) + 32 * x32;
+                    float * d1 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 1) + 32 * x32;
+                    float * d2 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 2) + 32 * x32;
+                    float * d3 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 3) + 32 * x32;
+                    _mm512_storeu_ps(d0,      a0); _mm512_storeu_ps(d0 + 16, b0);
+                    _mm512_storeu_ps(d1,      a1); _mm512_storeu_ps(d1 + 16, b1);
+                    _mm512_storeu_ps(d2,      a2); _mm512_storeu_ps(d2 + 16, b2);
+                    _mm512_storeu_ps(d3,      a3); _mm512_storeu_ps(d3 + 16, b3);
+                }
+            }
+
+            const int nc32 = nc - nc % 32;
+            std::free(panel);
+
+            int done = nc32;
+            if (nc - done >= 16) {
+                ggml_gemm_znq3_8x8_q8_0_impl(
+                        n, s + done, bs,
+                        b_ptr_start + (done / 8) * nb,
+                        vy, nr, 16, row_map, dst_bs1, dst_bs2);
+                done += 16;
+            }
+            if (done < nc) {
+                GGML_ASSERT(nc - done == 8);
+                ggml_gemm_znq3_8x8_q8_0_impl(
+                        n, s + done, bs,
+                        b_ptr_start + (done / 8) * nb,
+                        vy, nr, 8, row_map, dst_bs1, dst_bs2);
+            }
+            return;
+        }
+    }
+
+    // Medium-row path: process 16 activation rows x 16 output columns. Decode
+    // each compressed QK32 weight block once and reuse it across all 16 rows.
+    // VPDPBUSD sees q+128 as unsigned input; correction removes 128*sum(weight).
+    int y4 = 0;
+    if (nc % 16 == 0) {
+        const __m512i ones = _mm512_set1_epi8(1);
+        for (; y4 + 3 < nr / 4; y4 += 4) {
+            const block_q8_0x4 * a_ptrs[4] = {
+                a_ptr_start + (y4 + 0) * nb,
+                a_ptr_start + (y4 + 1) * nb,
+                a_ptr_start + (y4 + 2) * nb,
+                a_ptr_start + (y4 + 3) * nb,
+            };
+
+            for (int x16 = 0; x16 < nc / 16; ++x16) {
+                const block_znq3x8 * b_ptr_0 = b_ptr_start + (2 * x16 + 0) * nb;
+                const block_znq3x8 * b_ptr_1 = b_ptr_start + (2 * x16 + 1) * nb;
+                __m512 acc[16];
+                for (int r = 0; r < 16; ++r) {
+                    acc[r] = _mm512_setzero_ps();
+                }
+
+                for (int ib = 0; ib < nb; ++ib) {
+                    const __m256i b0_lo = znq4x8_book_repeat4(b_ptr_0[ib].books, false);
+                    const __m256i b0_hi = znq4x8_book_repeat4(b_ptr_0[ib].books, true);
+                    const __m256i b1_lo = znq4x8_book_repeat4(b_ptr_1[ib].books, false);
+                    const __m256i b1_hi = znq4x8_book_repeat4(b_ptr_1[ib].books, true);
+
+                    __m512i weights[QK_ZNQ / 4];
+                    __m512i sumw = _mm512_setzero_si512();
+                    for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                        const __m256i w0 = znq3x8_lookup_group(
+                                znq3x8_unpack_group(b_ptr_0[ib].planes[g]),
+                                g < 4 ? b0_lo : b0_hi, table07, table8f);
+                        const __m256i w1 = znq3x8_lookup_group(
+                                znq3x8_unpack_group(b_ptr_1[ib].planes[g]),
+                                g < 4 ? b1_lo : b1_hi, table07, table8f);
+                        weights[g] = znq4x8_combine_ymm(w0, w1);
+                        sumw = _mm512_dpbusd_epi32(sumw, ones, weights[g]);
+                    }
+                    const __m512i correction = _mm512_slli_epi32(sumw, 7);
+                    const __m512 wd = znq4x8_ufp8x16_to_fp32(b_ptr_0[ib].d, b_ptr_1[ib].d);
+
+                    for (int p = 0; p < 4; ++p) {
+                        for (int r = 0; r < 4; ++r) {
+                            const int rr = 4 * p + r;
+                            __m512i dot = _mm512_setzero_si512();
+                            for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                                const int chunk = g >> 1;
+                                const int within = (g & 1) * 4;
+                                const uint32_t q = znq4x8_load_u32(
+                                        a_ptrs[p][ib].qs + chunk * 32 + r * 8 + within) ^ 0x80808080u;
+                                dot = _mm512_dpbusd_epi32(
+                                        dot, _mm512_set1_epi32((int) q), weights[g]);
+                            }
+                            dot = _mm512_sub_epi32(dot, correction);
+                            const __m512 scale = _mm512_mul_ps(
+                                    wd, _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptrs[p][ib].d[r])));
+                            acc[rr] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dot), scale, acc[rr]);
+                        }
+                    }
+                }
+
+                for (int r = 0; r < 16; ++r) {
+                    float * dst_row = znq4x8_gemm_dst_row(
+                            s, bs, row_map, dst_bs1, dst_bs2, 4 * y4 + r);
+                    _mm512_storeu_ps(dst_row + 16 * x16, acc[r]);
+                }
+            }
+        }
+    }
+
+    // Four-row tail, and the complete path for an 8-column chunk.
+    for (int y = y4; y < nr / 4; ++y) {
+        const block_q8_0x4 * a_ptr = a_ptr_start + y * nb;
+        for (int x = 0; x < nc / 8; ++x) {
+            const block_znq3x8 * b_ptr = b_ptr_start + x * nb;
+            __m256 acc[4] = {
+                _mm256_setzero_ps(), _mm256_setzero_ps(),
+                _mm256_setzero_ps(), _mm256_setzero_ps(),
+            };
+
+            for (int ib = 0; ib < nb; ++ib) {
+                const __m256i books_lo = znq4x8_book_repeat4(b_ptr[ib].books, false);
+                const __m256i books_hi = znq4x8_book_repeat4(b_ptr[ib].books, true);
+                __m256i iacc[4] = {
+                    _mm256_setzero_si256(), _mm256_setzero_si256(),
+                    _mm256_setzero_si256(), _mm256_setzero_si256(),
+                };
+
+                for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                    const __m256i weights = znq3x8_lookup_group(
+                            znq3x8_unpack_group(b_ptr[ib].planes[g]),
+                            g < 4 ? books_lo : books_hi, table07, table8f);
+                    const int chunk = g >> 1;
+                    const int within = (g & 1) * 4;
+                    for (int r = 0; r < 4; ++r) {
+                        const uint32_t q = znq4x8_load_u32(a_ptr[ib].qs + chunk * 32 + r * 8 + within);
+                        iacc[r] = mul_sum_i8_pairs_acc_int32x8(
+                                iacc[r], weights, _mm256_set1_epi32((int) q));
+                    }
+                }
+
+                const __m256 wd = znq4x8_ufp8x8_to_fp32(b_ptr[ib].d);
+                for (int r = 0; r < 4; ++r) {
+                    const __m256 scales = _mm256_mul_ps(
+                            wd, _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[r])));
+                    acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc[r]), scales, acc[r]);
+                }
+            }
+
+            for (int r = 0; r < 4; ++r) {
+                float * dst_row = znq4x8_gemm_dst_row(
+                        s, bs, row_map, dst_bs1, dst_bs2, y * 4 + r);
+                _mm256_storeu_ps(dst_row + x * 8, acc[r]);
+            }
+        }
+    }
+    return;
+#endif
+
+    for (int y = 0; y < nr / 4; ++y) {
+        const block_q8_0x4 * a_ptr = a_ptr_start + y * nb;
+        for (int x = 0; x < nc / 8; ++x) {
+            const block_znq3x8 * b_ptr = b_ptr_start + x * nb;
+            float out[4][8] = {};
+            for (int ib = 0; ib < nb; ++ib) {
+                for (int r = 0; r < 4; ++r) {
+                    const float da = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[r]);
+                    for (int wr = 0; wr < 8; ++wr) {
+                        int32_t dot = 0;
+                        for (int j = 0; j < QK_ZNQ; ++j) {
+                            const int g = j / 4;
+                            const int jb = j & 3;
+                            const int pos = 4*wr + jb;
+                            const int code =
+                                ((b_ptr[ib].planes[g][0] >> pos) & 1u) |
+                                (((b_ptr[ib].planes[g][1] >> pos) & 1u) << 1) |
+                                (((b_ptr[ib].planes[g][2] >> pos) & 1u) << 2);
+                            const int book = (b_ptr[ib].books[wr] >> (4 * (j / 16))) & 0x0f;
+                            const int chunk = j / 8;
+                            const int offset = j & 7;
+                            const int8_t act = a_ptr[ib].qs[chunk * 32 + r * 8 + offset];
+                            dot += kvalues_znq3[8 * book + code] * act;
+                        }
+                        out[r][wr] += znq4x8_ufp8_to_fp32(b_ptr[ib].d[wr]) * da * dot;
+                    }
+                }
+            }
+            for (int r = 0; r < 4; ++r) {
+                float * dst_row = znq4x8_gemm_dst_row(
+                        s, bs, row_map, dst_bs1, dst_bs2, y * 4 + r);
+                memcpy(dst_row + x * 8, out[r], sizeof(out[r]));
+            }
+        }
+    }
+}
+
+void ggml_gemm_znq3_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+        const void * GGML_RESTRICT vy, int nr, int nc) {
+    ggml_gemm_znq3_8x8_q8_0_impl(n, s, bs, vx, vy, nr, nc, nullptr, 0, 0);
+}
+
+void ggml_gemm_znq3_8x8_q8_0_moe(
+        int n, float * GGML_RESTRICT s, size_t dst_bs1, size_t dst_bs2, const int32_t * row_map,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    GGML_ASSERT(row_map != nullptr);
+    ggml_gemm_znq3_8x8_q8_0_impl(n, s, 0, vx, vy, nr, nc, row_map, dst_bs1, dst_bs2);
+}
+
+void ggml_gemm_znq4_8x8_q8_0_moe(
+        int n, float * GGML_RESTRICT s, size_t dst_bs1, size_t dst_bs2, const int32_t * row_map,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    GGML_ASSERT(row_map != nullptr);
+    ggml_gemm_znq4_8x8_q8_0_impl(n, s, 0, vx, vy, nr, nc, row_map, dst_bs1, dst_bs2);
+}

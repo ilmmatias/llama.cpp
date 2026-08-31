@@ -5038,6 +5038,224 @@ size_t quantize_iq1_m(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     return nrow * nblock * sizeof(block_iq1_m);
 }
 
+// ============================ ZNQ QK32 nonlinear books
+
+static inline float znq_ufp8_to_fp32(uint8_t code) {
+    const int e = code >> 3;
+    const int m = code & 7;
+    if (e == 0) {
+        return ldexpf((float) m, -17);
+    }
+    return ldexpf(1.0f + (float) m * 0.125f, e - 15);
+}
+
+static uint8_t znq_fp32_to_ufp8(double x) {
+    if (!(x > 0.0f)) {
+        return 0;
+    }
+    int lo = 0;
+    int hi = 255;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        const double boundary = 0.5 * ((double) znq_ufp8_to_fp32((uint8_t) mid) + znq_ufp8_to_fp32((uint8_t) (mid + 1)));
+        // numpy.searchsorted(..., side="right") used by the lab selects the
+        // upper value when x is exactly on a midpoint.
+        if (x >= boundary) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return (uint8_t) lo;
+}
+
+static inline const int8_t * znq_values(int bits) {
+    switch (bits) {
+        case 2: return kvalues_znq2;
+        case 3: return kvalues_znq3;
+        case 4: return kvalues_znq4;
+        default:
+            GGML_ABORT("invalid ZNQ bit width");
+            return kvalues_znq2;
+    }
+}
+
+static uint8_t znq_encode_group(const float * x, int bits, int8_t * q, uint8_t * codes) {
+    const int nlevels = 1 << bits;
+    const int8_t * values = znq_values(bits);
+    double best_err = DBL_MAX;
+    int best_book = 0;
+
+    for (int book = 0; book < 16; ++book) {
+        const int8_t * levels = values + book*nlevels;
+        double err = 0.0;
+        for (int j = 0; j < 16; ++j) {
+            const int code = best_index_int8(nlevels, levels, x[j]);
+            const double d = (double) x[j] - levels[code];
+            err += d*d;
+        }
+        if (err < best_err) {
+            best_err = err;
+            best_book = book;
+        }
+    }
+
+    const int8_t * levels = values + best_book*nlevels;
+    for (int j = 0; j < 16; ++j) {
+        const int code = best_index_int8(nlevels, levels, x[j]);
+        q[j] = levels[code];
+        if (codes) {
+            codes[j] = (uint8_t) code;
+        }
+    }
+    return (uint8_t) best_book;
+}
+
+static void znq_pack_codes(int bits, const uint8_t * codes, uint8_t * dst) {
+    memset(dst, 0, (size_t) bits*QK_ZNQ/8);
+    if (bits == 2) {
+        for (int j = 0; j < QK_ZNQ; ++j) {
+            dst[j/4] |= (codes[j] & 3u) << (2*(j & 3));
+        }
+    } else if (bits == 3) {
+        for (int j = 0; j < QK_ZNQ; ++j) {
+            const int bit = 3*j;
+            const int byte = bit >> 3;
+            const int shift = bit & 7;
+            dst[byte] |= (uint8_t) ((codes[j] & 7u) << shift);
+            if (shift > 5) {
+                dst[byte + 1] |= (uint8_t) ((codes[j] & 7u) >> (8 - shift));
+            }
+        }
+    } else {
+        for (int j = 0; j < QK_ZNQ; ++j) {
+            dst[j/2] |= (codes[j] & 15u) << (4*(j & 1));
+        }
+    }
+}
+
+static inline uint8_t znq_unpack_code(const uint8_t * qs, int bits, int j) {
+    if (bits == 2) {
+        return (qs[j/4] >> (2*(j & 3))) & 3u;
+    }
+    if (bits == 3) {
+        const int bit = 3*j;
+        const int byte = bit >> 3;
+        const int shift = bit & 7;
+        uint16_t v = qs[byte] >> shift;
+        if (shift > 5) {
+            v |= (uint16_t) qs[byte + 1] << (8 - shift);
+        }
+        return v & 7u;
+    }
+    return (qs[j/2] >> (4*(j & 1))) & 15u;
+}
+
+static void quantize_row_znq_ref_impl(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k, int bits) {
+    GGML_ASSERT(k % QK_ZNQ == 0);
+    const int64_t nb = k / QK_ZNQ;
+    const size_t block_size = 2 + (size_t) bits*QK_ZNQ/8;
+    uint8_t * y = (uint8_t *) vy;
+
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const float * xb = x + ib*QK_ZNQ;
+        uint8_t * out = y + ib*block_size;
+        float amax = 0.0f;
+        for (int j = 0; j < QK_ZNQ; ++j) {
+            amax = MAX(amax, fabsf(xb[j]));
+        }
+        if (amax == 0.0f) {
+            memset(out, 0, block_size);
+            continue;
+        }
+
+        uint8_t sc = znq_fp32_to_ufp8(amax / 126.0f);
+        if (sc == 0) sc = 1;
+        float scale = znq_ufp8_to_fp32(sc);
+        int8_t q[QK_ZNQ];
+        float norm[QK_ZNQ];
+
+        // Match the four alternating book-assignment / least-squares scale
+        // iterations used by tools/znq-lab/sweep-general-qk32.py.
+        for (int it = 0; it < 4; ++it) {
+            const float is = 1.0f / scale;
+            for (int j = 0; j < QK_ZNQ; ++j) norm[j] = xb[j]*is;
+            znq_encode_group(norm +  0, bits, q +  0, NULL);
+            znq_encode_group(norm + 16, bits, q + 16, NULL);
+
+            double num = 0.0;
+            double den = 0.0;
+            for (int j = 0; j < QK_ZNQ; ++j) {
+                num += (double) xb[j] * q[j];
+                den += (double) q[j] * q[j];
+            }
+            const double ideal = den > 0.0 ? num/den : scale;
+            uint8_t next_sc = znq_fp32_to_ufp8(MAX(ideal, 0.0));
+            if (next_sc == 0) next_sc = sc;
+            if (next_sc == sc) break;
+            sc = next_sc;
+            scale = znq_ufp8_to_fp32(sc);
+        }
+
+        const float is = 1.0f / scale;
+        for (int j = 0; j < QK_ZNQ; ++j) norm[j] = xb[j]*is;
+        uint8_t codes[QK_ZNQ];
+        const uint8_t b0 = znq_encode_group(norm +  0, bits, q +  0, codes +  0);
+        const uint8_t b1 = znq_encode_group(norm + 16, bits, q + 16, codes + 16);
+        out[0] = sc;
+        out[1] = b0 | (b1 << 4);
+        znq_pack_codes(bits, codes, out + 2);
+    }
+}
+
+void quantize_row_znq2_ref(const float * GGML_RESTRICT x, block_znq2 * GGML_RESTRICT y, int64_t k) { quantize_row_znq_ref_impl(x, y, k, 2); }
+void quantize_row_znq3_ref(const float * GGML_RESTRICT x, block_znq3 * GGML_RESTRICT y, int64_t k) { quantize_row_znq_ref_impl(x, y, k, 3); }
+void quantize_row_znq4_ref(const float * GGML_RESTRICT x, block_znq4 * GGML_RESTRICT y, int64_t k) { quantize_row_znq_ref_impl(x, y, k, 4); }
+
+static size_t quantize_znq_impl(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+        int64_t nrow, int64_t n_per_row, int bits) {
+    GGML_ASSERT(n_per_row % QK_ZNQ == 0);
+    const size_t row_size = (size_t) (n_per_row/QK_ZNQ) * (2 + bits*QK_ZNQ/8);
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_znq_ref_impl(src + row*n_per_row, (uint8_t *) dst + row*row_size, n_per_row, bits);
+    }
+    return nrow*row_size;
+}
+
+size_t quantize_znq2(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix); return quantize_znq_impl(src, dst, nrow, n_per_row, 2);
+}
+size_t quantize_znq3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix); return quantize_znq_impl(src, dst, nrow, n_per_row, 3);
+}
+size_t quantize_znq4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix); return quantize_znq_impl(src, dst, nrow, n_per_row, 4);
+}
+
+static void dequantize_row_znq_impl(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t k, int bits) {
+    GGML_ASSERT(k % QK_ZNQ == 0);
+    const int64_t nb = k / QK_ZNQ;
+    const size_t block_size = 2 + (size_t) bits*QK_ZNQ/8;
+    const uint8_t * x = (const uint8_t *) vx;
+    const int nlevels = 1 << bits;
+    const int8_t * values = znq_values(bits);
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const uint8_t * in = x + ib*block_size;
+        const float d = znq_ufp8_to_fp32(in[0]);
+        const uint8_t books = in[1];
+        const uint8_t * qs = in + 2;
+        for (int j = 0; j < QK_ZNQ; ++j) {
+            const int book = (books >> (4*(j/16))) & 15;
+            const int code = znq_unpack_code(qs, bits, j);
+            y[ib*QK_ZNQ + j] = d * values[book*nlevels + code];
+        }
+    }
+}
+
+void dequantize_row_znq2(const block_znq2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) { dequantize_row_znq_impl(x, y, k, 2); }
+void dequantize_row_znq3(const block_znq3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) { dequantize_row_znq_impl(x, y, k, 3); }
+void dequantize_row_znq4(const block_znq4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) { dequantize_row_znq_impl(x, y, k, 4); }
+
 // ============================ 4-bit non-linear quants
 
 static void quantize_row_iq4_nl_impl(const int super_block_size, const int block_size, const float * GGML_RESTRICT x,
@@ -5725,6 +5943,13 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_IQ4_NL:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq4_nl, data, nb);
+            } break;
+        case GGML_TYPE_ZNQ2:
+        case GGML_TYPE_ZNQ3:
+        case GGML_TYPE_ZNQ4:
+            {
+                // All 256 UFP8 scale-byte encodings are finite and valid.
+                GGML_UNUSED(data); GGML_UNUSED(nb);
             } break;
 
         case GGML_TYPE_I8:
