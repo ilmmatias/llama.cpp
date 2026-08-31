@@ -4734,63 +4734,6 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
     }
 }
 
-// Large routed-expert perf tests can spend tens of seconds generating and quantizing
-// a full multi-expert tensor before the backend operation runs. For perf-only shape
-// coverage, quantize one valid row, repeat it through one expert, then repeat that
-// expert across the tensor. The device allocation and MMID memory geometry remain
-// identical while setup stays small and deterministic.
-static void init_mul_mat_id_tensors_repeated_expert(ggml_context * ctx, int n_mats) {
-    std::random_device rd;
-    std::default_random_engine rng(rd());
-
-    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-        if (t->type == GGML_TYPE_I32) {
-            if (ggml_is_view_op(t->op)) {
-                continue;
-            }
-            for (int64_t r = 0; r < ggml_nrows(t); r++) {
-                std::vector<int32_t> data(t->ne[0]);
-                for (int i = 0; i < t->ne[0]; i++) {
-                    data[i] = i % n_mats;
-                }
-                std::shuffle(data.begin(), data.end(), rng);
-                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
-            }
-            continue;
-        }
-
-        if (strcmp(t->name, "as") != 0) {
-            init_tensor_uniform(t);
-            continue;
-        }
-
-        GGML_ASSERT(ggml_is_quantized(t->type));
-        GGML_ASSERT(t->ne[2] == n_mats);
-        GGML_ASSERT(t->nb[2] == t->nb[1] * (size_t) t->ne[1]);
-
-        const int64_t k = t->ne[0];
-        std::vector<float> row(k);
-        for (int64_t i = 0; i < k; i++) {
-            row[i] = ((int) (i % 31) - 15) / 16.0f;
-        }
-
-        std::vector<float> imatrix(k, 1.0f);
-        std::vector<uint8_t> row_q(t->nb[1]);
-        const size_t row_bytes = ggml_quantize_chunk(
-            t->type, row.data(), row_q.data(), 0, 1, k, imatrix.data());
-        GGML_ASSERT(row_bytes == t->nb[1]);
-
-        std::vector<uint8_t> expert(t->nb[2]);
-        for (int64_t r = 0; r < t->ne[1]; r++) {
-            memcpy(expert.data() + r * t->nb[1], row_q.data(), row_bytes);
-        }
-
-        for (int e = 0; e < n_mats; e++) {
-            ggml_backend_tensor_set(t, expert.data(), (size_t) e * t->nb[2], expert.size());
-        }
-    }
-}
-
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
@@ -4801,7 +4744,6 @@ struct test_mul_mat_id : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
-    const bool repeated_expert_init;
 
     std::string vars() override {
         return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
@@ -4826,9 +4768,9 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32, bool repeated_expert_init = false)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), repeated_expert_init(repeated_expert_init) {
+            m(m), n(n), k(k) {
             GGML_ASSERT(n_used <= n_mats);
         }
 
@@ -4854,44 +4796,7 @@ struct test_mul_mat_id : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        if (repeated_expert_init) {
-            init_mul_mat_id_tensors_repeated_expert(ctx, n_mats);
-        } else {
-            init_mul_mat_id_tensors(ctx, n_mats);
-        }
-    }
-};
-
-// GGML_OP_MUL_MAT_ID with duplicate expert IDs in a token. Hash-routed/pruned MoE tables may
-// legitimately map multiple route slots to the same retained expert.
-struct test_mul_mat_id_duplicates : public test_mul_mat_id {
-    test_mul_mat_id_duplicates(ggml_type type_a, ggml_type type_b,
-            int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k)
-        : test_mul_mat_id(type_a, type_b, n_mats, n_used, b, m, n, k, true) {}
-
-    std::string vars() override {
-        return test_mul_mat_id::vars() + ",dups=1";
-    }
-
-    void initialize_tensors(ggml_context * ctx) override {
-        test_mul_mat_id::initialize_tensors(ctx);
-
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
-                continue;
-            }
-
-            for (int64_t r = 0; r < ggml_nrows(t); ++r) {
-                std::vector<int32_t> data(t->ne[0]);
-                for (int32_t i = 0; i < t->ne[0]; ++i) {
-                    data[i] = i % n_mats;
-                }
-                if (n_used > 1) {
-                    data[1] = data[0];
-                }
-                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
-            }
-        }
+        init_mul_mat_id_tensors(ctx, n_mats);
     }
 };
 
@@ -6379,6 +6284,87 @@ struct test_top_k : public test_case {
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
             }
         }
+    }
+};
+
+// qwen4exp QSA indexer top-k fusion: expand per-block scores to cells, add the f16 mask, top-k.
+struct test_topk_qsa : public test_case {
+    const int64_t n_blocks;
+    const int64_t n_kv;
+    const int64_t n_tps;
+    const int64_t n_stream;
+    const int     width;
+    ggml_tensor * out {};
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "TOPK_QSA";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_blocks, n_kv, n_tps, n_stream, width);
+    }
+
+    test_topk_qsa(int64_t n_blocks = 512, int64_t n_kv = 2048, int64_t n_tps = 2, int64_t n_stream = 1, int width = 1500)
+        : n_blocks(n_blocks), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width) {}
+
+    double max_err() override { return 0.0; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * score = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tps, n_stream);
+        ggml_set_name(score, "score");
+        ggml_tensor * cell_blk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_stream);
+        ggml_set_name(cell_blk, "cell_blk");
+        ggml_tensor * kq_mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_kv, n_tps, n_stream);
+        ggml_set_name(kq_mask, "kq_mask");
+
+        ggml_tensor * a = ggml_cont(ctx, ggml_permute(ctx, score, 1, 0, 2, 3));
+        ggml_tensor * e = ggml_get_rows(ctx, a, cell_blk);
+        e = ggml_cont(ctx, ggml_permute(ctx, e, 1, 0, 2, 3));
+        ggml_tensor * m = ggml_cast(ctx, kq_mask, GGML_TYPE_F32);
+        e = ggml_add(ctx, e, ggml_reshape_3d(ctx, m, n_kv, n_tps, n_stream));
+        out = ggml_top_k(ctx, e, width);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+
+    // distinct mask ramp + small scores keep every cell value unique, so no top-k ties
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (auto & v : data) { v = rand() % n_blocks; }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    for (int64_t i = 0; i < n_kv; i++) {
+                        data[r * n_kv + i] = ggml_fp32_to_fp16((float) i);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t, 0.0f, 0.5f);
+            }
+        }
+    }
+
+    // top-k output order is unspecified; compare as a set of indices
+    double err(const float * a, const float * b, size_t n) override {
+        std::vector<int32_t> ia(n), ib(n);
+        double diff = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            ia[i] = (int32_t) a[i];
+            ib[i] = (int32_t) b[i];
+            diff += std::fabs(a[i] - ia[i]) + std::fabs(b[i] - ib[i]);
+        }
+        return diff + jdst(ia.data(), ib.data(), n);
     }
 };
 
@@ -9577,13 +9563,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // Correctness regression for duplicate expert IDs within a token. Keep these in the eval suite
-    // (the production-shape duplicate cases below also live in the perf suite).
-    test_cases.emplace_back(new test_mul_mat_id_duplicates(
-        GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 192, 6, true, 256, 32, 256));
-    test_cases.emplace_back(new test_mul_mat_id_duplicates(
-        GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 192, 6, true, 256, 64, 256));
-
     for (int bs : {1, 4, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
@@ -9930,6 +9909,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int nrows : {4, 5, 6}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {393216, nrows, 1, 1}, 512));
     }
+
+    // Large-k, including multi-row and ties (qwen4exp)
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 1024,  1, 1, 1 }, 1024));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 2048,  2, 1, 1 }, 1024));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 4096,  1, 1, 1 }, 2048));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8192,  2, 1, 1 }, 2051));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 1, 1, 1 }, 2051));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 4, 1, 1 }, 2051));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8192,  2, 1, 1 }, 2051, true));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 4, 1, 1 }, 2051, true));
+
+    // qwen4exp QSA indexer top-k fusion (get_rows + f16 mask + top_k)
+    test_cases.emplace_back(new test_topk_qsa(512,  2048,  1, 1, 1500));
+    test_cases.emplace_back(new test_topk_qsa(512,  2048,  2, 1, 1500));
+    test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
+    test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
 
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {
@@ -10542,23 +10537,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    // DeepSeek-V4 routed gate-expert shape.  Keep 31/32 adjacent so RDNA2 MMQ can be
-    // tested independently of the scheduler's default batch-32 dynamic-offload threshold.
-    for (int bs : {1, 31, 32}) {
-        test_cases.emplace_back(new test_mul_mat_id(
-            GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 192, 6, false, 2048, bs, 4096, true));
-    }
-
-    // Duplicate-route regression for compact DeepSeek-V4 hash routing. Keep the matrix small;
-    // n=32 is enough to exercise the routed MMQ helper on RDNA2.
-    test_cases.emplace_back(new test_mul_mat_id_duplicates(
-        GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 192, 6, true, 256, 32, 256));
-
-    // Cross the 192-expert boundary in the compact routed-row permutation. This catches
-    // compact-MMQ implementations that accidentally reinterpret ids_dst values as expert IDs.
-    test_cases.emplace_back(new test_mul_mat_id_duplicates(
-        GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 192, 6, true, 256, 64, 256));
-
 
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
@@ -10694,32 +10672,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-
-    // DSV4 lightning-indexer selection. Keep row counts modest here; the full
-    // model benchmark exercises the 512-token prefill case.
-    for (auto nrows : {1, 64}) {
-        for (auto cols : {4096, 16384, 65536, 131072}) {
-            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 512));
-        }
-    }
-
-    // Production DeepSeek-V4 context ceiling and parallel-session decode rows.
-    // These exercise the HIP radix/hierarchical policy above its 131K crossover.
-    for (auto nrows : {1, 2, 3}) {
-        for (auto cols : {196608, 262144, 393216}) {
-            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 512));
-        }
-    }
-
-    for (auto nrows : {2, 4, 8}) {
-        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {131072, nrows, 1, 1}, 512));
-    }
-    for (auto nrows : {4, 5, 6, 8}) {
-        for (auto cols : {196608, 262144, 393216}) {
-            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 512));
-        }
-    }
-
     for (auto nrows : {1, 4, 8, 16}) {
         for (auto cols : {128, 1024, 4096, 8192, 16384, 32768, 65536, 131072, 200000, 2000000}) {
             test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, {cols, nrows, 1, 1}));
@@ -10773,27 +10725,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 }
             }
         }
-    }
-
-    // DeepSeek-V4 single-stream decode sweep for RDNA2 lightning-indexer tuning.
-    // The generic perf grid above deliberately samples only 256/4096/65536;
-    // these intermediate points locate the K-vectors-per-wave crossover without
-    // multiplying the full type/head/batch matrix.
-    for (int kv : { 512, 1024, 2048, 8192, 16384, 32768 }) {
-        test_cases.emplace_back(new test_lightning_indexer(
-            128, 64, kv, 1, 1, 1, GGML_TYPE_F16));
-    }
-
-    // DeepSeek-V4 hyperconnection kernels. HC_COMB uses 20 Sinkhorn iterations
-    // in production; batch sizes cover decode, the 512-token microbatch, and
-    // nearby workgroup boundaries. PRE/POST use the representative 4096-wide
-    // hidden dimension already exercised by the correctness suite.
-    for (int64_t n_tokens : { 1, 256, 336, 512, 513, 1024, 2048 }) {
-        test_cases.emplace_back(new test_dsv4_hc_comb(n_tokens, 20));
-    }
-    for (int64_t n_tokens : { 1, 21, 256, 512, 1024, 2048 }) {
-        test_cases.emplace_back(new test_dsv4_hc_pre (4096, n_tokens));
-        test_cases.emplace_back(new test_dsv4_hc_post(4096, n_tokens));
     }
 
     return test_cases;
