@@ -16,6 +16,15 @@
 
 #define UNUSED GGML_UNUSED
 
+// smallest src1 batch for which the decode pays for itself
+#define GGML_IQP_MIN_BATCH 8
+
+// same, per expert, for MUL_MAT_ID
+#define GGML_IQP_MIN_BATCH_ID 8
+
+bool ggml_cpu_iqp_mul_mat_id_min_batch(int64_t cne1) {
+    return cne1 >= GGML_IQP_MIN_BATCH_ID;
+}
 // src0 rows interleaved per panel
 #define IQP_NB_ROWS 8
 
@@ -41,6 +50,9 @@ static_assert(sizeof(block_iqp_x8) == 8 * sizeof(float) + 8 * sizeof(int32_t) + 
 #    define GGML_IQP_USE_BIAS 0
 #endif
 
+static inline size_t ggml_cpu_iqp_row_size(const struct ggml_tensor * dst) {
+    return ggml_row_size(GGML_TYPE_Q8_K, dst->src[1]->ne[0]);
+}
 // the low 7 bits of v are the first 7 signs and the 8th is their parity (cf. unpack_ksigns in the CUDA backend)
 static inline uint8_t iqp_unpack_ksigns(uint32_t v) {
     uint32_t p = v ^ (v >> 4);
@@ -1213,6 +1225,7 @@ void ggml_compute_forward_mul_mat_iqp(const struct ggml_compute_params * params,
     const int64_t ngroups = ne01 / IQP_NB_ROWS;
 
     // aim for 4 chunks per thread; the caller has already reset the chunk counter
+    // on NUMA systems fall back to one chunk per thread
     const int64_t chunks_per_thread = ggml_is_numa() ? 1 : 4;
     const int64_t groups_per_chunk  = MAX(1, (ngroups + nth * chunks_per_thread - 1) / (nth * chunks_per_thread));
     const int64_t nchunk            = (ngroups + groups_per_chunk - 1) / groups_per_chunk;
