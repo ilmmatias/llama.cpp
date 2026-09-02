@@ -118,11 +118,11 @@ static_assert(sizeof(block_iq4_nlx8) == 8 * sizeof(ggml_half) + QK4_NL * 4, "wro
 struct block_znq2x8 {
     uint8_t d[8];
     uint8_t books[8];
-    // Eight rows x 32 2-bit codes. For each 4-weight group, store two
-    // 32-bit bitplanes in [row0 w0..w3, row1 w0..w3, ...] bit order.
-    // Runtime unpack is two masked byte broadcasts plus OR, while the
-    // representation remains exactly 8 * sizeof(block_znq2) = 2.5 bpw.
-    uint32_t planes[QK_ZNQ / 4][2];
+    // Eight rows x 32 2-bit codes. For each 4-weight group, keep the
+    // original packed byte from each row in [row0..row7] order. One
+    // VPMULTISHIFTQB expands the eight bytes to 32 byte indices at runtime,
+    // while the representation remains exactly 8 * sizeof(block_znq2) = 2.5 bpw.
+    uint8_t qs[QK_ZNQ / 4][8];
 };
 
 static_assert(sizeof(block_znq2x8) == 8 * sizeof(block_znq2), "wrong znq2x8 block size/padding");

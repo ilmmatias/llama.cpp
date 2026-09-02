@@ -3823,10 +3823,6 @@ static int repack_iq4_nl_to_iq4_nl_8_bl(struct ggml_tensor * t, int interleave_b
     GGML_UNUSED(data_size);
 }
 
-static inline uint8_t znq2_repack_code(const uint8_t * qs, int j) {
-    return (uint8_t) ((qs[j / 4] >> (2 * (j & 3))) & 3u);
-}
-
 static block_znq2x8 make_block_znq2x8(const block_znq2 * in) {
     block_znq2x8 out = {};
 
@@ -3835,19 +3831,13 @@ static block_znq2x8 make_block_znq2x8(const block_znq2 * in) {
         out.books[r] = in[r].books;
     }
 
+    // Each source byte already contains the four 2-bit codes for one
+    // 4-weight group. Transpose only at byte granularity so runtime can load
+    // all eight rows with one qword broadcast before VPMULTISHIFTQB.
     for (int g = 0; g < QK_ZNQ / 4; ++g) {
-        uint32_t p0 = 0;
-        uint32_t p1 = 0;
         for (int r = 0; r < 8; ++r) {
-            for (int j = 0; j < 4; ++j) {
-                const uint8_t code = znq2_repack_code(in[r].qs, 4*g + j);
-                const int pos = 4*r + j;
-                p0 |= (uint32_t) ((code >> 0) & 1u) << pos;
-                p1 |= (uint32_t) ((code >> 1) & 1u) << pos;
-            }
+            out.qs[g][r] = in[r].qs[g];
         }
-        out.planes[g][0] = p0;
-        out.planes[g][1] = p1;
     }
 
     return out;
@@ -4975,10 +4965,20 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             const size_t dst_bs2 = nb2 / sizeof(float);
             const int64_t total_tasks = (int64_t) n_as * tasks_per_expert;
 
+            // With hundreds of experts, enumerate one output tile across all
+            // experts before advancing to the next tile. This keeps the tail
+            // of the dynamic queue from collapsing onto one hot expert.
+            // Preserve expert-major ordering for smaller MoEs.
+            const bool znq_tile_major = n_as >= 256;
+
             int64_t current_task = ith;
             while (current_task < total_tasks) {
-                const int cur_a = (int) (current_task / tasks_per_expert);
-                const int64_t local_task = current_task - (int64_t) cur_a * tasks_per_expert;
+                const int cur_a = znq_tile_major
+                    ? (int) (current_task % n_as)
+                    : (int) (current_task / tasks_per_expert);
+                const int64_t local_task = znq_tile_major
+                    ? current_task / n_as
+                    : current_task - (int64_t) cur_a * tasks_per_expert;
 
                 int64_t col;
                 int tile;

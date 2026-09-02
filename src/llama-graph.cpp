@@ -2262,9 +2262,31 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_biased", il);
     }
 
+    // Qwen3.8 Flash-Next can keep all routed expert matrices on CPU while the
+    // surrounding dense graph remains on an accelerator. In that hybrid case,
+    // keep both the routing-weight multiply and the expert reduction on CPU;
+    // otherwise the scheduler returns the full
+    // [n_embd, n_expert_used, n_tokens] surface to the accelerator (~10x the
+    // size of the already-reduced FFN output for top-10 routing).
+    //
+    // Gate on the actual down-expert buffer, so fully offloaded Qwen3.8 and all
+    // other architectures preserve the existing placement policy.
+    const bool cpu_moe_reduce =
+        arch == LLM_ARCH_QWEN4EXP &&
+        hparams.n_expert_used > 1 &&
+        down_exps != nullptr &&
+        down_exps->buffer != nullptr &&
+        ggml_backend_buffer_is_host(down_exps->buffer) &&
+        sched != nullptr &&
+        backend_cpu != nullptr;
+
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
+
+        if (cpu_moe_reduce && ggml_backend_supports_op(backend_cpu, experts)) {
+            ggml_backend_sched_set_tensor_backend(sched, experts, backend_cpu);
+        }
     }
 
     ggml_build_forward_expand(gf, experts);
@@ -2288,6 +2310,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
         moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+
+        if (cpu_moe_reduce && ggml_backend_supports_op(backend_cpu, moe_out)) {
+            ggml_backend_sched_set_tensor_backend(sched, moe_out, backend_cpu);
+        }
 
         ggml_build_forward_expand(gf, moe_out);
     }
