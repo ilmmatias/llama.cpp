@@ -1168,7 +1168,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_scan(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    return build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
+    return build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
 }
 
 // The selected cells are gathered into a window of their own, one per query, so the key and
@@ -1226,7 +1226,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_gather(
     mask = ggml_cast(ctx0, ggml_reshape_4d(ctx0, mask, width, 1, 1, n_q), GGML_TYPE_F16);
     cb(mask, "qsa_mask_sel", il);
 
-    return build_attn_mha(q_cur, k_sel, v_sel, nullptr, mask, nullptr, nullptr, kq_scale, il);
+    return build_attn_mha(q_cur, k_sel, v_sel, nullptr, mask, nullptr, nullptr, 0, kq_scale, il);
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
