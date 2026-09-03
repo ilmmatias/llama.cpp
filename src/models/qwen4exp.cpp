@@ -147,7 +147,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     }
 
     switch (hparams.n_layer()) {
-        case 48: type = LLM_TYPE_A3B; break;
+        case 48: type = LLM_TYPE_A6B; break;
         default: type = LLM_TYPE_UNKNOWN;
     }
 }

@@ -129,7 +129,7 @@ enum llm_type {
     LLM_TYPE_35B_A3B, // Qwen3.5
     LLM_TYPE_48B_A3B, // Kimi Linear
     LLM_TYPE_80B_A3B, // Qwen3 Next
-    LLM_TYPE_A3B,     // Qwen3.8 Flash Next
+    LLM_TYPE_A6B,     // Qwen3.8 Flash Next
     LLM_TYPE_100B_A6B,
     LLM_TYPE_102B_A12B, // Solar-Open
     LLM_TYPE_106B_A12B, // GLM-4.5-Air
