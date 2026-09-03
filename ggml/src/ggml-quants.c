@@ -5080,6 +5080,17 @@ static inline const int8_t * znq_values(int bits) {
     }
 }
 
+static inline float znq_max_abs(int bits) {
+    switch (bits) {
+        case 2: return 113.0f;
+        case 3: return 124.0f;
+        case 4: return 126.0f;
+        default:
+            GGML_ABORT("invalid ZNQ bit width");
+            return 113.0f;
+    }
+}
+
 static uint8_t znq_encode_group(const float * x, int bits, int8_t * q, uint8_t * codes, const float * w) {
     const int nlevels = 1 << bits;
     const int8_t * values = znq_values(bits);
@@ -5181,7 +5192,7 @@ static void quantize_row_znq_ref_impl(const float * GGML_RESTRICT x, void * GGML
             for (int j = 0; j < QK_ZNQ; ++j) weight[j] = 1.0f;
         }
 
-        uint8_t sc = znq_fp32_to_ufp8(amax / 126.0f);
+        uint8_t sc = znq_fp32_to_ufp8(amax / znq_max_abs(bits));
         if (sc == 0) sc = 1;
         float scale = znq_ufp8_to_fp32(sc);
         int8_t q[QK_ZNQ];
