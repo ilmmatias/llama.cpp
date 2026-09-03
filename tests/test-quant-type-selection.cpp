@@ -497,6 +497,45 @@ static int run_remote_tests(const std::string & snapshot_dir, const char * argv0
     return total_fail > 0 ? 1 : 0;
 }
 
+static int run_pure_tests() {
+    const llama_quant_model_desc desc = {
+        /*.architecture  =*/ "llama",
+        /*.n_embd        =*/ 4096,
+        /*.n_ff          =*/ 11008,
+        /*.n_layer       =*/ 1,
+        /*.n_head        =*/ 32,
+        /*.n_head_kv     =*/ 8,
+        /*.n_expert      =*/ 0,
+        /*.n_embd_head_k =*/ 128,
+        /*.n_embd_head_v =*/ 128,
+    };
+
+    llama_model * model = llama_quant_model_from_metadata(&desc);
+    llama_model_quantize_params qparams = llama_model_quantize_default_params();
+    qparams.pure = true;
+    quantize_state_impl * qs = llama_quant_init(model, &qparams);
+
+    struct ggml_init_params ctx_params = { ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx(ggml_init(ctx_params));
+    ggml_tensor * tensor = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 4096, 4096);
+    ggml_set_name(tensor, "blk.0.ffn_up.weight");
+
+    int n_fail = 0;
+    for (llama_ftype ftype : { LLAMA_FTYPE_MOSTLY_IQ2_S, LLAMA_FTYPE_MOSTLY_IQ2_M }) {
+        ggml_type result;
+        llama_quant_compute_types(qs, ftype, &tensor, &result, 1);
+        if (result != GGML_TYPE_IQ2_S) {
+            printf("  FAIL  --pure %s expected %s, got %s\n", llama_ftype_to_name(ftype), ggml_type_name(GGML_TYPE_IQ2_S), ggml_type_name(result));
+            n_fail++;
+        }
+    }
+
+    llama_quant_free(qs);
+    llama_model_free(model);
+    printf("  %s  --pure IQ2 type selection\n\n", n_fail == 0 ? "PASS" : "FAIL");
+    return n_fail > 0 ? 1 : 0;
+}
+
 int main(int argc, char ** argv) {
     std::string snapshot_dir = SNAPSHOT_DIR;
     bool        generate     = false;
@@ -516,5 +555,6 @@ int main(int argc, char ** argv) {
     // suppress llama log warnings during test (e.g. tensor type fallback messages)
     llama_log_set([](enum ggml_log_level, const char *, void *) {}, nullptr);
 
-    return run_remote_tests(snapshot_dir, argv[0]);
+    int result = run_pure_tests();
+    return run_remote_tests(snapshot_dir, argv[0]) || result;
 }

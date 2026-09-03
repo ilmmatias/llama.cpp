@@ -893,6 +893,14 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
     }
 }
 
+static ggml_type llama_ftype_get_pure_type(llama_ftype ftype) {
+    switch (ftype) {
+        case LLAMA_FTYPE_MOSTLY_IQ2_S:
+        case LLAMA_FTYPE_MOSTLY_IQ2_M: return GGML_TYPE_IQ2_S;
+        default:                       return llama_ftype_get_default_type(ftype);
+    }
+}
+
 
 static void init_quantize_state_counters(quantize_state_impl & qs, std::vector<tensor_metadata> & metadata) {
     for (auto & tm : metadata) {
@@ -923,7 +931,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         nthread = std::thread::hardware_concurrency();
     }
 
-    ggml_type default_type = llama_ftype_get_default_type(ftype);
+    ggml_type default_type = params->pure ? llama_ftype_get_pure_type(ftype) : llama_ftype_get_default_type(ftype);
     if (default_type == GGML_TYPE_COUNT) {
         throw std::runtime_error(format("invalid output file type %d\n", ftype));
     }
@@ -1481,7 +1489,7 @@ void llama_quant_compute_types(
     llama_model_quantize_params local_params = *qs->params;
     local_params.ftype = ftype;
 
-    ggml_type default_type = llama_ftype_get_default_type(ftype);
+    ggml_type default_type = local_params.pure ? llama_ftype_get_pure_type(ftype) : llama_ftype_get_default_type(ftype);
 
     // compute types
     for (size_t i = 0; i < n_tensors; i++) {
