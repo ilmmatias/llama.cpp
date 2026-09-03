@@ -5080,7 +5080,7 @@ static inline const int8_t * znq_values(int bits) {
     }
 }
 
-static uint8_t znq_encode_group(const float * x, int bits, int8_t * q, uint8_t * codes) {
+static uint8_t znq_encode_group(const float * x, int bits, int8_t * q, uint8_t * codes, const float * w) {
     const int nlevels = 1 << bits;
     const int8_t * values = znq_values(bits);
     double best_err = DBL_MAX;
@@ -5092,7 +5092,7 @@ static uint8_t znq_encode_group(const float * x, int bits, int8_t * q, uint8_t *
         for (int j = 0; j < 16; ++j) {
             const int code = best_index_int8(nlevels, levels, x[j]);
             const double d = (double) x[j] - levels[code];
-            err += d*d;
+            err += (w ? (double) w[j] : 1.0) * d*d;
         }
         if (err < best_err) {
             best_err = err;
@@ -5151,11 +5151,12 @@ static inline uint8_t znq_unpack_code(const uint8_t * qs, int bits, int j) {
     return (qs[j/2] >> (4*(j & 1))) & 15u;
 }
 
-static void quantize_row_znq_ref_impl(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k, int bits) {
+static void quantize_row_znq_ref_impl(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k, int bits, const float * GGML_RESTRICT quant_weights) {
     GGML_ASSERT(k % QK_ZNQ == 0);
     const int64_t nb = k / QK_ZNQ;
     const size_t block_size = 2 + (size_t) bits*QK_ZNQ/8;
     uint8_t * y = (uint8_t *) vy;
+    float weight[QK_ZNQ];
 
     for (int64_t ib = 0; ib < nb; ++ib) {
         const float * xb = x + ib*QK_ZNQ;
@@ -5169,6 +5170,17 @@ static void quantize_row_znq_ref_impl(const float * GGML_RESTRICT x, void * GGML
             continue;
         }
 
+        // Importance weighting in output space, matching how iq4_nl does it.
+        const float * qw = quant_weights ? quant_weights + ib*QK_ZNQ : NULL;
+        float sigma2 = 0;
+        if (qw) {
+            for (int j = 0; j < QK_ZNQ; ++j) sigma2 += xb[j]*xb[j];
+            sigma2 *= 2.f/QK_ZNQ;
+            for (int j = 0; j < QK_ZNQ; ++j) weight[j] = qw[j]*sqrtf(sigma2 + xb[j]*xb[j]);
+        } else {
+            for (int j = 0; j < QK_ZNQ; ++j) weight[j] = 1.0f;
+        }
+
         uint8_t sc = znq_fp32_to_ufp8(amax / 126.0f);
         if (sc == 0) sc = 1;
         float scale = znq_ufp8_to_fp32(sc);
@@ -5180,14 +5192,14 @@ static void quantize_row_znq_ref_impl(const float * GGML_RESTRICT x, void * GGML
         for (int it = 0; it < 4; ++it) {
             const float is = 1.0f / scale;
             for (int j = 0; j < QK_ZNQ; ++j) norm[j] = xb[j]*is;
-            znq_encode_group(norm +  0, bits, q +  0, NULL);
-            znq_encode_group(norm + 16, bits, q + 16, NULL);
+            znq_encode_group(norm +  0, bits, q +  0, NULL, weight);
+            znq_encode_group(norm + 16, bits, q + 16, NULL, weight + 16);
 
             double num = 0.0;
             double den = 0.0;
             for (int j = 0; j < QK_ZNQ; ++j) {
-                num += (double) xb[j] * q[j];
-                den += (double) q[j] * q[j];
+                num += (double) weight[j] * xb[j] * q[j];
+                den += (double) weight[j] * q[j] * q[j];
             }
             const double ideal = den > 0.0 ? num/den : scale;
             uint8_t next_sc = znq_fp32_to_ufp8(MAX(ideal, 0.0));
@@ -5197,39 +5209,40 @@ static void quantize_row_znq_ref_impl(const float * GGML_RESTRICT x, void * GGML
             scale = znq_ufp8_to_fp32(sc);
         }
 
+        // Final code/book selection at the LSQ fixpoint scale.
         const float is = 1.0f / scale;
         for (int j = 0; j < QK_ZNQ; ++j) norm[j] = xb[j]*is;
         uint8_t codes[QK_ZNQ];
-        const uint8_t b0 = znq_encode_group(norm +  0, bits, q +  0, codes +  0);
-        const uint8_t b1 = znq_encode_group(norm + 16, bits, q + 16, codes + 16);
+        const uint8_t b0 = znq_encode_group(norm +  0, bits, q +  0, codes +  0, weight);
+        const uint8_t b1 = znq_encode_group(norm + 16, bits, q + 16, codes + 16, weight + 16);
         out[0] = sc;
         out[1] = b0 | (b1 << 4);
         znq_pack_codes(bits, codes, out + 2);
     }
 }
 
-void quantize_row_znq2_ref(const float * GGML_RESTRICT x, block_znq2 * GGML_RESTRICT y, int64_t k) { quantize_row_znq_ref_impl(x, y, k, 2); }
-void quantize_row_znq3_ref(const float * GGML_RESTRICT x, block_znq3 * GGML_RESTRICT y, int64_t k) { quantize_row_znq_ref_impl(x, y, k, 3); }
-void quantize_row_znq4_ref(const float * GGML_RESTRICT x, block_znq4 * GGML_RESTRICT y, int64_t k) { quantize_row_znq_ref_impl(x, y, k, 4); }
+void quantize_row_znq2_ref(const float * GGML_RESTRICT x, block_znq2 * GGML_RESTRICT y, int64_t k) { quantize_row_znq_ref_impl(x, y, k, 2, NULL); }
+void quantize_row_znq3_ref(const float * GGML_RESTRICT x, block_znq3 * GGML_RESTRICT y, int64_t k) { quantize_row_znq_ref_impl(x, y, k, 3, NULL); }
+void quantize_row_znq4_ref(const float * GGML_RESTRICT x, block_znq4 * GGML_RESTRICT y, int64_t k) { quantize_row_znq_ref_impl(x, y, k, 4, NULL); }
 
 static size_t quantize_znq_impl(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
-        int64_t nrow, int64_t n_per_row, int bits) {
+        int64_t nrow, int64_t n_per_row, int bits, const float * GGML_RESTRICT quant_weights) {
     GGML_ASSERT(n_per_row % QK_ZNQ == 0);
     const size_t row_size = (size_t) (n_per_row/QK_ZNQ) * (2 + bits*QK_ZNQ/8);
     for (int64_t row = 0; row < nrow; ++row) {
-        quantize_row_znq_ref_impl(src + row*n_per_row, (uint8_t *) dst + row*row_size, n_per_row, bits);
+        quantize_row_znq_ref_impl(src + row*n_per_row, (uint8_t *) dst + row*row_size, n_per_row, bits, quant_weights);
     }
     return nrow*row_size;
 }
 
 size_t quantize_znq2(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * imatrix) {
-    GGML_UNUSED(imatrix); return quantize_znq_impl(src, dst, nrow, n_per_row, 2);
+    return quantize_znq_impl(src, dst, nrow, n_per_row, 2, imatrix);
 }
 size_t quantize_znq3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * imatrix) {
-    GGML_UNUSED(imatrix); return quantize_znq_impl(src, dst, nrow, n_per_row, 3);
+    return quantize_znq_impl(src, dst, nrow, n_per_row, 3, imatrix);
 }
 size_t quantize_znq4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * imatrix) {
-    GGML_UNUSED(imatrix); return quantize_znq_impl(src, dst, nrow, n_per_row, 4);
+    return quantize_znq_impl(src, dst, nrow, n_per_row, 4, imatrix);
 }
 
 static void dequantize_row_znq_impl(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t k, int bits) {
