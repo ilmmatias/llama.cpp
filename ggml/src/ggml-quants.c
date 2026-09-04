@@ -5039,6 +5039,7 @@ size_t quantize_iq1_m(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
 }
 
 // ============================ ZNQ QK32 nonlinear books
+enum { ZNQ_SCALE_SEARCH_RADIUS = 8 };
 
 static inline float znq_ufp8_to_fp32(uint8_t code) {
     const int e = code >> 3;
@@ -5050,14 +5051,14 @@ static inline float znq_ufp8_to_fp32(uint8_t code) {
 }
 
 static uint8_t znq_fp32_to_ufp8(double x) {
-    if (!(x > 0.0f)) {
+    if (!(x > 0.0)) {
         return 0;
     }
     int lo = 0;
     int hi = 255;
     while (lo < hi) {
         const int mid = (lo + hi) >> 1;
-        const double boundary = 0.5 * ((double) znq_ufp8_to_fp32((uint8_t) mid) + znq_ufp8_to_fp32((uint8_t) (mid + 1)));
+        const double boundary = 0.5 * ((double) znq_ufp8_to_fp32((uint8_t) mid) + (double) znq_ufp8_to_fp32((uint8_t) (mid + 1)));
         // numpy.searchsorted(..., side="right") used by the lab selects the
         // upper value when x is exactly on a midpoint.
         if (x >= boundary) {
@@ -5082,12 +5083,12 @@ static inline const int8_t * znq_values(int bits) {
 
 static inline float znq_max_abs(int bits) {
     switch (bits) {
-        case 2: return 113.0f;
-        case 3: return 124.0f;
+        case 2: return 114.0f;
+        case 3: return 125.0f;
         case 4: return 126.0f;
         default:
             GGML_ABORT("invalid ZNQ bit width");
-            return 113.0f;
+            return 114.0f;
     }
 }
 
@@ -5120,6 +5121,26 @@ static uint8_t znq_encode_group(const float * x, int bits, int8_t * q, uint8_t *
         }
     }
     return (uint8_t) best_book;
+}
+
+static double znq_encode_block(const float * x, int bits, float scale, int8_t * q,
+        uint8_t * books, uint8_t * codes, const float * w) {
+    float norm[QK_ZNQ];
+    const float is = 1.0f / scale;
+    for (int j = 0; j < QK_ZNQ; ++j) norm[j] = x[j]*is;
+
+    const uint8_t b0 = znq_encode_group(norm +  0, bits, q +  0, codes ? codes +  0 : NULL, w +  0);
+    const uint8_t b1 = znq_encode_group(norm + 16, bits, q + 16, codes ? codes + 16 : NULL, w + 16);
+    if (books) {
+        *books = b0 | (b1 << 4);
+    }
+
+    double err = 0.0;
+    for (int j = 0; j < QK_ZNQ; ++j) {
+        const double diff = (double) x[j] - (double) scale * (double) q[j];
+        err += (double) w[j] * diff*diff;
+    }
+    return err;
 }
 
 static void znq_pack_codes(int bits, const uint8_t * codes, uint8_t * dst) {
@@ -5198,8 +5219,7 @@ static void quantize_row_znq_ref_impl(const float * GGML_RESTRICT x, void * GGML
         int8_t q[QK_ZNQ];
         float norm[QK_ZNQ];
 
-        // Match the four alternating book-assignment / least-squares scale
-        // iterations used by tools/znq-lab/sweep-general-qk32.py.
+        // Alternate book assignment and least-squares scale selection.
         for (int it = 0; it < 4; ++it) {
             const float is = 1.0f / scale;
             for (int j = 0; j < QK_ZNQ; ++j) norm[j] = xb[j]*is;
@@ -5209,10 +5229,10 @@ static void quantize_row_znq_ref_impl(const float * GGML_RESTRICT x, void * GGML
             double num = 0.0;
             double den = 0.0;
             for (int j = 0; j < QK_ZNQ; ++j) {
-                num += (double) weight[j] * xb[j] * q[j];
-                den += (double) weight[j] * q[j] * q[j];
+                num += (double) weight[j] * (double) xb[j] * (double) q[j];
+                den += (double) weight[j] * (double) q[j] * (double) q[j];
             }
-            const double ideal = den > 0.0 ? num/den : scale;
+            const double ideal = den > 0.0 ? num/den : (double) scale;
             uint8_t next_sc = znq_fp32_to_ufp8(MAX(ideal, 0.0));
             if (next_sc == 0) next_sc = sc;
             if (next_sc == sc) break;
@@ -5220,14 +5240,41 @@ static void quantize_row_znq_ref_impl(const float * GGML_RESTRICT x, void * GGML
             scale = znq_ufp8_to_fp32(sc);
         }
 
-        // Final code/book selection at the LSQ fixpoint scale.
-        const float is = 1.0f / scale;
-        for (int j = 0; j < QK_ZNQ; ++j) norm[j] = xb[j]*is;
+        // Nearby scales improved ZNQ2/3 model metrics, but regressed held-out
+        // ZNQ4 KL divergence.
+        if (bits != 4) {
+            uint8_t best_sc = sc;
+            double best_err = znq_encode_block(xb, bits, scale, q, NULL, NULL, weight);
+            for (int delta = 1; delta <= ZNQ_SCALE_SEARCH_RADIUS; ++delta) {
+                const int lower = (int) sc - delta;
+                if (lower > 0) {
+                    const float candidate_scale = znq_ufp8_to_fp32((uint8_t) lower);
+                    const double err = znq_encode_block(xb, bits, candidate_scale, q, NULL, NULL, weight);
+                    if (err < best_err) {
+                        best_err = err;
+                        best_sc = (uint8_t) lower;
+                    }
+                }
+
+                const int upper = (int) sc + delta;
+                if (upper <= UINT8_MAX) {
+                    const float candidate_scale = znq_ufp8_to_fp32((uint8_t) upper);
+                    const double err = znq_encode_block(xb, bits, candidate_scale, q, NULL, NULL, weight);
+                    if (err < best_err) {
+                        best_err = err;
+                        best_sc = (uint8_t) upper;
+                    }
+                }
+            }
+            sc = best_sc;
+            scale = znq_ufp8_to_fp32(sc);
+        }
+
+        uint8_t books;
         uint8_t codes[QK_ZNQ];
-        const uint8_t b0 = znq_encode_group(norm +  0, bits, q +  0, codes +  0, weight);
-        const uint8_t b1 = znq_encode_group(norm + 16, bits, q + 16, codes + 16, weight + 16);
+        znq_encode_block(xb, bits, scale, q, &books, codes, weight);
         out[0] = sc;
-        out[1] = b0 | (b1 << 4);
+        out[1] = books;
         znq_pack_codes(bits, codes, out + 2);
     }
 }
