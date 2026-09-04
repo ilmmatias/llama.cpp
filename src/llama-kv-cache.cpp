@@ -1589,51 +1589,40 @@ static void set_mask_cell_scalar(
     llama_pos p1,
     llama_pos p1_x, llama_pos p1_y,
     llama_pos wlo, llama_pos whi,
+    llama_pos seq_pos_min,
+    bool swa_full_span,
     T * dst_ptr,
     T mask_drop,
-    T mask_keep,
-    const llama_swa_type swa_type
+    T mask_keep
 ) {
-    if constexpr (alibi) {
-        if (cells.is_empty(j) || !cells.seq_has(j, seq_id)) {
-            *dst_ptr = mask_drop;
-            return;
-        }
-        llama_pos p0 = cells.pos_get(j);
-
-        if ((causal && p0 > p1) ||
-            (swa && llama_hparams::is_masked_swa(0, swa_type, p0, p1))) {
-            *dst_ptr = mask_drop;
-            return;
-        }
-        if constexpr (is_2d) {
-            if (p0 == p1 && cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
-                *dst_ptr = mask_drop;
-                return;
-            }
-        }
-        *dst_ptr = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
+    if (cells.is_empty(j) || !cells.seq_has(j, seq_id)) {
+        *dst_ptr = mask_drop;
         return;
     }
 
-    bool nonempty = (cells.pos_get(j) >= 0);
-    bool keep = nonempty && cells.seq_has(j, seq_id);
+    const llama_pos p0 = cells.pos_get(j);
+    bool keep = true;
 
-    if (keep && (causal || swa)) {
-        llama_pos p0 = cells.pos_get(j);
-        keep = (p0 >= wlo && p0 <= whi);
+    if constexpr (causal || swa) {
+        keep = (p0 >= wlo && p0 <= whi) || (swa_full_span && p0 >= seq_pos_min);
     }
 
     if constexpr (is_2d) {
-        if (keep) {
-            llama_pos p0 = cells.pos_get(j);
-            if (p0 == p1 && cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
-                keep = false;
-            }
+        if (keep && p0 == p1 && cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
+            keep = false;
         }
     }
 
-    *dst_ptr = keep ? mask_keep : mask_drop;
+    if (!keep) {
+        *dst_ptr = mask_drop;
+        return;
+    }
+
+    if constexpr (alibi) {
+        *dst_ptr = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
+    } else {
+        *dst_ptr = mask_keep;
+    }
 }
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
@@ -1663,6 +1652,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
         seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
     }
+
+    const bool swa_full_span = !causal && swa && args.hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL;
 
     uint32_t              seq_srct[LLAMA_MAX_SEQ];
     std::vector<uint32_t> seq_idxs[LLAMA_MAX_SEQ];
@@ -1716,7 +1707,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     const uint32_t  j  = idxs[jj];
                     const llama_pos p0 = cpos[j];
 
-                    bool keep = (p0 >= wlo && p0 <= whi);
+                    bool keep = (p0 >= wlo && p0 <= whi) || (swa_full_span && p0 >= seq_pos_min[seq_id]);
                     if (keep && is_2d && p0 == p1) {
                         keep = !cells.ext_get(j).is_2d_gt(p1_x, p1_y);
                     }
@@ -1729,7 +1720,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 for (uint32_t j = 0; j < n_kv32; ++j) {
                     set_mask_cell_scalar<T, causal, swa, is_2d, true>(
                         cells, j, seq_id, p1, p1_x, p1_y, wlo, whi,
-                        &data[idst + j], mask_drop, mask_keep, swa_type
+                        seq_pos_min[seq_id], swa_full_span, &data[idst + j], mask_drop, mask_keep
                     );
                     if (!cells.is_empty(j) && cells.seq_has(j, seq_id)) {
                         llama_pos p0 = cells.pos_get(j);
@@ -1755,7 +1746,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 bool visible = alive;
 
                 if constexpr (causal || swa) {
-                    visible = visible && (p0 >= wlo && p0 <= whi);
+                    visible = visible && ((p0 >= wlo && p0 <= whi) || (swa_full_span && p0 >= seq_pos_min[seq_id]));
                 }
 
                 if constexpr (is_2d) {
@@ -1823,6 +1814,12 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
     // n_tps == n_tokens_per_stream
     const int64_t n_tps = n_tokens/n_stream;
+
+    // see llama_non_causal_type
+    // only the SWA cache (or the SWA layers of a single cache) become non-causal
+    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+        causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
+    }
 
     //const int64_t t_start = ggml_time_us();
 
