@@ -6775,31 +6775,21 @@ static inline __m256i znq4x8_book_repeat4(const uint8_t * p, bool high) {
 }
 
 static inline __m256i znq4x8_unpack_group(const uint8_t * p) {
-    // The repack stores two nibble bytes per row. Expanding each source byte to
-    // a uint16 lane lets low/high nibbles become adjacent bytes, producing
-    // [row0 w0..w3, row1 w0..w3, ... row7 w0..w3].
-    const __m128i packed = _mm_loadu_si128((const __m128i *) p);
-    const __m256i words = _mm256_cvtepu8_epi16(packed);
-    const __m256i lo = _mm256_and_si256(words, _mm256_set1_epi16(0x000f));
-    const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(words, 4), _mm256_set1_epi16(0x000f));
-    return _mm256_or_si256(lo, _mm256_slli_epi16(hi, 8));
+    // Each dword contains eight nibbles in output order.
+    const __m256i packed = _mm256_cvtepu32_epi64(_mm_loadu_si128((const __m128i *) p));
+    const __m256i shifts = _mm256_set1_epi64x(0x1c1814100c080400);
+    return _mm256_and_si256(_mm256_multishift_epi64_epi8(shifts, packed), _mm256_set1_epi8(15));
 }
 
 static inline __m256i znq4x8_lookup_group(
         __m256i codes, __m256i books,
         __m512i table03, __m512i table47, __m512i table8b, __m512i tablecf) {
-    // Each VPERMI2B chooses from two adjacent 64-byte groups of four books.
-    // books&7 selects within books 0..7 (or 8..15), then bit 3 chooses the
-    // lower or upper pair. This avoids eight dynamic 16-byte table loads.
-    const __m256i low3 = _mm256_and_si256(books, _mm256_set1_epi8(7));
-    const __m256i indices256 = _mm256_add_epi8(codes, _mm256_slli_epi16(low3, 4));
-    const __m512i indices = _mm512_inserti64x4(_mm512_setzero_si512(), indices256, 0);
-
-    const __m256i a = _mm512_castsi512_si256(_mm512_permutex2var_epi8(table03, indices, table47));
-    const __m256i b = _mm512_castsi512_si256(_mm512_permutex2var_epi8(table8b, indices, tablecf));
-    const __m256i high = _mm256_cmpgt_epi8(
-            _mm256_and_si256(books, _mm256_set1_epi8(8)), _mm256_setzero_si256());
-    return _mm256_blendv_epi8(a, b, high);
+    // Bit 7 selects the table pair; VPERMI2B uses only the low seven bits.
+    const __m256i indices256 = _mm256_add_epi8(codes, _mm256_slli_epi16(books, 4));
+    const __m512i indices = _mm512_castsi256_si512(indices256);
+    const __m512i a = _mm512_permutex2var_epi8(table03, indices, table47);
+    const __m512i b = _mm512_permutex2var_epi8(table8b, indices, tablecf);
+    return _mm512_castsi512_si256(_mm512_mask_blend_epi8(_mm512_movepi8_mask(indices), a, b));
 }
 
 static inline uint32_t znq4x8_load_u32(const void * p) {
@@ -6847,7 +6837,43 @@ void ggml_gemv_znq4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     for (int y = 0; y < nr; ++y) {
         const block_q8_0 * a_ptr = a_ptr_start + y * nb;
-        for (int x = 0; x < nc / 8; ++x) {
+        int x = 0;
+        for (; x + 1 < nc / 8; x += 2) {
+            const block_znq4x8 * b0 = b_ptr_start + x * nb;
+            const block_znq4x8 * b1 = b0 + nb;
+            __m512 acc = _mm512_setzero_ps();
+
+            for (int ib = 0; ib < nb; ++ib) {
+                const __m512i books_lo = znq4x8_combine_ymm(
+                        znq4x8_book_repeat4(b0[ib].books, false), znq4x8_book_repeat4(b1[ib].books, false));
+                const __m512i books_hi = znq4x8_combine_ymm(
+                        znq4x8_book_repeat4(b0[ib].books, true), znq4x8_book_repeat4(b1[ib].books, true));
+                __m512i dot = _mm512_setzero_si512();
+                __m512i sumw = _mm512_setzero_si512();
+
+                for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                    const __m512i codes = znq4x8_combine_ymm(
+                            znq4x8_unpack_group(b0[ib].qs + 16 * g), znq4x8_unpack_group(b1[ib].qs + 16 * g));
+                    const __m512i indices = _mm512_add_epi8(codes, _mm512_slli_epi16(g < 4 ? books_lo : books_hi, 4));
+                    const __m512i lo = _mm512_permutex2var_epi8(table03, indices, table47);
+                    const __m512i hi = _mm512_permutex2var_epi8(table8b, indices, tablecf);
+                    const __m512i weights = _mm512_mask_blend_epi8(_mm512_movepi8_mask(indices), lo, hi);
+                    const uint32_t q = znq4x8_load_u32(a_ptr[ib].qs + 4 * g) ^ 0x80808080u;
+                    dot = _mm512_dpbusd_epi32(dot, _mm512_set1_epi32((int) q), weights);
+                    sumw = _mm512_dpbusd_epi32(sumw, _mm512_set1_epi8(1), weights);
+                }
+
+                // Remove the unsigned activation bias before the block scale.
+                dot = _mm512_sub_epi32(dot, _mm512_slli_epi32(sumw, 7));
+                const __m512 scales = _mm512_mul_ps(
+                        znq4x8_ufp8x16_to_fp32(b0[ib].d, b1[ib].d),
+                        _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[ib].d)));
+                acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dot), scales, acc);
+            }
+
+            _mm512_storeu_ps(s + y * bs + x * 8, acc);
+        }
+        for (; x < nc / 8; ++x) {
             const block_znq4x8 * b_ptr = b_ptr_start + x * nb;
             __m256 acc = _mm256_setzero_ps();
 
@@ -6944,7 +6970,8 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
     // final 0/8/16/24 columns through the existing smaller kernels. Otherwise
     // thread counts whose chunk boundaries are not x32-aligned can demote the
     // whole chunk to the old narrow GEMM path.
-    if (nr >= 64 && nr % 4 == 0 && nc >= 32) {
+    // Keep the direct 16-row tile; use a panel before repeating decode for its tail.
+    if (nr >= 20 && nc >= 32) {
         const size_t panel_size = (size_t) nb * sizeof(znq4x32_panel_block);
         auto * panel = (znq4x32_panel_block *) std::malloc(panel_size);
 
@@ -7372,7 +7399,40 @@ void ggml_gemv_znq2_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     for (int y = 0; y < nr; ++y) {
         const block_q8_0 * a_ptr = a_ptr_start + y * nb;
-        for (int x = 0; x < nc / 8; ++x) {
+        int x = 0;
+        for (; x + 1 < nc / 8; x += 2) {
+            const block_znq2x8 * b0 = b_ptr_start + x * nb;
+            const block_znq2x8 * b1 = b0 + nb;
+            __m512 acc = _mm512_setzero_ps();
+
+            for (int ib = 0; ib < nb; ++ib) {
+                const __m512i books_lo = znq4x8_combine_ymm(
+                        znq4x8_book_repeat4(b0[ib].books, false), znq4x8_book_repeat4(b1[ib].books, false));
+                const __m512i books_hi = znq4x8_combine_ymm(
+                        znq4x8_book_repeat4(b0[ib].books, true), znq4x8_book_repeat4(b1[ib].books, true));
+                __m512i dot = _mm512_setzero_si512();
+                __m512i sumw = _mm512_setzero_si512();
+
+                for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                    const __m512i codes = znq4x8_combine_ymm(
+                            znq2x8_unpack_group(b0[ib].qs[g]), znq2x8_unpack_group(b1[ib].qs[g]));
+                    const __m512i indices = _mm512_add_epi8(codes, _mm512_slli_epi16(g < 4 ? books_lo : books_hi, 2));
+                    const __m512i weights = _mm512_permutexvar_epi8(indices, table);
+                    const uint32_t q = znq4x8_load_u32(a_ptr[ib].qs + 4 * g) ^ 0x80808080u;
+                    dot = _mm512_dpbusd_epi32(dot, _mm512_set1_epi32((int) q), weights);
+                    sumw = _mm512_dpbusd_epi32(sumw, _mm512_set1_epi8(1), weights);
+                }
+
+                dot = _mm512_sub_epi32(dot, _mm512_slli_epi32(sumw, 7));
+                const __m512 scales = _mm512_mul_ps(
+                        znq4x8_ufp8x16_to_fp32(b0[ib].d, b1[ib].d),
+                        _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[ib].d)));
+                acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dot), scales, acc);
+            }
+
+            _mm512_storeu_ps(s + y * bs + x * 8, acc);
+        }
+        for (; x < nc / 8; ++x) {
             const block_znq2x8 * b_ptr = b_ptr_start + x * nb;
             __m256 acc = _mm256_setzero_ps();
 
@@ -7442,7 +7502,8 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
     // Decode 32 output rows across K once, then reuse the expanded int8 panel
     // across every four-row activation tile. After decode this is the same
     // register-balanced Zen5 VNNI engine used by ZNQ3 and ZNQ4.
-    if (nr >= 64 && nc >= 32) {
+    // Keep the direct 16-row tile; use a panel before repeating decode for its tail.
+    if (nr >= 20 && nc >= 32) {
         const size_t panel_size = (size_t) nb * sizeof(znq2x32_panel_block);
         auto * panel = (znq2x32_panel_block *) std::malloc(panel_size);
 
@@ -7859,7 +7920,40 @@ void ggml_gemv_znq3_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     for (int y = 0; y < nr; ++y) {
         const block_q8_0 * a_ptr = a_ptr_start + y * nb;
-        for (int x = 0; x < nc / 8; ++x) {
+        int x = 0;
+        for (; x + 1 < nc / 8; x += 2) {
+            const block_znq3x8 * b0 = b_ptr_start + x * nb;
+            const block_znq3x8 * b1 = b0 + nb;
+            __m512 acc = _mm512_setzero_ps();
+
+            for (int ib = 0; ib < nb; ++ib) {
+                const __m512i books_lo = znq4x8_combine_ymm(
+                        znq4x8_book_repeat4(b0[ib].books, false), znq4x8_book_repeat4(b1[ib].books, false));
+                const __m512i books_hi = znq4x8_combine_ymm(
+                        znq4x8_book_repeat4(b0[ib].books, true), znq4x8_book_repeat4(b1[ib].books, true));
+                __m512i dot = _mm512_setzero_si512();
+                __m512i sumw = _mm512_setzero_si512();
+
+                for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                    const __m512i codes = znq4x8_combine_ymm(
+                            znq3x8_unpack_group(b0[ib].planes[g]), znq3x8_unpack_group(b1[ib].planes[g]));
+                    const __m512i indices = _mm512_add_epi8(codes, _mm512_slli_epi16(g < 4 ? books_lo : books_hi, 3));
+                    const __m512i weights = _mm512_permutex2var_epi8(table07, indices, table8f);
+                    const uint32_t q = znq4x8_load_u32(a_ptr[ib].qs + 4 * g) ^ 0x80808080u;
+                    dot = _mm512_dpbusd_epi32(dot, _mm512_set1_epi32((int) q), weights);
+                    sumw = _mm512_dpbusd_epi32(sumw, _mm512_set1_epi8(1), weights);
+                }
+
+                dot = _mm512_sub_epi32(dot, _mm512_slli_epi32(sumw, 7));
+                const __m512 scales = _mm512_mul_ps(
+                        znq4x8_ufp8x16_to_fp32(b0[ib].d, b1[ib].d),
+                        _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[ib].d)));
+                acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dot), scales, acc);
+            }
+
+            _mm512_storeu_ps(s + y * bs + x * 8, acc);
+        }
+        for (; x < nc / 8; ++x) {
             const block_znq3x8 * b_ptr = b_ptr_start + x * nb;
             __m256 acc = _mm256_setzero_ps();
 
@@ -7936,7 +8030,8 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
     // expanded int8 panel for every 4-row activation tile. ZNQ3's compressed
     // decode is cheaper than ZNQ4 after unpack: all 16x8 book entries fit in
     // two ZMM tables and require just one VPERMI2B per x8 group.
-    if (nr >= 64 && nc >= 32) {
+    // Keep the direct 16-row tile; use a panel before repeating decode for its tail.
+    if (nr >= 20 && nc >= 32) {
         const size_t panel_size = (size_t) nb * sizeof(znq3x32_panel_block);
         auto * panel = (znq3x32_panel_block *) std::malloc(panel_size);
 

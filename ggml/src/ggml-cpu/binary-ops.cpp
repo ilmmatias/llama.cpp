@@ -90,7 +90,14 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
         const src0_t * src0_ptr = (const src0_t *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
         const src1_t * src1_ptr = (const src1_t *) ((const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
 
-        if (is_src1_contiguous_rows) {
+        // Vectorize across the row instead of repeating a one-element vector operation.
+        if (ne10 == 1) {
+            const float y = type_conversion_table<src1_t>::to_f32(*src1_ptr);
+            for (int64_t i = 0; i < ne00; ++i) {
+                dst_ptr[i] = type_conversion_table<dst_t>::from_f32(
+                        op(type_conversion_table<src0_t>::to_f32(src0_ptr[i]), y));
+            }
+        } else if (is_src1_contiguous_rows) {
             // src1 is broadcastable across src0 and dst in i1, i2, i3
             const int64_t nr0 = ne00 / ne10;
 
