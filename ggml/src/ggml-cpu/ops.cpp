@@ -2057,22 +2057,52 @@ static void ggml_compute_forward_concat_f32(
 
     const float * x;
 
-    // TODO: smarter multi-theading
-    for (int i3 = 0; i3 < ne3; i3++) {
-        for (int i2 = ith; i2 < ne2; i2 += nth) {
-            for (int i1 = 0; i1 < ne1; i1++) {
-                for (int i0 = 0; i0 < ne0; i0++) {
-                    if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-                        x = (const float *) ((const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03);
-                    } else {
-                        x = (const float *) ((const char *)src1->data + (i0 - o[0])*nb10 + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13);
+    // Split all outer rows so a single sequence can use every worker.
+    const int64_t nr = ne1 * ne2 * ne3;
+    const int64_t dr = (nr + nth - 1) / nth;
+    const int64_t ir_end = MIN(dr * (ith + 1), nr);
+
+    if (dim == 0 && nb00 == sizeof(float) && nb11 == sizeof(float) && nb0 == sizeof(float) && ne10 >= 32) {
+        // Tile the transposed input so adjacent output rows reuse its cache lines.
+        constexpr int64_t rows_per_tile = 32;
+        constexpr int64_t cols_per_tile = 8;
+        for (int64_t ir = dr * ith; ir < ir_end; ir += rows_per_tile) {
+            const int64_t rows = MIN(rows_per_tile, ir_end - ir);
+            const char * src_rows[rows_per_tile];
+            float * dst_rows[rows_per_tile];
+            for (int64_t r = 0; r < rows; ++r) {
+                const int64_t i1 = (ir + r) % ne1;
+                const int64_t i2 = ((ir + r) / ne1) % ne2;
+                const int64_t i3 = (ir + r) / (ne1 * ne2);
+                dst_rows[r] = (float *) ((char *) dst->data + i1*nb1 + i2*nb2 + i3*nb3);
+                memcpy(dst_rows[r], (const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03, ne00*sizeof(float));
+                src_rows[r] = (const char *) src1->data + i1*nb11 + i2*nb12 + i3*nb13;
+            }
+            for (int64_t col = 0; col < ne10; col += cols_per_tile) {
+                const int64_t end = MIN(col + cols_per_tile, ne10);
+                for (int64_t r = 0; r < rows; ++r) {
+                    for (int64_t j = col; j < end; ++j) {
+                        dst_rows[r][ne00 + j] = *(const float *) (src_rows[r] + j*nb10);
                     }
-
-                    float * y = (float *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
-
-                    *y = *x;
                 }
             }
+        }
+        return;
+    }
+    for (int64_t ir = dr * ith; ir < ir_end; ++ir) {
+        const int64_t i1 = ir % ne1;
+        const int64_t i2 = (ir / ne1) % ne2;
+        const int64_t i3 = ir / (ne1 * ne2);
+        for (int i0 = 0; i0 < ne0; i0++) {
+            if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+                x = (const float *) ((const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03);
+            } else {
+                x = (const float *) ((const char *)src1->data + (i0 - o[0])*nb10 + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13);
+            }
+
+            float * y = (float *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
+
+            *y = *x;
         }
     }
 }
