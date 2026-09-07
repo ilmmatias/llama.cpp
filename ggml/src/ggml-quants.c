@@ -5042,12 +5042,15 @@ size_t quantize_iq1_m(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
 enum { ZNQ_SCALE_SEARCH_RADIUS = 8 };
 
 static inline float znq_ufp8_to_fp32(uint8_t code) {
-    const int e = code >> 3;
-    const int m = code & 7;
+    const uint32_t e = code >> 3;
+    const uint32_t m = code & 7;
     if (e == 0) {
-        return ldexpf((float) m, -17);
+        return (float) m * (1.0f / 131072.0f);
     }
-    return ldexpf(1.0f + (float) m * 0.125f, e - 15);
+    const uint32_t bits = ((e + 112u) << 23) | (m << 20);
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
 }
 
 static uint8_t znq_fp32_to_ufp8(double x) {
@@ -5092,7 +5095,7 @@ static inline float znq_max_abs(int bits) {
     }
 }
 
-static uint8_t znq_encode_group(const float * x, int bits, int8_t * q, uint8_t * codes, const float * w) {
+static uint8_t znq_encode_group_scalar(const float * x, int bits, int8_t * q, uint8_t * codes, const float * w) {
     const int nlevels = 1 << bits;
     const int8_t * values = znq_values(bits);
     double best_err = DBL_MAX;
@@ -5121,6 +5124,90 @@ static uint8_t znq_encode_group(const float * x, int bits, int8_t * q, uint8_t *
         }
     }
     return (uint8_t) best_book;
+}
+
+#if defined(GGML_HAS_X86_INTRINSICS) && (defined(__GNUC__) || defined(__clang__)) && !defined(__FMA__) && !defined(__FAST_MATH__)
+#if defined(__clang__)
+#define ZNQ_AVX512 __attribute__((target("avx2,avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi")))
+#else
+#define ZNQ_AVX512 __attribute__((target("avx2,avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi"), optimize("fp-contract=off")))
+#endif
+
+static inline ZNQ_AVX512 __m256 znq_lookup_books(__m512i low, __m512i high, __m256i indices) {
+    const __m512i selected = _mm512_permutex2var_epi8(low, _mm512_zextsi256_si512(indices), high);
+    const __m256i values = _mm256_srai_epi32(_mm256_slli_epi32(_mm512_castsi512_si256(selected), 24), 24);
+    return _mm256_cvtepi32_ps(values);
+}
+
+static ZNQ_AVX512 uint8_t znq_encode_group_avx512(const float * x, int bits, int8_t * q, uint8_t * codes, const float * w) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const int nlevels = 1 << bits;
+    const int8_t * values = znq_values(bits);
+    const __m256i base = _mm256_setr_epi32(0, nlevels, 2*nlevels, 3*nlevels, 4*nlevels, 5*nlevels, 6*nlevels, 7*nlevels);
+    const __m256i last = _mm256_set1_epi32(nlevels - 1);
+    const __m256i one = _mm256_set1_epi32(1);
+    double errors[16];
+
+    // Each lane accumulates one book, preserving the scalar sum order and rounding.
+    for (int book = 0; book < 16; book += 8) {
+        const int8_t * table = values + book*nlevels;
+        const __mmask64 mask = nlevels == 4 ? (__mmask64) UINT32_MAX : (__mmask64) UINT64_MAX;
+        const __m512i low = _mm512_maskz_loadu_epi8(mask, table);
+        const __m512i high = nlevels == 16 ? _mm512_loadu_si512((const void *) (table + 64)) : _mm512_setzero_si512();
+        __m512d error = _mm512_setzero_pd();
+        for (int j = 0; j < 16; ++j) {
+            const __m256 value = _mm256_set1_ps(x[j]);
+            __m256i lo = _mm256_setzero_si256();
+            for (int step = nlevels / 2; step > 0; step /= 2) {
+                const __m256i mid = _mm256_min_epi32(_mm256_add_epi32(lo, _mm256_set1_epi32(step)), last);
+                const __m256 level = znq_lookup_books(low, high, _mm256_add_epi32(base, mid));
+                const __m256 ge = _mm256_cmp_ps(value, level, _CMP_GE_OQ);
+                lo = _mm256_blendv_epi8(lo, mid, _mm256_castps_si256(ge));
+            }
+            const __m256i hi = _mm256_min_epi32(_mm256_add_epi32(lo, one), last);
+            const __m256 lower = znq_lookup_books(low, high, _mm256_add_epi32(base, lo));
+            const __m256 upper = znq_lookup_books(low, high, _mm256_add_epi32(base, hi));
+            const __m256 nearer_lower = _mm256_cmp_ps(_mm256_sub_ps(value, lower), _mm256_sub_ps(upper, value), _CMP_LT_OQ);
+            const __m256 level = _mm256_blendv_ps(upper, lower, nearer_lower);
+            const __m512d diff = _mm512_sub_pd(_mm512_set1_pd((double) x[j]), _mm512_cvtps_pd(level));
+            const __m512d weight = _mm512_set1_pd(w ? (double) w[j] : 1.0);
+            const __m512d weighted = _mm512_mul_pd(weight, diff);
+            const __m512d squared = _mm512_mul_pd(weighted, diff);
+            error = _mm512_add_pd(error, squared);
+        }
+        _mm512_storeu_pd(errors + book, error);
+    }
+    int best_book = 0;
+    double best_err = DBL_MAX;
+    for (int book = 0; book < 16; ++book) {
+        if (errors[book] < best_err) {
+            best_err = errors[book];
+            best_book = book;
+        }
+    }
+    const int8_t * levels = values + best_book*nlevels;
+    for (int j = 0; j < 16; ++j) {
+        const int code = best_index_int8(nlevels, levels, x[j]);
+        q[j] = levels[code];
+        if (codes) {
+            codes[j] = (uint8_t) code;
+        }
+    }
+    return (uint8_t) best_book;
+}
+#undef ZNQ_AVX512
+#endif
+
+static uint8_t znq_encode_group(const float * x, int bits, int8_t * q, uint8_t * codes, const float * w) {
+#if defined(GGML_HAS_X86_INTRINSICS) && (defined(__GNUC__) || defined(__clang__)) && !defined(__FMA__) && !defined(__FAST_MATH__)
+    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+        __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512dq") && __builtin_cpu_supports("avx512vbmi")) {
+        return znq_encode_group_avx512(x, bits, q, codes, w);
+    }
+#endif
+    return znq_encode_group_scalar(x, bits, q, codes, w);
 }
 
 static double znq_encode_block(const float * x, int bits, float scale, int8_t * q,
