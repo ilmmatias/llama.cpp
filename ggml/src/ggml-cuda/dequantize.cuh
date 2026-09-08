@@ -1,5 +1,16 @@
 #include "common.cuh"
 #include "convert.cuh"
+#include "znq.cuh"
+
+template <int bits>
+static __device__ __forceinline__ void dequantize_znq(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const uint8_t * block = (const uint8_t *) vx + ib*(2 + 4*bits);
+    const float d = znq_scale_cuda(block[0]);
+    v.x = d * znq_value_cuda<bits>(block, iqs);
+    v.y = d * znq_value_cuda<bits>(block, iqs + 1);
+}
+
+
 
 static __device__ __forceinline__ void dequantize_q1_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q1_0 * x = (const block_q1_0 *) vx;

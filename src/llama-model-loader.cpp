@@ -1065,9 +1065,20 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 // find the first buffer type in the list that can use the tensor
 static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list) {
     GGML_ASSERT(!buft_list->empty());
+    const bool is_znq = tensor->type == GGML_TYPE_ZNQ2 || tensor->type == GGML_TYPE_ZNQ3 || tensor->type == GGML_TYPE_ZNQ4;
     for (const auto & cur : *buft_list) {
         ggml_backend_dev_t cur_dev = cur.first;
         ggml_backend_buffer_type_t cur_buft = cur.second;
+        if (is_znq && ggml_backend_dev_type(cur_dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                cur_buft == ggml_backend_dev_host_buffer_type(cur_dev)) {
+            // CPU ZNQ needs packed buffers for fast single-token execution.
+            for (const auto & cpu : *buft_list) {
+                if (ggml_backend_dev_type(cpu.first) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+                        !ggml_backend_buft_is_host(cpu.second) && weight_buft_supported(hparams, tensor, op, cpu.second, cpu.first)) {
+                    return cpu.second;
+                }
+            }
+        }
         if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev)) {
             return cur_buft;
         }

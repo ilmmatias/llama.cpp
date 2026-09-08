@@ -8267,6 +8267,7 @@ struct test_generic_op : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
         ggml_tensor * out = ggml_get_tensor(ctx, "out");
 
         std::random_device rd;
@@ -8744,6 +8745,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+    GGML_TYPE_ZNQ2, GGML_TYPE_ZNQ3, GGML_TYPE_ZNQ4,
 };
 
 static const ggml_type base_types[] = {
@@ -8772,6 +8774,7 @@ static const ggml_type other_types[] = {
     GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+    GGML_TYPE_ZNQ2, GGML_TYPE_ZNQ3, GGML_TYPE_ZNQ4,
     GGML_TYPE_BF16,
 };
 
