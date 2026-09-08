@@ -1354,13 +1354,17 @@ static __device__ __forceinline__ float vec_dot_iq1_m_q8_1(
     return d * ((sumi[0] + sumf[0]) * sc0 + (sumi[1] + sumf[1]) * sc1);
 }
 
-template <int bits>
+#define VDR_ZNQ2_Q8_1_MMVQ 8
+#define VDR_ZNQ3_Q8_1_MMVQ 8
+#define VDR_ZNQ4_Q8_1_MMVQ 8
+
+template <int bits, int vdr>
 static __device__ __forceinline__ float vec_dot_znq_q8_1(
         const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const int & kbx, const int & iqs) {
     const uint8_t * block = (const uint8_t *) vx + kbx*(2 + 4*bits);
     int sum = 0;
 #pragma unroll
-    for (int l = 0; l < 2; ++l) {
+    for (int l = 0; l < vdr; ++l) {
         sum = ggml_cuda_dp4a(znq_pack4_cuda<bits>(block, 4*(iqs + l)), get_int_b2(y->qs, iqs + l), sum);
     }
     return znq_scale_cuda(block[0]) * __low2float(y->ds) * sum;

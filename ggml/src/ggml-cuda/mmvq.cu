@@ -30,9 +30,9 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1;
         case GGML_TYPE_IQ1_S:   return vec_dot_iq1_s_q8_1;
         case GGML_TYPE_IQ1_M:   return vec_dot_iq1_m_q8_1;
-        case GGML_TYPE_ZNQ2:    return vec_dot_znq_q8_1<2>;
-        case GGML_TYPE_ZNQ3:    return vec_dot_znq_q8_1<3>;
-        case GGML_TYPE_ZNQ4:    return vec_dot_znq_q8_1<4>;
+        case GGML_TYPE_ZNQ2:    return vec_dot_znq_q8_1<2, VDR_ZNQ2_Q8_1_MMVQ>;
+        case GGML_TYPE_ZNQ3:    return vec_dot_znq_q8_1<3, VDR_ZNQ3_Q8_1_MMVQ>;
+        case GGML_TYPE_ZNQ4:    return vec_dot_znq_q8_1<4, VDR_ZNQ4_Q8_1_MMVQ>;
         case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
         case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1;
         case GGML_TYPE_IQ3_S:   return vec_dot_iq3_s_q8_1;
@@ -61,9 +61,9 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_IQ2_S:   return VDR_IQ2_S_Q8_1_MMVQ;
         case GGML_TYPE_IQ3_XXS: return VDR_IQ3_XXS_Q8_1_MMVQ;
         case GGML_TYPE_IQ3_S:   return VDR_IQ3_S_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ2:    return 2;
-        case GGML_TYPE_ZNQ3:    return 2;
-        case GGML_TYPE_ZNQ4:    return 2;
+        case GGML_TYPE_ZNQ2:    return VDR_ZNQ2_Q8_1_MMVQ;
+        case GGML_TYPE_ZNQ3:    return VDR_ZNQ3_Q8_1_MMVQ;
+        case GGML_TYPE_ZNQ4:    return VDR_ZNQ4_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_NL:  return VDR_IQ4_NL_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_XS:  return VDR_IQ4_XS_Q8_1_MMVQ;
         default:                return 1;
