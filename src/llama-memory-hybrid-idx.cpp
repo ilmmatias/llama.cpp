@@ -495,10 +495,13 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
     std::vector<int32_t> cur_blk_cells(r*n_blocks);
 
+    std::vector<int32_t> order;
+    std::vector<int32_t> rank;
+
     int64_t n_update = 0;
     bool have_fallback = false;
     std::vector<int32_t> fallback_cells(r, 0);
-    int32_t fallback_pos = 0;
+    int32_t fallback_pos[4] = { 0, 0, 0, 0 };
     int64_t fallback_idx = 0;
 
     for (int64_t s = 0; s < n_ns; ++s) {
@@ -506,31 +509,93 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
         const auto & cells = mem_idx->get_cells(seq_of_stream);
         int32_t * cur_cell_blk = dst_cell_blk != nullptr ? dst_cell_blk + s*n_kv : nullptr;
-        // an incomplete block cannot be pooled; the bias below forces those tail cells in
-        // -1 means no usable block, and block 0 only keeps the gather in range
-        std::fill(blk_of.begin(),  blk_of.end(),  -1);
-        std::fill(filled.begin(),  filled.end(),   0);
-        std::fill(cur_blk_cells.begin(), cur_blk_cells.end(), -1);
+        int n_seq_present = 0;
+
+        for (int sq = 0; sq < LLAMA_MAX_SEQ && n_seq_present < 2; ++sq) {
+            if (cells.seq_pos_min(sq) >= 0) {
+                n_seq_present++;
+            }
+        }
+
+        const bool one_seq = n_seq_present <= 1;
+
         // a cell no block covers needs its own -inf, which a per-block bias cannot carry
         // every cache path keeps the position below the cell window, so this stays false
         bool oor = false;
 
-        for (int64_t j = 0; j < n_kv; ++j) {
-            if (cells.is_empty(j)) {
-                continue;
+        bool dup = false;
+
+        bool ranked = false;
+
+        auto group_cells = [&]() {
+            // an incomplete block cannot be pooled; the bias below forces those tail cells in
+            // -1 means no usable block, and block 0 only keeps the gather in range
+            std::fill(blk_of.begin(),  blk_of.end(),  -1);
+            std::fill(filled.begin(),  filled.end(),   0);
+            std::fill(cur_blk_cells.begin(), cur_blk_cells.end(), -1);
+
+            oor = false;
+            dup = false;
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (cells.is_empty(j)) {
+                    continue;
+                }
+
+                const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
+                const int64_t b   = idx/r;
+
+                if (b >= n_blocks) {
+                    oor = true;
+                    continue;
+                }
+
+                const int64_t slot = b*r + (idx%r);
+
+                dup |= cur_blk_cells[slot] >= 0;
+
+                blk_of[j] = (int32_t) b;
+                cur_blk_cells[slot] = (int32_t) j;
+                filled[b]++;
+            }
+        };
+
+        group_cells();
+
+        // mrope repeats one position across an image, so rank cells instead of using the position
+        if (dup && ubatch->is_pos_2d() && one_seq) {
+            order.clear();
+            order.reserve(n_kv);
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (!cells.is_empty(j)) {
+                    order.push_back((int32_t) j);
+                }
             }
 
-            const llama_pos p = cells.pos_get(j);
-            const int64_t   b = p/r;
+            // same total order the mrope causal mask uses: pos, then ext.y, then ext.x
+            std::sort(order.begin(), order.end(), [&cells](int32_t a, int32_t b) {
+                const llama_pos pa = cells.pos_get(a);
+                const llama_pos pb = cells.pos_get(b);
 
-            if (b >= n_blocks) {
-                oor = true;
-                continue;
+                if (pa != pb) {
+                    return pa < pb;
+                }
+
+                const auto & ea = cells.ext_get(a);
+
+                return cells.ext_get(b).is_2d_gt(ea.x, ea.y);
+            });
+
+            rank.assign(n_kv, -1);
+
+            for (int64_t k = 0; k < (int64_t) order.size(); ++k) {
+                rank[order[k]] = (int32_t) k;
             }
 
-            blk_of[j] = (int32_t) b;
-            cur_blk_cells[b*r + (p%r)] = (int32_t) j;
-            filled[b]++;
+            ranked = true;
+
+            group_cells();
         }
 
         GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
@@ -555,6 +620,19 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 continue;
             }
 
+            int32_t sec_pos[4] = { (int32_t) (b*r), (int32_t) (b*r), (int32_t) (b*r), (int32_t) (b*r) };
+
+            if (ranked) {
+                const int32_t   c = cur_blk_cells[b*r];
+                const llama_pos p = cells.pos_get(c);
+                const auto &    e = cells.ext_get(c);
+
+                sec_pos[0] = p;
+                sec_pos[1] = e.y;
+                sec_pos[2] = e.x;
+                sec_pos[3] = p;
+            }
+
             llama_memory_hybrid_idx::qsa_block now;
             now.cells.assign(cur_blk_cells.begin() + b*r, cur_blk_cells.begin() + (b + 1)*r);
 
@@ -574,7 +652,9 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
             if (!have_fallback) {
                 have_fallback = true;
-                fallback_pos = (int32_t) (b*r);
+                for (int64_t sec = 0; sec < 4; ++sec) {
+                    fallback_pos[sec] = sec_pos[sec];
+                }
                 fallback_idx = global_dst;
                 for (int64_t ir = 0; ir < r; ++ir) {
                     const int64_t global_src = stream_off + cur_blk_cells[b*r + ir];
@@ -595,7 +675,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 dst_update_cells[n_update*r + ir] = (int32_t) global_src;
             }
             for (int64_t sec = 0; sec < 4; ++sec) {
-                dst_update_pos[sec*n_updates + n_update] = (int32_t) (b*r);
+                dst_update_pos[sec*n_updates + n_update] = sec_pos[sec];
             }
             dst_update_idxs[n_update++] = global_dst;
         }
@@ -624,10 +704,34 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         for (int64_t ii = 0; ii < n_tps; ++ii) {
             const int64_t      i      = s*n_tps + ii;
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
-            const llama_pos    q      = ubatch->pos[i];
+
+            int64_t q = ubatch->pos[i];
+
+            if (ranked) {
+                const llama_pos qt = ubatch->pos[i];
+                const llama_pos qy = ubatch->pos[i + n_tokens];
+                const llama_pos qx = ubatch->pos[i + n_tokens*2];
+
+                int64_t lo = 0;
+                int64_t hi = (int64_t) order.size();
+
+                while (lo < hi) {
+                    const int64_t   mid = (lo + hi)/2;
+                    const int32_t   c   = order[mid];
+                    const llama_pos pc  = cells.pos_get(c);
+
+                    if (pc < qt || (pc == qt && !cells.ext_get(c).is_2d_gt(qx, qy))) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+
+                q = lo - 1;
+            }
 
             // the tail is an incomplete block and is always visible, as in the reference
-            const llama_pos tail_start = (q + 1)/r*r;
+            const int64_t tail_start = (q + 1)/r*r;
 
             if (blk_bias) {
                 // a block sits wholly inside or outside the tail, so one value covers it
@@ -647,9 +751,13 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             for (int64_t j = 0; j < n_kv; ++j) {
                 float v = -INFINITY;
 
-                if (!cells.is_empty(j) && cells.seq_has(j, seq_id) && cells.pos_get(j) <= q) {
-                    // finite, so it can never meet a -inf and produce a nan
-                    v = cells.pos_get(j) >= tail_start ? 1e9f : (blk_of[j] < 0 ? -INFINITY : 0.0f);
+                if (!cells.is_empty(j) && cells.seq_has(j, seq_id)) {
+                    const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
+
+                    if (idx <= q) {
+                        // finite, so it can never meet a -inf and produce a nan
+                        v = idx >= tail_start ? 1e9f : (blk_of[j] < 0 ? -INFINITY : 0.0f);
+                    }
                 }
 
                 cur_bias[j] = v;
@@ -665,7 +773,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             dst_update_cells[ir] = have_fallback ? fallback_cells[ir] : 0;
         }
         for (int64_t sec = 0; sec < 4; ++sec) {
-            dst_update_pos[sec*n_updates] = have_fallback ? fallback_pos : 0;
+            dst_update_pos[sec*n_updates] = have_fallback ? fallback_pos[sec] : 0;
         }
         dst_update_idxs[0] = have_fallback ? fallback_idx : 0;
         n_update = 1;
