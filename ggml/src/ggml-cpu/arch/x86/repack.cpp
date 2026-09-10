@@ -7893,6 +7893,30 @@ static inline __m256i znq3x8_lookup_group(
     return _mm512_castsi512_si256(_mm512_permutex2var_epi8(table07, indices, table8f));
 }
 
+static inline __m512i znq3x16_unpack_group(const uint32_t planes0[3], const uint32_t planes1[3]) {
+    const __mmask64 m0 = (__mmask64) planes0[0] | ((__mmask64) planes1[0] << 32);
+    const __mmask64 m1 = (__mmask64) planes0[1] | ((__mmask64) planes1[1] << 32);
+    const __mmask64 m2 = (__mmask64) planes0[2] | ((__mmask64) planes1[2] << 32);
+
+    const __m512i b0 = _mm512_maskz_set1_epi8(m0, 1);
+    const __m512i b1 = _mm512_maskz_set1_epi8(m1, 2);
+    const __m512i b2 = _mm512_maskz_set1_epi8(m2, 4);
+    return _mm512_ternarylogic_epi32(b0, b1, b2, 0xfe);
+}
+
+static inline __m512i znq3x16_book_repeat4(const uint8_t * p0, const uint8_t * p1, bool high) {
+    const __m128i lo = _mm_loadl_epi64((const __m128i *) p0);
+    const __m128i hi = _mm_loadl_epi64((const __m128i *) p1);
+    __m128i books = _mm_unpacklo_epi64(lo, hi);
+    if (high) {
+        books = _mm_srli_epi16(books, 4);
+    }
+    books = _mm_and_si128(books, _mm_set1_epi8(0x0f));
+
+    const __m512i dwords = _mm512_cvtepu8_epi32(books);
+    return _mm512_mullo_epi32(dwords, _mm512_set1_epi32(0x01010101));
+}
+
 // Transient decoded panel for 32 ZNQ3 output rows. This deliberately has the
 // same post-decode layout as the ZNQ4 panel: once 3-bit codes have been
 // expanded to int8 weights, both formats share the exact same Zen5 VNNI core.
@@ -7927,16 +7951,13 @@ void ggml_gemv_znq3_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
             __m512 acc = _mm512_setzero_ps();
 
             for (int ib = 0; ib < nb; ++ib) {
-                const __m512i books_lo = znq4x8_combine_ymm(
-                        znq4x8_book_repeat4(b0[ib].books, false), znq4x8_book_repeat4(b1[ib].books, false));
-                const __m512i books_hi = znq4x8_combine_ymm(
-                        znq4x8_book_repeat4(b0[ib].books, true), znq4x8_book_repeat4(b1[ib].books, true));
+                const __m512i books_lo = znq3x16_book_repeat4(b0[ib].books, b1[ib].books, false);
+                const __m512i books_hi = znq3x16_book_repeat4(b0[ib].books, b1[ib].books, true);
                 __m512i dot = _mm512_setzero_si512();
                 __m512i sumw = _mm512_setzero_si512();
 
                 for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                    const __m512i codes = znq4x8_combine_ymm(
-                            znq3x8_unpack_group(b0[ib].planes[g]), znq3x8_unpack_group(b1[ib].planes[g]));
+                    const __m512i codes = znq3x16_unpack_group(b0[ib].planes[g], b1[ib].planes[g]);
                     const __m512i indices = _mm512_add_epi8(codes, _mm512_slli_epi16(g < 4 ? books_lo : books_hi, 3));
                     const __m512i weights = _mm512_permutex2var_epi8(table07, indices, table8f);
                     const uint32_t q = znq4x8_load_u32(a_ptr[ib].qs + 4 * g) ^ 0x80808080u;
