@@ -56,9 +56,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         // K-shift must not rotate them while the stream copies in the same update still apply
         hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;
 
-        // fool llama_kv_cache into thinking this is a MLA cache, so it won't cache V tensors
-        hparams_idx.n_embd_head_k_mla_impl = model.hparams.indexer_head_size;
-        hparams_idx.n_embd_head_v_mla_impl = model.hparams.indexer_head_size;
+        // note: upstream 311d4211b ("avoid allocating V cache for indexer") marks this cache as MLA
+        // so that llama_kv_cache skips V. That assumes a K-only indexer; this tree persists the
+        // derived (pooled, normalized, rotated) keys in the indexer V cache, so V must exist.
 
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
