@@ -176,9 +176,7 @@ static __global__ void dsv4_hc_comb_f32(
     }
 }
 
-// One block owns one embedding tile for one token. The four stream weights
-// are uniform across the tile, so stage them once and reuse them for all 256
-// embedding elements instead of issuing the same four weight loads per thread.
+template <bool gated>
 static __global__ void dsv4_hc_pre_f32_tiled(
         const float * x,
         const float * weights,
@@ -190,8 +188,10 @@ static __global__ void dsv4_hc_pre_f32_tiled(
         int64_t sx2,
         int64_t sw0,
         int64_t sw1,
+        int64_t sw2,
         int64_t sd0,
-        int64_t sd1) {
+        int64_t sd1,
+        float scale) {
     __shared__ float weights_s[DSV4_HC];
 
     ggml_cuda_pdl_lc();
@@ -202,10 +202,12 @@ static __global__ void dsv4_hc_pre_f32_tiled(
 
     ggml_cuda_pdl_sync();
 
-    if (tid < DSV4_HC) {
-        weights_s[tid] = weights[tid*sw0 + it*sw1];
+    if constexpr (!gated) {
+        if (tid < DSV4_HC) {
+            weights_s[tid] = weights[tid*sw0 + it*sw1];
+        }
+        __syncthreads();
     }
-    __syncthreads();
 
     if (i0 >= n_embd) {
         return;
@@ -214,17 +216,20 @@ static __global__ void dsv4_hc_pre_f32_tiled(
     float sum = 0.0f;
 #pragma unroll
     for (int ih = 0; ih < DSV4_HC; ++ih) {
-        sum = fmaf(x[i0*sx0 + ih*sx1 + it*sx2], weights_s[ih], sum);
+        float wv;
+        if constexpr (gated) {
+            wv = 1.0f / (1.0f + expf(-weights[i0*sw0 + ih*sw1 + it*sw2]));
+        } else {
+            wv = weights_s[ih];
+        }
+
+        sum = fmaf(x[i0*sx0 + ih*sx1 + it*sx2], wv, sum);
     }
 
-    dst[i0*sd0 + it*sd1] = sum;
+    dst[i0*sd0 + it*sd1] = scale * sum;
 }
 
-// One block owns one embedding tile for one token. The 4 post coefficients
-// and 4x4 combination matrix are uniform across that tile, so stage them once
-// in shared memory. Each thread then loads x and the four residual streams once
-// and produces all four destination streams. This mirrors the Vulkan kernel and
-// avoids re-reading x/residual four times in separate destination blocks.
+template <bool has_comb>
 static __global__ void dsv4_hc_post_f32_tiled(
         const float * x,
         const float * residual,
@@ -260,11 +265,15 @@ static __global__ void dsv4_hc_post_f32_tiled(
     if (tid < DSV4_HC) {
         post_s[tid] = post[tid*sp0 + it*sp1];
     }
-    if (tid < DSV4_HC*DSV4_HC) {
-        const int idst = tid & (DSV4_HC - 1);
-        const int isrc = tid / DSV4_HC;
-        comb_s[tid] = comb[idst*sc0 + isrc*sc1 + it*sc2];
+
+    if constexpr (has_comb) {
+        if (tid < DSV4_HC*DSV4_HC) {
+            const int idst = tid & (DSV4_HC - 1);
+            const int isrc = tid / DSV4_HC;
+            comb_s[tid] = comb[idst*sc0 + isrc*sc1 + it*sc2];
+        }
     }
+
     __syncthreads();
 
     if (i0 >= n_embd) {
@@ -272,20 +281,30 @@ static __global__ void dsv4_hc_post_f32_tiled(
     }
 
     const float xv = x[i0*sx0 + it*sx1];
-    float r[DSV4_HC];
-#pragma unroll
-    for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
-        r[isrc] = residual[i0*sr0 + isrc*sr1 + it*sr2];
-    }
 
-#pragma unroll
-    for (int idst = 0; idst < DSV4_HC; ++idst) {
-        float sum = xv * post_s[idst];
+    if constexpr (has_comb) {
+        float r[DSV4_HC];
 #pragma unroll
         for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
-            sum = fmaf(r[isrc], comb_s[idst + DSV4_HC*isrc], sum);
+            r[isrc] = residual[i0*sr0 + isrc*sr1 + it*sr2];
         }
-        dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
+
+#pragma unroll
+        for (int idst = 0; idst < DSV4_HC; ++idst) {
+            float sum = xv * post_s[idst];
+#pragma unroll
+            for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+                sum = fmaf(r[isrc], comb_s[idst + DSV4_HC*isrc], sum);
+            }
+            dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
+        }
+    } else {
+#pragma unroll
+        for (int idst = 0; idst < DSV4_HC; ++idst) {
+            dst[i0*sd0 + idst*sd1 + it*sd2] =
+                xv * post_s[idst] +
+                residual[i0*sr0 + idst*sr1 + it*sr2];
+        }
     }
 }
 
@@ -355,17 +374,28 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     GGML_ASSERT(hc == DSV4_HC);
 
+    const float scale = ggml_get_op_params_f32(dst, 0);
+    const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
+
     constexpr int block_size = 256;
     const dim3 block_dims(block_size, 1, 1);
     const dim3 grid_dims((n_embd + block_size - 1) / block_size, n_tokens, 1);
-    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    ggml_cuda_kernel_launch(dsv4_hc_pre_f32_tiled, launch_params,
-            (const float *) x->data, (const float *) weights->data, (float *) dst->data,
+    auto kernel = gated
+        ? dsv4_hc_pre_f32_tiled<true>
+        : dsv4_hc_pre_f32_tiled<false>;
+
+    ggml_cuda_kernel_launch(kernel, launch_params,
+            (const float *) x->data,
+            (const float *) weights->data,
+            (float *) dst->data,
             n_embd, n_tokens,
             nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
-            nbw0 / sizeof(float), nbw1 / sizeof(float),
-            nbd0 / sizeof(float), nbd1 / sizeof(float));
+            nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
+            nbd0 / sizeof(float), nbd1 / sizeof(float),
+            scale);
 }
 
 void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -377,14 +407,17 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(residual->type == GGML_TYPE_F32);
     GGML_ASSERT(post->type == GGML_TYPE_F32);
-    GGML_ASSERT(comb->type == GGML_TYPE_F32);
+    GGML_ASSERT(comb == nullptr || comb->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
     GGML_TENSOR_LOCALS(size_t, nbx, x,        nb);
     GGML_TENSOR_LOCALS(size_t, nbr, residual, nb);
     GGML_TENSOR_LOCALS(size_t, nbp, post,     nb);
-    GGML_TENSOR_LOCALS(size_t, nbc, comb,     nb);
     GGML_TENSOR_LOCALS(size_t, nbd, dst,      nb);
+
+    const size_t nbc0 = comb ? comb->nb[0] : 0;
+    const size_t nbc1 = comb ? comb->nb[1] : 0;
+    const size_t nbc2 = comb ? comb->nb[2] : 0;
 
     const int64_t n_embd   = x->ne[0];
     const int64_t n_tokens = x->ne[1];
@@ -397,9 +430,16 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const dim3 grid_dims((n_embd + block_size - 1) / block_size, n_tokens, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    ggml_cuda_kernel_launch(dsv4_hc_post_f32_tiled, launch_params,
-            (const float *) x->data, (const float *) residual->data,
-            (const float *) post->data, (const float *) comb->data, (float *) dst->data,
+    auto kernel = comb
+        ? dsv4_hc_post_f32_tiled<true>
+        : dsv4_hc_post_f32_tiled<false>;
+
+    ggml_cuda_kernel_launch(kernel, launch_params,
+            (const float *) x->data,
+            (const float *) residual->data,
+            (const float *) post->data,
+            comb ? (const float *) comb->data : nullptr,
+            (float *) dst->data,
             n_embd, n_tokens,
             nbx0 / sizeof(float), nbx1 / sizeof(float),
             nbr0 / sizeof(float), nbr1 / sizeof(float), nbr2 / sizeof(float),
