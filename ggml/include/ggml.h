@@ -2748,6 +2748,17 @@ extern "C" {
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
 
+    // hc_post with an identity comb and per-stream sigmoid gate (Qwen3.8-Flash-Next):
+    //   post[h, t] = 2*sigmoid(gate[h, t]*gate_scale)
+    //   result[i, h, t] = x[i, t]*post[h, t] + residual[i, h, t]
+    //
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_post_gated(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * gate,
+            float                 gate_scale);
+
     // Qwen4Exp sparse-attention block score.
     // q:     F32 [n_embd, n_head, n_query, n_stream]
     // k:     F32 [n_embd, n_cache]

@@ -6660,15 +6660,18 @@ struct ggml_tensor * ggml_dsv4_hc_pre_gated(
 
 // ggml_dsv4_hc_post
 
-struct ggml_tensor * ggml_dsv4_hc_post(
+static struct ggml_tensor * ggml_dsv4_hc_post_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
         struct ggml_tensor  * residual,
         struct ggml_tensor  * post,
-        struct ggml_tensor  * comb) {
+        struct ggml_tensor  * comb,
+        float                 gate_scale,
+        bool                  gated) {
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(residual->type == GGML_TYPE_F32);
     GGML_ASSERT(post->type == GGML_TYPE_F32);
+    GGML_ASSERT(!gated || comb == NULL);
 
     const int64_t n_embd   = x->ne[0];
     const int64_t n_tokens = x->ne[1];
@@ -6697,6 +6700,9 @@ struct ggml_tensor * ggml_dsv4_hc_post(
 
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
 
+    ggml_set_op_params_f32(result, 0, gate_scale);
+    ggml_set_op_params_i32(result, 1, gated ? 1 : 0);
+
     result->op     = GGML_OP_DSV4_HC_POST;
     result->src[0] = x;
     result->src[1] = residual;
@@ -6704,6 +6710,24 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[3] = comb;
 
     return result;
+}
+
+struct ggml_tensor * ggml_dsv4_hc_post(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * post,
+        struct ggml_tensor  * comb) {
+    return ggml_dsv4_hc_post_impl(ctx, x, residual, post, comb, 1.0f, false);
+}
+
+struct ggml_tensor * ggml_dsv4_hc_post_gated(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * gate,
+        float                 gate_scale) {
+    return ggml_dsv4_hc_post_impl(ctx, x, residual, gate, NULL, gate_scale, true);
 }
 
 // ggml_qsa_block_score

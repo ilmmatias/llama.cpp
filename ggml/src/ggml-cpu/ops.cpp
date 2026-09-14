@@ -11653,6 +11653,10 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
     const int64_t n_tokens = x->ne[1];
     const int64_t hc       = residual->ne[1];
 
+    const float gate_scale = ggml_get_op_params_f32(dst, 0);
+    const bool  gated      = ggml_get_op_params_i32(dst, 1) != 0;
+    GGML_ASSERT(!gated || comb == nullptr);
+
     GGML_ASSERT(dst->ne[0] == n_embd);
     GGML_ASSERT(dst->ne[1] == hc);
     GGML_ASSERT(dst->ne[2] == n_tokens);
@@ -11694,7 +11698,10 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
         const int64_t it     = ir / (n_embd * hc);
 
         const float xv = *(const float *) ((const char *) x->data    + i0*nbx0 + it*nbx1);
-        const float pv = *(const float *) ((const char *) post->data + idst*nbp0 + it*nbp1);
+        float pv = *(const float *) ((const char *) post->data + idst*nbp0 + it*nbp1);
+        if (gated) {
+            pv = 2.0f / (1.0f + expf(-pv * gate_scale));
+        }
 
         float sum = xv * pv;
         if (comb) {

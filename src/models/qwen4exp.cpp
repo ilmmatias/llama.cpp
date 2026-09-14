@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -392,22 +393,34 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = residual->ne[2];
 
-    // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
-    ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
-    w = ggml_scale(ctx0, w, 2.0f);
+    // Fold 2*sigmoid(inject/hc) into the identity HC-post kernel. At tg1 this
+    // otherwise launches three kernels to transform only hc=4 floats per mixer.
+    static const bool fuse_post_gate = [] {
+        const char * e = std::getenv("QWEN4EXP_HC_POST_GATE_FUSE");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
 
     ggml_tensor * cur = nullptr;
-    if (cparams.fused_dsv4_hc_post && il >= 0) {
-        // identity comb: every stream adds the same block output, scaled by its own weight
-        cur = ggml_dsv4_hc_post(ctx0, block_out, residual, w, nullptr);
+    if (cparams.fused_dsv4_hc_post && il >= 0 && fuse_post_gate) {
+        cur = ggml_dsv4_hc_post_gated(ctx0, block_out, residual, inject, 1.0f / (float) hc);
         res->add_fused_node({LLM_FUSED_OP_DSV4_HC_POST, cur, il});
     } else {
-        w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
+        // Reference/#28901 path. Keeping this intact gives a same-binary A/B with
+        // QWEN4EXP_HC_POST_GATE_FUSE=0 when the ordinary identity post is supported.
+        ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
+        w = ggml_scale(ctx0, w, 2.0f);
 
-        ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
-        b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
+        if (cparams.fused_dsv4_hc_post && il >= 0) {
+            cur = ggml_dsv4_hc_post(ctx0, block_out, residual, w, nullptr);
+            res->add_fused_node({LLM_FUSED_OP_DSV4_HC_POST, cur, il});
+        } else {
+            w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
 
-        cur = ggml_add(ctx0, residual, ggml_mul(ctx0, b, w));
+            ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
+            b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
+
+            cur = ggml_add(ctx0, residual, ggml_mul(ctx0, b, w));
+        }
     }
     cb(cur, "hc_combine", il);
 

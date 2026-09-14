@@ -229,7 +229,7 @@ static __global__ void dsv4_hc_pre_f32_tiled(
     dst[i0*sd0 + it*sd1] = scale * sum;
 }
 
-template <bool has_comb>
+template <bool has_comb, bool gated_post>
 static __global__ void dsv4_hc_post_f32_tiled(
         const float * x,
         const float * residual,
@@ -245,6 +245,7 @@ static __global__ void dsv4_hc_post_f32_tiled(
         int64_t sr2,
         int64_t sp0,
         int64_t sp1,
+        float gate_scale,
         int64_t sc0,
         int64_t sc1,
         int64_t sc2,
@@ -253,6 +254,8 @@ static __global__ void dsv4_hc_post_f32_tiled(
         int64_t sd2) {
     __shared__ float post_s[DSV4_HC];
     __shared__ float comb_s[DSV4_HC*DSV4_HC];
+
+    static_assert(!has_comb || !gated_post, "gated HC post only supports identity mixing");
 
     ggml_cuda_pdl_lc();
 
@@ -263,7 +266,11 @@ static __global__ void dsv4_hc_post_f32_tiled(
     ggml_cuda_pdl_sync();
 
     if (tid < DSV4_HC) {
-        post_s[tid] = post[tid*sp0 + it*sp1];
+        float pv = post[tid*sp0 + it*sp1];
+        if constexpr (gated_post) {
+            pv = 2.0f / (1.0f + expf(-pv * gate_scale));
+        }
+        post_s[tid] = pv;
     }
 
     if constexpr (has_comb) {
@@ -423,7 +430,11 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const int64_t n_tokens = x->ne[1];
     const int64_t hc       = residual->ne[1];
 
+    const float gate_scale = ggml_get_op_params_f32(dst, 0);
+    const bool  gated_post = ggml_get_op_params_i32(dst, 1) != 0;
+
     GGML_ASSERT(hc == DSV4_HC);
+    GGML_ASSERT(!gated_post || comb == nullptr);
 
     constexpr int block_size = 256;
     const dim3 block_dims(block_size, 1, 1);
@@ -431,8 +442,10 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
     auto kernel = comb
-        ? dsv4_hc_post_f32_tiled<true>
-        : dsv4_hc_post_f32_tiled<false>;
+        ? dsv4_hc_post_f32_tiled<true, false>
+        : gated_post
+            ? dsv4_hc_post_f32_tiled<false, true>
+            : dsv4_hc_post_f32_tiled<false, false>;
 
     ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data,
@@ -444,6 +457,7 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbx0 / sizeof(float), nbx1 / sizeof(float),
             nbr0 / sizeof(float), nbr1 / sizeof(float), nbr2 / sizeof(float),
             nbp0 / sizeof(float), nbp1 / sizeof(float),
+            gate_scale,
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
 }

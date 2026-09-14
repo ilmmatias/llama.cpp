@@ -4328,6 +4328,7 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
     const bool    identity;
+    const bool    gated;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4335,11 +4336,13 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR3(n_embd, n_tokens, identity);
+        return VARS_TO_STR4(n_embd, n_tokens, identity, gated);
     }
 
-    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false)
-        : n_embd(n_embd), n_tokens(n_tokens), identity(identity) {}
+    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false)
+        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated) {
+        GGML_ASSERT(!gated || identity);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
@@ -4349,7 +4352,7 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
         ggml_set_name(residual, "residual");
 
         ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
-        ggml_set_name(post, "post");
+        ggml_set_name(post, gated ? "gate" : "post");
 
         ggml_tensor * comb = nullptr;
         if (!identity) {
@@ -4357,7 +4360,9 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
             ggml_set_name(comb, "comb");
         }
 
-        out = ggml_dsv4_hc_post(ctx, x, residual, post, comb);
+        out = gated
+            ? ggml_dsv4_hc_post_gated(ctx, x, residual, post, 1.0f/hc)
+            : ggml_dsv4_hc_post(ctx, x, residual, post, comb);
         ggml_set_name(out, "out");
         return out;
     }
@@ -9149,6 +9154,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, true, true));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
