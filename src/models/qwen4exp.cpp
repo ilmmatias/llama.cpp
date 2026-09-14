@@ -876,7 +876,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
     const int64_t n_block_top = std::min<int64_t>(n_blocks, (width + r - 1)/r + 1);
     const bool compact_select = blk_bias && n_tps == 1 && n_stream == 1 && cparams.flash_attn &&
-        4*n_tps*width < n_kv && n_block_top < n_blocks;
+        8*n_tps*width < n_kv && n_block_top < n_blocks;
 
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
@@ -1128,7 +1128,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // selected cells twice, so the two meet at 2*n_tps*width == n_kv. the margin below keeps
     // the win clear and the windows small enough to stay in the compute buffer of a decode
     // graph. flash attention keeps the value side as rows, which is what the gather reads
-    ggml_tensor * cur = cparams.flash_attn && 4*n_tps*width < n_kv
+    ggml_tensor * cur = cparams.flash_attn && 16*n_tps*width < n_kv
         ? build_qsa_gather(inp, q_cur, top_k, kq_scale, il)
         : build_qsa_scan  (inp, q_cur, top_k, kq_scale, il);
     cb(cur, "kqv_out", il);
