@@ -290,7 +290,7 @@ add_test(NAME test-download-model COMMAND ${CMAKE_COMMAND}
     -DDEST=${MODEL_DEST}
     -DNAME=${MODEL_NAME}
     -DHASH=${MODEL_HASH}
-    -P ${CMAKE_SOURCE_DIR}/cmake/download-models.cmake
+    -P ${PROJECT_SOURCE_DIR}/cmake/download-models.cmake
 )
 set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download-model)
 
@@ -324,7 +324,7 @@ if (APPLE)
     llama_build(test-rset-release.cpp)
 endif()
 
-if (NOT GGML_BACKEND_DL)
+if (NOT GGML_BACKEND_DL AND GGML_CPU)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)
     llama_build_and_test(test-quantize-fns.cpp)
