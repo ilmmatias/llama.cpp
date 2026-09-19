@@ -180,9 +180,7 @@ llama_kv_cache::llama_kv_cache(
         name_tag != nullptr && strcmp(name_tag, "idx_") == 0 &&
         qsa_indexer_host_env != nullptr && atoi(qsa_indexer_host_env) != 0;
 
-    if (qsa_indexer_host) {
-        LLAMA_LOG_INFO("%s: using mapped pinned host memory for the raw QSA indexer K cache\n", __func__);
-    }
+    bool qsa_indexer_host_logged = false;
 
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
@@ -237,6 +235,8 @@ llama_kv_cache::llama_kv_cache(
 
         if (offload) {
             auto * dev = model.dev_layer(il);
+            buft = ggml_backend_dev_buffer_type(dev);
+            dev_name = ggml_backend_dev_name(dev);
 
             if (qsa_indexer_host) {
                 using qsa_host_buft_fn_t = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t);
@@ -245,19 +245,23 @@ llama_kv_cache::llama_kv_cache(
                 auto * fn = reinterpret_cast<qsa_host_buft_fn_t>(
                         ggml_backend_reg_get_proc_address(reg, "ggml_backend_qsa_host_buffer_type"));
 
-                if (fn == nullptr) {
-                    throw std::runtime_error("QSA mapped host cache is not supported by the selected backend");
-                }
+                // Fit probes temporarily move layers to CPU/system-memory backends.
+                // Those backends do not export the mapped-host QSA buffer hook; in
+                // that case use the layer's normal buffer type instead of failing
+                // the entire fit pass.  The final ROCm/CUDA layout still takes the
+                // mapped path for every layer that remains on that accelerator.
+                if (fn != nullptr) {
+                    if (ggml_backend_buffer_type_t qsa_buft = fn(dev)) {
+                        buft = qsa_buft;
+                        dev_name = ggml_backend_buft_name(buft);
 
-                buft = fn(dev);
-                if (buft == nullptr) {
-                    throw std::runtime_error("failed to get QSA mapped host buffer type");
+                        if (!qsa_indexer_host_logged) {
+                            LLAMA_LOG_INFO("%s: using mapped pinned host memory for the raw QSA indexer K cache\n",
+                                    __func__);
+                            qsa_indexer_host_logged = true;
+                        }
+                    }
                 }
-
-                dev_name = ggml_backend_buft_name(buft);
-            } else {
-                buft = ggml_backend_dev_buffer_type(dev);
-                dev_name = ggml_backend_dev_name(dev);
             }
         }
 
