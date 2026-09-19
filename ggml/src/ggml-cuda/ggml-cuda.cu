@@ -1334,6 +1334,95 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
     return &ggml_backend_cuda_buffer_type_host;
 }
 
+// QSA mapped-host buffer type.
+//
+// Keep this distinct from the ordinary CUDA/HIP host buffer.  The scheduler
+// may otherwise decide that unrelated host tensors are valid GPU inputs.  Only
+// kernels that explicitly translate this buffer's CPU pointer with
+// ggml_cuda_qsa_host_device_ptr() are allowed to consume it on a discrete GPU.
+struct ggml_backend_cuda_qsa_host_buft_context {
+    std::string name;
+};
+
+static const char * ggml_backend_cuda_qsa_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    auto * ctx = static_cast<const ggml_backend_cuda_qsa_host_buft_context *>(buft->context);
+    return ctx->name.c_str();
+}
+
+bool ggml_backend_buft_is_cuda_qsa_host(ggml_backend_buffer_type_t buft) {
+    return buft != nullptr && buft->iface.get_name == ggml_backend_cuda_qsa_host_buffer_type_name;
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_qsa_host_buffer_type_alloc_buffer(
+        ggml_backend_buffer_type_t buft, size_t size) {
+    // no-alloc model fitting still asks for a zero-sized dummy buffer
+    if (size == 0) {
+        ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), 0);
+        if (buffer != nullptr) {
+            buffer->buft = buft;
+        }
+        return buffer;
+    }
+
+    void * ptr = nullptr;
+    cudaError_t err = cudaHostAlloc(&ptr, size, cudaHostAllocMapped | cudaHostAllocPortable);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("%s: failed to allocate %.2f MiB of mapped pinned memory: %s\n", __func__,
+                size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        return nullptr;
+    }
+
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    buffer->buft = buft;
+    buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
+    return buffer;
+}
+
+ggml_backend_buffer_type_t ggml_backend_cuda_qsa_host_buffer_type(ggml_backend_dev_t dev) {
+    static std::mutex mutex;
+    static std::map<ggml_backend_dev_t, std::unique_ptr<ggml_backend_buffer_type>> bufts;
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    auto it = bufts.find(dev);
+    if (it == bufts.end()) {
+        auto buft = std::make_unique<ggml_backend_buffer_type>();
+        buft->iface = {
+            /* .get_name         = */ ggml_backend_cuda_qsa_host_buffer_type_name,
+            /* .alloc_buffer     = */ ggml_backend_cuda_qsa_host_buffer_type_alloc_buffer,
+            /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+            /* .get_max_size     = */ NULL,
+            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+        };
+        buft->device  = dev;
+        buft->context = new ggml_backend_cuda_qsa_host_buft_context {
+            std::string(ggml_backend_dev_name(dev)) + "_QSA_Host",
+        };
+
+        it = bufts.emplace(dev, std::move(buft)).first;
+    }
+
+    return it->second.get();
+}
+
+void * ggml_cuda_qsa_host_device_ptr(const ggml_tensor * tensor) {
+    GGML_ASSERT(tensor != nullptr);
+    GGML_ASSERT(tensor->buffer != nullptr);
+
+    if (!ggml_backend_buft_is_cuda_qsa_host(ggml_backend_buffer_get_type(tensor->buffer))) {
+        return tensor->data;
+    }
+
+    void * host_base = ggml_backend_buffer_get_base(tensor->buffer);
+    void * device_base = nullptr;
+    CUDA_CHECK(cudaHostGetDevicePointer(&device_base, host_base, 0));
+
+    const ptrdiff_t offset = (const char *) tensor->data - (const char *) host_base;
+    return (char *) device_base + offset;
+}
+
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
 //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 //}
@@ -4569,12 +4658,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // node's output on the host-visible buffer, which the compute path
                 // handles. Allow that here, mirroring the src-tensor check below.
                 assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
-                       (integrated && ggml_backend_buft_is_cuda_host(node->buffer->buft)));
+                       (integrated && ggml_backend_buft_is_cuda_host(node->buffer->buft)) ||
+                       ggml_backend_buft_is_cuda_qsa_host(node->buffer->buft));
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
-                               (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
+                               (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)) ||
+                               ggml_backend_buft_is_cuda_qsa_host(node->src[j]->buffer->buft));
                     }
                 }
 #else
@@ -5767,7 +5858,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
-    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
+    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) ||
+        (integrated && ggml_backend_buft_is_cuda_host(buft)) ||
+        (ggml_backend_buft_is_cuda_qsa_host(buft) && buft->device == dev);
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
@@ -5935,6 +6028,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_qsa_host_buffer_type") == 0) {
+        return (void *)ggml_backend_cuda_qsa_host_buffer_type;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;

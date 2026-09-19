@@ -170,6 +170,20 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    // The compact QSA block-key cache remains on device.  The raw per-token
+    // indexer K history is only needed to form/rebuild those block keys, so it
+    // is a good low-traffic place to prototype mapped host cache storage.
+    const char * qsa_indexer_host_env = getenv("LLAMA_QSA_INDEXER_HOST");
+    const bool qsa_indexer_host =
+        offload && is_mla &&
+        model.arch == LLM_ARCH_QWEN4EXP &&
+        name_tag != nullptr && strcmp(name_tag, "idx_") == 0 &&
+        qsa_indexer_host_env != nullptr && atoi(qsa_indexer_host_env) != 0;
+
+    if (qsa_indexer_host) {
+        LLAMA_LOG_INFO("%s: using mapped pinned host memory for the raw QSA indexer K cache\n", __func__);
+    }
+
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -223,9 +237,28 @@ llama_kv_cache::llama_kv_cache(
 
         if (offload) {
             auto * dev = model.dev_layer(il);
-            buft = ggml_backend_dev_buffer_type(dev);
 
-            dev_name = ggml_backend_dev_name(dev);
+            if (qsa_indexer_host) {
+                using qsa_host_buft_fn_t = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t);
+
+                auto * reg = ggml_backend_dev_backend_reg(dev);
+                auto * fn = reinterpret_cast<qsa_host_buft_fn_t>(
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_qsa_host_buffer_type"));
+
+                if (fn == nullptr) {
+                    throw std::runtime_error("QSA mapped host cache is not supported by the selected backend");
+                }
+
+                buft = fn(dev);
+                if (buft == nullptr) {
+                    throw std::runtime_error("failed to get QSA mapped host buffer type");
+                }
+
+                dev_name = ggml_backend_buft_name(buft);
+            } else {
+                buft = ggml_backend_dev_buffer_type(dev);
+                dev_name = ggml_backend_dev_name(dev);
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);

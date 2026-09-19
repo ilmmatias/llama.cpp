@@ -1,6 +1,8 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
 
+void * ggml_cuda_qsa_host_device_ptr(const ggml_tensor * tensor);
+
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
 // Generic quantized set_rows kernel template
@@ -380,17 +382,23 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16));
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
 
+    // SET_ROWS returns a view of the destination cache tensor.  Keep the tensor
+    // metadata intact but hand the kernel the GPU-visible alias of mapped host
+    // storage when this is the QSA raw-indexer cache.
+    ggml_tensor dst_mapped = *dst;
+    dst_mapped.data = ggml_cuda_qsa_host_device_ptr(dst);
+
     if (src0->type == GGML_TYPE_F32) {
         if (src1->type == GGML_TYPE_I64) {
-            set_rows_cuda<float, int64_t>(ctx, src0, src1, dst);
+            set_rows_cuda<float, int64_t>(ctx, src0, src1, &dst_mapped);
         } else {
-            set_rows_cuda<float, int32_t>(ctx, src0, src1, dst);
+            set_rows_cuda<float, int32_t>(ctx, src0, src1, &dst_mapped);
         }
     } else if (src0->type == GGML_TYPE_F16) {
         if (src1->type == GGML_TYPE_I64) {
-            set_rows_cuda<half, int64_t>(ctx, src0, src1, dst);
+            set_rows_cuda<half, int64_t>(ctx, src0, src1, &dst_mapped);
         } else {
-            set_rows_cuda<half, int32_t>(ctx, src0, src1, dst);
+            set_rows_cuda<half, int32_t>(ctx, src0, src1, &dst_mapped);
         }
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(src0->type));

@@ -2,6 +2,8 @@
 #include "dequantize.cuh"
 #include "convert.cuh"
 
+void * ggml_cuda_qsa_host_device_ptr(const ggml_tensor * tensor);
+
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
@@ -466,7 +468,8 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
 
-    get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
+    get_rows_cuda(ggml_cuda_qsa_host_device_ptr(src0), src0->type,
+        (const int32_t *) src1->data, dst->data, dst->type,
         ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
 }
 
