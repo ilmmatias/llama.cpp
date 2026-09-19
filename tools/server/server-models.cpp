@@ -181,6 +181,10 @@ private:
     }
 
     void on_line(child_t & c, const std::string & line) {
+        if (line == "\n" || line == "\r\n") {
+            return;
+        }
+
         if (string_starts_with(line, CMD_CHILD_TO_ROUTER_STATE)) {
             LOG_DBG("[%5d] %s", c.port, line.c_str()); // prevent spamming the log
             models.handle_child_state(c.name, line);
