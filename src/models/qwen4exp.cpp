@@ -808,6 +808,7 @@ public:
 
         res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
         if (compact_select) {
+            res &= params.ubatch.n_seqs_unq == 1;
             res &= cell_blk == nullptr;
             res &= block_cells != nullptr && block_cell_bias != nullptr;
             res &= block_cells->ne[0] == (int64_t) ratio;
@@ -885,11 +886,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         cparams.causal_attn && !hparams.use_alibi;
 
     // Keep the legacy fixed cell width, but only materialize the full cell surface
-    // when the sparse gather path would not be used anyway.
+    // when the compact block-first selection would not be worthwhile.
     const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
     const int64_t n_block_top = std::min<int64_t>(n_blocks, (width + r - 1)/r + 1);
-    const bool compact_select = blk_bias && n_tps == 1 && n_stream == 1 && cparams.flash_attn &&
-        8*n_tps*width < n_kv && n_block_top < n_blocks;
+    const bool compact_select = blk_bias && n_stream == 1 && ubatch.n_seqs_unq == 1 && cparams.flash_attn &&
+        8*width < n_kv && n_block_top < n_blocks;
 
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
@@ -1030,52 +1031,47 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     ggml_tensor * top_k = nullptr;
 
     if (compact_select) {
-        // Stage 3: rank the compact block surface first. The extra block is enough
-        // to cover the worst-case one-cell tail while still returning the legacy
-        // fixed width (indexer_top_k + r - 1) after the candidate refinement.
+        // Rank blocks per query before expanding to cells. The extra block covers
+        // the worst-case partial tail while preserving the legacy fixed width.
         ggml_tensor * top_blocks = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_block_top));
-        top_blocks = ggml_reshape_1d(ctx0, top_blocks, n_block_top);
         cb(top_blocks, "indexer_top_blocks", il);
 
-        // block_cells is [r, n_blocks]. Missing positions in the incomplete tail map
-        // to cell zero but carry -inf in block_cell_bias, so they can never survive
-        // the final candidate top-k when enough real cells exist.
-        ggml_tensor * candidate_cells = ggml_get_rows(ctx0, inp->block_cells, top_blocks);
-        ggml_tensor * candidate_slot_bias = ggml_get_rows(ctx0, inp->block_cell_bias, top_blocks);
-        candidate_cells = ggml_reshape_2d(ctx0, candidate_cells, r, n_block_top);
-        candidate_slot_bias = ggml_reshape_2d(ctx0, candidate_slot_bias, r, n_block_top);
+        const int64_t n_candidates = r*n_block_top;
+        ggml_tensor * top_blocks_flat = ggml_reshape_1d(ctx0, top_blocks, n_block_top*n_tps);
 
-        // Gather the selected block scores and repeat each score across its r cells.
-        // This recreates the old expanded score, but only for ~the attention budget.
-        ggml_tensor * score_rows = ggml_reshape_2d(ctx0, ggml_cont(ctx0, score), 1, n_blocks);
+        // Gather the physical cells and tail-slot bias for every selected block.
+        // Flattening [block, query] first keeps this gather compact; reshaping then
+        // restores a per-query candidate surface of only ~the attention budget.
+        ggml_tensor * candidate_cells = ggml_get_rows(ctx0, inp->block_cells, top_blocks_flat);
+        ggml_tensor * candidate_slot_bias = ggml_get_rows(ctx0, inp->block_cell_bias, top_blocks_flat);
+        candidate_cells = ggml_reshape_2d(ctx0, candidate_cells, n_candidates, n_tps);
+        candidate_slot_bias = ggml_reshape_3d(ctx0, candidate_slot_bias, r, n_block_top, n_tps);
+
+        // score is [n_blocks, n_tps]. View each query as a separate row bank so
+        // get_rows selects that query's own block ids without a dense cell expansion.
+        ggml_tensor * score_rows = ggml_reshape_3d(ctx0, ggml_cont(ctx0, score), 1, n_blocks, n_tps);
         ggml_tensor * candidate_scores = ggml_get_rows(ctx0, score_rows, top_blocks);
-        candidate_scores = ggml_repeat_4d(ctx0, candidate_scores, r, n_block_top, 1, 1);
+        candidate_scores = ggml_repeat_4d(ctx0, candidate_scores, r, n_block_top, n_tps, 1);
         candidate_scores = ggml_add(ctx0, candidate_scores, candidate_slot_bias);
 
-        const int64_t n_candidates = r*n_block_top;
-        ggml_tensor * candidate_ids = ggml_reshape_1d(ctx0, candidate_cells, n_candidates);
-
-        // Preserve the original token-level attention mask semantics on the reduced
-        // candidate set (future/foreign/empty cells remain -inf).
-        ggml_tensor * mask_rows = ggml_view_2d(ctx0, kq_mask, 1, n_kv, kq_mask->nb[0], 0);
-        ggml_tensor * candidate_mask = ggml_get_rows(ctx0, mask_rows, candidate_ids);
-        if (candidate_mask->type != GGML_TYPE_F32) {
-            candidate_mask = ggml_cast(ctx0, candidate_mask, GGML_TYPE_F32);
-        }
-        candidate_mask = ggml_reshape_4d(ctx0, candidate_mask, r, n_block_top, 1, 1);
+        // Gather only the candidate entries from the attention mask. get_rows
+        // converts F16 masks to F32, avoiding the full [n_kv, n_tps] F32 cast.
+        GGML_ASSERT(kq_mask->nb[3] == kq_mask->nb[1]*n_tps);
+        ggml_tensor * mask_cells = ggml_view_3d(ctx0, kq_mask, 1, n_kv, n_tps,
+                kq_mask->nb[0], kq_mask->nb[1], 0);
+        ggml_tensor * candidate_mask = ggml_get_rows(ctx0, mask_cells, candidate_cells);
+        candidate_mask = ggml_reshape_3d(ctx0, candidate_mask, r, n_block_top, n_tps);
         candidate_scores = ggml_add(ctx0, candidate_scores, candidate_mask);
         cb(candidate_scores, "indexer_score_candidates", il);
 
-        // The second top-k is tiny (~2050 cells for Qwen3.8) and resolves the
-        // incomplete tail / boundary block exactly like the legacy cell top-k.
-        ggml_tensor * candidate_top = ggml_cont(ctx0, ggml_top_k(
-                ctx0, ggml_reshape_1d(ctx0, candidate_scores, n_candidates), width));
+        // The second top-k is only ~2050 cells per query. Translate those
+        // candidate-relative indices back to physical KV-cell ids per query.
+        candidate_scores = ggml_reshape_2d(ctx0, candidate_scores, n_candidates, n_tps);
+        ggml_tensor * candidate_top = ggml_cont(ctx0, ggml_top_k(ctx0, candidate_scores, width));
 
-        // candidate_top indexes the candidate array; translate it back to physical
-        // KV-cell ids expected by build_qsa_gather/build_qsa_scan.
-        ggml_tensor * candidate_rows = ggml_reshape_2d(ctx0, candidate_cells, 1, n_candidates);
+        ggml_tensor * candidate_rows = ggml_reshape_3d(ctx0, candidate_cells, 1, n_candidates, n_tps);
         top_k = ggml_get_rows(ctx0, candidate_rows, candidate_top);
-        top_k = ggml_reshape_4d(ctx0, top_k, width, 1, 1, 1);
+        top_k = ggml_reshape_4d(ctx0, top_k, width, n_tps, 1, 1);
         cb(top_k, "indexer_top_k", il);
     } else {
         // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary

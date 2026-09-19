@@ -851,13 +851,22 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             const int64_t tail_start = (q + 1)/r*r;
 
             if (blk_bias) {
-                // a block sits wholly inside or outside the tail, so one value covers it
-                // the caller adds the attention mask, which drops empty, foreign and future cells
+                // Block-first compact selection performs its top-k before the per-cell
+                // attention mask is gathered. Reject future blocks here so they cannot
+                // consume the shortlist; only the current partial tail is force-selected.
+                // The legacy expanded path still gets its future masking before token top-k.
                 float * cur_blk_bias = dst_bias + i*n_blocks;
 
                 for (int64_t b = 0; b < n_blocks; ++b) {
-                    // finite, so it can never meet a -inf and produce a nan
-                    cur_blk_bias[b] = b*r >= tail_start ? 1e9f : (filled[b] < r ? -INFINITY : 0.0f);
+                    const int64_t b0 = b*r;
+                    if (dst_block_cells != nullptr && b0 > q) {
+                        cur_blk_bias[b] = -INFINITY;
+                    } else if (b0 >= tail_start) {
+                        // finite, so it can never meet a -inf and produce a nan
+                        cur_blk_bias[b] = 1e9f;
+                    } else {
+                        cur_blk_bias[b] = filled[b] < r ? -INFINITY : 0.0f;
+                    }
                 }
 
                 continue;
