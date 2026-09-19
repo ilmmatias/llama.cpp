@@ -987,10 +987,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
     ggml_tensor * score = nullptr;
 
-    // Decode fast path: gather cached block keys and perform the four rectified
-    // head dots, head reduction and block bias in one backend op.  Keep the
-    // existing graph for multi-token/prefill so this stage measures decode only.
-    if (blk_bias && n_tps == 1 && q->type == GGML_TYPE_F32) {
+    // Fuse the four rectified head dots, head reduction and block bias into one
+    // backend op. Wave32 uses the single-query kernel for decode and a tiled
+    // block/query kernel for batched prefill, avoiding the [block, head, query]
+    // score surface in both cases.
+    if (blk_bias && q->type == GGML_TYPE_F32) {
         ggml_tensor * q_score = ggml_reshape_4d(ctx0, ggml_cont(ctx0, q),
                 idx_dim, n_idx_h, n_tps, n_stream);
         score = ggml_qsa_block_score(ctx0, q_score, k_blocks,
