@@ -11,8 +11,9 @@
 // llama_memory_hybrid_idx
 //
 
-// llama_memory_hybrid plus a third cache with one indexer key per token, for block-sparse attention (qwen4exp QSA)
-// the indexer is a side buffer over the attention cells: same size, padding, streams and slots, so cell j is one token in both
+// llama_memory_hybrid plus Qwen4Exp QSA state: one raw indexer key per attention cell and
+// a compact derived-key cache with one F32 row per compression block. The raw indexer mirrors
+// the attention-cell layout; the block cache has its own shared slot table.
 
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
@@ -100,12 +101,20 @@ private:
 
     struct qsa_block {
         std::vector<uint32_t> cells;
-        uint32_t cache_cell = 0;
-
-        bool operator==(const qsa_block & other) const {
-            return cells == other.cells && cache_cell == other.cache_cell;
-        }
+        uint32_t cache_slot = 0;
+        bool valid = false;
     };
+
+    struct qsa_slot_state {
+        std::map<std::vector<uint32_t>, uint32_t> by_cells;
+        std::vector<uint32_t> refs;
+        std::vector<uint32_t> free_slots;
+        uint32_t next_slot = 0;
+    };
+
+    void qsa_reset() const;
+    uint32_t qsa_acquire_slot(uint32_t ratio, const std::vector<uint32_t> & cells, bool & is_new) const;
+    void qsa_release_slot(uint32_t ratio, qsa_block & block) const;
 
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
@@ -115,11 +124,14 @@ private:
     // llama_kv_cache keeps a reference to what it is given
     llama_hparams hparams_idx;
 
+    // The raw indexer cache has one row per attention cell. Derived QSA block keys
+    // need only one row per compression block, so keep them in a separate compact cache.
+    const uint32_t qsa_block_capacity;
     const std::unique_ptr<llama_kv_cache> mem_idx;
+    const std::unique_ptr<llama_kv_cache> mem_qsa_blocks;
 
-    // Tensor values live in the F32 V side of mem_idx. This metadata only records
-    // which physical token rows each cached block represents.
     mutable std::map<uint32_t, std::map<llama_seq_id, std::vector<qsa_block>>> qsa_blocks;
+    mutable std::map<uint32_t, qsa_slot_state> qsa_slots;
 
 };
 
@@ -168,6 +180,7 @@ public:
     uint32_t get_qsa_update_capacity(
             const llama_ubatch & ubatch, uint32_t ratio, uint32_t n_blocks) const;
 
+    ggml_tensor * get_qsa_block_storage(int32_t il) const;
 
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:

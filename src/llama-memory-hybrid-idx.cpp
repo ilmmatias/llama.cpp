@@ -46,26 +46,61 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         n_seq_max, n_rs_seq, offload, unified,
         filter_attn, filter_recr),
     hparams_idx(model.hparams),
+    qsa_block_capacity(filter_idx == nullptr ? 0 : [&] {
+        uint32_t min_ratio = std::numeric_limits<uint32_t>::max();
+        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+            if (!filter_idx(il)) {
+                continue;
+            }
+
+            const uint32_t ratio = model.hparams.dsv4_compress_ratios[il];
+            if (ratio > 0) {
+                min_ratio = std::min(min_ratio, ratio);
+            }
+        }
+
+        if (min_ratio == std::numeric_limits<uint32_t>::max()) {
+            return 0u;
+        }
+
+        const uint64_t n_stream = unified ? 1 : n_seq_max;
+        const uint64_t n_cells = (uint64_t) kv_size*n_stream;
+        // Complete blocks partition the physical cells. The small per-sequence margin
+        // covers branch/tail boundaries without giving the block cache token-cache scale.
+        const uint64_t n_blocks = (n_cells + min_ratio - 1)/min_ratio + std::max(1u, n_seq_max);
+        GGML_ASSERT(n_blocks <= std::numeric_limits<uint32_t>::max());
+        return (uint32_t) n_blocks;
+    }()),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
         hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
 
-        hparams_idx.n_embd_head_v_full = model.hparams.indexer_head_size;
         // the cached indexer keys are raw, rotation happens after pooling at read time, so a
         // K-shift must not rotate them while the stream copies in the same update still apply
         hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;
 
-        // note: upstream 311d4211b ("avoid allocating V cache for indexer") marks this cache as MLA
-        // so that llama_kv_cache skips V. That assumes a K-only indexer; this tree persists the
-        // derived (pooled, normalized, rotated) keys in the indexer V cache, so V must exist.
+        // The raw indexer is K-only. Derived pooled/normalized/rotated block keys live
+        // in mem_qsa_blocks below instead of wasting one F32 V row per token cell.
+        hparams_idx.n_embd_head_k_mla_impl = model.hparams.indexer_head_size;
+        hparams_idx.n_embd_head_v_mla_impl = model.hparams.indexer_head_size;
 
-        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
+        LLAMA_LOG_INFO("%s: creating indexer K cache, size = %u cells\n", __func__, kv_size);
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k, GGML_TYPE_F32, false, offload, unified,
+            model, hparams_idx, type_k, type_v, false, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
+    }()),
+    mem_qsa_blocks(filter_idx == nullptr || qsa_block_capacity == 0 ? nullptr : [&] {
+        LLAMA_LOG_INFO("%s: creating compact QSA block cache, size = %u blocks\n", __func__, qsa_block_capacity);
+
+        // This cache is storage only: one F32 K row per derived block, shared across
+        // sequences by our slot table. It is always one stream and never stores V.
+        return new llama_kv_cache(
+            model, hparams_idx, GGML_TYPE_F32, GGML_TYPE_F32, false, offload, true,
+            qsa_block_capacity, 1, 1, 0, LLAMA_SWA_TYPE_NONE,
+            nullptr, filter_idx, nullptr, nullptr, "idx_blk_");
     }()) {}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
@@ -147,14 +182,17 @@ void llama_memory_hybrid_idx::clear(bool data) {
     if (mem_idx) {
         mem_idx->clear(data);
     }
+    if (mem_qsa_blocks) {
+        mem_qsa_blocks->clear(data);
+    }
 
-    qsa_blocks.clear();
+    qsa_reset();
 }
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
     if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
-        qsa_blocks.clear();
+        qsa_reset();
         return false;
     }
 
@@ -162,7 +200,7 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         mem_idx->seq_rm(seq_id, p0, p1);
     }
 
-    qsa_blocks.clear();
+    qsa_reset();
 
     return get_mem_attn()->seq_rm(seq_id, p0, p1);
 }
@@ -174,7 +212,7 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
         mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     }
 
-    qsa_blocks.clear();
+    qsa_reset();
 }
 
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
@@ -184,7 +222,7 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
         mem_idx->seq_keep(seq_id);
     }
 
-    qsa_blocks.clear();
+    qsa_reset();
 }
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
@@ -194,7 +232,7 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
         mem_idx->seq_add(seq_id, p0, p1, shift);
     }
 
-    qsa_blocks.clear();
+    qsa_reset();
 }
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
@@ -204,7 +242,7 @@ void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_p
         mem_idx->seq_div(seq_id, p0, p1, d);
     }
 
-    qsa_blocks.clear();
+    qsa_reset();
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_breakdown() const {
@@ -212,6 +250,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
 
     if (mem_idx) {
         for (const auto & buft_size : mem_idx->memory_breakdown()) {
+            mb[buft_size.first] += buft_size.second;
+        }
+    }
+    if (mem_qsa_blocks) {
+        for (const auto & buft_size : mem_qsa_blocks->memory_breakdown()) {
             mb[buft_size.first] += buft_size.second;
         }
     }
@@ -263,7 +306,7 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
         throw;
     }
 
-    qsa_blocks.clear();
+    qsa_reset();
 }
 
 void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
@@ -281,7 +324,68 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
         mem_idx->seq_rm(seq_id, -1, -1);
     }
 
+    qsa_reset();
+}
+
+void llama_memory_hybrid_idx::qsa_reset() const {
     qsa_blocks.clear();
+    qsa_slots.clear();
+}
+
+uint32_t llama_memory_hybrid_idx::qsa_acquire_slot(
+        uint32_t ratio, const std::vector<uint32_t> & cells, bool & is_new) const {
+    GGML_ASSERT(mem_qsa_blocks != nullptr);
+
+    auto & state = qsa_slots[ratio];
+    const auto found = state.by_cells.find(cells);
+    if (found != state.by_cells.end()) {
+        const uint32_t slot = found->second;
+        GGML_ASSERT(slot < state.refs.size() && state.refs[slot] > 0);
+        state.refs[slot]++;
+        is_new = false;
+        return slot;
+    }
+
+    uint32_t slot;
+    if (!state.free_slots.empty()) {
+        slot = state.free_slots.back();
+        state.free_slots.pop_back();
+    } else {
+        slot = state.next_slot++;
+    }
+
+    if (slot >= qsa_block_capacity) {
+        throw std::runtime_error("QSA compact block cache exhausted");
+    }
+
+    if (state.refs.size() <= slot) {
+        state.refs.resize(slot + 1, 0);
+    }
+    GGML_ASSERT(state.refs[slot] == 0);
+    state.refs[slot] = 1;
+    state.by_cells.emplace(cells, slot);
+    is_new = true;
+    return slot;
+}
+
+void llama_memory_hybrid_idx::qsa_release_slot(uint32_t ratio, qsa_block & block) const {
+    if (!block.valid) {
+        return;
+    }
+
+    const auto state_it = qsa_slots.find(ratio);
+    GGML_ASSERT(state_it != qsa_slots.end());
+    auto & state = state_it->second;
+    GGML_ASSERT(block.cache_slot < state.refs.size() && state.refs[block.cache_slot] > 0);
+
+    if (--state.refs[block.cache_slot] == 0) {
+        const auto key_it = state.by_cells.find(block.cells);
+        GGML_ASSERT(key_it != state.by_cells.end() && key_it->second == block.cache_slot);
+        state.by_cells.erase(key_it);
+        state.free_slots.push_back(block.cache_slot);
+    }
+
+    block = {};
 }
 
 llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
@@ -398,6 +502,11 @@ bool llama_memory_hybrid_idx_context::apply() {
 
 const llama_kv_cache_context * llama_memory_hybrid_idx_context::get_idx() const {
     return static_cast<const llama_kv_cache_context *>(ctx_idx.get());
+}
+
+ggml_tensor * llama_memory_hybrid_idx_context::get_qsa_block_storage(int32_t il) const {
+    GGML_ASSERT(mem != nullptr && mem->mem_qsa_blocks != nullptr);
+    return mem->mem_qsa_blocks->get_k_storage(il);
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
@@ -605,9 +714,9 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
 
 
-        // Derived block keys live in the row-major F32 V side of the indexer cache.
-        // K and V use the same physical row id, so pick one member row as the block's
-        // persistent destination and refresh it only when the block membership changes.
+        // Raw indexer K keeps token-cell addressing, while derived keys live in a
+        // compact one-row-per-block cache. Global raw-K row ids make shared prefixes
+        // converge on the same compact slot even when several sequences reference them.
         const int64_t cache_stream = mem_idx->get_n_stream() == 1 ? 0 : seq_of_stream;
         const int64_t stream_off = cache_stream*(int64_t) mem_idx->get_size();
         auto & cached = mem->qsa_blocks[ratio][seq_of_stream];
@@ -617,10 +726,11 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
         for (int64_t b = 0; b < n_blocks; ++b) {
             // Incomplete/padding blocks are masked or force-selected as tail, so their
-            // dot product is irrelevant. Keep the gather index in range.
-            dst_block_key_cell[s*n_blocks + b] = (int32_t) stream_off;
+            // dot product is irrelevant. Keep the compact gather index in range.
+            dst_block_key_cell[s*n_blocks + b] = 0;
 
             if (filled[b] != r) {
+                mem->qsa_release_slot(ratio, cached[b]);
                 continue;
             }
 
@@ -638,50 +748,53 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             }
 
             llama_memory_hybrid_idx::qsa_block now;
-            now.cells.assign(cur_blk_cells.begin() + b*r, cur_blk_cells.begin() + (b + 1)*r);
-
-            uint32_t cache_cell = (uint32_t) cur_blk_cells[(b + 1)*r - 1];
+            now.cells.resize(r);
             for (int64_t ir = 0; ir < r; ++ir) {
-                const uint32_t cell = (uint32_t) cur_blk_cells[b*r + ir];
-                if (cells.seq_count(cell) == 1) {
-                    cache_cell = cell;
-                    break;
-                }
+                const int64_t global_src = stream_off + cur_blk_cells[b*r + ir];
+                GGML_ASSERT(global_src <= std::numeric_limits<int32_t>::max());
+                now.cells[ir] = (uint32_t) global_src;
             }
-            now.cache_cell = cache_cell;
 
-            const int64_t global_dst = stream_off + cache_cell;
-            GGML_ASSERT(global_dst <= std::numeric_limits<int32_t>::max());
-            dst_block_key_cell[s*n_blocks + b] = (int32_t) global_dst;
+            bool refresh = false;
+            if (!cached[b].valid || cached[b].cells != now.cells) {
+                mem->qsa_release_slot(ratio, cached[b]);
+
+                bool is_new = false;
+                now.cache_slot = mem->qsa_acquire_slot(ratio, now.cells, is_new);
+                now.valid = true;
+                cached[b] = std::move(now);
+                refresh = is_new;
+            }
+
+            const uint32_t cache_slot = cached[b].cache_slot;
+            GGML_ASSERT(cache_slot <= (uint32_t) std::numeric_limits<int32_t>::max());
+            dst_block_key_cell[s*n_blocks + b] = (int32_t) cache_slot;
 
             if (!have_fallback) {
                 have_fallback = true;
                 for (int64_t sec = 0; sec < 4; ++sec) {
                     fallback_pos[sec] = sec_pos[sec];
                 }
-                fallback_idx = global_dst;
+                fallback_idx = cache_slot;
                 for (int64_t ir = 0; ir < r; ++ir) {
-                    const int64_t global_src = stream_off + cur_blk_cells[b*r + ir];
-                    GGML_ASSERT(global_src <= std::numeric_limits<int32_t>::max());
-                    fallback_cells[ir] = (int32_t) global_src;
+                    fallback_cells[ir] = (int32_t) cached[b].cells[ir];
                 }
             }
 
-            if (cached[b] == now) {
+            // A matching physical block may already be referenced by another sequence.
+            // In that case its derived rows are already valid in every QSA layer.
+            if (!refresh) {
                 continue;
             }
-            cached[b] = std::move(now);
 
             GGML_ASSERT(n_update < n_updates);
             for (int64_t ir = 0; ir < r; ++ir) {
-                const int64_t global_src = stream_off + cur_blk_cells[b*r + ir];
-                GGML_ASSERT(global_src <= std::numeric_limits<int32_t>::max());
-                dst_update_cells[n_update*r + ir] = (int32_t) global_src;
+                dst_update_cells[n_update*r + ir] = (int32_t) cached[b].cells[ir];
             }
             for (int64_t sec = 0; sec < 4; ++sec) {
                 dst_update_pos[sec*n_updates + n_update] = sec_pos[sec];
             }
-            dst_update_idxs[n_update++] = global_dst;
+            dst_update_idxs[n_update++] = cache_slot;
         }
 
         if (dst_block_cells != nullptr) {

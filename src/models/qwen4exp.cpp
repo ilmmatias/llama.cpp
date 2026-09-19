@@ -839,10 +839,10 @@ public:
     ggml_tensor * block_cells     = nullptr;   // I32 [ratio, n_blocks, 1], compact decode only
     ggml_tensor * block_cell_bias = nullptr;   // F32 same shape, -inf for unfilled tail slots
     ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
-    ggml_tensor * block_key_cells = nullptr;   // I32 [n_blocks, n_stream], global rows in indexer V
+    ggml_tensor * block_key_cells = nullptr;   // I32 [n_blocks, n_stream], slots in compact QSA block cache
     ggml_tensor * update_cells    = nullptr;   // I32 [ratio, n_updates], global rows in indexer K
     ggml_tensor * update_pos      = nullptr;   // I32 [4*n_updates]
-    ggml_tensor * update_idxs     = nullptr;   // I64 [n_updates], global rows in indexer V
+    ggml_tensor * update_idxs     = nullptr;   // I64 [n_updates], slots in compact QSA block cache
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t ratio;
@@ -929,8 +929,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         res->add_input(std::move(qsa));
         qsa_inps.emplace((uint32_t) r, inp);
     }
-    // Raw indexer keys remain in K. Only blocks whose physical member rows changed are
-    // pooled, normalized and rotated; their derived F32 keys persist in indexer V.
+    // Raw indexer keys remain in the token-sized K cache. Only blocks whose physical
+    // member rows changed are pooled, normalized and rotated; their derived F32 keys
+    // persist in a separate compact one-row-per-block cache.
     ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
     k_raw = ggml_reshape_3d(ctx0, k_raw, idx_dim, 1, n_tokens);
     cb(k_raw, "indexer_k_raw", il);
@@ -962,9 +963,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(update_keys, "indexer_k_update", il);
 
-    ggml_tensor * k_blocks = mctx_idx->cpy_v(ctx0, update_keys, inp->update_idxs, il);
-    ggml_build_forward_expand(gf, k_blocks);
+    if (ggml_row_size(update_keys->type, idx_dim) == update_keys->nb[2]) {
+        update_keys = ggml_reshape_2d(ctx0, update_keys, idx_dim, n_updates);
+    } else {
+        update_keys = ggml_cont_2d(ctx0, update_keys, idx_dim, n_updates);
+    }
+
+    ggml_tensor * k_blocks = mctx_hyb->get_qsa_block_storage(il);
     k_blocks = ggml_reshape_2d(ctx0, k_blocks, idx_dim, k_blocks->ne[1]*k_blocks->ne[2]);
+    k_blocks = ggml_set_rows(ctx0, k_blocks, update_keys, inp->update_idxs);
+    ggml_build_forward_expand(gf, k_blocks);
 
 
 
