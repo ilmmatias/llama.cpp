@@ -2756,6 +2756,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
         [](common_params & params) {
+            params.expert_cache_moe_placement_explicit = true;
             params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
@@ -2765,6 +2766,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
+            }
+            if (value > 0) {
+                params.expert_cache_moe_placement_explicit = true;
             }
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
         }
@@ -2781,31 +2785,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
     add_opt(common_arg(
-        {"--expert-cache-shadow"},
-        "enable the routed-expert shadow cache (uploads are performed, execution remains unchanged)",
-        [](common_params & params) {
-            params.expert_cache_shadow = true;
-        }
-    ));
-    add_opt(common_arg(
-        {"--expert-cache-hybrid"},
-        "enable hybrid routed-expert caching (cache hits execute on the GPU, misses remain on the CPU)",
-        [](common_params & params) {
-            params.expert_cache_hybrid = true;
-        }
-    ));
-    add_opt(common_arg(
-        {"--expert-cache-slots"}, "N",
-        string_format("number of routed-expert cache slots per MoE layer (default: %d)", params.expert_cache_slots),
+        {"-ecs", "--expert-cache-slots"}, "N",
+        string_format("number of routed-expert cache slots per MoE layer; 0 disables the cache (default: %d)", params.expert_cache_slots),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("expert cache slots must be non-negative");
             }
             params.expert_cache_slots = value;
+            params.expert_cache_hybrid = value > 0;
+            params.expert_cache_shadow = false;
         }
     ));
     add_opt(common_arg(
-        {"--expert-cache-admit-window"}, "N",
+        {"-eca", "--expert-cache-admit-window"}, "N",
         string_format("admit a missing expert after a repeat within N generated tokens; 0 admits every miss (default: %d)",
             params.expert_cache_admit_window),
         [](common_params & params, int value) {
@@ -2816,13 +2808,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
-        {"--expert-cache-workers"}, "N",
-        string_format("background CPU converters for hybrid expert admissions (default: %d)", params.expert_cache_workers),
+        {"-ecw", "--expert-cache-workers"}, "N",
+        string_format("background CPU converters for expert-cache admissions (default: %d)", params.expert_cache_workers),
         [](common_params & params, int value) {
             if (value <= 0) {
                 throw std::invalid_argument("expert cache workers must be positive");
             }
             params.expert_cache_workers = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"-ecstats", "--expert-cache-stats"},
+        "print expert-cache admission, transfer, and hybrid-execution statistics",
+        [](common_params & params) {
+            params.expert_cache_stats = true;
         }
     ));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0

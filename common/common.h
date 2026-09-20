@@ -479,8 +479,10 @@ struct common_params {
     int32_t expert_cache_slots        = 0;
     int32_t expert_cache_admit_window = 0;
     int32_t expert_cache_workers      = 1;
-    bool    expert_cache_shadow       = false;
+    bool    expert_cache_shadow       = false; // legacy internal mode; CLI uses hybrid when slots > 0
     bool    expert_cache_hybrid       = false;
+    bool    expert_cache_stats        = false;
+    bool    expert_cache_moe_placement_explicit = false;
 
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model

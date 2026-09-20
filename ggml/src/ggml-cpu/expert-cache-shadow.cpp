@@ -301,8 +301,9 @@ static bool copy_native_expert(const ggml_tensor * tensor, int32_t expert, void 
 
 class expert_cache {
 public:
-    expert_cache(expert_cache_mode mode, uint32_t slots, uint32_t admit_window, uint32_t convert_workers, ggml_backend_dev_t device) :
-        mode(mode), slots(slots), admit_window(admit_window), convert_workers(std::max<uint32_t>(1, convert_workers)), device(device) {
+    expert_cache(expert_cache_mode mode, uint32_t slots, uint32_t admit_window, uint32_t convert_workers, bool print_stats, ggml_backend_dev_t device) :
+        mode(mode), slots(slots), admit_window(admit_window), convert_workers(std::max<uint32_t>(1, convert_workers)),
+        print_stats(print_stats), device(device) {
         upload_backend = ggml_backend_dev_init(device, nullptr);
         if (mode == expert_cache_mode::hybrid) {
             compute_backend = ggml_backend_dev_init(device, nullptr);
@@ -330,9 +331,11 @@ public:
             upload_thread = std::thread([this]() { worker_main_hybrid_upload(); });
         }
 
-        fprintf(stderr, "expert_cache: enabled on %s: mode=%s slots/layer=%u admit_window=%u converters=%u\n",
-                ggml_backend_dev_name(device), mode_name(), slots, admit_window,
-                mode == expert_cache_mode::hybrid ? this->convert_workers : 1);
+        if (print_stats) {
+            fprintf(stderr, "expert_cache: enabled on %s: mode=%s slots/layer=%u admit_window=%u converters=%u\n",
+                    ggml_backend_dev_name(device), mode_name(), slots, admit_window,
+                    mode == expert_cache_mode::hybrid ? this->convert_workers : 1);
+        }
     }
 
     ~expert_cache() {
@@ -382,7 +385,7 @@ public:
         const double wall_s = route_last_us > route_first_us ? (double) (route_last_us - route_first_us) / 1.0e6 : 0.0;
         const double wall_gib_s = wall_s > 0 ? ((double) upload_bytes / (1024.0 * 1024.0 * 1024.0)) / wall_s : 0.0;
 
-        if (selections || allocated_bytes) {
+        if (print_stats && (selections || allocated_bytes)) {
             fprintf(stderr,
                     "~expert_cache: mode=%s cache=%.1f MiB tokens=%" PRIu64 " selections=%" PRIu64
                     " simulated_hit=%.2f%% ready_hit=%.2f%% pending_hit=%.2f%% admissions=%" PRIu64 "\n",
@@ -401,7 +404,7 @@ public:
                         worker_gib_s, convert_gib_s, convert_workers, wall_gib_s, max_queue, max_converted_queue);
             }
         }
-        if (mode == expert_cache_mode::hybrid && (hybrid_launches || hybrid_compatible_layers)) {
+        if (print_stats && mode == expert_cache_mode::hybrid && (hybrid_launches || hybrid_compatible_layers)) {
             const double avg_routes = hybrid_launches ? (double) hybrid_routes / (double) hybrid_launches : 0.0;
             const double wait_ms_per_launch = hybrid_launches ? (double) hybrid_wait_us / 1000.0 / (double) hybrid_launches : 0.0;
             const double overlap_ms_per_launch = hybrid_launches ? (double) hybrid_elapsed_us / 1000.0 / (double) hybrid_launches : 0.0;
@@ -1649,6 +1652,7 @@ private:
     const uint32_t slots;
     const uint32_t admit_window;
     const uint32_t convert_workers;
+    const bool print_stats;
     ggml_backend_dev_t device = nullptr;
     ggml_backend_t upload_backend = nullptr;
     ggml_backend_t compute_backend = nullptr;
@@ -1721,13 +1725,13 @@ private:
 std::mutex g_expert_cache_mutex;
 std::unique_ptr<expert_cache> g_expert_cache;
 
-static void configure_expert_cache(expert_cache_mode mode, uint32_t slots, uint32_t admit_window, uint32_t convert_workers, ggml_backend_dev_t device) {
+static void configure_expert_cache(expert_cache_mode mode, uint32_t slots, uint32_t admit_window, uint32_t convert_workers, bool print_stats, ggml_backend_dev_t device) {
     std::lock_guard<std::mutex> lock(g_expert_cache_mutex);
     g_expert_cache.reset();
     if (slots == 0 || device == nullptr) {
         return;
     }
-    g_expert_cache = std::make_unique<expert_cache>(mode, slots, admit_window, convert_workers, device);
+    g_expert_cache = std::make_unique<expert_cache>(mode, slots, admit_window, convert_workers, print_stats, device);
 }
 
 } // namespace
@@ -1736,15 +1740,16 @@ extern "C" void ggml_backend_cpu_expert_cache_shadow_configure(
         uint32_t slots,
         uint32_t admit_window,
         ggml_backend_dev_t device) {
-    configure_expert_cache(expert_cache_mode::shadow, slots, admit_window, 1, device);
+    configure_expert_cache(expert_cache_mode::shadow, slots, admit_window, 1, false, device);
 }
 
 extern "C" void ggml_backend_cpu_expert_cache_hybrid_configure(
         uint32_t slots,
         uint32_t admit_window,
         uint32_t convert_workers,
+        bool print_stats,
         ggml_backend_dev_t device) {
-    configure_expert_cache(expert_cache_mode::hybrid, slots, admit_window, convert_workers, device);
+    configure_expert_cache(expert_cache_mode::hybrid, slots, admit_window, convert_workers, print_stats, device);
 }
 
 extern "C" void ggml_backend_cpu_expert_cache_shadow_route(

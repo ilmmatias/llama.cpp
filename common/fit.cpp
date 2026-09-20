@@ -221,7 +221,7 @@ common_device_memory_data_vec common_get_device_memory_data(
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+        size_t * margins_s, uint32_t n_ctx_min, bool keep_moe_cpu, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
@@ -516,8 +516,22 @@ static void common_params_fit_impl(
     if (!tensor_buft_overrides) {
         throw common_params_fit_exception("did not provide buffer to set tensor_buft_overrides, abort");
     }
+
+    const size_t ntbo_base_cap = llama_max_tensor_buft_overrides();
+    size_t ntbo_base = 0;
     if (mparams->tensor_buft_overrides && (mparams->tensor_buft_overrides->pattern || mparams->tensor_buft_overrides->buft)) {
-        throw common_params_fit_exception("model_params::tensor_buft_overrides already set by user, abort");
+        if (!keep_moe_cpu) {
+            throw common_params_fit_exception("model_params::tensor_buft_overrides already set by user, abort");
+        }
+        if (mparams->tensor_buft_overrides != tensor_buft_overrides) {
+            throw common_params_fit_exception("expert cache requires writable tensor_buft_overrides to match model_params, abort");
+        }
+        while (ntbo_base < ntbo_base_cap && tensor_buft_overrides[ntbo_base].pattern != nullptr) {
+            ++ntbo_base;
+        }
+        if (ntbo_base == 0 || ntbo_base + 1 >= ntbo_base_cap) {
+            throw common_params_fit_exception("invalid tensor_buft_overrides for expert-cache fit, abort");
+        }
     }
 
     // step 3: iteratively fill the back to front with "dense" layers
@@ -596,7 +610,7 @@ static void common_params_fit_impl(
 
         mparams.tensor_split = tensor_split;
 
-        size_t itbo = 0;
+        size_t itbo = ntbo_base;
         for (size_t id = 0; id < nd; id++) {
             il0 += ngl_per_device[id].n_full();
             for (uint32_t il = il0; il < il0 + ngl_per_device[id].n_part; il++) {
@@ -649,7 +663,7 @@ static void common_params_fit_impl(
     };
 
     int64_t global_surplus_cpu_moe = 0;
-    if (hp_nex > 0) {
+    if (hp_nex > 0 && !keep_moe_cpu) {
         const static std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps"; // matches all MoE tensors
         ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
         tensor_buft_overrides[0] = {pattern_moe_all.c_str(), cpu_buft};
@@ -920,11 +934,12 @@ enum common_params_fit_status common_fit_params(
         size_t * margins,
         uint32_t n_ctx_min,
         const common_fit_extra_model * extra,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        bool keep_moe_cpu) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
+        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, keep_moe_cpu, extra, log_level);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

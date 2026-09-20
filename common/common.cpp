@@ -1271,7 +1271,7 @@ static void common_init_sampler_from_model(
 }
 
 using common_expert_cache_shadow_configure_fn = void (*)(uint32_t, uint32_t, ggml_backend_dev_t);
-using common_expert_cache_hybrid_configure_fn = void (*)(uint32_t, uint32_t, uint32_t, ggml_backend_dev_t);
+using common_expert_cache_hybrid_configure_fn = void (*)(uint32_t, uint32_t, uint32_t, bool, ggml_backend_dev_t);
 
 static void * common_expert_cache_proc_get(const char * name) {
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1283,6 +1283,107 @@ static void * common_expert_cache_proc_get(const char * name) {
     return ggml_backend_reg_get_proc_address(reg, name);
 }
 
+static ggml_backend_dev_t common_expert_cache_device_get(const common_params & params) {
+    for (auto * dev : params.devices) {
+        if (dev == nullptr) {
+            continue;
+        }
+        const auto type = ggml_backend_dev_type(dev);
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            return dev;
+        }
+    }
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        const auto type = ggml_backend_dev_type(dev);
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            return dev;
+        }
+    }
+    return nullptr;
+}
+
+static void common_expert_cache_prepare_params(common_params & params) {
+    if (params.expert_cache_slots <= 0) {
+        return;
+    }
+    if (params.expert_cache_moe_placement_explicit) {
+        throw std::invalid_argument("--expert-cache-slots cannot be combined with --cpu-moe/--n-cpu-moe");
+    }
+
+    params.expert_cache_hybrid = true;
+    params.expert_cache_shadow = false;
+
+    const auto cpu_buft = ggml_backend_cpu_buffer_type();
+    if (!params.tensor_buft_overrides.empty() &&
+        params.tensor_buft_overrides.front().pattern != nullptr &&
+        strcmp(params.tensor_buft_overrides.front().pattern, LLM_FFN_EXPS_REGEX) == 0 &&
+        params.tensor_buft_overrides.front().buft == cpu_buft) {
+        return;
+    }
+
+    if (params.tensor_buft_overrides.empty() || params.tensor_buft_overrides.back().pattern != nullptr) {
+        params.tensor_buft_overrides.push_back({nullptr, nullptr});
+    }
+    params.tensor_buft_overrides.insert(params.tensor_buft_overrides.begin(), llm_ffn_exps_cpu_override());
+}
+
+static size_t common_expert_cache_fit_reserve(
+        const char * path_model,
+        const llama_model_params & mparams_cpu_moe,
+        const llama_context_params & cparams,
+        uint32_t slots,
+        ggml_backend_dev_t cache_dev,
+        size_t & cache_device_index) {
+    if (slots == 0 || cache_dev == nullptr || mparams_cpu_moe.tensor_buft_overrides == nullptr) {
+        return 0;
+    }
+
+    llama_model_params mparams_full = mparams_cpu_moe;
+    mparams_full.tensor_buft_overrides = mparams_cpu_moe.tensor_buft_overrides + 1; // skip cache-owned CPU MoE override
+
+    std::vector<ggml_backend_dev_t> devs_full;
+    std::vector<ggml_backend_dev_t> devs_cpu;
+    uint32_t ngl_full = 0, nct_full = 0, nex_full = 0;
+    uint32_t ngl_cpu  = 0, nct_cpu  = 0, nex_cpu  = 0;
+
+    const auto full = common_get_device_memory_data(
+        path_model, &mparams_full, &cparams, devs_full, ngl_full, nct_full, nex_full, GGML_LOG_LEVEL_ERROR);
+    const auto cpu = common_get_device_memory_data(
+        path_model, &mparams_cpu_moe, &cparams, devs_cpu, ngl_cpu, nct_cpu, nex_cpu, GGML_LOG_LEVEL_ERROR);
+
+    if (nex_full == 0 || nex_cpu != nex_full) {
+        throw std::runtime_error("expert cache requested for a model without a consistent routed-expert count");
+    }
+
+    size_t expert_bytes = 0;
+    for (size_t i = 0; i < devs_full.size(); ++i) {
+        for (size_t j = 0; j < devs_cpu.size(); ++j) {
+            if (devs_full[i] == devs_cpu[j] && full[i].model > cpu[j].model) {
+                expert_bytes += full[i].model - cpu[j].model;
+                break;
+            }
+        }
+    }
+
+    cache_device_index = devs_cpu.size();
+    for (size_t i = 0; i < devs_cpu.size(); ++i) {
+        if (devs_cpu[i] == cache_dev) {
+            cache_device_index = i;
+            break;
+        }
+    }
+    if (cache_device_index == devs_cpu.size()) {
+        throw std::runtime_error("expert cache device is not part of the model device set");
+    }
+    if (expert_bytes == 0) {
+        throw std::runtime_error("unable to estimate routed-expert cache memory for --fit");
+    }
+
+    const size_t n_expert = (size_t) nex_full;
+    return (expert_bytes / n_expert) * slots + ((expert_bytes % n_expert) * slots + n_expert - 1) / n_expert;
+}
+
 static void common_expert_cache_reset() {
     if (auto fn = reinterpret_cast<common_expert_cache_shadow_configure_fn>(
             common_expert_cache_proc_get("ggml_backend_cpu_expert_cache_shadow_configure"))) {
@@ -1290,70 +1391,34 @@ static void common_expert_cache_reset() {
     }
     if (auto fn = reinterpret_cast<common_expert_cache_hybrid_configure_fn>(
             common_expert_cache_proc_get("ggml_backend_cpu_expert_cache_hybrid_configure"))) {
-        fn(0, 0, 1, nullptr);
+        fn(0, 0, 1, false, nullptr);
     }
 }
 
 static void common_expert_cache_configure(const common_params & params) {
-    if (params.expert_cache_shadow && params.expert_cache_hybrid) {
-        throw std::invalid_argument("--expert-cache-shadow and --expert-cache-hybrid are mutually exclusive");
-    }
-    if (!params.expert_cache_shadow && !params.expert_cache_hybrid) {
+    if (params.expert_cache_slots <= 0) {
         common_expert_cache_reset();
         return;
-    }
-    if (params.expert_cache_slots <= 0) {
-        throw std::invalid_argument("expert cache mode requires --expert-cache-slots > 0");
     }
     if (params.expert_cache_workers <= 0) {
         throw std::invalid_argument("expert cache mode requires --expert-cache-workers > 0");
     }
 
-    ggml_backend_dev_t cache_dev = nullptr;
-    for (auto * dev : params.devices) {
-        if (dev == nullptr) {
-            continue;
-        }
-        const auto type = ggml_backend_dev_type(dev);
-        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-            cache_dev = dev;
-            break;
-        }
-    }
-    if (cache_dev == nullptr) {
-        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-            auto * dev = ggml_backend_dev_get(i);
-            const auto type = ggml_backend_dev_type(dev);
-            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                cache_dev = dev;
-                break;
-            }
-        }
-    }
+    ggml_backend_dev_t cache_dev = common_expert_cache_device_get(params);
     if (cache_dev == nullptr) {
         throw std::runtime_error("expert cache requested but no GPU device is available");
     }
 
-    if (params.expert_cache_hybrid) {
-        auto fn = reinterpret_cast<common_expert_cache_hybrid_configure_fn>(
-            common_expert_cache_proc_get("ggml_backend_cpu_expert_cache_hybrid_configure"));
-        if (fn == nullptr) {
-            throw std::runtime_error("CPU backend does not provide hybrid routed-expert cache support");
-        }
-        fn((uint32_t) params.expert_cache_slots,
-           (uint32_t) params.expert_cache_admit_window,
-           (uint32_t) params.expert_cache_workers,
-           cache_dev);
-    } else {
-        auto fn = reinterpret_cast<common_expert_cache_shadow_configure_fn>(
-            common_expert_cache_proc_get("ggml_backend_cpu_expert_cache_shadow_configure"));
-        if (fn == nullptr) {
-            throw std::runtime_error("CPU backend does not provide routed-expert shadow cache support");
-        }
-        fn((uint32_t) params.expert_cache_slots,
-           (uint32_t) params.expert_cache_admit_window,
-           cache_dev);
+    auto fn = reinterpret_cast<common_expert_cache_hybrid_configure_fn>(
+        common_expert_cache_proc_get("ggml_backend_cpu_expert_cache_hybrid_configure"));
+    if (fn == nullptr) {
+        throw std::runtime_error("CPU backend does not provide hybrid routed-expert cache support");
     }
+    fn((uint32_t) params.expert_cache_slots,
+       (uint32_t) params.expert_cache_admit_window,
+       (uint32_t) params.expert_cache_workers,
+       params.expert_cache_stats,
+       cache_dev);
 }
 
 struct common_init_result::impl {
@@ -1375,6 +1440,8 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    common_expert_cache_prepare_params(params);
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1403,13 +1470,31 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
         };
 
+        std::vector<size_t> fit_targets = params.fit_params_target;
+        if (params.expert_cache_slots > 0) {
+            ggml_backend_dev_t cache_dev = common_expert_cache_device_get(params);
+            if (cache_dev == nullptr) {
+                throw std::runtime_error("expert cache requested but no GPU device is available");
+            }
+            size_t cache_device_index = 0;
+            const size_t reserve = common_expert_cache_fit_reserve(
+                params.model.path.c_str(), mparams, cparams, (uint32_t) params.expert_cache_slots, cache_dev, cache_device_index);
+            if (cache_device_index >= fit_targets.size()) {
+                throw std::runtime_error("expert cache device index exceeds fit target array");
+            }
+            fit_targets[cache_device_index] += reserve;
+            COM_TRC("expert cache reserves %.1f MiB on %s during fit\n",
+                (double) reserve / (1024.0 * 1024.0), ggml_backend_dev_name(cache_dev));
+        }
+
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
-            params.fit_params_target.data(),
+            fit_targets.data(),
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
+            params.expert_cache_slots > 0);
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
