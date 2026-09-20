@@ -1426,6 +1426,168 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// The ordinary MMVQ+GLU fusion produces one F32 row at a time. The down
+// projection immediately quantizes those rows back to Q8_1, so for the
+// single-token cached-MoE path it is cheaper to group 32 output rows in one
+// workgroup and emit the native Q8_1 block directly.
+template <ggml_type type, int nwarps>
+__launch_bounds__(nwarps * ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_glu_q8_1(
+        const void * gate_ptr, const void * up_ptr, const block_q8_1 * y, const int32_t * ids,
+        block_q8_1 * dst,
+        const uint32_t ncols_x, const uint32_t stride_row_x, const uint32_t stride_channel_x,
+        const ggml_glu_op glu_op, const float glu_limit) {
+    const void * GGML_CUDA_RESTRICT gate = gate_ptr;
+    const void * GGML_CUDA_RESTRICT up   = up_ptr;
+
+    constexpr int qk        = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi        = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr       = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int route = blockIdx.y;
+    const int row_base = blockIdx.x * QK8_1;
+    const int expert = ids[route];
+    const int blocks_per_row_x = ncols_x / qk;
+    constexpr int blocks_per_iter = vdr * warp_size / qi;
+
+    __shared__ float values[QK8_1];
+
+    // Each wave computes several complete gate/up rows. Keeping a whole Q8_1
+    // block inside one workgroup gives us the cross-row reduction needed for
+    // the Q8_1 scale without ever materializing the F32 GLU tensor.
+    for (int r = warp; r < QK8_1; r += nwarps) {
+        const int row = row_base + r;
+        const int kbx_offset = expert * stride_channel_x + row * stride_row_x;
+        float tmp_up = 0.0f;
+        float tmp_gate = 0.0f;
+
+        for (int kbx = lane / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk / QK8_1);
+            const int kqs = vdr * (lane % (qi / vdr));
+            tmp_up += vec_dot_q_cuda(up, &y[kby], kbx_offset + kbx, kqs);
+            tmp_gate += vec_dot_q_cuda(gate, &y[kby], kbx_offset + kbx, kqs);
+        }
+
+        tmp_up   = warp_reduce_sum<warp_size>(tmp_up);
+        tmp_gate = warp_reduce_sum<warp_size>(tmp_gate);
+
+        if (lane == 0) {
+            float result = tmp_up;
+            switch (glu_op) {
+                case GGML_GLU_OP_SWIGLU:
+                    result *= ggml_cuda_op_silu_single(tmp_gate);
+                    break;
+                case GGML_GLU_OP_GEGLU:
+                    result *= ggml_cuda_op_gelu_single(tmp_gate);
+                    break;
+                case GGML_GLU_OP_SWIGLU_OAI:
+                    result = ggml_cuda_op_swiglu_oai_single(tmp_gate, result);
+                    break;
+                case GGML_GLU_OP_SWIGLU_CLAMP:
+                    result = ggml_cuda_op_swiglu_clamp_single(tmp_gate, result, glu_limit);
+                    break;
+                default:
+                    result *= tmp_gate;
+                    break;
+            }
+            values[r] = result;
+        }
+    }
+
+    __syncthreads();
+
+    // Native MMVQ Q8_1 has 32 values per block. On this fast path we require
+    // a physical wave size of 32, so the first wave exactly matches one block
+    // and uses the same amax/sum definition as quantize_row_q8_1_cuda().
+    if (warp == 0) {
+        const float value = values[lane];
+        float amax = warp_reduce_max<QK8_1>(fabsf(value));
+        float sum  = warp_reduce_sum<QK8_1>(value);
+        const float d = amax / 127.0f;
+        const int8_t q = amax == 0.0f ? 0 : roundf(value / d);
+
+        const int64_t blocks_per_route = gridDim.x;
+        block_q8_1 & out = dst[(int64_t) route * blocks_per_route + blockIdx.x];
+        out.qs[lane] = q;
+        if (lane == 0) {
+            out.ds = make_half2(d, sum);
+        }
+    }
+}
+
+template <ggml_type type>
+static void mul_mat_vec_q_glu_q8_1_launch(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * src1, const ggml_tensor * ids,
+        ggml_tensor * dst_q8, const ggml_glu_op glu_op, const float glu_limit) {
+    constexpr int nwarps = 8;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    const int64_t blocks_per_route = dst_q8->ne[0] / QK8_1;
+    const dim3 block_nums(blocks_per_route, ids->ne[0], 1);
+    const dim3 block_dims(warp_size, nwarps, 1);
+    const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, ctx.stream());
+
+    const size_t ts = ggml_type_size(type);
+    const uint32_t stride_row_x = up->nb[1] / ts;
+    const uint32_t stride_channel_x = up->nb[2] / ts;
+
+    ggml_cuda_kernel_launch(mul_mat_vec_q_glu_q8_1<type, nwarps>, launch_params,
+        gate->data, up->data, (const block_q8_1 *) src1->data, (const int32_t *) ids->data,
+        (block_q8_1 *) dst_q8->data,
+        (uint32_t) up->ne[0], stride_row_x, stride_channel_x, glu_op, glu_limit);
+}
+
+bool ggml_cuda_mul_mat_vec_q_glu_q8_1(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * src1, const ggml_tensor * ids,
+        ggml_tensor * dst_q8, const ggml_glu_op glu_op, const float glu_limit) {
+    if (gate == nullptr || up == nullptr || src1 == nullptr || ids == nullptr || dst_q8 == nullptr ||
+            gate->type != up->type || src1->type != GGML_TYPE_Q8_1 || ids->type != GGML_TYPE_I32 ||
+            dst_q8->type != GGML_TYPE_Q8_1) {
+        return false;
+    }
+
+    // The Q8_1 quantizer below maps one physical wave to one 32-value block.
+    // Other wave sizes keep using the existing two-kernel GLU + quant path.
+    if (ggml_cuda_info().devices[ctx.device].warp_size != QK8_1) {
+        return false;
+    }
+
+    if (glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_GEGLU &&
+            glu_op != GGML_GLU_OP_SWIGLU_OAI && glu_op != GGML_GLU_OP_SWIGLU_CLAMP) {
+        return false;
+    }
+
+    if (!ggml_are_same_shape(gate, up) || !ggml_are_same_stride(gate, up) ||
+            gate->ne[3] != 1 || src1->ne[0] != up->ne[0] ||
+            src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+            dst_q8->ne[0] != up->ne[1] || dst_q8->ne[1] != ids->ne[0] ||
+            dst_q8->ne[2] != 1 || dst_q8->ne[3] != 1 ||
+            dst_q8->ne[0] % QK8_1 != 0 || src1->ne[0] % QK8_1 != 0 ||
+            up->nb[0] != ggml_type_size(up->type) || ids->nb[0] != sizeof(int32_t)) {
+        return false;
+    }
+
+    switch (up->type) {
+        case GGML_TYPE_ZNQ2:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_ZNQ2>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_ZNQ3:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_ZNQ3>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_ZNQ4:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_ZNQ4>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        default:
+            return false;
+    }
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {

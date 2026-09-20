@@ -4004,6 +4004,55 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return bias_node->src[1];
     };
 
+    // Cached single-token experts enter this backend with the common hidden
+    // activation already in native Q8_1. Fuse the complete gate/up/GLU prefix
+    // into a native Q8_1 scratch tensor for the down MMVQ, eliminating both
+    // the F32 GLU materialization and the down projection's quantization launch.
+    if (i + 3 < cgraph->n_nodes) {
+        const ggml_op ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU, GGML_OP_MUL_MAT_ID };
+        const int out_nodes[] = { i + 3 };
+        if (ggml_can_fuse_subgraph(cgraph, i, 4, ops, out_nodes, 1) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, out_nodes, 1)) {
+            ggml_tensor * glu  = cgraph->nodes[i + 2];
+            ggml_tensor * down = cgraph->nodes[i + 3];
+            ggml_tensor * gate = glu->src[0];
+            ggml_tensor * up   = glu->src[1];
+
+            const bool gate_up_order =
+                (gate == cgraph->nodes[i] && up == cgraph->nodes[i + 1]) ||
+                (gate == cgraph->nodes[i + 1] && up == cgraph->nodes[i]);
+            const bool edges_ok = gate_up_order && down->src[1] == glu &&
+                gate->src[1] == up->src[1] && gate->src[2] == up->src[2] &&
+                down->src[2] == up->src[2];
+
+            if (edges_ok && up->src[1]->type == GGML_TYPE_Q8_1 &&
+                    ggml_cuda_should_fuse_mul_mat(up, gate, glu) &&
+                    ggml_cuda_should_fuse_mul_mat_vec_q(up) && ggml_cuda_should_fuse_mul_mat_vec_q(down) &&
+                    glu->ne[0] % QK8_1 == 0) {
+                const size_t q8_bytes = (size_t) (glu->ne[0] / QK8_1) * sizeof(block_q8_1) *
+                    (size_t) glu->ne[1] * (size_t) glu->ne[2] * (size_t) glu->ne[3];
+                ggml_cuda_pool_alloc<char> q8_tmp(cuda_ctx->pool(), q8_bytes);
+
+                ggml_tensor q8 = *glu;
+                q8.type = GGML_TYPE_Q8_1;
+                q8.data = q8_tmp.get();
+                q8.buffer = nullptr;
+                q8.view_src = nullptr;
+                q8.op = GGML_OP_NONE;
+                q8.nb[0] = sizeof(block_q8_1);
+                q8.nb[1] = (size_t) (q8.ne[0] / QK8_1) * sizeof(block_q8_1);
+                q8.nb[2] = q8.nb[1] * (size_t) q8.ne[1];
+                q8.nb[3] = q8.nb[2] * (size_t) q8.ne[2];
+
+                if (ggml_cuda_mul_mat_vec_q_glu_q8_1(*cuda_ctx, gate->src[0], up->src[0], up->src[1],
+                            up->src[2], &q8, ggml_get_glu_op(glu), ggml_get_op_params_f32(glu, 3))) {
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, down->src[0], &q8, down->src[2], down);
+                    return 3;
+                }
+            }
+        }
+    }
+
     // gate + glu + up, with optional scale/bias on both lanes.
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
