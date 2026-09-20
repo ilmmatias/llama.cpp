@@ -2,6 +2,8 @@
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
 
+#define MMVQ_DENSE_FUSION_MAX_COLS 4 // Max. number of dst columns for which to fuse the MMVQ epilogue.
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,

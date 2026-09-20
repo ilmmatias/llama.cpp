@@ -1243,6 +1243,8 @@ struct test_case {
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
+    // extra runs for fusions that only run under CUDA graphs
+    virtual int n_warmup_runs() { return 0; }
 
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
@@ -1510,6 +1512,10 @@ struct test_case {
 
             GGML_UNUSED(index);
         };
+
+        for (int i = 0; i < n_warmup_runs(); ++i) {
+            ggml_backend_graph_compute(backend1, gf);
+        }
 
         std::vector<ggml_tensor *> fused_nodes_to_verify = fusion_test_nodes();
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
@@ -4737,6 +4743,95 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// alpha/beta projections + GGML_OP_GATED_DELTA_NET (producer fusion)
+struct test_gated_delta_net_ab_fusion : public test_case {
+    const ggml_type w_type;
+    const int64_t   head_count;
+    const int64_t   head_size;
+    const int64_t   n_tokens;
+    const int64_t   n_embd;
+    const bool      dt_per_token;
+    const bool      dt_internal;
+
+    ggml_tensor * gate_node = nullptr;
+    ggml_tensor * beta_node = nullptr;
+    ggml_tensor * out_node  = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR7(w_type, head_count, head_size, n_tokens, n_embd, dt_per_token, dt_internal);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_AB_FUSION";
+    }
+
+    bool run_whole_graph() override { return true; }
+    int  n_warmup_runs()  override { return 2; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { gate_node, beta_node, out_node }; }
+
+    double max_nmse_err() override { return w_type == GGML_TYPE_F32 ? 1e-6 : 5e-4; }
+
+    test_gated_delta_net_ab_fusion(ggml_type w_type = GGML_TYPE_BF16, int64_t head_count = 4,
+            int64_t head_size = 16, int64_t n_tokens = 4, int64_t n_embd = 128, bool dt_per_token = false,
+            bool dt_internal = false)
+        : w_type(w_type), head_count(head_count), head_size(head_size), n_tokens(n_tokens),
+          n_embd(n_embd), dt_per_token(dt_per_token), dt_internal(dt_internal) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t M = head_count;
+        const int64_t N = n_tokens;
+
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, N);
+        ggml_tensor * wa = ggml_new_tensor_2d(ctx, w_type, n_embd, M);
+        ggml_tensor * wb = ggml_new_tensor_2d(ctx, w_type, n_embd, M);
+
+        ggml_tensor * dt = dt_per_token ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, M)
+                                        : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, M);
+        ggml_tensor * ssm_a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, M);
+        ggml_set_name(dt,    "dt");
+        ggml_set_name(ssm_a, "ssm_a");
+
+        ggml_tensor * alpha   = ggml_mul_mat(ctx, wa, x);
+        ggml_tensor * alpha_r = ggml_reshape_3d(ctx, alpha, M, N, 1);
+        alpha = ggml_add(ctx, alpha_r, dt_internal ? alpha_r : dt);
+        alpha = ggml_softplus(ctx, alpha);
+        alpha = ggml_mul(ctx, alpha, ssm_a);
+        ggml_tensor * g = ggml_reshape_4d(ctx, alpha, 1, M, N, 1);
+
+        ggml_tensor * beta = ggml_mul_mat(ctx, wb, x);
+        beta = ggml_reshape_4d(ctx, beta, 1, M, N, 1);
+        beta = ggml_sigmoid(ctx, beta);
+
+        gate_node = g;
+        beta_node = beta;
+
+        ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, M, N, 1);
+        ggml_tensor * k     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, M, N, 1);
+        ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, M, N, 1);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_size, M, 1);
+        ggml_set_name(v, "v");
+
+        out_node = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+        return out_node;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "ssm_a") == 0) {
+                init_tensor_uniform(t, -4.0f, -0.5f);
+            } else if (strcmp(t->name, "dt") == 0) {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -7074,19 +7169,24 @@ struct test_mul_mat_vec_fusion : public test_case {
     const bool with_gate;
     const bool with_lane_scale;
     std::array<int64_t, 2> batch_dims;
+    const bool full_bias_shape;
+    const bool strided_bias;
+    const ggml_type bias_type;
 
     test_mul_mat_vec_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k,
                         bool use_id = false, int n_mats = 1, int n_used = 1, bool b = false, bool with_bias = false, bool with_gate = true,
-                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2})
+                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, bool full_bias_shape = false,
+                        bool strided_bias = false, ggml_type bias_type = GGML_TYPE_F32)
     : type(type), glu_op(op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), b(b), with_bias(with_bias),
-        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims) {
+        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), full_bias_shape(full_bias_shape),
+        strided_bias(strided_bias), bias_type(bias_type) {
         if (use_id) {
             GGML_ASSERT(n_used <= n_mats);
         }
     }
 
     std::string vars() override {
-        return VARS_TO_STR13(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims);
+        return VARS_TO_STR16(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims, full_bias_shape, strided_bias, bias_type);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7096,6 +7196,15 @@ struct test_mul_mat_vec_fusion : public test_case {
 
     bool run_whole_graph() override { return true; }
     bool use_weight_context() override { return use_id && with_lane_scale; }
+
+    ggml_tensor * build_bias(ggml_context * ctx, const std::array<int64_t, 4> & ne) {
+        if (!strided_bias) {
+            return ggml_new_tensor(ctx, bias_type, 4, ne.data());
+        }
+        ggml_tensor * backing = ggml_new_tensor_4d(ctx, bias_type, 2*ne[0], ne[1], ne[2], ne[3]);
+        return ggml_view_4d(ctx, backing, ne[0], ne[1], ne[2], ne[3],
+                            backing->nb[1], backing->nb[2], backing->nb[3], 0);
+    }
 
     ggml_tensor * build_gate(ggml_context * ctx, ggml_tensor * ffn_gate, ggml_tensor * ffn_up) {
         ggml_tensor * out = nullptr;
@@ -7150,9 +7259,10 @@ struct test_mul_mat_vec_fusion : public test_case {
                     ffn_up = build_lane_scale_dense(ctx, ffn_up);
                 }
                 if (with_bias) {
-                    std::array<int64_t, 4> bias_ne = { ffn_up->ne[0], 1, channels, samples };
-                    ggml_tensor * up_bias = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, bias_ne.data());
-                    ffn_up = ggml_add(ctx, ffn_up, up_bias);
+                    std::array<int64_t, 4> bias_ne = { ffn_up->ne[0], full_bias_shape ? ffn_up->ne[1] : 1, channels, samples };
+                    ggml_tensor * up_bias = build_bias(ctx, bias_ne);
+                    const bool bias_first = strided_bias || bias_type != GGML_TYPE_F32;
+                    ffn_up = bias_first ? ggml_add(ctx, up_bias, ffn_up) : ggml_add(ctx, ffn_up, up_bias);
                 }
                 return ffn_up;
             };
@@ -7163,7 +7273,7 @@ struct test_mul_mat_vec_fusion : public test_case {
                     ffn_gate = build_lane_scale_dense(ctx, ffn_gate);
                 }
                 if (with_bias) {
-                    std::array<int64_t, 4> bias_ne   = { ffn_gate->ne[0], 1, channels, samples };
+                    std::array<int64_t, 4> bias_ne   = { ffn_gate->ne[0], full_bias_shape ? ffn_gate->ne[1] : 1, channels, samples };
                     ggml_tensor * gate_bias = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, bias_ne.data());
                     ffn_gate = ggml_add(ctx, ffn_gate, gate_bias);
                 }
@@ -11106,6 +11216,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             false, 16, 8, false, false, true, false, { 1, 1 }));
     }
 
+    // multi-token dense fusion: epilogue only
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_NVFP4}) {
+        for (int64_t n_tokens : {2, 3, 4, 5, 8}) {
+            for (bool with_bias : {false, true}) {
+                for (bool with_lane_scale : {false, true}) {
+                    if ((with_lane_scale && type != GGML_TYPE_NVFP4) || (!with_bias && !with_lane_scale)) {
+                        continue;
+                    }
+                    test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n_tokens, 32, 256,
+                        false, 1, 1, false, with_bias, /*with_gate =*/ false, with_lane_scale, {1, 1},
+                        /*full_bias_shape =*/ with_bias));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 2, 32, 256,
+            false, 1, 1, false, /*with_bias =*/ true, /*with_gate =*/ false, false, {1, 1},
+            /*full_bias_shape =*/ true, /*strided_bias =*/ true));
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 2, 32, 256,
+            false, 1, 1, false, /*with_bias =*/ true, /*with_gate =*/ false, false, {1, 1},
+            /*full_bias_shape =*/ true, /*strided_bias =*/ false, /*bias_type =*/ GGML_TYPE_F16));
+    }
+
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
             for (bool bias_probs : {false, true}) {
@@ -11187,6 +11319,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+
+    // gdn alpha/beta producer fusion
+    for (ggml_type w : {GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_gated_delta_net_ab_fusion(w, 8, 32, 4, 128));
+    }
+    for (int64_t n_tokens : {1, 8, 9}) {
+        test_cases.emplace_back(new test_gated_delta_net_ab_fusion(GGML_TYPE_BF16, 8, 32, n_tokens, 128));
+    }
+    // due to wider block size the K reduction runs more than one iteration
+    test_cases.emplace_back(new test_gated_delta_net_ab_fusion(GGML_TYPE_BF16, 8, 32, 4, 384));
+    test_cases.emplace_back(new test_gated_delta_net_ab_fusion(GGML_TYPE_Q8_0, 8, 32, 4, 384));
+    // head count == token count makes the per-token dt a legal broadcast
+    test_cases.emplace_back(new test_gated_delta_net_ab_fusion(GGML_TYPE_BF16, 4, 32, 4, 128, /*dt_per_token =*/ true));
+    test_cases.emplace_back(new test_gated_delta_net_ab_fusion(GGML_TYPE_BF16, 8, 32, 1, 128, false, /*dt_internal =*/ true));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
