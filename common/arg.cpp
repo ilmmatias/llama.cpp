@@ -2780,6 +2780,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_DENSE_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
+    add_opt(common_arg(
+        {"--expert-cache-shadow"},
+        "enable the routed-expert shadow cache (uploads are performed, execution remains unchanged)",
+        [](common_params & params) {
+            params.expert_cache_shadow = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--expert-cache-slots"}, "N",
+        string_format("number of routed-expert cache slots per MoE layer (default: %d)", params.expert_cache_slots),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("expert cache slots must be non-negative");
+            }
+            params.expert_cache_slots = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--expert-cache-admit-window"}, "N",
+        string_format("admit a missing expert after a repeat within N generated tokens; 0 admits every miss (default: %d)",
+            params.expert_cache_admit_window),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("expert cache admission window must be non-negative");
+            }
+            params.expert_cache_admit_window = value;
+        }
+    ));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

@@ -473,6 +473,13 @@ struct common_params {
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
+
+    // Experimental routed-expert cache. Shadow mode performs real admissions/uploads
+    // while keeping expert execution on its existing backend.
+    int32_t expert_cache_slots        = 0;
+    int32_t expert_cache_admit_window = 0;
+    bool    expert_cache_shadow       = false;
+
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use

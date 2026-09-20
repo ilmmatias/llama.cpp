@@ -1270,9 +1270,70 @@ static void common_init_sampler_from_model(
     get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA),    sparams.mirostat_eta,    common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA);
 }
 
+using common_expert_cache_shadow_configure_fn = void (*)(uint32_t, uint32_t, ggml_backend_dev_t);
+
+static common_expert_cache_shadow_configure_fn common_expert_cache_shadow_configure_fn_get() {
+    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu_dev == nullptr) {
+        return nullptr;
+    }
+
+    auto * reg = ggml_backend_dev_backend_reg(cpu_dev);
+    return reinterpret_cast<common_expert_cache_shadow_configure_fn>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_expert_cache_shadow_configure"));
+}
+
+static void common_expert_cache_shadow_reset() {
+    if (auto fn = common_expert_cache_shadow_configure_fn_get()) {
+        fn(0, 0, nullptr);
+    }
+}
+
+static void common_expert_cache_shadow_configure(const common_params & params) {
+    if (!params.expert_cache_shadow) {
+        common_expert_cache_shadow_reset();
+        return;
+    }
+    if (params.expert_cache_slots <= 0) {
+        throw std::invalid_argument("--expert-cache-shadow requires --expert-cache-slots > 0");
+    }
+
+    auto fn = common_expert_cache_shadow_configure_fn_get();
+    if (fn == nullptr) {
+        throw std::runtime_error("CPU backend does not provide routed-expert shadow cache support");
+    }
+
+    ggml_backend_dev_t cache_dev = nullptr;
+    for (auto * dev : params.devices) {
+        if (dev == nullptr) {
+            continue;
+        }
+        const auto type = ggml_backend_dev_type(dev);
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            cache_dev = dev;
+            break;
+        }
+    }
+    if (cache_dev == nullptr) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            auto * dev = ggml_backend_dev_get(i);
+            const auto type = ggml_backend_dev_type(dev);
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                cache_dev = dev;
+                break;
+            }
+        }
+    }
+    if (cache_dev == nullptr) {
+        throw std::runtime_error("--expert-cache-shadow requested but no GPU device is available");
+    }
+
+    fn((uint32_t) params.expert_cache_slots, (uint32_t) params.expert_cache_admit_window, cache_dev);
+}
+
 struct common_init_result::impl {
     impl() = default;
-    ~impl() = default;
+    ~impl() { common_expert_cache_shadow_reset(); }
 
     // note: the order in which model, context, etc. are declared matters because their destructors will be called bottom-to-top
 
@@ -1402,6 +1463,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     pimpl->context.reset(lctx);
+
+    common_expert_cache_shadow_configure(params);
 
     set_process_priority(params.cpuparams.priority);
 
