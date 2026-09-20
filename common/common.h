@@ -478,7 +478,9 @@ struct common_params {
     // while keeping expert execution on its existing backend.
     int32_t expert_cache_slots        = 0;
     int32_t expert_cache_admit_window = 0;
+    int32_t expert_cache_workers      = 1;
     bool    expert_cache_shadow       = false;
+    bool    expert_cache_hybrid       = false;
 
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model

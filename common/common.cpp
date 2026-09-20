@@ -1271,36 +1271,42 @@ static void common_init_sampler_from_model(
 }
 
 using common_expert_cache_shadow_configure_fn = void (*)(uint32_t, uint32_t, ggml_backend_dev_t);
+using common_expert_cache_hybrid_configure_fn = void (*)(uint32_t, uint32_t, uint32_t, ggml_backend_dev_t);
 
-static common_expert_cache_shadow_configure_fn common_expert_cache_shadow_configure_fn_get() {
+static void * common_expert_cache_proc_get(const char * name) {
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (cpu_dev == nullptr) {
         return nullptr;
     }
 
     auto * reg = ggml_backend_dev_backend_reg(cpu_dev);
-    return reinterpret_cast<common_expert_cache_shadow_configure_fn>(
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_expert_cache_shadow_configure"));
+    return ggml_backend_reg_get_proc_address(reg, name);
 }
 
-static void common_expert_cache_shadow_reset() {
-    if (auto fn = common_expert_cache_shadow_configure_fn_get()) {
+static void common_expert_cache_reset() {
+    if (auto fn = reinterpret_cast<common_expert_cache_shadow_configure_fn>(
+            common_expert_cache_proc_get("ggml_backend_cpu_expert_cache_shadow_configure"))) {
         fn(0, 0, nullptr);
+    }
+    if (auto fn = reinterpret_cast<common_expert_cache_hybrid_configure_fn>(
+            common_expert_cache_proc_get("ggml_backend_cpu_expert_cache_hybrid_configure"))) {
+        fn(0, 0, 1, nullptr);
     }
 }
 
-static void common_expert_cache_shadow_configure(const common_params & params) {
-    if (!params.expert_cache_shadow) {
-        common_expert_cache_shadow_reset();
+static void common_expert_cache_configure(const common_params & params) {
+    if (params.expert_cache_shadow && params.expert_cache_hybrid) {
+        throw std::invalid_argument("--expert-cache-shadow and --expert-cache-hybrid are mutually exclusive");
+    }
+    if (!params.expert_cache_shadow && !params.expert_cache_hybrid) {
+        common_expert_cache_reset();
         return;
     }
     if (params.expert_cache_slots <= 0) {
-        throw std::invalid_argument("--expert-cache-shadow requires --expert-cache-slots > 0");
+        throw std::invalid_argument("expert cache mode requires --expert-cache-slots > 0");
     }
-
-    auto fn = common_expert_cache_shadow_configure_fn_get();
-    if (fn == nullptr) {
-        throw std::runtime_error("CPU backend does not provide routed-expert shadow cache support");
+    if (params.expert_cache_workers <= 0) {
+        throw std::invalid_argument("expert cache mode requires --expert-cache-workers > 0");
     }
 
     ggml_backend_dev_t cache_dev = nullptr;
@@ -1325,15 +1331,34 @@ static void common_expert_cache_shadow_configure(const common_params & params) {
         }
     }
     if (cache_dev == nullptr) {
-        throw std::runtime_error("--expert-cache-shadow requested but no GPU device is available");
+        throw std::runtime_error("expert cache requested but no GPU device is available");
     }
 
-    fn((uint32_t) params.expert_cache_slots, (uint32_t) params.expert_cache_admit_window, cache_dev);
+    if (params.expert_cache_hybrid) {
+        auto fn = reinterpret_cast<common_expert_cache_hybrid_configure_fn>(
+            common_expert_cache_proc_get("ggml_backend_cpu_expert_cache_hybrid_configure"));
+        if (fn == nullptr) {
+            throw std::runtime_error("CPU backend does not provide hybrid routed-expert cache support");
+        }
+        fn((uint32_t) params.expert_cache_slots,
+           (uint32_t) params.expert_cache_admit_window,
+           (uint32_t) params.expert_cache_workers,
+           cache_dev);
+    } else {
+        auto fn = reinterpret_cast<common_expert_cache_shadow_configure_fn>(
+            common_expert_cache_proc_get("ggml_backend_cpu_expert_cache_shadow_configure"));
+        if (fn == nullptr) {
+            throw std::runtime_error("CPU backend does not provide routed-expert shadow cache support");
+        }
+        fn((uint32_t) params.expert_cache_slots,
+           (uint32_t) params.expert_cache_admit_window,
+           cache_dev);
+    }
 }
 
 struct common_init_result::impl {
     impl() = default;
-    ~impl() { common_expert_cache_shadow_reset(); }
+    ~impl() { common_expert_cache_reset(); }
 
     // note: the order in which model, context, etc. are declared matters because their destructors will be called bottom-to-top
 
@@ -1464,7 +1489,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     pimpl->context.reset(lctx);
 
-    common_expert_cache_shadow_configure(params);
+    common_expert_cache_configure(params);
 
     set_process_priority(params.cpuparams.priority);
 

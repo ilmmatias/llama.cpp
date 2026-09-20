@@ -676,6 +676,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_expert_cache_shadow_configure") == 0) {
         return (void *) ggml_backend_cpu_expert_cache_shadow_configure;
     }
+    if (strcmp(name, "ggml_backend_cpu_expert_cache_hybrid_configure") == 0) {
+        return (void *) ggml_backend_cpu_expert_cache_hybrid_configure;
+    }
 
     // threadpool - TODO:  move to ggml-base
     if (strcmp(name, "ggml_threadpool_new") == 0) {

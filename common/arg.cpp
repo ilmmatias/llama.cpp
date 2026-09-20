@@ -2788,6 +2788,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--expert-cache-hybrid"},
+        "enable hybrid routed-expert caching (cache hits execute on the GPU, misses remain on the CPU)",
+        [](common_params & params) {
+            params.expert_cache_hybrid = true;
+        }
+    ));
+    add_opt(common_arg(
         {"--expert-cache-slots"}, "N",
         string_format("number of routed-expert cache slots per MoE layer (default: %d)", params.expert_cache_slots),
         [](common_params & params, int value) {
@@ -2806,6 +2813,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("expert cache admission window must be non-negative");
             }
             params.expert_cache_admit_window = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--expert-cache-workers"}, "N",
+        string_format("background CPU converters for hybrid expert admissions (default: %d)", params.expert_cache_workers),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("expert cache workers must be positive");
+            }
+            params.expert_cache_workers = value;
         }
     ));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
