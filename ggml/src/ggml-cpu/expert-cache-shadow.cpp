@@ -1,6 +1,7 @@
 #include "expert-cache-shadow.h"
 
 #include "ggml-alloc.h"
+#include "quants.h"
 #include "repack.h"
 
 #include <algorithm>
@@ -67,6 +68,7 @@ struct expert_cache_hybrid_template {
     ggml_tensor * input = nullptr;
     ggml_tensor * ids = nullptr;
     ggml_tensor * output = nullptr;
+    bool input_q8 = false;
 };
 
 struct expert_cache_layer {
@@ -403,11 +405,13 @@ public:
             const double avg_routes = hybrid_launches ? (double) hybrid_routes / (double) hybrid_launches : 0.0;
             const double wait_ms_per_launch = hybrid_launches ? (double) hybrid_wait_us / 1000.0 / (double) hybrid_launches : 0.0;
             const double overlap_ms_per_launch = hybrid_launches ? (double) hybrid_elapsed_us / 1000.0 / (double) hybrid_launches : 0.0;
+            const double preq_us_per_input = hybrid_preq_inputs ? (double) hybrid_preq_us / (double) hybrid_preq_inputs : 0.0;
             fprintf(stderr,
                     "~expert_cache: hybrid_layers=%" PRIu64 " launches=%" PRIu64 " routes=%" PRIu64
-                    " routes/launch=%.2f sync_wait=%.3f ms/launch launch_to_join=%.3f ms/launch fallbacks=%" PRIu64 "\n",
+                    " routes/launch=%.2f sync_wait=%.3f ms/launch launch_to_join=%.3f ms/launch fallbacks=%" PRIu64
+                    " preq8=%" PRIu64 " q8_cpu=%.2f us/input\n",
                     hybrid_compatible_layers, hybrid_launches, hybrid_routes, avg_routes,
-                    wait_ms_per_launch, overlap_ms_per_launch, hybrid_fallbacks);
+                    wait_ms_per_launch, overlap_ms_per_launch, hybrid_fallbacks, hybrid_preq_inputs, preq_us_per_input);
         }
 
         if (staging_buffer != nullptr) {
@@ -418,6 +422,9 @@ public:
                 ggml_backend_buffer_free(staging->buffer);
                 staging->buffer = nullptr;
             }
+        }
+        if (hybrid_input_q8_buffer != nullptr) {
+            ggml_backend_buffer_free(hybrid_input_q8_buffer);
         }
         if (hybrid_output_buffer != nullptr) {
             ggml_backend_buffer_free(hybrid_output_buffer);
@@ -910,7 +917,13 @@ private:
             return nullptr;
         }
 
-        t->input = ggml_new_tensor_3d(t->ctx, GGML_TYPE_F32, layer.input_dim, 1, 1);
+        // Hybrid templates are single-token decode graphs. Quantize that one
+        // activation on CPU and upload native Q8_1 so the GPU can enter MMVQ
+        // directly instead of launching its own F32 -> Q8_1 conversion kernel.
+        // This is independent of the number of routed cache hits: MUL_MAT_ID's
+        // MMVQ batch limit applies to tokens (ne[2]), not expert routes.
+        t->input_q8 = layer.input_dim % ggml_blck_size(GGML_TYPE_Q8_1) == 0;
+        t->input = ggml_new_tensor_3d(t->ctx, t->input_q8 ? GGML_TYPE_Q8_1 : GGML_TYPE_F32, layer.input_dim, 1, 1);
         t->ids = ggml_new_tensor_2d(t->ctx, GGML_TYPE_I32, hit_count, 1);
         auto * gate = ggml_mul_mat_id(t->ctx, layer.cache_gate, t->input, t->ids);
         auto * up   = ggml_mul_mat_id(t->ctx, layer.cache_up,   t->input, t->ids);
@@ -946,6 +959,31 @@ private:
         auto * ret = t.get();
         layer.hybrid_templates[(size_t) hit_count] = std::move(t);
         return ret;
+    }
+
+    bool ensure_hybrid_q8_input(size_t size) {
+        if (hybrid_input_q8_size >= size) {
+            return true;
+        }
+        if (hybrid_input_q8_buffer != nullptr) {
+            ggml_backend_buffer_free(hybrid_input_q8_buffer);
+            hybrid_input_q8_buffer = nullptr;
+            hybrid_input_q8_ptr = nullptr;
+        }
+        hybrid_input_q8_fallback.clear();
+
+        if (host_buft != nullptr) {
+            hybrid_input_q8_buffer = ggml_backend_buft_alloc_buffer(host_buft, size);
+            if (hybrid_input_q8_buffer != nullptr) {
+                hybrid_input_q8_ptr = ggml_backend_buffer_get_base(hybrid_input_q8_buffer);
+                hybrid_input_q8_size = size;
+                return true;
+            }
+        }
+        hybrid_input_q8_fallback.resize(size);
+        hybrid_input_q8_ptr = hybrid_input_q8_fallback.data();
+        hybrid_input_q8_size = size;
+        return hybrid_input_q8_ptr != nullptr;
     }
 
     bool ensure_hybrid_output(size_t size) {
@@ -1032,7 +1070,26 @@ private:
             return;
         }
 
-        ggml_backend_tensor_set_async(compute_backend, t->input, op->src[1]->data, 0, ggml_nbytes(t->input));
+        const void * input_data = op->src[1]->data;
+        if (t->input_q8) {
+            const size_t q8_bytes = ggml_nbytes(t->input);
+            if (!ensure_hybrid_q8_input(q8_bytes)) {
+                ++hybrid_fallbacks;
+                layer.active_ready_mask = 0;
+                layer.active_slots.clear();
+                layer.active_route_positions.clear();
+                layer.active_hits = 0;
+                return;
+            }
+            const auto q0 = std::chrono::steady_clock::now();
+            quantize_row_q8_1((const float *) op->src[1]->data, hybrid_input_q8_ptr, layer.input_dim);
+            const auto q1 = std::chrono::steady_clock::now();
+            hybrid_preq_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(q1 - q0).count();
+            ++hybrid_preq_inputs;
+            input_data = hybrid_input_q8_ptr;
+        }
+
+        ggml_backend_tensor_set_async(compute_backend, t->input, input_data, 0, ggml_nbytes(t->input));
         ggml_backend_tensor_set_async(compute_backend, t->ids, layer.active_slots.data(), 0,
                 (size_t) layer.active_hits * sizeof(int32_t));
         const enum ggml_status status = ggml_backend_graph_compute_async(compute_backend, t->graph);
@@ -1622,6 +1679,11 @@ private:
     size_t staging_size = 0;
     std::vector<uint8_t> staging_fallback;
 
+    ggml_backend_buffer_t hybrid_input_q8_buffer = nullptr;
+    void * hybrid_input_q8_ptr = nullptr;
+    size_t hybrid_input_q8_size = 0;
+    std::vector<uint8_t> hybrid_input_q8_fallback;
+
     ggml_backend_buffer_t hybrid_output_buffer = nullptr;
     void * hybrid_output_ptr = nullptr;
     size_t hybrid_output_size = 0;
@@ -1652,6 +1714,8 @@ private:
     uint64_t hybrid_fallbacks = 0;
     uint64_t hybrid_wait_us = 0;
     uint64_t hybrid_elapsed_us = 0;
+    uint64_t hybrid_preq_inputs = 0;
+    uint64_t hybrid_preq_us = 0;
 };
 
 std::mutex g_expert_cache_mutex;
