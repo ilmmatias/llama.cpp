@@ -595,11 +595,15 @@ public:
         }
 
         if (launched) {
-            const auto wait0 = std::chrono::steady_clock::now();
-            ggml_backend_synchronize(compute_backend);
-            const auto wait1 = std::chrono::steady_clock::now();
-            hybrid_wait_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(wait1 - wait0).count();
-            hybrid_elapsed_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(wait1 - launch_time).count();
+            if (print_stats) {
+                const auto wait0 = std::chrono::steady_clock::now();
+                ggml_backend_synchronize(compute_backend);
+                const auto wait1 = std::chrono::steady_clock::now();
+                hybrid_wait_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(wait1 - wait0).count();
+                hybrid_elapsed_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(wait1 - launch_time).count();
+            } else {
+                ggml_backend_synchronize(compute_backend);
+            }
 
             const uint8_t * src = (const uint8_t *) hybrid_output_ptr;
             for (int i = 0; i < hit_count; ++i) {
@@ -1084,11 +1088,15 @@ private:
                 layer.active_hits = 0;
                 return;
             }
-            const auto q0 = std::chrono::steady_clock::now();
-            quantize_row_q8_1((const float *) op->src[1]->data, hybrid_input_q8_ptr, layer.input_dim);
-            const auto q1 = std::chrono::steady_clock::now();
-            hybrid_preq_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(q1 - q0).count();
-            ++hybrid_preq_inputs;
+            if (print_stats) {
+                const auto q0 = std::chrono::steady_clock::now();
+                quantize_row_q8_1((const float *) op->src[1]->data, hybrid_input_q8_ptr, layer.input_dim);
+                const auto q1 = std::chrono::steady_clock::now();
+                hybrid_preq_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(q1 - q0).count();
+                ++hybrid_preq_inputs;
+            } else {
+                quantize_row_q8_1((const float *) op->src[1]->data, hybrid_input_q8_ptr, layer.input_dim);
+            }
             input_data = hybrid_input_q8_ptr;
         }
 
@@ -1107,9 +1115,11 @@ private:
         }
         ggml_backend_tensor_get_async(compute_backend, t->output, hybrid_output_ptr, 0, out_bytes);
         layer.active_gpu_launched = true;
-        layer.active_launch_time = std::chrono::steady_clock::now();
-        ++hybrid_launches;
-        hybrid_routes += (uint64_t) layer.active_hits;
+        if (print_stats) {
+            layer.active_launch_time = std::chrono::steady_clock::now();
+            ++hybrid_launches;
+            hybrid_routes += (uint64_t) layer.active_hits;
+        }
     }
 
     static void clear_active_locked(expert_cache_layer & layer) {
@@ -1130,12 +1140,14 @@ private:
             ++model.token;
         }
         model.last_layer = layer_id;
-        const int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-        if (route_first_us == 0) {
-            route_first_us = now_us;
+        if (print_stats) {
+            const int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (route_first_us == 0) {
+                route_first_us = now_us;
+            }
+            route_last_us = now_us;
         }
-        route_last_us = now_us;
         return model.token;
     }
 
@@ -1516,7 +1528,7 @@ private:
                 continue;
             }
 
-            const auto t0 = std::chrono::steady_clock::now();
+            const auto t0 = print_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             uint8_t * dst = (uint8_t *) staging.ptr;
             bool converted = true;
             for (size_t i = 0; i < parts.size(); ++i) {
@@ -1526,14 +1538,18 @@ private:
                 }
                 dst += part_bytes[i];
             }
-            const auto t1 = std::chrono::steady_clock::now();
-            conversion_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
-                                    std::memory_order_relaxed);
+            if (print_stats) {
+                const auto t1 = std::chrono::steady_clock::now();
+                conversion_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
+                                        std::memory_order_relaxed);
+            }
             if (!converted) {
                 ++stale_requests;
                 continue;
             }
-            conversion_bytes.fetch_add(bundle_bytes, std::memory_order_relaxed);
+            if (print_stats) {
+                conversion_bytes.fetch_add(bundle_bytes, std::memory_order_relaxed);
+            }
 
             {
                 std::lock_guard<std::mutex> lock(staging.mutex);
@@ -1598,7 +1614,7 @@ private:
                 continue;
             }
 
-            const auto t0 = std::chrono::steady_clock::now();
+            const auto t0 = print_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             size_t staging_offset = 0;
             for (size_t i = 0; i < part_bytes.size(); ++i) {
                 const size_t bytes = part_bytes[i];
@@ -1606,14 +1622,17 @@ private:
                 ggml_backend_tensor_set_async(upload_backend, cache_parts[i],
                         (const uint8_t *) staging.ptr + staging_offset, slot_offset, bytes);
                 staging_offset += bytes;
-                ++upload_ops;
+                if (print_stats) {
+                    ++upload_ops;
+                }
             }
             ggml_backend_synchronize(upload_backend);
-            const auto t1 = std::chrono::steady_clock::now();
-
-            upload_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-            upload_bytes += bundle_bytes;
-            ++uploads;
+            if (print_stats) {
+                const auto t1 = std::chrono::steady_clock::now();
+                upload_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+                upload_bytes += bundle_bytes;
+                ++uploads;
+            }
 
             {
                 std::lock_guard<std::mutex> lock(state_mutex);
