@@ -474,14 +474,10 @@ struct common_params {
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
 
-    // Experimental routed-expert cache. Shadow mode performs real admissions/uploads
-    // while keeping expert execution on its existing backend.
+    // Routed-expert GPU cache for CPU-resident MoE weights.
     int32_t expert_cache_slots        = 0;
     int32_t expert_cache_admit_window = 0;
     int32_t expert_cache_workers      = 1;
-    bool    expert_cache_shadow       = false; // legacy internal mode; CLI uses hybrid when slots > 0
-    bool    expert_cache_hybrid       = false;
-    bool    expert_cache_stats        = false;
     bool    expert_cache_moe_placement_explicit = false;
 
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory

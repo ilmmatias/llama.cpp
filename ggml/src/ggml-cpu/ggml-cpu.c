@@ -16,7 +16,6 @@
 #include "ggml.h"
 #include "common.h"
 #include "tiled/tiled.h"
-#include "expert-cache-shadow.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -1762,12 +1761,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
 
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {
         return;
-    }
-
-    // Observe routed-expert IDs before the extra-buffer dispatch. CPU_REPACK
-    // handles quantized MUL_MAT_ID here and returns before the generic path.
-    if (params->ith == 0 && tensor->op == GGML_OP_MUL_MAT_ID && tensor->src[2] != NULL) {
-        ggml_backend_cpu_expert_cache_shadow_route(tensor->src[0], tensor->src[2]);
     }
 
     // extra_buffer op?

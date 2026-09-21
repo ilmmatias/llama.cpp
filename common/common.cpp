@@ -1270,8 +1270,7 @@ static void common_init_sampler_from_model(
     get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA),    sparams.mirostat_eta,    common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA);
 }
 
-using common_expert_cache_shadow_configure_fn = void (*)(uint32_t, uint32_t, ggml_backend_dev_t);
-using common_expert_cache_hybrid_configure_fn = void (*)(uint32_t, uint32_t, uint32_t, bool, ggml_backend_dev_t);
+using common_expert_cache_configure_fn = void (*)(uint32_t, uint32_t, uint32_t, ggml_backend_dev_t);
 
 static void * common_expert_cache_proc_get(const char * name) {
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1310,9 +1309,6 @@ static void common_expert_cache_prepare_params(common_params & params) {
     if (params.expert_cache_moe_placement_explicit) {
         throw std::invalid_argument("--expert-cache-slots cannot be combined with --cpu-moe/--n-cpu-moe");
     }
-
-    params.expert_cache_hybrid = true;
-    params.expert_cache_shadow = false;
 
     const auto cpu_buft = ggml_backend_cpu_buffer_type();
     if (!params.tensor_buft_overrides.empty() &&
@@ -1385,15 +1381,12 @@ static size_t common_expert_cache_fit_reserve(
 }
 
 static void common_expert_cache_reset() {
-    if (auto fn = reinterpret_cast<common_expert_cache_shadow_configure_fn>(
-            common_expert_cache_proc_get("ggml_backend_cpu_expert_cache_shadow_configure"))) {
-        fn(0, 0, nullptr);
-    }
-    if (auto fn = reinterpret_cast<common_expert_cache_hybrid_configure_fn>(
-            common_expert_cache_proc_get("ggml_backend_cpu_expert_cache_hybrid_configure"))) {
-        fn(0, 0, 1, false, nullptr);
+    if (auto fn = reinterpret_cast<common_expert_cache_configure_fn>(
+            common_expert_cache_proc_get("ggml_backend_cpu_expert_cache_configure"))) {
+        fn(0, 0, 1, nullptr);
     }
 }
+
 
 static void common_expert_cache_configure(const common_params & params) {
     if (params.expert_cache_slots <= 0) {
@@ -1401,7 +1394,7 @@ static void common_expert_cache_configure(const common_params & params) {
         return;
     }
     if (params.expert_cache_workers <= 0) {
-        throw std::invalid_argument("expert cache mode requires --expert-cache-workers > 0");
+        throw std::invalid_argument("expert cache requires --expert-cache-workers > 0");
     }
 
     ggml_backend_dev_t cache_dev = common_expert_cache_device_get(params);
@@ -1409,15 +1402,14 @@ static void common_expert_cache_configure(const common_params & params) {
         throw std::runtime_error("expert cache requested but no GPU device is available");
     }
 
-    auto fn = reinterpret_cast<common_expert_cache_hybrid_configure_fn>(
-        common_expert_cache_proc_get("ggml_backend_cpu_expert_cache_hybrid_configure"));
+    auto fn = reinterpret_cast<common_expert_cache_configure_fn>(
+        common_expert_cache_proc_get("ggml_backend_cpu_expert_cache_configure"));
     if (fn == nullptr) {
-        throw std::runtime_error("CPU backend does not provide hybrid routed-expert cache support");
+        throw std::runtime_error("CPU backend does not provide routed-expert cache support");
     }
     fn((uint32_t) params.expert_cache_slots,
        (uint32_t) params.expert_cache_admit_window,
        (uint32_t) params.expert_cache_workers,
-       params.expert_cache_stats,
        cache_dev);
 }
 

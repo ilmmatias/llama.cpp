@@ -10,7 +10,7 @@
 #include "traits.h"
 
 #include "arch-fallback.h"
-#include "expert-cache-shadow.h"
+#include "expert-cache.h"
 
 #include <cmath>
 #include <cstring>
@@ -4780,16 +4780,16 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int n_ids = ids->ne[0]; // n_expert_used
         const int n_as  = ne02;       // n_expert
 
-        // Hybrid mode is decode-only. Thread 0 freezes the ready cache-hit set,
+        // Expert cache is decode-only. Thread 0 freezes the ready cache-hit set,
         // launches the full cached gate/up/GLU/down subgraph on the GPU, and
         // removes those route positions from the CPU MUL_MAT_ID work.
-        uint64_t hybrid_route_mask = 0;
+        uint64_t cached_route_mask = 0;
         if (ith == 0) {
-            hybrid_route_mask = ggml_backend_cpu_expert_cache_hybrid_begin(op);
-            if (hybrid_route_mask != 0) {
+            cached_route_mask = ggml_backend_cpu_expert_cache_begin(op);
+            if (cached_route_mask != 0) {
                 GGML_ASSERT(ids->ne[1] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1);
                 for (int id = 0; id < n_ids && id < 64; ++id) {
-                    if (hybrid_route_mask & (UINT64_C(1) << id)) {
+                    if (cached_route_mask & (UINT64_C(1) << id)) {
                         memset((char *) dst->data + (size_t) id * nb1, 0, (size_t) ne01 * sizeof(float));
                     }
                 }
@@ -4858,7 +4858,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             // group rows by src0 matrix
             for (int32_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
                 for (int32_t id = 0; id < n_ids; ++id) {
-                    if (iid1 == 0 && id < 64 && (hybrid_route_mask & (UINT64_C(1) << id))) {
+                    if (iid1 == 0 && id < 64 && (cached_route_mask & (UINT64_C(1) << id))) {
                         continue;
                     }
                     const int32_t i02 =
@@ -5146,7 +5146,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         }
 
         if (ith == 0) {
-            ggml_backend_cpu_expert_cache_hybrid_end(op);
+            ggml_backend_cpu_expert_cache_end(op);
         }
 
 #undef MMID_MATRIX_ROW

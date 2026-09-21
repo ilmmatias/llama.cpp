@@ -2792,8 +2792,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("expert cache slots must be non-negative");
             }
             params.expert_cache_slots = value;
-            params.expert_cache_hybrid = value > 0;
-            params.expert_cache_shadow = false;
         }
     ));
     add_opt(common_arg(
@@ -2815,13 +2813,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("expert cache workers must be positive");
             }
             params.expert_cache_workers = value;
-        }
-    ));
-    add_opt(common_arg(
-        {"-ecstats", "--expert-cache-stats"},
-        "print expert-cache admission, transfer, and hybrid-execution statistics",
-        [](common_params & params) {
-            params.expert_cache_stats = true;
         }
     ));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
