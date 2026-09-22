@@ -118,10 +118,7 @@ static_assert(sizeof(block_iq4_nlx8) == 8 * sizeof(ggml_half) + QK4_NL * 4, "wro
 struct block_znq2x8 {
     uint8_t d[8];
     uint8_t books[8];
-    // Eight rows x 32 2-bit codes. For each 4-weight group, keep the
-    // original packed byte from each row in [row0..row7] order. One
-    // VPMULTISHIFTQB expands the eight bytes to 32 byte indices at runtime,
-    // while the representation remains exactly 8 * sizeof(block_znq2) = 2.5 bpw.
+    // Packed 2-bit codes interleaved by 4-weight group across eight rows.
     uint8_t qs[QK_ZNQ / 4][8];
 };
 
@@ -130,10 +127,7 @@ static_assert(sizeof(block_znq2x8) == 8 * sizeof(block_znq2), "wrong znq2x8 bloc
 struct block_znq3x8 {
     uint8_t d[8];
     uint8_t books[8];
-    // Eight rows x 32 3-bit codes. For each 4-weight group, store three
-    // 32-bit bitplanes in [row0 w0..w3, row1 w0..w3, ...] bit order.
-    // This preserves the exact 3.5 bpw footprint while making runtime unpack
-    // three masked byte broadcasts plus one ternary OR on AVX-512VL/BW.
+    // Three bitplanes per 4-weight group, interleaved across eight rows.
     uint32_t planes[QK_ZNQ / 4][3];
 };
 
@@ -165,11 +159,11 @@ struct block_mxfp4x8 {
 };
 static_assert(sizeof(block_mxfp4x8) == 8 + QK_MXFP4 * 4, "wrong mxfp4x8 block size/padding");
 
-// "Q8 panel": one super-block of a grid based IQ type (iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_xs, iq1_s, iq1_m) decoded into signed 8 bit values plus *integer* sub-block scales, 8 rows interleaved, built into transient scratch for the duration of one mul_mat (see iqp.h).
-// Every supported type has a sub-block scale of the form (d * 2^-k) * small_int, so the panel splits it into dfac[row] = d * 2^-k and the integer iscales[], and (dfac[row] * iscales[sb * 8 + row]) * qs is bit identical to dequantize_row_iq* - d has 11 mantissa bits, 2^-k is exact and the integer has at most 6 significant bits, so nothing rounds - which lets the kernels apply the sub-block scales in integer and accumulate a whole super-block exactly in int32.
-// Sub-blocks are 16 wide rather than 32 because iq2_xs / iq2_s scale each half of a 32 group with its own nibble.
-// qs layout, for one super-block of 256 columns x 8 rows: qs[sb * 128 + g * 32 + row * 4 + k] holds column sb * 16 + g * 4 + k, so one 32 byte load is 4 columns x 8 rows, ready for _mm256_dpbusd_epi32 against a broadcast int32 of the activation.
-// bias[row] = 128 * sum over the super-block of (weight * integer scale of its sub-block), which removes the unsigned-activation term with one int32 subtract per super-block.
+// Q8 panel for grid IQ types. Eight rows are decoded to signed 8-bit values
+// with integer sub-block scales. Sub-blocks are 16 elements wide.
+//
+// qs[sb * 128 + g * 32 + row * 4 + k] stores column
+// sb * 16 + g * 4 + k. bias[] removes the unsigned-activation correction.
 #define IQP_SB_SIZE 16                    // weights per sub-block
 #define IQP_NSB     (QK_K / IQP_SB_SIZE)  // sub-blocks per super-block
 
@@ -183,15 +177,15 @@ struct block_iqp_x8 {
 static_assert(sizeof(block_iqp_x8) == 8 * sizeof(float) + 8 * sizeof(int32_t) + IQP_NSB * 8 + QK_K * 8,
               "wrong iqp_x8 block size/padding");
 
-// does this build read bias[]? With VNNI the activations go in as unsigned bytes (y + 128) and the resulting 128 * sum(w) term is removed with the per-row bias.
-// Without VNNI the maddubs int16 accumulator would overflow for unsigned operands, so the kernels use the classic sign trick instead and the bias must not be applied - the decode then skips filling it.
+// VNNI uses unsigned activations and subtracts bias[]. Other paths use signed
+// activations and leave bias[] unused.
 #if defined(__AVX2__) && ((defined(__AVX512VNNI__) && defined(__AVX512VL__)) || defined(__AVXVNNI__))
 #define GGML_IQP_USE_BIAS 1
 #else
 #define GGML_IQP_USE_BIAS 0
 #endif
 
-// the decode (iqp.cpp) fills bias[] and the x86 kernels subtract it only when GGML_IQP_USE_BIAS is 1, and the two are separate TUs that must see the same feature macros. Renaming the kernels per bias mode turns a mismatch into a link error instead of silently wrong results.
+// Keep the decoder and x86 kernels on the same bias convention.
 #if GGML_IQP_USE_BIAS
 #    define ggml_gemv_iqp_8x8_q8_K ggml_gemv_iqp_8x8_q8_K_bias
 #    define ggml_gemm_iqp_8x8_q8_K ggml_gemm_iqp_8x8_q8_K_bias

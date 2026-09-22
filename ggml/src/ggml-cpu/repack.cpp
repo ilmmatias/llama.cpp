@@ -2722,9 +2722,8 @@ void ggml_gemm_q2_K_16x1_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs,
 }
 #endif
 
-// "Q8 panel" kernels. vx points at block_iqp_x8 (8 interleaved rows), vy at plain (non interleaved)
-// block_q8_K rows. The signed values are dotted directly here - the unsigned activation trick and
-// the matching bias correction are only used by the SIMD implementations.
+// Q8-panel generic kernels. vx contains eight interleaved rows; vy contains
+// ordinary block_q8_K rows.
 void ggml_gemv_iqp_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     const int nb                = n / QK_K;
     const int ncols_interleaved = 8;
@@ -2773,7 +2772,7 @@ void ggml_gemv_iqp_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     }
 }
 
-// one 4 row x nc column tile: the four activation rows are independent, so this is the whole gemm body for any four rows, however they were addressed. s points at the first of the four output rows, which are bs floats apart
+// Four independent activation rows; output rows are bs floats apart.
 static void iqp_gemm_tile_4_generic(int nb, float * GGML_RESTRICT s, size_t bs, const block_iqp_x8 * GGML_RESTRICT b_ptr_start, const block_q8_K * const a_ptr[4], int nc) {
     const int ncols_interleaved = 8;
 
@@ -4514,11 +4513,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     const int64_t ne02 = op->src[0]->ne[2]; // n_as, n_expert
                     const int64_t ne12 = op->src[1]->ne[2]; // n_tokens
 
-                    // Generic MUL_MAT_ID only needs one quantized row per row in
-                    // src1. ZNQ2/3/4 MoE prompt processing additionally materializes the
-                    // routed rows in expert order so all workers can consume the
-                    // same block_q8_0x4 stream. With top-k routing this can be kx
-                    // larger than the generic src1 buffer (Qwen3-30B-A3B: k=8).
+                    // ZNQ MoE stores routed activation rows in expert order.
                     size_t activation_size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
@@ -4815,10 +4810,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         };
         static_assert(sizeof(mmid_row_mapping) == 2 * sizeof(int32_t), "unexpected MUL_MAT_ID row-map padding");
 
-        // 0035 originally placed the expert-grouped stream in nbw3, which is
-        // only the generic src1 quantization area. In the common MoE layout
-        // ne11 == 1 while n_ids > 1, so that overwrote the row mapping and then
-        // the end of params->wdata. Reserve/address the routed footprint here.
+        // Reserve the expert-grouped activation stream separately from the row map.
         const size_t routed_q8_size = nbw1 * (size_t) n_ids * (size_t) ne12;
         const size_t activation_size = use_znq_moe ? MAX(nbw3, routed_q8_size) : nbw3;
 
@@ -4834,10 +4826,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         auto * matrix_row_counts = (int64_t *) (wdata_src1_end);                                        // [n_as]
         struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *) (matrix_row_counts + n_as); // [n_as][ne12]
 
-        // ZNQ2/3/4 MoE use a different activation layout from the generic
-        // MUL_MAT_ID implementation. Route first, then quantize directly into
-        // expert-grouped block_q8_0x4 groups so the work is done once and the
-        // existing 16-row / 64+-row GEMM kernels can reuse decoded weights.
+        // ZNQ MoE routes activations before packing them into expert-grouped Q8_0 rows.
         // src1: float32 => param type
         if (!use_znq_moe) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
@@ -4879,9 +4868,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             static_assert(QK8_0 == 32, "ZNQ MoE Q8 packing assumes QK8_0 == 32");
             GGML_ASSERT(ne00 % QK8_0 == 0);
 
-            // Pack activation rows directly into expert order. Four-row jobs are
-            // spread across workers globally, so Mixtral's small expert count does
-            // not leave half the machine idle during activation quantization.
+            // Pack routed activation rows directly in expert order.
             int64_t qtask = 0;
             int64_t expert_row_base = 0;
             for (int cur_a = 0; cur_a < n_as; ++cur_a) {
@@ -4945,14 +4932,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         };
 
         if (use_znq_moe) {
-            // Schedule ZNQ2/3/4 MoE work as (expert, output-tile) jobs instead
-            // of making every worker walk every expert with a fixed column slice.
-            //
-            // Sweep variant: use eight adjacent x32 output panels per task.
-            // This strongly amortizes scheduler/GEMM-entry overhead, trading
-            // away output-column granularity and potentially some load balance.
-            // Keep the sub-32 tail shaped as 16+8 rather than 24 so it reaches
-            // the 16x16 kernel instead of demoting all 24 columns to the x8 path.
+            // Schedule work by expert and output tile. Keep a 24-column tail as
+            // 16 + 8 so both pieces use the larger kernels.
             constexpr int64_t znq_moe_task_cols = 256;
             GGML_ASSERT(ne01 > 0 && ne01 % NB_COLS == 0);
             GGML_ASSERT(ids->ne[1] == ne12);
@@ -4963,9 +4944,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             const int64_t tasks_per_expert = n_full_tiles + tail_tasks;
             const int64_t n_routed_rows = (int64_t) n_ids * ne12;
 
-            // Packing above has consumed the counts. Convert the same scratch
-            // array in-place to expert start offsets, avoiding another allocation
-            // or a prefix scan in every scheduled tile.
+            // Convert row counts in-place to expert start offsets.
             if (ith == 0) {
                 int64_t row_offset = 0;
                 for (int cur_a = 0; cur_a < n_as; ++cur_a) {
@@ -4975,8 +4954,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 }
                 GGML_ASSERT(row_offset == n_routed_rows);
 
-                // Give each worker one initial task without an atomic fetch;
-                // subsequent tasks come from the shared chunk counter.
+                // Seed one task per worker before using the shared counter.
                 ggml_threadpool_chunk_set(params->threadpool, nth);
             }
             ggml_barrier(params->threadpool);
@@ -4985,10 +4963,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             const size_t dst_bs2 = nb2 / sizeof(float);
             const int64_t total_tasks = (int64_t) n_as * tasks_per_expert;
 
-            // With hundreds of experts, enumerate one output tile across all
-            // experts before advancing to the next tile. This keeps the tail
-            // of the dynamic queue from collapsing onto one hot expert.
-            // Preserve expert-major ordering for smaller MoEs.
+            // Use tile-major ordering for large expert counts.
             const bool znq_tile_major = n_as >= 256;
 
             int64_t current_task = ith;
@@ -5038,9 +5013,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                             src0_cur + col*nb01, expert_q8, (int) gemm_rows, tile);
                     }
 
-                    // At most three rows remain outside block_q8_0x4. Process
-                    // only this task's columns, so tail work is dynamically
-                    // balanced along with the main GEMM rather than serialized.
+                    // Up to three rows remain outside block_q8_0x4.
                     for (int64_t ir1 = gemm_rows; ir1 < nr1; ++ir1) {
                         const mmid_row_mapping row = MMID_MATRIX_ROW(cur_a, ir1);
                         const char * src1_col = expert_q8 + ir1*nbw1;
@@ -5054,8 +5027,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 current_task = ggml_threadpool_chunk_add(params->threadpool, 1);
             }
 
-            // Counts were converted to prefix offsets, so do not fall through
-            // to the generic per-expert loop below.
+            // matrix_row_counts now contains prefix offsets.
             return;
         }
 #endif
@@ -5097,10 +5069,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 const int64_t gemm_rows = nr1 - nr1 % 4;
 
                 if (gemm_rows > 0) {
-                    // Store GEMM results directly into the final routed dst rows.
-                    // This removes the per-worker contiguous float tile and its
-                    // full write/read/memcpy pass without changing activation
-                    // packing or the 16-row / x32 decoded-weight kernels.
+                    // Store GEMM results directly in routed destination rows.
                     const int32_t * row_map = reinterpret_cast<const int32_t *>(&MMID_MATRIX_ROW(cur_a, 0));
                     const size_t dst_bs1 = nb1 / sizeof(float);
                     const size_t dst_bs2 = nb2 / sizeof(float);
@@ -5120,8 +5089,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
 #endif
 
-            // The expert-grouped tail remains ordinary Q8_0 blocks, so 0..3
-            // routed rows use the existing GEMV. TG therefore remains unchanged.
+            // The expert-grouped tail remains ordinary Q8_0 blocks.
             for (; ir1 < nr1; ++ir1) {
                 struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
 

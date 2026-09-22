@@ -1143,8 +1143,6 @@ GGML_TABLE_BEGIN(int8_t, kvalues_iq4nl, 16)
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 GGML_TABLE_END()
 
-// ZNQ2/ZNQ3 v2 canonical nonlinear books. Trained on family-balanced BF16
-// blocks from DeepSeek, Qwen, and Gemma models, with OLMo3 held out.
 GGML_TABLE_BEGIN(int8_t, kvalues_znq2, 64)
     -45, -16, 11, 42,
     -50, -12, 23, 64,
@@ -1183,8 +1181,6 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq3, 128)
     -119, -85, -49, -15, 17, 50, 86, 118,
 GGML_TABLE_END()
 
-// ZNQ4 retains the v1 books: its trained candidate improved block NMSE but
-// regressed held-out model KL divergence.
 GGML_TABLE_BEGIN(int8_t, kvalues_znq4, 256)
     -74, -52, -39, -28, -20, -13, -8, -2, 3, 8, 14, 21, 30, 40, 54, 77,
     -102, -67, -48, -34, -24, -16, -9, -3, 3, 10, 17, 25, 35, 48, 66, 100,

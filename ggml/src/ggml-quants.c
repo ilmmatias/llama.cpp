@@ -5062,8 +5062,6 @@ static uint8_t znq_fp32_to_ufp8(double x) {
     while (lo < hi) {
         const int mid = (lo + hi) >> 1;
         const double boundary = 0.5 * ((double) znq_ufp8_to_fp32((uint8_t) mid) + (double) znq_ufp8_to_fp32((uint8_t) (mid + 1)));
-        // numpy.searchsorted(..., side="right") used by the lab selects the
-        // upper value when x is exactly on a midpoint.
         if (x >= boundary) {
             lo = mid + 1;
         } else {
@@ -5327,8 +5325,6 @@ static void quantize_row_znq_ref_impl(const float * GGML_RESTRICT x, void * GGML
             scale = znq_ufp8_to_fp32(sc);
         }
 
-        // Nearby scales improved ZNQ2/3 model metrics, but regressed held-out
-        // ZNQ4 KL divergence.
         if (bits != 4) {
             uint8_t best_sc = sc;
             double best_err = znq_encode_block(xb, bits, scale, q, NULL, NULL, weight);
