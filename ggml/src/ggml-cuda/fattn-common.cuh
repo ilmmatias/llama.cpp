@@ -969,7 +969,7 @@ static __global__ void flash_attn_combine_results(
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
-    dst[tid] = VKQ_numerator / VKQ_denominator;
+    dst[tid] = VKQ_denominator == 0.0f ? 0.0f : VKQ_numerator / VKQ_denominator;
 }
 
 template <int DV, int ncols1, int ncols2>
