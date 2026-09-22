@@ -247,7 +247,6 @@ struct tiled_kernel_ws {
 
 static thread_local tiled_kernel_ws tiled_ws;
 
-// GGML_CPU_TILED_MM: master switch, on by default. If off, we fast return false and normal vec_dot mul_mat resumes
 static bool ggml_tiled_matmul_enabled(void) {
     static bool enabled = true;
     static bool inited  = false;
@@ -259,7 +258,6 @@ static bool ggml_tiled_matmul_enabled(void) {
     return enabled;
 }
 
-// GGML_CPU_TILED_MM_FORCE: test/bench only, take the tiled path even when unprofitable
 static bool ggml_tiled_matmul_forced(void) {
     static bool forced = false;
     static bool inited  = false;
@@ -271,7 +269,6 @@ static bool ggml_tiled_matmul_forced(void) {
     return forced;
 }
 
-// Called by ggml-cpu.c to increase wdata in the case of VNNI, or other future kernels that need a second scratch space
 size_t ggml_tiled_extra_wdata_len(int64_t ne10, int64_t nr1) {
 #if defined(KERNEL_SRC1_UNPACK)
     if (ggml_tiled_matmul_enabled()) {
@@ -285,20 +282,16 @@ size_t ggml_tiled_extra_wdata_len(int64_t ne10, int64_t nr1) {
     return 0;
 }
 
-// compatibility/profitability gate.  anything not supported here will fall back to the vec_dot path
 static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
                                         const struct ggml_tensor * src1) {
     if (!ggml_tiled_matmul_enabled()) {
         return false;
     }
 
-    // hard constraints: the kernel is only correct/defined for these
-
-    // repack-buffer weights hold a repacked layout, let that kernel handle
+    // Repacked weights use their own kernels.
     if (src0->extra != NULL) {
         return false;
     }
-    // K-quant weights only for now
     if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K &&
         src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_Q3_K && src0->type != GGML_TYPE_Q2_K) {
         return false;
@@ -308,16 +301,14 @@ static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
     }
 
     if (src1->type == GGML_TYPE_Q8_K && !ggml_is_contiguous(src1)) {
-        // We can handle noncontiguous floats because we're repacking to q8_k anyways
         return false;
     }
 
-    // If forced, skip profitability check
     if (ggml_tiled_matmul_forced()) {
         return true;
     }
 
-    // We are slightly profitable at 64 rows, unprofitable below, fall back to optimized vec_dot
+    // Use vec_dot below 64 rows.
     if (src1->ne[1] < 64) {
         return false;
     }
@@ -409,7 +400,6 @@ static void ggml_compute_forward_mul_mat_tiled_one_chunk(
         tiled_ws.src1 = new tiled_tile_src1();
     }
     if (!tiled_ws.acc) {
-        // Write buffer, stays in L2 and reduces TLB pressure until we copy/transpose out to main mem at the end.
         tiled_ws.acc = static_cast<float *>(
             ::operator new(sizeof(float) * (size_t) TILED_TILE_ROWS * TILED_TILE_ROWS,
                            std::align_val_t(64)));
@@ -466,8 +456,7 @@ static void ggml_compute_forward_mul_mat_tiled_one_chunk(
                                        qv, nr1_pad, iir1, kblk);
 
                 // 16x16 microtiles sweeping the window
-                // Unpack routines zeropad our macrotiles outside the valid unpacked ranges, 
-                // so invalid vals are harmless for final dotproducts, don't need to special case them
+                // Unpackers zero-pad ragged macrotiles.
                 for (int64_t ir0 = iir0; ir0 < iir0_end; ir0 += MICRO) {
                     for (int64_t ir1 = iir1; ir1 < iir1_end; ir1 += MICRO) {
                         tiled_run_microtile<SUBBLK, HAS_MIN, BIAS>(*tiled_ws.src0, *tiled_ws.src1,
@@ -476,7 +465,6 @@ static void ggml_compute_forward_mul_mat_tiled_one_chunk(
                     }
                 }
             }
-            // write acc back out from L2 to main memory
             tiled_store_window(tiled_ws.acc, n_src0, n_src1, TILED_TILE_ROWS,
                                (float *) (dst_col + iir0 * nb0 + i11 * nb1), nb1 / nb0);
         }
@@ -539,47 +527,39 @@ static void ggml_compute_forward_mul_mat_tiled_driver(
         }
     }
 
-    // interleave the whole tensor's src1 codes once (VNNI builds only)
+    // Interleave src1 once for VNNI kernels.
 #if defined(KERNEL_SRC1_UNPACK)
     tiled_prepare_src1_interleave(params, src1, vec_dot_type, ne10, ne11 * ne12 * ne13, ith, nth);
 #endif
 
     if (ith == 0) {
-        // Every thread starts at ith, so the first unprocessed chunk is nth. This saves a bit of coordination right at the start.
+        // Seed the shared counter after the initial per-worker chunks.
         ggml_threadpool_chunk_set(params->threadpool, nth);
     }
 
     ggml_barrier(params->threadpool);
 
-    // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
     const int64_t nr0 = ne0;
 
-    // This is the size of the rest of the dimensions of the result
     const int64_t nr1 = ne1 * ne2 * ne3;
 
-    // Now select a reasonable chunk size.
     int chunk_size = TILED_TILE_ROWS;
 
-    // distribute the work across the inner or outer loop based on which one is larger
-    // The number of chunks in the 0/1 dim. CEIL(nr/chunk_size)
     int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
     int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
 
-    // Step down chunk size if too few chunks to saturate cores, minimum is microtile size
+    // Reduce the chunk size until there is enough parallel work.
     while (nchunk0 * nchunk1 < nth * 4 && chunk_size > 16) {
         chunk_size = chunk_size / 2;
         nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
         nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
     }
 
-    // The number of elements in each chunk
     const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
     const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
 
-    // The first chunk comes from our thread_id, the rest will get auto-assigned.
     int current_chunk = ith;
 
-    // TODO:  if we KNOW we're on a machine where all cores are equal, we could skip the coordination/work-stealing and just assign chunks deterministically
     while (current_chunk < nchunk0 * nchunk1) {
         const int64_t ith0 = current_chunk % nchunk0;
         const int64_t ith1 = current_chunk / nchunk0;
@@ -603,7 +583,6 @@ static void ggml_compute_forward_mul_mat_tiled_driver(
 bool ggml_compute_forward_mul_mat_tiled(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
-    // --use-ref means bail out and go back to vec_dot reference impl
     if (params->use_ref) {
         return false;
     }

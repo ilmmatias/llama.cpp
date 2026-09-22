@@ -1,5 +1,3 @@
-// mulmat microtile kernels, only optimized for x86 archs so far.
-
 #include "tiled-kernel.h"
 #include "tiled.h"
 #include "ggml-cpu-impl.h"
@@ -10,7 +8,6 @@
 #include <immintrin.h>
 #endif
 
-// Reference implementation, slower than existing vec_dot approach
 template <int SUBBLK, bool HAS_MIN, int BIAS>
 static void tiled_run_microtile_scalar(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                                        int i0, int j0, float * buf, int buf_stride) {
@@ -20,7 +17,7 @@ static void tiled_run_microtile_scalar(const tiled_tile_src0 & src0, const tiled
     float acc[TILED_MICRO][TILED_MICRO];
     memset(acc, 0, sizeof(acc));
 
-    // subdots at subblock granularity over the 256-K block, exact integer math
+    // Accumulate exact integer sub-block dot products.
     for (int s = 0; s < NB; s++) {
         for (int j = 0; j < TILED_MICRO; j++) {
             const int br = j0 + j;
@@ -39,13 +36,12 @@ static void tiled_run_microtile_scalar(const tiled_tile_src0 & src0, const tiled
                     raw += (int32_t) q0[e] * (int32_t) q1[e];
                 }
 
-                // BIAS: subtract BIAS*bsum (src1's per-subblock code sum) from the exact int raw 
+                // Remove the unsigned-activation bias.
                 int32_t corr = raw;
                 if constexpr (BIAS != 0) {
                     corr -= BIAS * bsum;
                 }
                 const int32_t scales_raw = (int32_t) src0.scales[ar * NB + s] * corr;
-                // d is NOT applied here: it is constant over the s-loop, so we apply it last before write-out
                 if constexpr (HAS_MIN) {
                     const int32_t mins_bsum = (int32_t) src0.mins[ar * NB + s] * bsum;
                     acc[i][j] += (float) src0.d[ar] * (float) scales_raw
@@ -57,7 +53,6 @@ static void tiled_run_microtile_scalar(const tiled_tile_src0 & src0, const tiled
         }
     }
 
-    // Apply d and write out to buf
     for (int i = 0; i < TILED_MICRO; i++) {
         for (int j = 0; j < TILED_MICRO; j++) {
             buf[(i0 + i) * buf_stride + (j0 + j)] += src1.d[j0 + j] * acc[i][j];
@@ -83,7 +78,6 @@ static void tiled_run_micro_vnni_8x16(const tiled_tile_src0 & src0, const tiled_
     constexpr int NS = SUBBLK / 16;
     constexpr int NG = SUBBLK / 4;
 
-    // band width, see the register-pressure note above
     constexpr int NUM_ROWS = 8;
 
     const __m512 d1_vec = _mm512_loadu_ps(&src1.d[j0]);
@@ -110,7 +104,7 @@ static void tiled_run_micro_vnni_8x16(const tiled_tile_src0 & src0, const tiled_
         __m512i acc16[NUM_ROWS];
         for (int t = 0; t < NUM_ROWS; t++) { acc16[t] = _mm512_setzero_si512(); }
 
-        #pragma GCC unroll 8 // pragma unrolled justified by measuing with/without
+        #pragma GCC unroll 8
         for (int g = 0; g < NG; g++) {
             const int kg = s * NG + g;
             const __m512i codes = _mm512_loadu_si512((const __m512i *) &src1.q[kg * TILED_TILE_ROWS * 4 + j0 * 4]);
@@ -121,7 +115,7 @@ static void tiled_run_micro_vnni_8x16(const tiled_tile_src0 & src0, const tiled_
             }
         }
 
-        // int correction: s1_acc += scales*(raw-BIAS*bsums)
+        // s1_acc += scales * (raw - BIAS * bsums)
         for (int t = 0; t < NUM_ROWS; t++) {
             const int ar = i0 + t;
             __m512i rawi = acc16[t];
@@ -133,8 +127,7 @@ static void tiled_run_micro_vnni_8x16(const tiled_tile_src0 & src0, const tiled_
         }
     }
 
-    // s2_acc += mins*bsums; independent of the dpbusd results, so it runs here instead of in the
-    // band pass: the band pass keeps the register budget for the 8-row band
+    // Accumulate the independent min term outside the dpbusd chain.
     if constexpr (HAS_MIN) {
         for (int s = 0; s < NB; s++) {
             __m512i bsums32 = _mm512_loadu_si512((const __m512i *) &bsums[s * NS * TILED_TILE_ROWS + j0]);
@@ -148,7 +141,6 @@ static void tiled_run_micro_vnni_8x16(const tiled_tile_src0 & src0, const tiled_
         }
     }
 
-    // epilogue: int->float, apply per-row scales, store to buf
     for (int t = 0; t < NUM_ROWS; t++) {
         const int ar = i0 + t;
         __m512 f1 = _mm512_cvtepi32_ps(s1_acc[t]);
@@ -173,9 +165,6 @@ static void tiled_run_microtile_vnni(const tiled_tile_src0 & src0, const tiled_t
 #endif // __AVX512VNNI__ && __AVX512VL__
 
 #if defined(__AVX2__)
-// AVX2 kernel.
-// We're effectively applying the existing vec_dot algorithms to an 8x16 block here.
-// Different paths based on subblock size as it affects when/where we multiply in scales and apply mins
 // SUBBLK=32: one 256-bit maddubs per (s, column), a 256-bit set1 scale,
 // one 8-lane i32 accumulator per column.
 // SUBBLK=16: two subblocks per 32B load. The 256-bit maddubs product
@@ -382,7 +371,6 @@ static void tiled_run_microtile_avx(const tiled_tile_src0 & src0, const tiled_ti
 
 #endif // __AVX__ && !__AVX2__
 
-// main microtile entry point
 template <int SUBBLK, bool HAS_MIN, int BIAS>
 void tiled_run_microtile(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                          int i0, int j0, float * buf, int buf_stride) {
@@ -397,7 +385,6 @@ void tiled_run_microtile(const tiled_tile_src0 & src0, const tiled_tile_src1 & s
 #endif
 }
 
-// explicit instantiations for the in-use formats (q4_K and q5_K share the constants)
 template void tiled_run_microtile<32, true, 0>(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                                                int i0, int j0, float * buf, int buf_stride);
 template void tiled_run_microtile<16, false, 32>(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,

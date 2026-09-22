@@ -1,13 +1,8 @@
 #pragma once
 
-// Tiled matmul kernel API: tile structs, kernel definitions
-
-// Currently only optimized for x86, new architectures should implement:
-// tiled_run_microtile:  16x16 microkernel
-// bit unpacking routines: tiled_unpk_nib4, tiled_unpk_2bit, tiled_unpk_or
 #include "ggml-quants.h"
 #include "ggml.h"
-#include "ggml-cpu-impl.h" // ggml_compute_params; no-op for the consumers, which include it first
+#include "ggml-cpu-impl.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -43,12 +38,10 @@ struct tiled_tile_src1 {
     float       d[TILED_TILE_ROWS];
 };
 
-// Ensure total size of both panels plus result window under 512kb for L2 cache fit
+// Keep both panels and the result window below 512 KiB.
 static_assert(sizeof(tiled_tile_src0) + sizeof(tiled_tile_src1) + (sizeof(float) * 65536) < 512 * 1024,
               "tiled tile memory budget exceeded");
 
-// unpack primitives for reading quants, defined as inline here to keep arch-specific code in kernel.h/.cpp
-// If this section gets too hairy later, we can break up into separate includes.
 #if defined(__AVX2__)
 // packed 4-bit codes -> low nibbles (lo) + high nibbles (hi)
 inline void tiled_unpk_nib4(const uint8_t * src, uint8_t * lo, uint8_t * hi) {
@@ -96,9 +89,7 @@ void tiled_run_microtile(const tiled_tile_src0 & src0, const tiled_tile_src1 & s
                          int i0, int j0, float * buf, int buf_stride);
 
 
-// Defined when this arch's kernel reads the src1 tile codes in a non-natural order.
-// If set, driver will call kernel methods `tiled_prepare_src1_interleave` and 
-// `tiled_unpack_src1_q8_K_kernel` to prepare the tensor and macrotiles instead of doing a naive copy.
+// VNNI reads src1 as [k/4][row][4].
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
 #define KERNEL_SRC1_UNPACK 1
 #endif
@@ -109,7 +100,6 @@ void tiled_run_microtile(const tiled_tile_src0 & src0, const tiled_tile_src1 & s
 void tiled_unpack_src1_q8_K_kernel(int n_rows, tiled_tile_src1 * tile,
                                    const int8_t * qv, int64_t nr1_pad, int64_t r_start, int64_t kblk);
 
-// geometry of an additional src1 scratch region in wdata
 struct tiled_interleave_geom {
     int8_t       * qv;      // base of the [slab][k/4][row][4] code region (null when not built)
     int64_t       nr1_pad;  // row count padded to 16 (0 then)
@@ -121,8 +111,7 @@ tiled_interleave_geom tiled_get_interleave_geom(const struct ggml_compute_params
                                                 enum ggml_type vec_dot_type,
                                                 int64_t ne10, int64_t nr1);
 
-// The q8 codes of the whole tensor are scattered into a flat [slab][k/4-in-slab][row][4] wdata region 
-// (rows padded to 16, zeroed tail) so the per (window, slab) unpack becomes a contiguous copy.
+// q8 codes are stored as [slab][k/4][row][4], with rows padded to 16.
 void tiled_prepare_src1_interleave(const struct ggml_compute_params * params,
                                    const struct ggml_tensor * src1,
                                    enum ggml_type vec_dot_type,
