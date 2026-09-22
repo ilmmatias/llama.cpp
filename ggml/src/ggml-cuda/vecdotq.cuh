@@ -1365,7 +1365,7 @@ static __device__ __forceinline__ float vec_dot_znq_q8_1(
     int sum = 0;
 #pragma unroll
     for (int l = 0; l < vdr; ++l) {
-        sum = ggml_cuda_dp4a(znq_pack4_cuda<bits>(block, 4*(iqs + l)), get_int_b2(y->qs, iqs + l), sum);
+        sum = ggml_cuda_dp4a(znq_pack4_cuda<bits, (vdr > 1)>(block, 4*(iqs + l)), get_int_b2(y->qs, iqs + l), sum);
     }
     return znq_scale_cuda(block[0]) * __low2float(y->ds) * sum;
 }
