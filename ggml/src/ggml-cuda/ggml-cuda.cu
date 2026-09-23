@@ -3327,8 +3327,7 @@ static int ggml_cuda_try_gdn_ab_fusion(
     }
 
     const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
-    if (!use_cuda_graph || cuda_ctx->curr_stream_no != 0 ||
-            !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING) {
+    if (!use_cuda_graph || cuda_ctx->curr_stream_no != 0) {
         return 0;
     }
 
