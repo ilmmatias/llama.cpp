@@ -12,11 +12,14 @@
 #include "arch-fallback.h"
 #include "expert-cache.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
 #include <cstdlib>
+#include <thread>
+#include <vector>
 
 #include "repack.h"
 
@@ -4196,6 +4199,64 @@ static int repack_iq4_nl_to_iq4_nl_8_bl(struct ggml_tensor * t, int interleave_b
     GGML_UNUSED(data_size);
 }
 
+template <typename block_t, typename block_x8_t>
+static void repack_znq_8_bl_parallel(
+        const block_t * src,
+        block_x8_t * dst,
+        int64_t nrow,
+        int64_t nblocks,
+        size_t data_size,
+        block_x8_t (*make_block)(const block_t *)) {
+    GGML_ASSERT(nrow % 8 == 0);
+
+    const int64_t n_groups = nrow / 8;
+    if (n_groups == 0) {
+        return;
+    }
+
+    // Thread creation is cheap compared to repacking a large expert tensor, but
+    // not compared to small matrices. Keep the chunks coarse enough that this
+    // remains a win outside the giant-MoE case too.
+    constexpr size_t min_bytes_per_thread = 16ull * 1024 * 1024;
+
+    size_t n_threads = std::thread::hardware_concurrency();
+    if (n_threads == 0) {
+        n_threads = 1;
+    }
+
+    const size_t max_threads_by_work = std::max<size_t>(1, (data_size + min_bytes_per_thread - 1) / min_bytes_per_thread);
+    n_threads = std::min(n_threads, (size_t) n_groups);
+    n_threads = std::min(n_threads, max_threads_by_work);
+
+    auto run_range = [&](size_t tid) {
+        const int64_t begin = n_groups * (int64_t) tid       / (int64_t) n_threads;
+        const int64_t end   = n_groups * (int64_t) (tid + 1) / (int64_t) n_threads;
+
+        block_t tmp[8];
+        for (int64_t g = begin; g < end; ++g) {
+            const block_t * src_g = src + g * 8 * nblocks;
+            block_x8_t * dst_g = dst + g * nblocks;
+
+            for (int64_t x = 0; x < nblocks; ++x) {
+                for (int r = 0; r < 8; ++r) {
+                    tmp[r] = src_g[x + (int64_t) r * nblocks];
+                }
+                dst_g[x] = make_block(tmp);
+            }
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(n_threads > 0 ? n_threads - 1 : 0);
+    for (size_t tid = 1; tid < n_threads; ++tid) {
+        workers.emplace_back(run_range, tid);
+    }
+    run_range(0);
+    for (auto & worker : workers) {
+        worker.join();
+    }
+}
+
 static block_znq2x8 make_block_znq2x8(const block_znq2 * in) {
     block_znq2x8 out = {};
 
@@ -4232,16 +4293,8 @@ static int repack_znq2_to_znq2_8_bl(struct ggml_tensor * t, const void * GGML_RE
         return -1;
     }
 
-    block_znq2 tmp[8];
-    for (int b = 0; b < nrow; b += 8) {
-        for (int64_t x = 0; x < nblocks; ++x) {
-            for (int r = 0; r < 8; ++r) {
-                tmp[r] = src[x + r * nblocks];
-            }
-            *dst++ = make_block_znq2x8(tmp);
-        }
-        src += 8 * nblocks;
-    }
+    repack_znq_8_bl_parallel(src, dst, nrow, nblocks, data_size, make_block_znq2x8);
+
     return 0;
 }
 
@@ -4301,16 +4354,8 @@ static int repack_znq3_to_znq3_8_bl(struct ggml_tensor * t, const void * GGML_RE
         return -1;
     }
 
-    block_znq3 tmp[8];
-    for (int b = 0; b < nrow; b += 8) {
-        for (int64_t x = 0; x < nblocks; ++x) {
-            for (int r = 0; r < 8; ++r) {
-                tmp[r] = src[x + r * nblocks];
-            }
-            *dst++ = make_block_znq3x8(tmp);
-        }
-        src += 8 * nblocks;
-    }
+    repack_znq_8_bl_parallel(src, dst, nrow, nblocks, data_size, make_block_znq3x8);
+
     return 0;
 }
 
@@ -4349,16 +4394,8 @@ static int repack_znq4_to_znq4_8_bl(struct ggml_tensor * t, const void * GGML_RE
         return -1;
     }
 
-    block_znq4 tmp[8];
-    for (int b = 0; b < nrow; b += 8) {
-        for (int64_t x = 0; x < nblocks; ++x) {
-            for (int r = 0; r < 8; ++r) {
-                tmp[r] = src[x + r * nblocks];
-            }
-            *dst++ = make_block_znq4x8(tmp);
-        }
-        src += 8 * nblocks;
-    }
+    repack_znq_8_bl_parallel(src, dst, nrow, nblocks, data_size, make_block_znq4x8);
+
     return 0;
 }
 
