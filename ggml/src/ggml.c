@@ -1086,6 +1086,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MUL_MAT",
     "MUL_MAT_ID",
+    "MOE_REDUCE",
     "OUT_PROD",
 
     "SCALE",
@@ -1166,7 +1167,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1202,6 +1203,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "X*Y",
     "X[i]*Y",
+    "sum_i(x[i]*w[i])",
     "X*Y",
 
     "x*v",
@@ -1282,7 +1284,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3478,6 +3480,25 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[1] = b;
     result->src[2] = ids;
 
+    return result;
+}
+
+// ggml_moe_reduce
+
+struct ggml_tensor * ggml_moe_reduce(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * experts,
+        struct ggml_tensor  * weights) {
+    GGML_ASSERT(experts->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(experts->ne[1] > 0 && experts->ne[2] > 0 && experts->ne[3] == 1);
+    GGML_ASSERT(weights->ne[0] == 1 && weights->ne[1] == experts->ne[1] &&
+                weights->ne[2] == experts->ne[2] && weights->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(experts) && ggml_is_contiguous(weights));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, experts->ne[0], experts->ne[2]);
+    result->op     = GGML_OP_MOE_REDUCE;
+    result->src[0] = experts;
+    result->src[1] = weights;
     return result;
 }
 

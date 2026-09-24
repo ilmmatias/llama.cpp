@@ -528,6 +528,7 @@ extern "C" {
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
+        GGML_OP_MOE_REDUCE,
         GGML_OP_OUT_PROD,
 
         GGML_OP_SCALE,
@@ -1508,6 +1509,14 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // Sum routed expert outputs after multiplying each route by its weight.
+    // experts: [n_embd, n_expert_used, n_tokens], weights: [1, n_expert_used, n_tokens]
+    // result: [n_embd, n_tokens]
+    GGML_API struct ggml_tensor * ggml_moe_reduce(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * experts,
+            struct ggml_tensor  * weights);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

@@ -11799,6 +11799,35 @@ void ggml_compute_forward_qsa_block_score(
     }
 }
 
+void ggml_compute_forward_moe_reduce(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * experts = dst->src[0];
+    const ggml_tensor * weights = dst->src[1];
+    const int64_t n_embd   = experts->ne[0];
+    const int64_t n_used   = experts->ne[1];
+    const int64_t n_tokens = experts->ne[2];
+    const int64_t dr = (n_tokens + params->nth - 1) / params->nth;
+    const int64_t t0 = dr * params->ith;
+    const int64_t t1 = std::min(t0 + dr, n_tokens);
+
+    for (int64_t t = t0; t < t1; ++t) {
+        const float * src = (const float *) experts->data + t*n_used*n_embd;
+        const float * w   = (const float *) weights->data + t*n_used;
+        float * out = (float *) dst->data + t*n_embd;
+
+        for (int64_t i = 0; i < n_embd; ++i) {
+            out[i] = src[i] * w[0];
+        }
+        for (int64_t e = 1; e < n_used; ++e) {
+            const float * row = src + e*n_embd;
+            for (int64_t i = 0; i < n_embd; ++i) {
+                out[i] += row[i] * w[e];
+            }
+        }
+    }
+}
+
 
 // ggml_compute_forward_rwkv_wkv7
 

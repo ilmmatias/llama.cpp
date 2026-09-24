@@ -7256,6 +7256,37 @@ struct test_moe_reduce : public test_case {
     }
 };
 
+struct test_moe_reduce_cpu : public test_case {
+    std::string op_desc(ggml_tensor *) override { return "MOE_REDUCE_CPU"; }
+    bool run_whole_graph() override { return true; }
+    double max_err(ggml_backend_t) override { return 1e-5; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double worst = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            worst = std::max(worst, std::max((double) fabsf(a[i]), (double) fabsf(b[i])));
+        }
+        return worst;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int64_t n_embd = 63;
+        constexpr int64_t n_used = 10;
+        constexpr int64_t n_tokens = 17;
+        ggml_tensor * experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_used, n_tokens);
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
+        ggml_tensor * weighted = ggml_mul(ctx, experts, weights);
+
+        ggml_tensor * reference = ggml_view_2d(ctx, weighted, n_embd, n_tokens, weighted->nb[2], 0);
+        for (int64_t e = 1; e < n_used; ++e) {
+            ggml_tensor * row = ggml_view_2d(ctx, weighted, n_embd, n_tokens, weighted->nb[2], e*weighted->nb[1]);
+            reference = ggml_add(ctx, reference, row);
+        }
+
+        return ggml_sub(ctx, ggml_moe_reduce(ctx, experts, weights), reference);
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -11407,6 +11438,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
+    test_cases.emplace_back(new test_moe_reduce_cpu());
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));

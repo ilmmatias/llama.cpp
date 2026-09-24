@@ -2320,6 +2320,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
         cb(experts, "ffn_moe_down_biased", il);
     }
+    const bool reduce_on_cpu = arch == LLM_ARCH_QWEN4EXP && n_tokens > 1 && !weight_before_ffn &&
+        experts->op == GGML_OP_MUL_MAT_ID && down_exps_b == nullptr &&
+        backend_cpu != nullptr && down_exps->buffer != nullptr &&
+        ggml_backend_buft_get_device(ggml_backend_buffer_get_type(down_exps->buffer)) ==
+            ggml_backend_get_device(backend_cpu);
+
+    if (reduce_on_cpu) {
+        ggml_tensor * moe_out = ggml_moe_reduce(ctx0, experts, weights);
+        ggml_backend_sched_set_tensor_backend(sched, moe_out, backend_cpu);
+        cb(moe_out, "ffn_moe_out", il);
+        ggml_build_forward_expand(gf, moe_out);
+        return moe_out;
+    }
 
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
