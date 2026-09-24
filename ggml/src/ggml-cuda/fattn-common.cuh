@@ -721,6 +721,10 @@ static __global__ void flash_attn_mask_to_KV_max(
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
+void ggml_cuda_flash_attn_ext_prepare_indices(
+        ggml_cuda_pool & pool, const ggml_tensor * mask, const ggml_tensor * selected,
+        int32_t * indices, int32_t * counts, int32_t n_queries, cudaStream_t stream);
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -1103,7 +1107,14 @@ void launch_fattn(
         const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
 
         KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        // src[5] is used only on the temporary tensor made by the backend-local QSA fusion.
+        if (KQV->src[5]) {
+            GGML_ASSERT(ncols1 == 1 && KQV->src[5]->ne[0] == n_kv_max);
+            ggml_cuda_flash_attn_ext_prepare_indices(ctx.pool(), mask, KQV->src[5], KV_max.ptr,
+                KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], main_stream);
+        } else {
+            ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        }
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
