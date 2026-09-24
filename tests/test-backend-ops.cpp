@@ -8233,10 +8233,13 @@ struct test_flash_attn_qsa : public test_flash_attn_ext {
     const bool empty_row;
 
     test_flash_attn_qsa(int64_t hs, int64_t kv, int64_t nb, int64_t n_selected,
-                       int64_t gqa = 4, int64_t streams = 1, bool empty_row = false)
-        : test_flash_attn_ext(hs, hs, 2, {gqa, streams}, kv, nb, true, empty_row, 0.0f, hs == 64 ? 20.0f : 0.0f,
+                       int64_t gqa = 4, int64_t streams = 1, bool empty_row = false, float softcap = 0.0f)
+        : test_flash_attn_ext(hs, hs, 2, {gqa, streams}, kv, nb, true, empty_row, 0.0f, softcap,
               GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, false, n_selected),
-          empty_row(empty_row) {}
+          empty_row(empty_row) {
+        // The tile kernel omits softcap code for 64-dimensional heads.
+        GGML_ASSERT(softcap == 0.0f || hs == 128 || hs == 256 || hs == 512);
+    }
 
     std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_QSA"; }
     std::string vars() override { return test_flash_attn_ext::vars() + "," + VAR_TO_STR(empty_row); }
@@ -11349,12 +11352,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // strided indices and KV, sinks with an empty selection, and the dense fallback.
     test_cases.emplace_back(new test_flash_attn_qsa( 64,  2048, 3,    1));
     test_cases.emplace_back(new test_flash_attn_qsa( 64,  2048, 3,   33, 4, 2));
-    test_cases.emplace_back(new test_flash_attn_qsa(128,  2048, 5,  257, 2));
+    test_cases.emplace_back(new test_flash_attn_qsa(128,  2048, 5,  257, 2, 1, false, 20.0f));
     test_cases.emplace_back(new test_flash_attn_qsa(128,  4096, 3,  513, 4, 2, true));
     test_cases.emplace_back(new test_flash_attn_qsa(128,  8192, 1, 1025));
     test_cases.emplace_back(new test_flash_attn_qsa(256,  8192, 1, 2048, 12));
     test_cases.emplace_back(new test_flash_attn_qsa(256, 16384, 1, 2050, 12));
     test_cases.emplace_back(new test_flash_attn_qsa(256, 16384, 9, 2050, 12));
+    test_cases.emplace_back(new test_flash_attn_qsa(256,  8192, 3, 1025, 8, 1, false, 20.0f));
     test_cases.emplace_back(new test_flash_attn_qsa(128, 16384, 1, 4096));
     test_cases.emplace_back(new test_flash_attn_qsa(128,   512, 3,  129));
 
