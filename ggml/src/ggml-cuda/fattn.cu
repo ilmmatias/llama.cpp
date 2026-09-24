@@ -5,6 +5,92 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#ifdef GGML_USE_HIP
+#include <hipcub/hipcub.hpp>
+
+// Sort physical rows to preserve the dense-mask compactor's traversal order.
+// Filtering and deduplication also preserve SET_ROWS semantics for repeated indices.
+template <int items_per_thread>
+__launch_bounds__(256, 1)
+static __global__ void flash_attn_prepare_selected_indices(
+        const half * mask, const int32_t * selected, int32_t * indices, int32_t * counts,
+        const int n_kv, const int n_selected, const int64_t ms1, const int64_t ms3,
+        const int64_t is1, const int64_t is2) {
+    using sort_t = hipcub::BlockRadixSort<int32_t, 256, items_per_thread>;
+    using scan_t = hipcub::BlockScan<int, 256>;
+    __shared__ union {
+        typename sort_t::TempStorage sort;
+        typename scan_t::TempStorage scan;
+    } temp;
+    __shared__ int32_t last[256];
+
+    const int tid = threadIdx.x;
+    const int64_t list = int64_t(blockIdx.y)*gridDim.x + blockIdx.x;
+    mask += blockIdx.y*ms3 + blockIdx.x*ms1;
+    selected += blockIdx.y*is2 + blockIdx.x*is1;
+    indices += list*n_selected;
+
+    int32_t rows[items_per_thread];
+#pragma unroll
+    for (int j = 0; j < items_per_thread; ++j) {
+        const int i = tid + j*256;
+        int row = i < n_selected ? selected[i] : INT_MAX;
+        if (row < 0 || row >= n_kv || !isfinite(__half2float(mask[row]))) {
+            row = INT_MAX;
+        }
+        rows[j] = row;
+    }
+
+    sort_t(temp.sort).Sort(rows);
+    last[tid] = rows[items_per_thread - 1];
+    __syncthreads();
+
+    bool keep[items_per_thread];
+    int count = 0;
+#pragma unroll
+    for (int j = 0; j < items_per_thread; ++j) {
+        const int prev = j > 0 ? rows[j - 1] : (tid > 0 ? last[tid - 1] : -1);
+        keep[j] = rows[j] != INT_MAX && rows[j] != prev;
+        count += keep[j];
+    }
+
+    int offset, total;
+    scan_t(temp.scan).ExclusiveSum(count, offset, total);
+#pragma unroll
+    for (int j = 0; j < items_per_thread; ++j) {
+        if (keep[j]) {
+            indices[offset++] = rows[j];
+        }
+    }
+    for (int i = total + tid; i < n_selected; i += 256) {
+        indices[i] = -1;
+    }
+    if (tid == 0) {
+        counts[list] = total;
+    }
+}
+#endif // GGML_USE_HIP
+
+void ggml_cuda_flash_attn_ext_prepare_indices(const ggml_tensor * mask, const ggml_tensor * selected,
+        int32_t * indices, int32_t * counts, int32_t n_queries, cudaStream_t stream) {
+#ifdef GGML_USE_HIP
+    GGML_ASSERT(selected->ne[0] > 0 && selected->ne[0] <= 4096);
+    const auto kernel = selected->ne[0] <=  256 ? flash_attn_prepare_selected_indices<1> :
+                        selected->ne[0] <=  512 ? flash_attn_prepare_selected_indices<2> :
+                        selected->ne[0] <= 1024 ? flash_attn_prepare_selected_indices<4> :
+                        selected->ne[0] <= 2048 ? flash_attn_prepare_selected_indices<8> :
+                                                 flash_attn_prepare_selected_indices<16>;
+    const ggml_cuda_kernel_launch_params launch_params(dim3(n_queries, mask->ne[3], 1), dim3(256, 1, 1), 0, stream);
+    ggml_cuda_kernel_launch(kernel, launch_params, (const half *) mask->data, (const int32_t *) selected->data,
+        indices, counts, int(mask->ne[0]), int(selected->ne[0]), int64_t(mask->nb[1]/sizeof(half)),
+        int64_t(mask->nb[3]/sizeof(half)), int64_t(selected->nb[1]/sizeof(int32_t)), int64_t(selected->nb[2]/sizeof(int32_t)));
+    CUDA_CHECK(cudaGetLastError());
+#else
+    GGML_UNUSED_VARS(mask, selected, indices, counts, n_queries, stream);
+    GGML_ABORT("direct sparse attention indices are only supported on HIP");
+#endif // GGML_USE_HIP
+}
+
 #ifndef GGML_USE_MUSA
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
 template <int ncols1, bool oob>
@@ -803,4 +889,37 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
+}
+
+bool ggml_cuda_flash_attn_ext_indices_supported(int device, const ggml_tensor * dst,
+        const ggml_tensor * mask, const ggml_tensor * indices) {
+#ifdef GGML_USE_HIP
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    // Keep the experiment on RDNA2's existing single-query sparse tile path.
+    return GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[device].cc) && !dst->src[5] &&
+        ggml_cuda_get_best_fattn_kernel(device, dst) == BEST_FATTN_KERNEL_TILE &&
+        ggml_cuda_flash_attn_ext_tile_shall_use_sparse(dst, 1) &&
+        (Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256) &&
+        (Q->ne[2]/K->ne[2]) % 2 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+        ggml_get_op_params_f32(dst, 1) == 0.0f &&
+        mask->type == GGML_TYPE_F16 && ggml_are_same_shape(mask, dst->src[3]) && ggml_is_contiguous(mask) &&
+        indices->type == GGML_TYPE_I32 && indices->nb[0] == sizeof(int32_t) &&
+        indices->ne[0] > 0 && indices->ne[0] <= 4096 && indices->ne[0] == ggml_get_op_params_i32(dst, 4) &&
+        indices->ne[1] == Q->ne[1] && indices->ne[2] == mask->ne[3] && indices->ne[3] == 1;
+#else
+    GGML_UNUSED_VARS(device, dst, mask, indices);
+    return false;
+#endif // GGML_USE_HIP
+}
+
+void ggml_cuda_flash_attn_ext_indices(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        ggml_tensor * mask, ggml_tensor * indices) {
+    GGML_ASSERT(ggml_cuda_flash_attn_ext_indices_supported(ctx.device, dst, mask, indices));
+    ggml_cuda_set_device(ctx.device);
+    // The public FLASH_ATTN_EXT operation and the scheduled graph stay unchanged.
+    ggml_tensor fused = *dst;
+    fused.src[3] = mask;
+    fused.src[5] = indices;
+    ggml_cuda_flash_attn_ext_tile(ctx, &fused);
 }

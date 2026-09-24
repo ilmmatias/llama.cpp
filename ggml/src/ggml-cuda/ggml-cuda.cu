@@ -3807,6 +3807,55 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// Elide the dense QSA selection mask when the sparse tile kernel can consume its indices.
+static int ggml_cuda_try_qsa_mask_fusion(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
+    static const bool enabled = getenv("GGML_CUDA_QSA_DIRECT_INDICES") == nullptr ||
+        std::atoi(getenv("GGML_CUDA_QSA_DIRECT_INDICES")) != 0;
+    if (!enabled || graph->nodes[i]->op != GGML_OP_FILL ||
+            !ggml_can_fuse_subgraph(graph, i,
+                { GGML_OP_FILL, GGML_OP_FILL, GGML_OP_VIEW, GGML_OP_SET_ROWS,
+                  GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_FLASH_ATTN_EXT }, { i + 6 })) {
+        return 0;
+    }
+
+    ggml_tensor * zeros    = graph->nodes[i];
+    ggml_tensor * all      = graph->nodes[i + 1];
+    ggml_tensor * rows     = graph->nodes[i + 2];
+    ggml_tensor * set      = graph->nodes[i + 3];
+    ggml_tensor * restored = graph->nodes[i + 4];
+    ggml_tensor * add      = graph->nodes[i + 5];
+    ggml_tensor * fa       = graph->nodes[i + 6];
+    ggml_tensor * mask     = add->src[1];
+    ggml_tensor * indices  = set->src[1];
+
+    const bool chain_ok = all->src[0] == mask && rows->src[0] == all && rows->view_offs == 0 &&
+        set->src[0] == zeros && set->src[2] == rows && restored->src[0] == set && restored->view_offs == 0 &&
+        add->src[0] == restored && fa->src[3] == add &&
+        ggml_get_op_params_f32(zeros, 0) == 0.0f && ggml_get_op_params_f32(all, 0) == -INFINITY;
+    const bool shape_ok = chain_ok && zeros->type == GGML_TYPE_F32 && all->type == GGML_TYPE_F16 &&
+        ggml_is_contiguous(zeros) && ggml_is_contiguous(all) && ggml_is_contiguous(rows) &&
+        ggml_is_contiguous(restored) && ggml_are_same_shape(all, mask) && ggml_are_same_shape(restored, mask) &&
+        rows->ne[0] == 1 && rows->ne[1] == mask->ne[0] && rows->ne[2] == mask->ne[1] && rows->ne[3] == mask->ne[3] &&
+        zeros->ne[0] == 1 && zeros->ne[1] == indices->ne[0] &&
+        zeros->ne[2] == indices->ne[1] && zeros->ne[3] == indices->ne[2];
+    const int output = i + 6;
+    if (!shape_ok || !ggml_cuda_flash_attn_ext_indices_supported(ctx.device, fa, mask, indices) ||
+            !ggml_cuda_check_fusion_memory_ranges(graph, i, 7, &output, 1)) {
+        return 0;
+    }
+
+    ggml_cuda_flash_attn_ext_indices(ctx, fa, mask, indices);
+    static const bool debug = getenv("GGML_CUDA_QSA_DIRECT_INDICES_DEBUG") != nullptr &&
+        std::atoi(getenv("GGML_CUDA_QSA_DIRECT_INDICES_DEBUG")) != 0;
+    static std::atomic<unsigned> logged{0};
+    const unsigned bit = fa->src[0]->ne[1] == 1 ? 1u : 2u;
+    if (debug && !(logged.fetch_or(bit, std::memory_order_relaxed) & bit)) {
+        GGML_LOG_INFO("%s: direct indices active (%s, kv=%lld, selected=%lld)\n", __func__,
+            bit == 1 ? "decode" : "prefill", (long long) mask->ne[0], (long long) indices->ne[0]);
+    }
+    return 6;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, bool use_cuda_graph) {
 
@@ -3816,6 +3865,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_FILL && cuda_ctx->stream_context().concurrent_events.empty()) {
+        const int nodes_to_skip = ggml_cuda_try_qsa_mask_fusion(*cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
 
     // mul_mat x2 -> gated_delta_net: the alpha/beta projections and their activation tails
     if (node->op == GGML_OP_MUL_MAT) {

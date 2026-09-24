@@ -8228,6 +8228,75 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// QSA mask construction plus FA, evaluated as one graph to exercise backend fusion.
+struct test_flash_attn_qsa : public test_flash_attn_ext {
+    const bool empty_row;
+
+    test_flash_attn_qsa(int64_t hs, int64_t kv, int64_t nb, int64_t n_selected,
+                       int64_t gqa = 4, int64_t streams = 1, bool empty_row = false)
+        : test_flash_attn_ext(hs, hs, 2, {gqa, streams}, kv, nb, true, empty_row, 0.0f, hs == 64 ? 20.0f : 0.0f,
+              GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, false, n_selected),
+          empty_row(empty_row) {}
+
+    std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_QSA"; }
+    std::string vars() override { return test_flash_attn_ext::vars() + "," + VAR_TO_STR(empty_row); }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_flash_attn_ext::build_graph(ctx);
+        ggml_tensor * m = out->src[3];
+        // Top-k is normally a strided view into a wider argsort result.
+        ggml_tensor * storage = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_kv_max + 3, nb, nr23[1]);
+        ggml_set_name(storage, "qsa_indices");
+        ggml_tensor * ids = ggml_view_3d(ctx, storage, n_kv_max, nb, nr23[1], storage->nb[1], storage->nb[2], 0);
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, ids);
+        }
+
+        ggml_tensor * all = ggml_fill(ctx, m, -INFINITY);
+        ggml_tensor * rows = ggml_view_4d(ctx, all, 1, kv, nb, nr23[1], all->nb[0], all->nb[1], all->nb[3], 0);
+        ggml_tensor * zeros = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_kv_max, nb, nr23[1]), 0.0f);
+        ggml_tensor * set = ggml_set_rows(ctx, rows, zeros, ids);
+        ggml_tensor * restored = ggml_view_4d(ctx, set, kv, nb, 1, nr23[1], set->nb[2], set->nb[3], set->nb[3], 0);
+        out->src[3] = ggml_add(ctx, restored, m);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (strcmp(t->name, "qsa_indices") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t s = 0; s < nr23[1]; ++s) {
+                    for (int64_t q = 0; q < nb; ++q) {
+                        for (int64_t j = 0; j < t->ne[0]; ++j) {
+                            // Unsorted, different per query/stream, with duplicates across sort lanes.
+                            const int64_t jj = j % 17 == 0 ? 0 : j;
+                            data[(s*nb + q)*t->ne[0] + j] = jj == 0 ? 0 : (jj*37 + q*11 + s*19) % kv;
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "m") == 0) {
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (int64_t s = 0; s < nr23[1]; ++s) {
+                    for (int64_t q = 0; q < nb; ++q) {
+                        for (int64_t k = 0; k < kv; ++k) {
+                            const bool visible = !(empty_row && q == 0) && k <= kv/2 + q && (k == 0 || (k + s) % 7 != 0);
+                            data[(s*nb + q)*kv + k] = ggml_fp32_to_fp16(visible ? -0.125f*(k % 5) : -INFINITY);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -11275,6 +11344,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // sparse mask + quantized cache
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
+
+    // Direct QSA indices: radix-sort size boundaries, duplicate/hidden rows, streams,
+    // strided indices and KV, sinks with an empty selection, and the dense fallback.
+    test_cases.emplace_back(new test_flash_attn_qsa( 64,  2048, 3,    1));
+    test_cases.emplace_back(new test_flash_attn_qsa( 64,  2048, 3,   33, 4, 2));
+    test_cases.emplace_back(new test_flash_attn_qsa(128,  2048, 5,  257, 2));
+    test_cases.emplace_back(new test_flash_attn_qsa(128,  4096, 3,  513, 4, 2, true));
+    test_cases.emplace_back(new test_flash_attn_qsa(128,  8192, 1, 1025));
+    test_cases.emplace_back(new test_flash_attn_qsa(256,  8192, 1, 2048, 12));
+    test_cases.emplace_back(new test_flash_attn_qsa(256, 16384, 1, 2050, 12));
+    test_cases.emplace_back(new test_flash_attn_qsa(256, 16384, 9, 2050, 12));
+    test_cases.emplace_back(new test_flash_attn_qsa(128, 16384, 1, 4096));
+    test_cases.emplace_back(new test_flash_attn_qsa(128,   512, 3,  129));
 
     // Qwen QSA: 256/256, gqa 12, budget 2048.
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
