@@ -4,6 +4,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cinttypes>
 #include <cstdlib>
 
@@ -775,6 +776,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
     return ggml_mul(ctx0, normalized, gated);
 }
 
+static int64_t qwen4exp_qsa_compact_factor(const char * name) {
+    const char * value = std::getenv(name);
+    if (value == nullptr) {
+        return 8;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const int64_t factor = std::strtoll(value, &end, 10);
+    if (errno == ERANGE || end == value || *end != '\0' || factor < 0) {
+        throw std::runtime_error(format("%s must be a non-negative integer, got '%s'", name, value));
+    }
+    return factor;
+}
+
 // QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
 // one mean-pooled indexer key scores each block; set_input resolves the cache layout
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
@@ -837,7 +853,7 @@ public:
     // per stream: a cell index names a different token in each stream
     ggml_tensor * k_idxs    = nullptr;   // I32 [n_tokens]
     ggml_tensor * cell_blk  = nullptr;   // I32 [n_kv, n_stream]
-    ggml_tensor * block_cells     = nullptr;   // I32 [ratio, n_blocks, 1], compact decode only
+    ggml_tensor * block_cells     = nullptr;   // I32 [ratio, n_blocks, 1], compact selection
     ggml_tensor * block_cell_bias = nullptr;   // F32 same shape, -inf for unfilled tail slots
     ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
     ggml_tensor * block_key_cells = nullptr;   // I32 [n_blocks, n_stream], slots in compact QSA block cache
@@ -885,12 +901,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
         cparams.causal_attn && !hparams.use_alibi;
 
-    // Keep the legacy fixed cell width, but only materialize the full cell surface
-    // when the compact block-first selection would not be worthwhile.
+    // 0 disables compact selection; otherwise require n_kv > factor*width.
+    static const int64_t compact_factor_pp = qwen4exp_qsa_compact_factor("QWEN4EXP_QSA_COMPACT_PP");
+    static const int64_t compact_factor_tg = qwen4exp_qsa_compact_factor("QWEN4EXP_QSA_COMPACT_TG");
+    static const bool compact_debug = [] {
+        const char * e = std::getenv("QWEN4EXP_QSA_COMPACT_DEBUG");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+
+    const int64_t compact_factor = n_tps == 1 ? compact_factor_tg : compact_factor_pp;
     const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
     const int64_t n_block_top = std::min<int64_t>(n_blocks, (width + r - 1)/r + 1);
     const bool compact_select = blk_bias && n_stream == 1 && ubatch.n_seqs_unq == 1 && cparams.flash_attn &&
-        8*width < n_kv && n_block_top < n_blocks;
+        n_block_top < n_blocks && compact_factor > 0 && width <= (n_kv - 1)/compact_factor;
 
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
@@ -899,6 +922,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     if (it != qsa_inps.end()) {
         inp = it->second;
     } else {
+        if (compact_debug) {
+            LLAMA_LOG_INFO("%s: %s selection graph (%s, queries=%" PRId64 ", kv=%" PRId64 ", width=%" PRId64
+                           ", block_size=%" PRId64 ", blocks=%" PRId64 "/%" PRId64 ", factor=%" PRId64 ")\n",
+                           __func__, compact_select ? "compact" : "expanded", n_tps == 1 ? "decode" : "prefill",
+                           n_tps, n_kv, width, r, n_block_top, n_blocks, compact_factor);
+        }
         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, compact_select);
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
