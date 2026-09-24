@@ -1150,7 +1150,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // reshape top_k indices: [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_batch, n_stream, 1]
     ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
 
-    // Keep selection outside the mask-building span so the backend can fuse it with FA.
+    // keep selection outside the mask-building span so the backend can fuse it with FA
     ggml_build_forward_expand(gf, top_k_3d);
 
     // prepare zero-filled tensor with rows of size 1: [1, n_top_k, n_batch, n_stream]

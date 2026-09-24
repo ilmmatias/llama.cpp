@@ -8231,35 +8231,42 @@ struct test_flash_attn_ext : public test_case {
 // QSA mask construction plus FA, evaluated as one graph to exercise backend fusion.
 struct test_flash_attn_qsa : public test_flash_attn_ext {
     const bool empty_row;
+    const ggml_type type_indices;
 
     test_flash_attn_qsa(int64_t hs, int64_t kv, int64_t nb, int64_t n_selected,
-                       int64_t gqa = 4, int64_t streams = 1, bool empty_row = false, float softcap = 0.0f)
-        : test_flash_attn_ext(hs, hs, 2, {gqa, streams}, kv, nb, true, empty_row, 0.0f, softcap,
-              GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, false, n_selected),
-          empty_row(empty_row) {
-        // The tile kernel omits softcap code for 64-dimensional heads.
-        GGML_ASSERT(softcap == 0.0f || hs == 128 || hs == 256 || hs == 512);
+                        int64_t gqa = 4, int64_t streams = 1, bool empty_row = false, float softcap = 0.0f,
+                        float max_bias = 0.0f, int64_t hsv = 0, ggml_type type_indices = GGML_TYPE_I32)
+        : test_flash_attn_ext(hs, hsv ? hsv : hs, 2, {gqa, streams}, kv, nb, true, empty_row, max_bias, softcap,
+                              GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, false, n_selected),
+          empty_row(empty_row), type_indices(type_indices) {}
+
+    std::string op_desc(ggml_tensor *) override {
+        return "FLASH_ATTN_QSA";
     }
 
-    std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_QSA"; }
-    std::string vars() override { return test_flash_attn_ext::vars() + "," + VAR_TO_STR(empty_row); }
-    bool run_whole_graph() override { return true; }
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + "," + VARS_TO_STR2(empty_row, type_indices);
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * out = test_flash_attn_ext::build_graph(ctx);
-        ggml_tensor * m = out->src[3];
+        ggml_tensor * m   = out->src[3];
         // Top-k is normally a strided view into a wider argsort result.
-        ggml_tensor * storage = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_kv_max + 3, nb, nr23[1]);
+        ggml_tensor * storage = ggml_new_tensor_3d(ctx, type_indices, n_kv_max + 3, nb, nr23[1]);
         ggml_set_name(storage, "qsa_indices");
         ggml_tensor * ids = ggml_view_3d(ctx, storage, n_kv_max, nb, nr23[1], storage->nb[1], storage->nb[2], 0);
         if (mode == MODE_TEST) {
             ggml_build_forward_expand(gf, ids);
         }
 
-        ggml_tensor * all = ggml_fill(ctx, m, -INFINITY);
-        ggml_tensor * rows = ggml_view_4d(ctx, all, 1, kv, nb, nr23[1], all->nb[0], all->nb[1], all->nb[3], 0);
-        ggml_tensor * zeros = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_kv_max, nb, nr23[1]), 0.0f);
-        ggml_tensor * set = ggml_set_rows(ctx, rows, zeros, ids);
+        ggml_tensor * all      = ggml_fill(ctx, m, -INFINITY);
+        ggml_tensor * rows     = ggml_view_4d(ctx, all, 1, kv, nb, nr23[1], all->nb[0], all->nb[1], all->nb[3], 0);
+        ggml_tensor * zeros    = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_kv_max, nb, nr23[1]), 0.0f);
+        ggml_tensor * set      = ggml_set_rows(ctx, rows, zeros, ids);
         ggml_tensor * restored = ggml_view_4d(ctx, set, kv, nb, 1, nr23[1], set->nb[2], set->nb[3], set->nb[3], 0);
         out->src[3] = ggml_add(ctx, restored, m);
         return out;
@@ -8271,7 +8278,7 @@ struct test_flash_attn_qsa : public test_flash_attn_ext {
                 continue;
             }
             if (strcmp(t->name, "qsa_indices") == 0) {
-                std::vector<int32_t> data(ggml_nelements(t));
+                std::vector<int64_t> data(ggml_nelements(t));
                 for (int64_t s = 0; s < nr23[1]; ++s) {
                     for (int64_t q = 0; q < nb; ++q) {
                         for (int64_t j = 0; j < t->ne[0]; ++j) {
@@ -8281,7 +8288,12 @@ struct test_flash_attn_qsa : public test_flash_attn_ext {
                         }
                     }
                 }
-                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+                if (type_indices == GGML_TYPE_I32) {
+                    const std::vector<int32_t> data32(data.begin(), data.end());
+                    ggml_backend_tensor_set(t, data32.data(), 0, ggml_nbytes(t));
+                } else {
+                    ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+                }
             } else if (strcmp(t->name, "m") == 0) {
                 std::vector<ggml_fp16_t> data(ggml_nelements(t));
                 for (int64_t s = 0; s < nr23[1]; ++s) {
@@ -11348,8 +11360,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
 
-    // Direct QSA indices: radix-sort size boundaries, duplicate/hidden rows, streams,
-    // strided indices and KV, sinks with an empty selection, and the dense fallback.
+    // Direct QSA indices: sort boundaries, duplicates, hidden rows, streams, strides, empty selections, and dense fallback.
     test_cases.emplace_back(new test_flash_attn_qsa( 64,  2048, 3,    1));
     test_cases.emplace_back(new test_flash_attn_qsa( 64,  2048, 3,   33, 4, 2));
     test_cases.emplace_back(new test_flash_attn_qsa(128,  2048, 5,  257, 2, 1, false, 20.0f));
@@ -11361,6 +11372,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_qsa(256,  8192, 3, 1025, 8, 1, false, 20.0f));
     test_cases.emplace_back(new test_flash_attn_qsa(128, 16384, 1, 4096));
     test_cases.emplace_back(new test_flash_attn_qsa(128,   512, 3,  129));
+
+    // Direct indices without grouped heads, with odd GQA, ALiBi, and an unpadded KV length.
+    test_cases.emplace_back(new test_flash_attn_qsa( 64,  4096, 3,   33, 1, 2));
+    test_cases.emplace_back(new test_flash_attn_qsa(128,  4096, 3,  257, 3, 2, true));
+    test_cases.emplace_back(new test_flash_attn_qsa(256,  8192, 1, 1025, 5));
+    test_cases.emplace_back(new test_flash_attn_qsa(128,  4096, 3,   33, 4, 1, false, 20.0f, 8.0f));
+    test_cases.emplace_back(new test_flash_attn_qsa( 80,  4097, 3,  257));
+
+    // Other tile head sizes, including asymmetric K/V heads.
+    test_cases.emplace_back(new test_flash_attn_qsa( 40,  2048, 3,   33, 3));
+    test_cases.emplace_back(new test_flash_attn_qsa( 72,  2048, 3,   33));
+    test_cases.emplace_back(new test_flash_attn_qsa( 96,  2048, 3,   33));
+    test_cases.emplace_back(new test_flash_attn_qsa(112,  2048, 3,   33));
+    test_cases.emplace_back(new test_flash_attn_qsa(192,  2048, 3,   33, 8, 1, false, 0.0f, 0.0f, 128));
+    test_cases.emplace_back(new test_flash_attn_qsa(320,  2048, 3,   33, 32, 1, false, 0.0f, 0.0f, 256));
+    test_cases.emplace_back(new test_flash_attn_qsa(512,  2048, 3,   33, 8));
+    test_cases.emplace_back(new test_flash_attn_qsa(576,  2048, 3,   33, 4, 1, false, 0.0f, 0.0f, 512));
+
+    // Segmented sorting above the block-sort limit, including tails, streams, and I64 indices.
+    test_cases.emplace_back(new test_flash_attn_qsa( 64, 16384, 3, 4097, 3, 2, true));
+    test_cases.emplace_back(new test_flash_attn_qsa(128, 32768, 3, 8192, 4, 2));
+    test_cases.emplace_back(new test_flash_attn_qsa( 64,  2048, 3,   33, 3, 2, false, 0.0f, 0.0f, 0, GGML_TYPE_I64));
+    test_cases.emplace_back(new test_flash_attn_qsa( 64, 16384, 3, 4097, 3, 2, false, 0.0f, 0.0f, 0, GGML_TYPE_I64));
 
     // Qwen QSA: 256/256, gqa 12, budget 2048.
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
