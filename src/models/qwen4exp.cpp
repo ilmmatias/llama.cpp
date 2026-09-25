@@ -890,7 +890,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
     const int64_t n_block_top = std::min<int64_t>(n_blocks, (width + r - 1)/r + 1);
     const bool compact_select = blk_bias && n_stream == 1 && ubatch.n_seqs_unq == 1 && cparams.flash_attn &&
-        8*width < n_kv && n_block_top < n_blocks;
+        width < n_kv && n_block_top < n_blocks;
 
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
