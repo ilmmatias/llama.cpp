@@ -104,6 +104,7 @@ struct expert_cache_layer {
     enum ggml_glu_op glu_op = GGML_GLU_OP_COUNT;
     std::array<uint8_t, GGML_MAX_OP_PARAMS> glu_params = {};
     std::array<uint8_t, GGML_MAX_OP_PARAMS> gate_params = {};
+    std::array<uint8_t, GGML_MAX_OP_PARAMS> gate_up_params = {};
     std::array<uint8_t, GGML_MAX_OP_PARAMS> up_params = {};
     std::array<uint8_t, GGML_MAX_OP_PARAMS> down_params = {};
 
@@ -658,7 +659,7 @@ private:
         layer.checked = true;
         layer.compatible = false;
 
-        if (layer.gate_up != nullptr || layer.gate == nullptr || layer.up == nullptr || layer.down == nullptr) {
+        if (layer.down == nullptr) {
             return;
         }
         if (down_op->src[0] != layer.down || down_op->src[1] == nullptr || down_op->src[2] == nullptr) {
@@ -669,24 +670,73 @@ private:
         if (act->op != GGML_OP_GLU || act->src[0] == nullptr || act->src[1] == nullptr) {
             return;
         }
-        const ggml_tensor * gate_op = act->src[0];
-        const ggml_tensor * up_op = act->src[1];
-        if (gate_op->op != GGML_OP_MUL_MAT_ID || up_op->op != GGML_OP_MUL_MAT_ID ||
-            gate_op->src[0] != layer.gate || up_op->src[0] != layer.up ||
-            gate_op->src[1] == nullptr || gate_op->src[1] != up_op->src[1] ||
-            gate_op->src[2] != down_op->src[2] || up_op->src[2] != down_op->src[2] ||
-            gate_op->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(gate_op->src[1])) {
-            return;
-        }
-        const ggml_tensor * input = gate_op->src[1];
-        if (input->ne[1] != 1 || input->ne[2] != 1 || input->ne[3] != 1 ||
-            gate_op->ne[2] != 1 || up_op->ne[2] != 1 || down_op->ne[2] != 1) {
-            return;
-        }
-        if (gate_op->ne[0] != up_op->ne[0] || gate_op->ne[1] != up_op->ne[1] ||
-            act->ne[0] != gate_op->ne[0] || act->ne[1] != gate_op->ne[1] ||
-            down_op->ne[1] != down_op->src[2]->ne[0]) {
-            return;
+
+        const ggml_tensor * input = nullptr;
+
+        if (layer.gate_up != nullptr) {
+            const ggml_tensor * gate_view = act->src[0];
+            const ggml_tensor * up_view   = act->src[1];
+
+            if (gate_view->op != GGML_OP_VIEW || up_view->op != GGML_OP_VIEW ||
+                gate_view->src[0] == nullptr || gate_view->src[0] != up_view->src[0]) {
+                return;
+            }
+
+            const ggml_tensor * gate_up_op = gate_view->src[0];
+            if (gate_up_op->op != GGML_OP_MUL_MAT_ID ||
+                gate_up_op->src[0] != layer.gate_up ||
+                gate_up_op->src[1] == nullptr ||
+                gate_up_op->src[2] != down_op->src[2] ||
+                gate_up_op->src[1]->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(gate_up_op->src[1])) {
+                return;
+            }
+
+            input = gate_up_op->src[1];
+            if (input->ne[1] != 1 || input->ne[2] != 1 || input->ne[3] != 1 ||
+                gate_up_op->ne[2] != 1 || gate_view->ne[2] != 1 ||
+                up_view->ne[2] != 1 || down_op->ne[2] != 1) {
+                return;
+            }
+            if (gate_view->ne[0] != up_view->ne[0] ||
+                gate_view->ne[1] != up_view->ne[1] ||
+                gate_up_op->ne[0] != 2 * gate_view->ne[0] ||
+                gate_up_op->ne[1] != gate_view->ne[1] ||
+                act->ne[0] != gate_view->ne[0] ||
+                act->ne[1] != gate_view->ne[1] ||
+                down_op->ne[1] != down_op->src[2]->ne[0]) {
+                return;
+            }
+
+            memcpy(layer.gate_up_params.data(), gate_up_op->op_params, GGML_MAX_OP_PARAMS);
+        } else {
+            if (layer.gate == nullptr || layer.up == nullptr) {
+                return;
+            }
+
+            const ggml_tensor * gate_op = act->src[0];
+            const ggml_tensor * up_op   = act->src[1];
+            if (gate_op->op != GGML_OP_MUL_MAT_ID || up_op->op != GGML_OP_MUL_MAT_ID ||
+                gate_op->src[0] != layer.gate || up_op->src[0] != layer.up ||
+                gate_op->src[1] == nullptr || gate_op->src[1] != up_op->src[1] ||
+                gate_op->src[2] != down_op->src[2] || up_op->src[2] != down_op->src[2] ||
+                gate_op->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(gate_op->src[1])) {
+                return;
+            }
+
+            input = gate_op->src[1];
+            if (input->ne[1] != 1 || input->ne[2] != 1 || input->ne[3] != 1 ||
+                gate_op->ne[2] != 1 || up_op->ne[2] != 1 || down_op->ne[2] != 1) {
+                return;
+            }
+            if (gate_op->ne[0] != up_op->ne[0] || gate_op->ne[1] != up_op->ne[1] ||
+                act->ne[0] != gate_op->ne[0] || act->ne[1] != gate_op->ne[1] ||
+                down_op->ne[1] != down_op->src[2]->ne[0]) {
+                return;
+            }
+
+            memcpy(layer.gate_params.data(), gate_op->op_params, GGML_MAX_OP_PARAMS);
+            memcpy(layer.up_params.data(), up_op->op_params, GGML_MAX_OP_PARAMS);
         }
 
         layer.n_expert_used = down_op->src[2]->ne[0];
@@ -698,8 +748,6 @@ private:
         layer.output_dim = down_op->ne[0];
         layer.glu_op = ggml_get_glu_op(act);
         memcpy(layer.glu_params.data(), act->op_params, GGML_MAX_OP_PARAMS);
-        memcpy(layer.gate_params.data(), gate_op->op_params, GGML_MAX_OP_PARAMS);
-        memcpy(layer.up_params.data(), up_op->op_params, GGML_MAX_OP_PARAMS);
         memcpy(layer.down_params.data(), down_op->op_params, GGML_MAX_OP_PARAMS);
         layer.templates.resize((size_t) layer.n_expert_used + 1);
         layer.template_failed.assign((size_t) layer.n_expert_used + 1, 0);
@@ -736,12 +784,37 @@ private:
         t->input_q8 = layer.input_dim % ggml_blck_size(GGML_TYPE_Q8_1) == 0;
         t->input = ggml_new_tensor_3d(t->ctx, t->input_q8 ? GGML_TYPE_Q8_1 : GGML_TYPE_F32, layer.input_dim, 1, 1);
         t->ids = ggml_new_tensor_2d(t->ctx, GGML_TYPE_I32, hit_count, 1);
-        auto * gate = ggml_mul_mat_id(t->ctx, layer.cache_gate, t->input, t->ids);
-        auto * up   = ggml_mul_mat_id(t->ctx, layer.cache_up,   t->input, t->ids);
-        memcpy(gate->op_params, layer.gate_params.data(), GGML_MAX_OP_PARAMS);
-        memcpy(up->op_params,   layer.up_params.data(),   GGML_MAX_OP_PARAMS);
 
-        auto * act = ggml_glu_split(t->ctx, gate, up, layer.glu_op);
+        ggml_tensor * act = nullptr;
+
+        if (layer.cache_gate_up != nullptr) {
+            auto * gate_up = ggml_mul_mat_id(t->ctx, layer.cache_gate_up, t->input, t->ids);
+            memcpy(gate_up->op_params, layer.gate_up_params.data(), GGML_MAX_OP_PARAMS);
+
+            GGML_ASSERT(gate_up->ne[0] % 2 == 0);
+            const int64_t n_ff = gate_up->ne[0] / 2;
+
+            auto * gate = ggml_view_3d(
+                    t->ctx, gate_up,
+                    n_ff, gate_up->ne[1], gate_up->ne[2],
+                    gate_up->nb[1], gate_up->nb[2], 0);
+
+            auto * up = ggml_view_3d(
+                    t->ctx, gate_up,
+                    n_ff, gate_up->ne[1], gate_up->ne[2],
+                    gate_up->nb[1], gate_up->nb[2],
+                    n_ff * gate_up->nb[0]);
+
+            act = ggml_glu_split(t->ctx, gate, up, layer.glu_op);
+        } else {
+            auto * gate = ggml_mul_mat_id(t->ctx, layer.cache_gate, t->input, t->ids);
+            auto * up   = ggml_mul_mat_id(t->ctx, layer.cache_up,   t->input, t->ids);
+            memcpy(gate->op_params, layer.gate_params.data(), GGML_MAX_OP_PARAMS);
+            memcpy(up->op_params,   layer.up_params.data(),   GGML_MAX_OP_PARAMS);
+
+            act = ggml_glu_split(t->ctx, gate, up, layer.glu_op);
+        }
+
         memcpy(act->op_params, layer.glu_params.data(), GGML_MAX_OP_PARAMS);
 
         t->output = ggml_mul_mat_id(t->ctx, layer.cache_down, act, t->ids);
