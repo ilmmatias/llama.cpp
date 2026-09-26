@@ -353,9 +353,9 @@ struct cmd_params {
     std::vector<int>                 poll;
     std::vector<int>                 n_gpu_layers;
     std::vector<int>                 n_cpu_moe;
-    int                              expert_cache_slots;
-    int                              expert_cache_admit_window;
-    int                              expert_cache_workers;
+    std::vector<int>                 expert_cache_slots;
+    std::vector<int>                 expert_cache_admit_window;
+    std::vector<int>                 expert_cache_workers;
     std::vector<llama_split_mode>    split_mode;
     std::vector<llama_load_mode>     load_mode;
     std::vector<llama_lazy_mode>     lazy_mode;
@@ -402,9 +402,9 @@ static const cmd_params cmd_params_defaults = {
     /* poll                 */ { 50 },
     /* n_gpu_layers         */ { -1 },
     /* n_cpu_moe            */ { 0 },
-    /* expert_cache_slots    */ 0,
-    /* expert_cache_admit_window */ 0,
-    /* expert_cache_workers  */ 1,
+    /* expert_cache_slots   */ { 0 },
+    /* expert_cache_admit_window */ { 0 },
+    /* expert_cache_workers */ { 1 },
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* load_mode            */ { LLAMA_LOAD_MODE_AUTO },
     /* lazy_mode            */ { LLAMA_LAZY_MODE_AUTO },
@@ -479,9 +479,9 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --poll <0...100>                                  (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
     printf("  -ngl, --n-gpu-layers <n>                          (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                           (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
-    printf("  -ecs, --expert-cache-slots <n>                    GPU expert-cache slots per MoE layer; 0 disables (default: %d)\n", cmd_params_defaults.expert_cache_slots);
-    printf("  -eca, --expert-cache-admit-window <n>             admit after repeat within n generated tokens; 0 admits every miss (default: %d)\n", cmd_params_defaults.expert_cache_admit_window);
-    printf("  -ecw, --expert-cache-workers <n>                  background CPU converters for expert admissions (default: %d)\n", cmd_params_defaults.expert_cache_workers);
+    printf("  -ecs, --expert-cache-slots <n>                    (default: %s)\n", join(cmd_params_defaults.expert_cache_slots, ",").c_str());
+    printf("  -eca, --expert-cache-admit-window <n>             (default: %s)\n", join(cmd_params_defaults.expert_cache_admit_window, ",").c_str());
+    printf("  -ecw, --expert-cache-workers <n>                  (default: %s)\n", join(cmd_params_defaults.expert_cache_workers, ",").c_str());
     printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
@@ -548,9 +548,6 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
-    params.expert_cache_slots   = cmd_params_defaults.expert_cache_slots;
-    params.expert_cache_admit_window = cmd_params_defaults.expert_cache_admit_window;
-    params.expert_cache_workers = cmd_params_defaults.expert_cache_workers;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -759,28 +756,22 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     invalid_param = true;
                     break;
                 }
-                params.expert_cache_slots = std::stoi(argv[i]);
-                if (params.expert_cache_slots < 0) {
-                    throw std::invalid_argument("expert cache slots must be non-negative");
-                }
+                auto p = parse_int_range(argv[i]);
+                params.expert_cache_slots.insert(params.expert_cache_slots.end(), p.begin(), p.end());
             } else if (arg == "-eca" || arg == "--expert-cache-admit-window") {
                 if (++i >= argc) {
                     invalid_param = true;
                     break;
                 }
-                params.expert_cache_admit_window = std::stoi(argv[i]);
-                if (params.expert_cache_admit_window < 0) {
-                    throw std::invalid_argument("expert cache admission window must be non-negative");
-                }
+                auto p = parse_int_range(argv[i]);
+                params.expert_cache_admit_window.insert(params.expert_cache_admit_window.end(), p.begin(), p.end());
             } else if (arg == "-ecw" || arg == "--expert-cache-workers") {
                 if (++i >= argc) {
                     invalid_param = true;
                     break;
                 }
-                params.expert_cache_workers = std::stoi(argv[i]);
-                if (params.expert_cache_workers <= 0) {
-                    throw std::invalid_argument("expert cache workers must be positive");
-                }
+                auto p = parse_int_range(argv[i]);
+                params.expert_cache_workers.insert(params.expert_cache_workers.end(), p.begin(), p.end());
             } else if (llama_supports_rpc() && (arg == "-rpc" || arg == "--rpc")) {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1186,6 +1177,15 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.n_cpu_moe.empty()) {
         params.n_cpu_moe = cmd_params_defaults.n_cpu_moe;
     }
+    if (params.expert_cache_slots.empty()) {
+        params.expert_cache_slots = cmd_params_defaults.expert_cache_slots;
+    }
+    if (params.expert_cache_admit_window.empty()) {
+        params.expert_cache_admit_window = cmd_params_defaults.expert_cache_admit_window;
+    }
+    if (params.expert_cache_workers.empty()) {
+        params.expert_cache_workers = cmd_params_defaults.expert_cache_workers;
+    }
     if (params.split_mode.empty()) {
         params.split_mode = cmd_params_defaults.split_mode;
     }
@@ -1263,6 +1263,9 @@ struct cmd_params_instance {
     int                poll;
     int                n_gpu_layers;
     int                n_cpu_moe;
+    int                expert_cache_slots;
+    int                expert_cache_admit_window;
+    int                expert_cache_workers;
     llama_split_mode   split_mode;
     llama_load_mode    load_mode;
     llama_lazy_mode    lazy_mode;
@@ -1333,6 +1336,8 @@ struct cmd_params_instance {
 
     bool equal_mparams(const cmd_params_instance & other) const {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
+               // when enabled, the expert cache forces the routed experts to CPU when loading the model
+               (expert_cache_slots > 0) == (other.expert_cache_slots > 0) &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
@@ -1368,6 +1373,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & fpc : params.fit_params_min_ctx)
     for (const auto & nl : params.n_gpu_layers)
     for (const auto & ncmoe : params.n_cpu_moe)
+    for (const auto & ecs : params.expert_cache_slots)
     for (const auto & sm : params.split_mode)
     for (const auto & lm : params.load_mode)
     for (const auto & lzm : params.lazy_mode)
@@ -1389,7 +1395,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & cm : params.cpu_mask)
     for (const auto & cs : params.cpu_strict)
     for (const auto & nd : params.n_depth)
-    for (const auto & pl : params.poll) {
+    for (const auto & pl : params.poll)
+    for (const auto & eca : params.expert_cache_admit_window)
+    for (const auto & ecw : params.expert_cache_workers) {
         for (const auto & n_prompt : params.n_prompt) {
             if (n_prompt == 0) {
                 continue;
@@ -1410,6 +1418,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .poll                  = */ pl,
                 /* .n_gpu_layers          = */ nl,
                 /* .n_cpu_moe             = */ ncmoe,
+                /* .expert_cache_slots        = */ ecs,
+                /* .expert_cache_admit_window = */ eca,
+                /* .expert_cache_workers      = */ ecw,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1448,6 +1459,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .poll                  = */ pl,
                 /* .n_gpu_layers          = */ nl,
                 /* .n_cpu_moe             = */ ncmoe,
+                /* .expert_cache_slots        = */ ecs,
+                /* .expert_cache_admit_window = */ eca,
+                /* .expert_cache_workers      = */ ecw,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1486,6 +1500,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .poll                  = */ pl,
                 /* .n_gpu_layers          = */ nl,
                 /* .n_cpu_moe             = */ ncmoe,
+                /* .expert_cache_slots        = */ ecs,
+                /* .expert_cache_admit_window = */ eca,
+                /* .expert_cache_workers      = */ ecw,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1529,6 +1546,9 @@ struct test {
     ggml_type                type_v;
     int                      n_gpu_layers;
     int                      n_cpu_moe;
+    int                      expert_cache_slots;
+    int                      expert_cache_admit_window;
+    int                      expert_cache_workers;
     llama_split_mode         split_mode;
     llama_load_mode          load_mode;
     llama_lazy_mode          lazy_mode;
@@ -1570,6 +1590,9 @@ struct test {
         type_v         = inst.type_v;
         n_gpu_layers   = inst.n_gpu_layers;
         n_cpu_moe      = inst.n_cpu_moe;
+        expert_cache_slots        = inst.expert_cache_slots;
+        expert_cache_admit_window = inst.expert_cache_admit_window;
+        expert_cache_workers      = inst.expert_cache_workers;
         split_mode     = inst.split_mode;
         load_mode      = inst.load_mode;
         lazy_mode      = inst.lazy_mode;
@@ -1638,7 +1661,9 @@ struct test {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "n_threads_batch", "cpu_mask",      "cpu_strict",     "poll",
-            "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
+            "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",
+            "expert_cache_slots", "expert_cache_admit_window", "expert_cache_workers",
+            "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
             "embeddings",
@@ -1656,6 +1681,7 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
+            field == "expert_cache_slots" || field == "expert_cache_admit_window" || field == "expert_cache_workers" ||
             field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
             return INT;
         }
@@ -1729,6 +1755,9 @@ struct test {
                                             ggml_type_name(type_v),
                                             std::to_string(n_gpu_layers),
                                             std::to_string(n_cpu_moe),
+                                            std::to_string(expert_cache_slots),
+                                            std::to_string(expert_cache_admit_window),
+                                            std::to_string(expert_cache_workers),
                                             split_mode_str(split_mode),
                                             std::to_string(main_gpu),
                                             std::to_string(no_kv_offload),
@@ -1934,6 +1963,15 @@ struct markdown_printer : public printer {
         if (field == "no_host") {
             return 4;
         }
+        if (field == "expert_cache_slots") {
+            return 5;
+        }
+        if (field == "expert_cache_admit_window") {
+            return 5;
+        }
+        if (field == "expert_cache_workers") {
+            return 4;
+        }
 
         int width = std::max((int) field.length(), 10);
 
@@ -1986,6 +2024,15 @@ struct markdown_printer : public printer {
         if (field == "fit_min_ctx") {
             return "fitc";
         }
+        if (field == "expert_cache_slots") {
+            return "ecs";
+        }
+        if (field == "expert_cache_admit_window") {
+            return "eca";
+        }
+        if (field == "expert_cache_workers") {
+            return "ecw";
+        }
         return field;
     }
 
@@ -2003,6 +2050,15 @@ struct markdown_printer : public printer {
         }
         if (params.n_cpu_moe.size() > 1 || params.n_cpu_moe != cmd_params_defaults.n_cpu_moe) {
             fields.emplace_back("n_cpu_moe");
+        }
+        if (params.expert_cache_slots.size() > 1 || params.expert_cache_slots != cmd_params_defaults.expert_cache_slots) {
+            fields.emplace_back("expert_cache_slots");
+        }
+        if (params.expert_cache_admit_window.size() > 1 || params.expert_cache_admit_window != cmd_params_defaults.expert_cache_admit_window) {
+            fields.emplace_back("expert_cache_admit_window");
+        }
+        if (params.expert_cache_workers.size() > 1 || params.expert_cache_workers != cmd_params_defaults.expert_cache_workers) {
+            fields.emplace_back("expert_cache_workers");
         }
         if (params.n_threads.size() > 1 || params.n_threads != cmd_params_defaults.n_threads || is_cpu_backend) {
             fields.emplace_back("n_threads");
@@ -2308,12 +2364,14 @@ int llama_bench(int argc, char ** argv) {
     using expert_cache_configure_fn_t = void (*)(uint32_t, uint32_t, uint32_t, ggml_backend_dev_t);
     auto * expert_cache_configure_fn = reinterpret_cast<expert_cache_configure_fn_t>(
         ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_expert_cache_configure"));
-    if (params.expert_cache_slots > 0) {
+    const bool expert_cache_enabled =
+        std::any_of(params.expert_cache_slots.begin(), params.expert_cache_slots.end(), [](int n) { return n > 0; });
+    if (expert_cache_enabled) {
         if (expert_cache_configure_fn == nullptr) {
             fprintf(stderr, "%s: error: CPU backend does not provide routed-expert cache support\n", __func__);
             return 1;
         }
-        if (params.expert_cache_workers <= 0) {
+        if (std::any_of(params.expert_cache_workers.begin(), params.expert_cache_workers.end(), [](int n) { return n <= 0; })) {
             fprintf(stderr, "%s: error: --expert-cache-workers must be > 0\n", __func__);
             return 1;
         }
@@ -2379,12 +2437,12 @@ int llama_bench(int argc, char ** argv) {
 
         std::vector<ggml_backend_dev_t> devs_full;
         std::vector<ggml_backend_dev_t> devs_cpu;
-        uint32_t ngl_full = 0, nct_full = 0, nex_full = 0;
-        uint32_t ngl_cpu  = 0, nct_cpu  = 0, nex_cpu  = 0;
+        uint32_t ngl_full = 0, nct_full = 0, nex_full = 0, nxu_full = 0;
+        uint32_t ngl_cpu  = 0, nct_cpu  = 0, nex_cpu  = 0, nxu_cpu  = 0;
         const auto full = common_get_device_memory_data(inst.model.c_str(), &mparams_full, &cparams,
-            devs_full, ngl_full, nct_full, nex_full, params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            devs_full, ngl_full, nct_full, nex_full, nxu_full, params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
         const auto cpu = common_get_device_memory_data(inst.model.c_str(), &mparams_cpu_moe, &cparams,
-            devs_cpu, ngl_cpu, nct_cpu, nex_cpu, params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            devs_cpu, ngl_cpu, nct_cpu, nex_cpu, nxu_cpu, params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
         if (nex_full == 0 || nex_cpu != nex_full) {
             throw std::runtime_error("expert cache requires a consistent routed-expert count");
         }
@@ -2409,12 +2467,12 @@ int llama_bench(int argc, char ** argv) {
             throw std::runtime_error("unable to estimate expert-cache fit reservation");
         }
         const size_t n_expert = (size_t) nex_full;
-        const size_t slots = (size_t) params.expert_cache_slots;
+        const size_t slots = (size_t) inst.expert_cache_slots;
         return (expert_bytes / n_expert) * slots + ((expert_bytes % n_expert) * slots + n_expert - 1) / n_expert;
     };
 
     auto configure_expert_cache = [&](const cmd_params_instance & inst) -> bool {
-        if (params.expert_cache_slots <= 0) {
+        if (inst.expert_cache_slots <= 0) {
             return true;
         }
         ggml_backend_dev_t cache_dev = expert_cache_device(inst);
@@ -2423,9 +2481,9 @@ int llama_bench(int argc, char ** argv) {
             return false;
         }
         expert_cache_configure_fn(
-            (uint32_t) params.expert_cache_slots,
-            (uint32_t) params.expert_cache_admit_window,
-            (uint32_t) params.expert_cache_workers,
+            (uint32_t) inst.expert_cache_slots,
+            (uint32_t) inst.expert_cache_admit_window,
+            (uint32_t) inst.expert_cache_workers,
             cache_dev);
         return true;
     };
@@ -2448,7 +2506,7 @@ int llama_bench(int argc, char ** argv) {
         auto cparams = inst.to_llama_cparams();
 
         std::vector<llama_model_tensor_buft_override> cache_overrides;
-        if (params.expert_cache_slots > 0) {
+        if (inst.expert_cache_slots > 0) {
             cache_overrides.push_back(llm_ffn_exps_cpu_override());
             if (mparams.tensor_buft_overrides != nullptr) {
                 for (const auto * ov = mparams.tensor_buft_overrides; ov->pattern != nullptr; ++ov) {
@@ -2476,7 +2534,7 @@ int llama_bench(int argc, char ** argv) {
             // use default n_gpu_layers and n_ctx so common_fit_params can adjust them
             mparams.n_gpu_layers          = llama_model_default_params().n_gpu_layers;
             mparams.tensor_split = fit_tensor_split.data();
-            if (params.expert_cache_slots > 0) {
+            if (inst.expert_cache_slots > 0) {
                 fit_overrides[0] = llm_ffn_exps_cpu_override();
                 fit_overrides[1] = {nullptr, nullptr};
             }
@@ -2484,7 +2542,7 @@ int llama_bench(int argc, char ** argv) {
             cparams.n_ctx = 0;
 
             std::vector<size_t> margins(llama_max_devices(), inst.fit_target * 1024 * 1024);
-            if (params.expert_cache_slots > 0) {
+            if (inst.expert_cache_slots > 0) {
                 ggml_backend_dev_t cache_dev = expert_cache_device(inst);
                 if (cache_dev == nullptr) {
                     throw std::runtime_error("expert cache requested but no GPU device is available");
@@ -2507,7 +2565,7 @@ int llama_bench(int argc, char ** argv) {
                 inst.fit_min_ctx,
                 nullptr,
                 params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
-                params.expert_cache_slots > 0);
+                inst.expert_cache_slots > 0);
        }
 
         // keep the same model between tests when possible
@@ -2701,7 +2759,7 @@ int llama_bench(int argc, char ** argv) {
 
         llama_free(ctx);
 
-        if (params.expert_cache_slots > 0) {
+        if (inst.expert_cache_slots > 0) {
             expert_cache_configure_fn(0, 0, 1, nullptr);
         }
 
@@ -2719,7 +2777,7 @@ int llama_bench(int argc, char ** argv) {
         p_err->print_footer();
     }
 
-    if (params.expert_cache_slots > 0) {
+    if (expert_cache_enabled) {
         expert_cache_configure_fn(0, 0, 1, nullptr);
     }
 
