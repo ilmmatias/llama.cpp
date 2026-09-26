@@ -1326,8 +1326,11 @@ static ggml_backend_dev_t common_expert_cache_device_get(const common_params & p
 }
 
 static void common_expert_cache_prepare_params(common_params & params) {
-    if (params.expert_cache_slots <= 0) {
+    if (params.expert_cache_slots <= 0 && !params.expert_cache_slots_auto) {
         return;
+    }
+    if (params.expert_cache_slots_auto && !params.fit_params) {
+        throw std::invalid_argument("--expert-cache-slots auto requires --fit; pick an explicit number of slots to run without fitting");
     }
     if (params.expert_cache_moe_placement_explicit) {
         throw std::invalid_argument("--expert-cache-slots cannot be combined with --cpu-moe/--n-cpu-moe");
@@ -1353,7 +1356,9 @@ static size_t common_expert_cache_fit_reserve(
         const llama_context_params & cparams,
         uint32_t slots,
         ggml_backend_dev_t cache_dev,
-        size_t & cache_device_index) {
+        size_t & cache_device_index,
+        uint32_t & n_expert_out,
+        uint32_t & n_expert_used_max_out) {
     if (slots == 0 || cache_dev == nullptr || mparams_cpu_moe.tensor_buft_overrides == nullptr) {
         return 0;
     }
@@ -1363,13 +1368,13 @@ static size_t common_expert_cache_fit_reserve(
 
     std::vector<ggml_backend_dev_t> devs_full;
     std::vector<ggml_backend_dev_t> devs_cpu;
-    uint32_t ngl_full = 0, nct_full = 0, nex_full = 0;
-    uint32_t ngl_cpu  = 0, nct_cpu  = 0, nex_cpu  = 0;
+    uint32_t ngl_full = 0, nct_full = 0, nex_full = 0, nxu_full = 0;
+    uint32_t ngl_cpu  = 0, nct_cpu  = 0, nex_cpu  = 0, nxu_cpu  = 0;
 
     const auto full = common_get_device_memory_data(
-        path_model, &mparams_full, &cparams, devs_full, ngl_full, nct_full, nex_full, GGML_LOG_LEVEL_ERROR);
+        path_model, &mparams_full, &cparams, devs_full, ngl_full, nct_full, nex_full, nxu_full, GGML_LOG_LEVEL_ERROR);
     const auto cpu = common_get_device_memory_data(
-        path_model, &mparams_cpu_moe, &cparams, devs_cpu, ngl_cpu, nct_cpu, nex_cpu, GGML_LOG_LEVEL_ERROR);
+        path_model, &mparams_cpu_moe, &cparams, devs_cpu, ngl_cpu, nct_cpu, nex_cpu, nxu_cpu, GGML_LOG_LEVEL_ERROR);
 
     if (nex_full == 0 || nex_cpu != nex_full) {
         throw std::runtime_error("expert cache requested for a model without a consistent routed-expert count");
@@ -1398,6 +1403,9 @@ static size_t common_expert_cache_fit_reserve(
     if (expert_bytes == 0) {
         throw std::runtime_error("unable to estimate routed-expert cache memory for --fit");
     }
+
+    n_expert_out = nex_full;
+    n_expert_used_max_out = nxu_full;
 
     const size_t n_expert = (size_t) nex_full;
     return (expert_bytes / n_expert) * slots + ((expert_bytes % n_expert) * slots + n_expert - 1) / n_expert;
@@ -1486,14 +1494,29 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         };
 
         std::vector<size_t> fit_targets = params.fit_params_target;
-        if (params.expert_cache_slots > 0) {
-            ggml_backend_dev_t cache_dev = common_expert_cache_device_get(params);
+
+        const bool cache_fixed = params.expert_cache_slots > 0;
+        const bool cache_auto  = params.expert_cache_slots_auto;
+
+        // the fit appends its own overrides to this array: capture the prepared state so every fit pass can start from it
+        const std::vector<llama_model_tensor_buft_override> overrides_base = params.tensor_buft_overrides;
+
+        ggml_backend_dev_t cache_dev = nullptr;
+        size_t cache_device_index = 0;
+
+        if (cache_fixed || cache_auto) {
+            cache_dev = common_expert_cache_device_get(params);
             if (cache_dev == nullptr) {
                 throw std::runtime_error("expert cache requested but no GPU device is available");
             }
-            size_t cache_device_index = 0;
+        }
+
+        if (cache_fixed) {
+            uint32_t n_expert_unused = 0;
+            uint32_t n_expert_used_max_unused = 0;
             const size_t reserve = common_expert_cache_fit_reserve(
-                params.model.path.c_str(), mparams, cparams, (uint32_t) params.expert_cache_slots, cache_dev, cache_device_index);
+                params.model.path.c_str(), mparams, cparams, (uint32_t) params.expert_cache_slots, cache_dev, cache_device_index,
+                n_expert_unused, n_expert_used_max_unused);
             if (cache_device_index >= fit_targets.size()) {
                 throw std::runtime_error("expert cache device index exceeds fit target array");
             }
@@ -1502,14 +1525,126 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 (double) reserve / (1024.0 * 1024.0), ggml_backend_dev_name(cache_dev));
         }
 
-        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
-            params.tensor_split,
-            params.tensor_buft_overrides.data(),
-            fit_targets.data(),
-            params.fit_params_min_ctx,
-            has_draft || spec_mtp ? &extra : nullptr,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
-            params.expert_cache_slots > 0);
+        const ggml_log_level fit_log_level = params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR;
+        const common_fit_extra_model * extra_ptr = has_draft || spec_mtp ? &extra : nullptr;
+
+        if (!cache_auto) {
+            common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+                params.tensor_split,
+                params.tensor_buft_overrides.data(),
+                fit_targets.data(),
+                params.fit_params_min_ctx,
+                extra_ptr,
+                fit_log_level,
+                cache_fixed);
+        } else {
+            // auto cache sizing: size the cache from the memory the fit leaves on the cache device,
+            // capped at the slot count that is still useful for the model's routing
+            uint32_t n_expert = 0;
+            uint32_t n_expert_used_max = 0;
+            const size_t slot_bytes = common_expert_cache_fit_reserve(
+                params.model.path.c_str(), mparams, cparams, 1, cache_dev, cache_device_index, n_expert, n_expert_used_max);
+            if (cache_device_index >= fit_targets.size()) {
+                throw std::runtime_error("expert cache device index exceeds fit target array");
+            }
+
+            // one cache slot across all MoE layers: expert_bytes / n_expert
+            const uint32_t slot_cap = common_fit_expert_cache_slots_from_surplus(INT64_MAX, slot_bytes, n_expert, n_expert_used_max);
+            uint32_t slots = 0;
+
+            const auto fit_with_cache_reserve = [&](uint32_t cache_slots, llama_model_params & mparams_o, llama_context_params & cparams_o, std::vector<int64_t> * surplus_out) {
+                // each pass needs clean model/context params: fit writes into everything it is handed
+                auto mparams_i     = common_model_params_to_llama(params);
+                auto cparams_i     = common_context_params_to_llama(params);
+                auto mparams_dft_i = common_model_params_to_llama(params_dft);
+                auto cparams_dft_i = common_context_params_to_llama(params_dft);
+                if (spec_mtp) {
+                    cparams_dft_i.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                }
+                cparams_dft_i.n_rs_seq = 0;
+
+                const common_fit_extra_model extra_i = {
+                    /*.path_model   =*/ params_dft.model.path.c_str(),
+                    /*.mparams      =*/ &mparams_dft_i,
+                    /*.cparams      =*/ &cparams_dft_i,
+                    /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
+                };
+
+                std::vector<size_t> targets_i = fit_targets;
+                targets_i[cache_device_index] += (size_t) cache_slots * slot_bytes;
+
+                std::vector<int64_t> surplus_i(fit_targets.size(), 0);
+
+                std::memset(params.tensor_split, 0, sizeof(params.tensor_split));
+                params.tensor_buft_overrides = overrides_base;
+
+                const auto status = common_fit_params(params.model.path.c_str(), &mparams_i, &cparams_i,
+                    params.tensor_split,
+                    params.tensor_buft_overrides.data(),
+                    targets_i.data(),
+                    params.fit_params_min_ctx,
+                    has_draft || spec_mtp ? &extra_i : nullptr,
+                    fit_log_level,
+                    true, // keep_moe_cpu: the routed experts stay in system memory, the cache covers the hot ones
+                    surplus_out != nullptr ? surplus_out->data() : surplus_i.data());
+
+                mparams_o = mparams_i;
+                cparams_o = cparams_i;
+                return status;
+            };
+
+            llama_model_params   mparams_f;
+            llama_context_params cparams_f;
+
+            if (!params.fit_prefer_cache) {
+                // default: offload as many layers as the fit can place, then cache whatever the fit leaves free
+                std::vector<int64_t> surplus(fit_targets.size(), 0);
+                fit_with_cache_reserve(0, mparams_f, cparams_f, &surplus);
+
+                slots = common_fit_expert_cache_slots_from_surplus(surplus[cache_device_index], slot_bytes, n_expert, n_expert_used_max);
+                if (slots == 0) {
+                    COM_WRN("expert cache auto-fit: %.1f MiB left on %s after layer offloading is not enough for a slot, disabling the cache\n",
+                        (double) std::max<int64_t>(surplus[cache_device_index], 0) / (1024.0 * 1024.0), ggml_backend_dev_name(cache_dev));
+                } else {
+                    // refit with the cache footprint reserved so that KV and scratch buffers do not claim it
+                    fit_with_cache_reserve(slots, mparams_f, cparams_f, nullptr);
+                }
+            } else {
+                // maximize useful cache slots first: binary-search the largest slot count that keeps the fit feasible
+                uint32_t lo = 0;
+                uint32_t hi = slot_cap + 1;
+
+                while (lo + 1 < hi) {
+                    const uint32_t mid = lo + (hi - lo) / 2;
+
+                    llama_model_params   mparams_i;
+                    llama_context_params cparams_i;
+                    std::vector<int64_t>   surplus_i(fit_targets.size(), 0);
+
+                    const auto status_i = fit_with_cache_reserve(mid, mparams_i, cparams_i, &surplus_i);
+
+                    if (status_i == COMMON_PARAMS_FIT_STATUS_SUCCESS && surplus_i[cache_device_index] >= 0) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+
+                slots = lo;
+                if (slots == 0) {
+                    COM_WRN("expert cache auto-fit: %s\n", "not even a single slot/layer keeps the fit feasible, disabling the cache");
+                }
+
+                // commit the search result: fit the final params with the cache footprint reserved on the cache device
+                fit_with_cache_reserve(slots, mparams_f, cparams_f, nullptr);
+            }
+
+            mparams = mparams_f;
+            cparams = cparams_f;
+
+            params.expert_cache_slots = (int32_t) slots;
+            params.expert_cache_slots_auto = false;
+        }
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);

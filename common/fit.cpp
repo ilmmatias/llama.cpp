@@ -35,6 +35,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
+        uint32_t & hp_n_expert_used_max,
         ggml_log_level log_level,
         const char * path_model_link = nullptr,
         const llama_model_params * mparams_link = nullptr,
@@ -183,6 +184,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     }
     hp_n_ctx_train = llama_model_n_ctx_train(model);
     hp_n_expert    = llama_model_n_expert(model);
+    hp_n_expert_used_max = llama_model_n_expert_used_max(model);
 
     common_memory_breakdown_print(ctx);
 
@@ -203,9 +205,10 @@ common_device_memory_data_vec common_get_device_memory_data(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
+        uint32_t & hp_n_expert_used_max,
         ggml_log_level log_level) {
     std::vector<llama_device_memory_data> impl = common_get_device_memory_data_impl(
-            path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
+            path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, hp_n_expert_used_max, log_level);
 
     common_device_memory_data_vec ret(impl.size());
     for (size_t i = 0; i < impl.size(); i++) {
@@ -221,7 +224,7 @@ common_device_memory_data_vec common_get_device_memory_data(
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins_s, uint32_t n_ctx_min, bool keep_moe_cpu, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+        size_t * margins_s, uint32_t n_ctx_min, bool keep_moe_cpu, const common_fit_extra_model * extra, enum ggml_log_level log_level, int64_t * out_device_surplus) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
@@ -233,6 +236,7 @@ static void common_params_fit_impl(
     uint32_t hp_ngl = 0; // hparams.n_gpu_layers
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
+    uint32_t hp_nex_used = 0; // hparams.n_expert_used_max
 
     // size the context for all sequences, but keep minimums and alignment per KV stream
     const uint32_t n_seq_max  = std::max<uint32_t>(1, cparams->n_seq_max);
@@ -251,6 +255,7 @@ static void common_params_fit_impl(
         uint32_t ngl_extra = 0;
         uint32_t nct_extra = 0;
         uint32_t nex_extra = 0;
+        uint32_t nxu_extra = 0;
 
         extra->cparams->n_ctx = cparams->n_ctx;
 
@@ -260,7 +265,7 @@ static void common_params_fit_impl(
         dmds_t measured;
         try {
             measured = common_get_device_memory_data_impl(
-                extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level,
+                extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, nxu_extra, log_level,
                 path_model, &mparams_link, cparams);
         } catch (const std::runtime_error & e) {
             // the extra model is optional, fit the main model alone rather than giving up
@@ -296,7 +301,7 @@ static void common_params_fit_impl(
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
-    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, hp_nex_used, log_level);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_seq_max, UINT32_MAX);
@@ -308,7 +313,7 @@ static void common_params_fit_impl(
         if (n_seq_max > 1) {
             LOG_TRC("%s: context size unset -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
                 __func__, n_ctx_max, n_seq_max);
-            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, hp_nex_used, log_level);
         }
     }
     add_extra_memory(dmds_full, *mparams);
@@ -386,6 +391,9 @@ static void common_params_fit_impl(
             __func__, sum_projected_used/MiB, sum_free/MiB);
         if (nd == 1) {
             if (projected_free_per_device[0] >= margins[0]) {
+                if (out_device_surplus) {
+                    out_device_surplus[0] = projected_free_per_device[0] - margins[0];
+                }
                 LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
                     __func__, projected_free_per_device[0]/MiB, margins[0]/MiB);
                 return;
@@ -399,6 +407,11 @@ static void common_params_fit_impl(
                 }
             }
             if (!changes_needed) {
+                if (out_device_surplus) {
+                    for (size_t id = 0; id < nd; id++) {
+                        out_device_surplus[id] = projected_free_per_device[id] - margins[id];
+                    }
+                }
                 LOG_TRC("%s: targets for free memory can be met on all devices, no changes needed\n", __func__);
                 return;
             }
@@ -447,7 +460,7 @@ static void common_params_fit_impl(
 
                     int64_t sum_projected_used_min_ctx = 0;
                     cparams->n_ctx = n_ctx_min_total;
-                    dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                    dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, hp_nex_used, log_level);
                     add_extra_memory(dmds_min_ctx, *mparams);
                     if (nd == 0) {
                         sum_projected_used_min_ctx = dmds_min_ctx.back().mb.total();
@@ -469,6 +482,10 @@ static void common_params_fit_impl(
                         LOG_TRC("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
                             __func__, n_ctx_max, cparams->n_ctx, memory_reduction/MiB);
                         if (nd <= 1) {
+                            if (out_device_surplus) {
+                                // the context size was interpolated to land on the memory target: no surplus to report
+                                out_device_surplus[0] = 0;
+                            }
                             LOG_TRC("%s: entire model can be fit by reducing context\n", __func__);
                             return;
                         }
@@ -643,7 +660,7 @@ static void common_params_fit_impl(
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy);
 
         dmds_t dmd_nl = common_get_device_memory_data_impl(
-            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, hp_nex_used, log_level);
         add_extra_memory(dmd_nl, mparams_copy);
 
         LOG_TRC("%s: memory for test allocation by device:\n", func_name);
@@ -672,7 +689,7 @@ static void common_params_fit_impl(
 
         LOG_TRC("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
         dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
-            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, hp_nex_used, log_level);
         add_extra_memory(dmds_cpu_moe, *mparams);
 
         for (size_t id = 0; id < nd; id++) {
@@ -708,6 +725,14 @@ static void common_params_fit_impl(
 
     std::vector<ngl_t> ngl_per_device(nd);
     std::vector<int64_t> mem = get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
+
+    auto report_surplus = [&]() {
+        if (out_device_surplus) {
+            for (size_t id = 0; id < nd; id++) {
+                out_device_surplus[id] = dmds_full[id].free - mem[id] - margins[id];
+            }
+        }
+    };
 
     // optimize the number of layers per device using the method of false position:
     //   - ngl_per_device has 0 layers for each device, lower bound
@@ -777,6 +802,7 @@ static void common_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
     }
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
+        report_surplus();
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
         return;
     }
@@ -922,6 +948,7 @@ static void common_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
     }
 
+    report_surplus();
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
 }
 
@@ -935,11 +962,11 @@ enum common_params_fit_status common_fit_params(
         uint32_t n_ctx_min,
         const common_fit_extra_model * extra,
         ggml_log_level log_level,
-        bool keep_moe_cpu) {
+        bool keep_moe_cpu, int64_t * out_device_surplus) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, keep_moe_cpu, extra, log_level);
+        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, keep_moe_cpu, extra, log_level, out_device_surplus);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
@@ -951,6 +978,21 @@ enum common_params_fit_status common_fit_params(
     const int64_t t1_us = llama_time_us();
     LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
     return status;
+}
+
+uint32_t common_fit_expert_cache_slots_from_surplus(int64_t surplus_bytes, size_t slot_bytes, uint32_t n_expert, uint32_t n_expert_used_max) {
+    // beyond a handful of slots per layer, the hit rate of the routed-expert cache has diminishing returns:
+    // sizing the cache to cover a multiple of the max. experts used per token is more useful than more VRAM held idle
+    constexpr uint32_t EXPERT_CACHE_FIT_USEFUL_MULTIPLE = 4;
+
+    if (slot_bytes == 0 || n_expert == 0 || surplus_bytes < (int64_t)slot_bytes) {
+        return 0;
+    }
+
+    const uint32_t useful_cap = std::min(n_expert, EXPERT_CACHE_FIT_USEFUL_MULTIPLE * std::max((uint32_t)1, n_expert_used_max));
+    const uint64_t slots = (uint64_t)surplus_bytes / slot_bytes;
+
+    return (uint32_t)std::min<uint64_t>(slots, useful_cap);
 }
 
 void common_memory_breakdown_print(const struct llama_context * ctx) {
@@ -1143,8 +1185,9 @@ void common_fit_print(
     uint32_t hp_ngl = 0; // hparams.n_gpu_layers
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
+    uint32_t hp_nex_used = 0; // hparams.n_expert_used_max
 
-    auto dmd = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+    auto dmd = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, hp_nex_used, GGML_LOG_LEVEL_ERROR);
     GGML_ASSERT(dmd.size() == devs.size() + 1);
 
     for (size_t id = 0; id < devs.size(); id++) {

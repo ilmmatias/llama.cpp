@@ -2785,13 +2785,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
     add_opt(common_arg(
-        {"-ecs", "--expert-cache-slots"}, "N",
-        string_format("number of routed-expert cache slots per MoE layer; 0 disables the cache (default: %d)", params.expert_cache_slots),
-        [](common_params & params, int value) {
-            if (value < 0) {
+        {"-ecs", "--expert-cache-slots"}, "{N|auto}",
+        string_format("number of routed-expert cache slots per MoE layer, or 'auto' to size the cache from the VRAM left by --fit (more slots per layer than a small multiple of the model's max. used experts are not useful); 0 disables the cache (default: %d)",
+            params.expert_cache_slots),
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.expert_cache_slots_auto = true;
+                return;
+            }
+            const int slots = std::stoi(value);
+            if (slots < 0) {
                 throw std::invalid_argument("expert cache slots must be non-negative");
             }
-            params.expert_cache_slots = value;
+            params.expert_cache_slots = slots;
         }
     ));
     add_opt(common_arg(
@@ -2955,6 +2961,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.fit_params_min_ctx = value;
         }
     ).set_env("LLAMA_ARG_FIT_CTX"));
+
+    add_opt(common_arg(
+        { "--fit-prefer" }, "{layers,cache}",
+        "when --fit distributes the free device memory with an expert cache: 'layers' offloads as many layers as possible first, 'cache' fills useful expert-cache slots first (default: layers)",
+        [](common_params & params, const std::string & value) {
+            if (value == "layers") {
+                params.fit_prefer_cache = false;
+            } else if (value == "cache") {
+                params.fit_prefer_cache = true;
+            } else {
+                throw std::invalid_argument(string_format("unknown value for --fit-prefer: '%s' (expected 'layers' or 'cache')", value.c_str()));
+            }
+        }
+    ).set_env("LLAMA_ARG_FIT_PREFER"));
+
     add_opt(common_arg(
         {"--check-tensors"},
         string_format("check model tensor data for invalid values (default: %s)", params.check_tensors ? "true" : "false"),

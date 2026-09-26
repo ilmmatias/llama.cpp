@@ -36,7 +36,13 @@ common_params_fit_status common_fit_params(
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
                      ggml_log_level   log_level,             // minimum log level to print during fitting, lower levels go to debug log
-                               bool   keep_moe_cpu = false); // preserve a leading CPU MoE override and do not refill sparse experts onto devices
+                              bool   keep_moe_cpu = false,        // preserve a leading CPU MoE override and do not refill sparse experts onto devices
+                           int64_t * out_device_surplus = nullptr); // optional buffer (llama_model_n_devices elements) receiving free - projected_use - margin per device after fitting
+
+// number of expert-cache slots that fit in a surplus of VRAM:
+//   - slot_bytes is the per-layer routed-expert bytes divided by the expert count
+//   - capped by usefulness at min(n_expert, EXPERT_CACHE_FIT_USEFUL_MULTIPLE * max(1, n_expert_used_max))
+uint32_t common_fit_expert_cache_slots_from_surplus(int64_t surplus_bytes, size_t slot_bytes, uint32_t n_expert, uint32_t n_expert_used_max);
 
 // print estimated memory to stdout
 void common_fit_print(
@@ -65,4 +71,5 @@ common_device_memory_data_vec common_get_device_memory_data(
                            uint32_t & hp_ngl,
                            uint32_t & hp_n_ctx_train,
                            uint32_t & hp_n_expert,
+                      uint32_t & hp_n_expert_used_max,
                      ggml_log_level   log_level);
