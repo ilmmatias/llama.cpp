@@ -975,7 +975,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     k_blocks = ggml_set_rows(ctx0, k_blocks, update_keys, inp->update_idxs);
     ggml_build_forward_expand(gf, k_blocks);
 
-
+    if (width == n_kv) {
+        ggml_build_forward_expand(gf, inp->cell_blk);
+        ggml_build_forward_expand(gf, inp->bias);
+        ggml_build_forward_expand(gf, inp->block_key_cells);
+        return nullptr;
+    }
 
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
