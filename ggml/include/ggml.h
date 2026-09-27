@@ -2519,6 +2519,9 @@ extern "C" {
 
     // Use finite mask entries as a sparse K/V set. Set 0 to disable.
     // n_kv_max must bound the number of finite entries in every mask row.
+    // HIP's sparse tile path reads K and V independently as F16, BF16, or Q8_0,
+    // including mixed types, without converting the full cache to F16.
+    // BF16 uses F32 arithmetic to preserve its exponent range.
     GGML_API void ggml_flash_attn_ext_set_n_kv_max(
             struct ggml_tensor * a,
             int32_t              n_kv_max);

@@ -883,7 +883,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
-    if (ggml_cuda_flash_attn_ext_tile_shall_use_sparse(dst, 2)) {
+    // Grouped heads share one query's selection; only ungrouped tiles need a two-query union.
+    const int sparse_ncols1 = gqa_opt_applies && gqa_ratio % 2 == 0 ? 1 : 2;
+    if (ggml_cuda_flash_attn_ext_tile_shall_use_sparse(dst, sparse_ncols1)) {
         return BEST_FATTN_KERNEL_TILE;
     }
 

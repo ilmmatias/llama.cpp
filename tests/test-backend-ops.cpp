@@ -8357,20 +8357,22 @@ struct test_flash_attn_ext : public test_case {
 struct test_flash_attn_qsa : public test_flash_attn_ext {
     const bool empty_row;
     const ggml_type type_indices;
+    const bool wide_bf16;
 
     test_flash_attn_qsa(int64_t hs, int64_t kv, int64_t nb, int64_t n_selected,
                         int64_t gqa = 4, int64_t streams = 1, bool empty_row = false, float softcap = 0.0f,
-                        float max_bias = 0.0f, int64_t hsv = 0, ggml_type type_indices = GGML_TYPE_I32)
+                        float max_bias = 0.0f, int64_t hsv = 0, ggml_type type_indices = GGML_TYPE_I32,
+                        ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, bool wide_bf16 = false)
         : test_flash_attn_ext(hs, hsv ? hsv : hs, 2, {gqa, streams}, kv, nb, true, empty_row, max_bias, softcap,
-                              GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, false, n_selected),
-          empty_row(empty_row), type_indices(type_indices) {}
+                              GGML_PREC_F32, type_K, type_V, {0, 2, 1, 3}, true, false, n_selected),
+          empty_row(empty_row), type_indices(type_indices), wide_bf16(wide_bf16) {}
 
     std::string op_desc(ggml_tensor *) override {
         return "FLASH_ATTN_QSA";
     }
 
     std::string vars() override {
-        return test_flash_attn_ext::vars() + "," + VARS_TO_STR2(empty_row, type_indices);
+        return test_flash_attn_ext::vars() + "," + VARS_TO_STR3(empty_row, type_indices, wide_bf16);
     }
 
     bool run_whole_graph() override {
@@ -8430,6 +8432,11 @@ struct test_flash_attn_qsa : public test_flash_attn_ext {
                     }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (wide_bf16 && t->type == GGML_TYPE_BF16) {
+                // Finite BF16 cache values that cannot be represented in FP16.
+                init_tensor_uniform(t, 0x1p16f, 0x1p17f);
+            } else if (wide_bf16 && t->type == GGML_TYPE_F32) {
+                init_tensor_uniform(t, -0x1p-18f, 0x1p-18f);
             } else {
                 init_tensor_uniform(t);
             }
@@ -11527,6 +11534,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // sparse mask + quantized cache
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
+
+    // Native sparse caches: independent storage types, compacted unions and direct QSA indices.
+    for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
+        for (ggml_type type_V : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 1, true, false, 0, 0,
+                GGML_PREC_F32, type_K, type_V, {0, 2, 1, 3}, true, false, 2051));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {1, 2}, 2048, 3, true, true, 8, 20,
+                GGML_PREC_F32, type_K, type_V, {0, 2, 1, 3}, true, false, 33));
+            test_cases.emplace_back(new test_flash_attn_qsa(256, 8192, 1, 2051, 12, 1, false, 0, 0, 0,
+                GGML_TYPE_I32, type_K, type_V));
+            test_cases.emplace_back(new test_flash_attn_qsa(128, 2048, 3, 33, 4, 2, true, 20, 0, 0,
+                GGML_TYPE_I64, type_K, type_V));
+            // A K tile starts halfway through a Q8_0 block for this head size.
+            test_cases.emplace_back(new test_flash_attn_qsa(96, 2048, 3, 33, 4, 1, false, 0, 0, 0,
+                GGML_TYPE_I32, type_K, type_V));
+            if (type_K == GGML_TYPE_BF16 || type_V == GGML_TYPE_BF16) {
+                test_cases.emplace_back(new test_flash_attn_qsa(128, 2048, 3, 33, 4, 1, false, 0, 0, 0,
+                    GGML_TYPE_I32, type_K, type_V, true));
+            }
+            if (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16) {
+                // Asymmetric heads and the widest sparse GQA tile exercise native cache strides and SRAM limits.
+                test_cases.emplace_back(new test_flash_attn_qsa(320, 2048, 1, 33, 32, 1, false, 0, 0, 256,
+                    GGML_TYPE_I32, type_K, type_V));
+                test_cases.emplace_back(new test_flash_attn_qsa(576, 2048, 1, 33, 16, 1, false, 0, 0, 512,
+                    GGML_TYPE_I32, type_K, type_V));
+            }
+        }
+    }
 
     // Direct QSA indices: sort boundaries, duplicates, hidden rows, streams, strides, empty selections, and dense fallback.
     test_cases.emplace_back(new test_flash_attn_qsa( 64,  2048, 3,    1));
