@@ -215,6 +215,32 @@ static void test_basic(testing & t) {
 }
 
 static void test_seq(testing & t) {
+    t.test("row_list_rebuild_after_old_cell_removal", [&](testing & t) {
+        llama_kv_cells cells;
+        cells.resize(5000);
+        t.assert_true(cells.seq_cells(0).empty());
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            cells.pos_set(i, i);
+            cells.seq_add(i, 0);
+        }
+        cells.seq_add(0, 1);
+        t.assert_true(cells.seq_cells(1) == std::vector<int32_t>({0}));
+
+        // Removing the oldest row exceeds the recent-removal search window.
+        cells.seq_rm(0, 0);
+        cells.rm_single(4999, 0);
+        std::vector<int32_t> expected;
+        for (int32_t i = 1; i < 4999; ++i) {
+            expected.push_back(i);
+        }
+        auto actual = cells.seq_cells(0);
+        std::sort(actual.begin(), actual.end());
+        t.assert_true(actual == expected);
+        t.assert_true(cells.seq_cells(1) == std::vector<int32_t>({0}));
+        cells.reset();
+        t.assert_true(cells.seq_cells(0).empty() && cells.seq_cells(1).empty());
+    });
+
     t.test("seq_add_has_count", [&](testing & t) {
         llama_kv_cells cells;
         cells.resize(4);
@@ -956,6 +982,16 @@ static void test_random(testing & t) {
             for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
                 t.assert_equal(msg + " seq_pos_min", ref.seq_pos_min(s), cells.seq_pos_min(s));
                 t.assert_equal(msg + " seq_pos_max", ref.seq_pos_max(s), cells.seq_pos_max(s));
+                std::vector<int32_t> expected_rows;
+                for (uint32_t i = 0; i < n; ++i) {
+                    if (ref.cells[i].seqs.count(s)) {
+                        expected_rows.push_back(i);
+                    }
+                }
+                auto actual_rows = cells.seq_cells(s);
+                std::sort(actual_rows.begin(), actual_rows.end());
+                t.assert_true(msg + " seq_cells", actual_rows == expected_rows);
+                t.assert_equal(msg + " seq_n_cells", expected_rows.size(), size_t(cells.seq_n_cells(s)));
             }
         };
 

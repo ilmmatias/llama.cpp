@@ -108,6 +108,22 @@ void llama_kv_cells::seq_pos_dec(llama_seq_id s, llama_pos p, uint32_t row) {
     assert(v.cnt[idx] > 0);
     assert(v.row_max[idx] != UINT32_MAX);
 
+    if (seq_cells_ok.test(s)) {
+        auto & list = seq_cells_list[s];
+        bool removed = false;
+        const size_t n_search = std::min<size_t>(list.size(), 4096);
+        for (size_t k = 0; k < n_search; ++k) {
+            if (list[list.size() - 1 - k] == (int32_t) row) {
+                list.erase(list.end() - 1 - k);
+                removed = true;
+                break;
+            }
+        }
+        if (!removed) {
+            seq_cells_ok.reset(s);
+        }
+    }
+
     --v.cnt[idx];
     --v.total;
 
@@ -160,6 +176,10 @@ void llama_kv_cells::seq_pos_dec(llama_seq_id s, llama_pos p, uint32_t row) {
 
 void llama_kv_cells::seq_pos_inc(llama_seq_id s, llama_pos p, uint32_t row) {
     auto & v = seq_pos[s];
+
+    if (seq_cells_ok.test(s)) {
+        seq_cells_list[s].push_back(row);
+    }
 
     if (v.total == 0) {
         v.base = p;
