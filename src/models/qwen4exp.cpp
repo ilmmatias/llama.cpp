@@ -298,7 +298,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         // it is unindexed in the checkpoint (mtp.hyper_connection_mixer.*), so a detached-head
         // export -- which has no trunk mixer to collide with -- writes it to the model-level
         // hc_head_* names instead. accept either spelling.
-        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, flags | TENSOR_NOT_REQUIRED);
+        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { n_embd, hc }, flags | TENSOR_NOT_REQUIRED | TENSOR_ALLOW_RESHAPE);
         layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, flags | TENSOR_NOT_REQUIRED);
         layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, flags | TENSOR_NOT_REQUIRED);
 
