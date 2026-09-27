@@ -126,6 +126,8 @@ public:
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
         }
+
+        seq_cells_ok.reset();
     }
 
     void reset_shift() {
@@ -414,6 +416,39 @@ public:
         return -1;
     }
 
+    // number of cells that contain seq_id
+    uint32_t seq_n_cells(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        return seq_pos[seq_id].total;
+    }
+
+    // the cells that contain seq_id, in no particular order
+    const std::vector<int32_t> & seq_cells(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        auto & res = seq_cells_list[seq_id];
+
+        if (!seq_cells_ok.test(seq_id)) {
+            res.clear();
+            res.reserve(seq_pos[seq_id].total);
+            for (size_t w = 0; w < used_bits.size(); ++w) {
+                for (uint64_t bits = used_bits[w]; bits; bits &= bits - 1) {
+                    const uint32_t i = (uint32_t) (64*w + llama_bits::countr_zero64(bits));
+                    if (seq[i].test(seq_id)) {
+                        res.push_back(i);
+                    }
+                }
+            }
+
+            seq_cells_ok.set(seq_id);
+        }
+
+        return res;
+    }
+
     // the minimum position of sequence seq_id currently present in any of the cells
     // return -1 if the sequence is not present
     llama_pos seq_pos_min(llama_seq_id seq_id) const {
@@ -641,6 +676,10 @@ public:
     };
 
     seq_pos_t seq_pos[LLAMA_MAX_SEQ];
+
+    // Cache each sequence's physical rows without replacing the position index.
+    mutable std::vector<int32_t> seq_cells_list[LLAMA_MAX_SEQ];
+    mutable std::bitset<LLAMA_MAX_SEQ> seq_cells_ok;
 
     void used_insert(uint32_t i) {
         assert(i < pos.size());

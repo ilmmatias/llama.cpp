@@ -123,6 +123,7 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
         const int  * __restrict__ KV_max,
+        const int  * __restrict__ KV_rows,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
         const float scale,
@@ -1364,8 +1365,13 @@ void launch_fattn(
 
     const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
 
-    const ggml_tensor * mask  = dst->src[3];
-    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * mask    = dst->src[3];
+    const ggml_tensor * sinks   = dst->src[4];
+    const ggml_tensor * kv_rows = dst->src[7];
+
+    // with kv_rows the kernel iterates over the mask columns and reads K/V rows through kv_rows
+    const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : K->ne[1];
+    GGML_ASSERT(!kv_rows || !use_sparse);
 
     ggml_tensor * KQV = dst;
 
@@ -1611,10 +1617,16 @@ void launch_fattn(
     }
 
     const bool use_kv_bounds = !use_sparse && (mask || KQV->src[6]) &&
-        K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+        n_kv_cols % FATTN_KQ_STRIDE == 0 &&
         (Q->ne[1] >= 1024 || Q->ne[3] > 1 || workspace_begin);
     if (use_kv_bounds) {
         KV_max.alloc(ntiles_x * Q->ne[3]);
+    }
+
+    // K/V are shared by all slices when read through kv_rows
+    if (kv_rows) {
+        nb13 = 0;
+        nb23 = 0;
     }
 
     const dim3 block_dim(warp_size, nwarps, 1);
@@ -1623,7 +1635,7 @@ void launch_fattn(
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
-    const int64_t n_kv = use_sparse ? n_kv_max : staged ? staging_rows : K->ne[1];
+    const int64_t n_kv = use_sparse ? n_kv_max : staged ? staging_rows : n_kv_cols;
     const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;
@@ -1748,8 +1760,8 @@ void launch_fattn(
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
-    const int64_t step = staged ? staging_rows : K->ne[1];
-    for (int64_t start = 0; start < K->ne[1]; start += step) {
+    const int64_t step = staged ? staging_rows : n_kv_cols;
+    for (int64_t start = 0; start < n_kv_cols; start += step) {
         const int64_t rows = staged ? std::min(step, K->ne[1] - start) : n_kv;
 
         if (use_kv_bounds) {
@@ -1858,6 +1870,7 @@ void launch_fattn(
             mask ? ((const char *) mask->data + start*mask->nb[0]) : nullptr,
             sinks && start == 0 ? ((const char *) sinks->data) : nullptr,
             chunk_indices,
+            kv_rows ? (const int *) kv_rows->data : nullptr,
             split_staging ? (float *) extra.parts : !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data,
             split_staging ? (float2 *) extra.parts_meta : dst_tmp_meta.ptr,
             scale, max_bias, m0, m1, n_head_log2, logit_softcap,

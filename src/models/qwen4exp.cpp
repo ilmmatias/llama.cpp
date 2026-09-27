@@ -461,7 +461,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     cb(inpL, "model.input_embed", -1);
     ggml_build_forward_expand(gf, inpL);
 
-    auto * inp = build_inp_mem_hybrid();
+    // QSA reads the KQ mask of the whole cache
+    auto * inp = build_inp_mem_hybrid(false);
 
     // qwen4exp always builds llama_memory_hybrid_idx, so this downcast is safe
     // the indexer cache inside it is absent when the GGUF has no indexer tensors
@@ -1171,7 +1172,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr,
-            top_k->ne[0], kq_scale, il, selected);
+            top_k->ne[0], kq_scale, il, nullptr, selected);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
