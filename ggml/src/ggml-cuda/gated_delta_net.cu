@@ -3,6 +3,55 @@
 #include "convert.cuh"
 #include "unary.cuh"
 
+// On RDNA the generic warp_reduce_sum compiles to 5 dependent ds_bpermute round trips (~100+ cycles each),
+// which dominates the per-token latency of the recurrence.
+#if defined(GGML_USE_HIP) && defined(RDNA)
+template <int mask>
+static __device__ __forceinline__ float gdn_dpp_row_xmask(const float x) {
+    return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x160 | mask, 0xf, 0xf, true));
+}
+
+static __device__ __forceinline__ float gdn_permlanex16_swap(const float x) {
+    return __int_as_float(__builtin_amdgcn_permlanex16(__float_as_int(x), __float_as_int(x), 0x76543210, 0xFEDCBA98, true, false));
+}
+
+template <int width>
+static __device__ __forceinline__ float gdn_warp_reduce_sum(float x) {
+    static_assert(
+        width == 1 || width == 2 || width == 4 ||
+        width == 8 || width == 16 || width == 32,
+        "unsupported reduction width");
+
+    // XOR 16 crosses two 16-lane DPP rows.
+    if constexpr (width >= 32) {
+        x += gdn_permlanex16_swap(x);
+    }
+
+    // Remaining stages are entirely within a 16-lane DPP row.
+    if constexpr (width >= 16) {
+        x += gdn_dpp_row_xmask<8>(x);
+    }
+    if constexpr (width >= 8) {
+        x += gdn_dpp_row_xmask<4>(x);
+    }
+    if constexpr (width >= 4) {
+        x += gdn_dpp_row_xmask<2>(x);
+    }
+    if constexpr (width >= 2) {
+        x += gdn_dpp_row_xmask<1>(x);
+    }
+
+    return x;
+}
+
+template <> __device__ __forceinline__ float warp_reduce_sum<1>(const float x) { return gdn_warp_reduce_sum<1>(x); }
+template <> __device__ __forceinline__ float warp_reduce_sum<2>(const float x) { return gdn_warp_reduce_sum<2>(x); }
+template <> __device__ __forceinline__ float warp_reduce_sum<4>(const float x) { return gdn_warp_reduce_sum<4>(x); }
+template <> __device__ __forceinline__ float warp_reduce_sum<8>(const float x) { return gdn_warp_reduce_sum<8>(x); }
+template <> __device__ __forceinline__ float warp_reduce_sum<16>(const float x) { return gdn_warp_reduce_sum<16>(x); }
+template <> __device__ __forceinline__ float warp_reduce_sum<32>(const float x) { return gdn_warp_reduce_sum<32>(x); }
+#endif // defined(GGML_USE_HIP) && defined(RDNA)
+
 template <int S_v, bool KDA, bool keep_rs_t, int cols_per_warp = 1>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
@@ -75,6 +124,7 @@ gated_delta_net_cuda(const float * q,
         const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
 
         const float beta_val = *beta_t;
+        const float g_val = KDA ? 0.0f : expf(*g_t);
 
         // Cache k and q in registers
         float k_reg[rows_per_lane];
@@ -90,8 +140,6 @@ gated_delta_net_cuda(const float * q,
         for (int c = 0; c < cols_per_warp; ++c) {
             const int col = col_base + c;
             if constexpr (!KDA) {
-                const float g_val = expf(*g_t);
-
                 // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
                 float kv_shard = 0.0f;
 #pragma unroll
@@ -197,8 +245,9 @@ static void launch_gated_delta_net(
     const auto & device = ggml_cuda_info().devices[ggml_cuda_get_device()];
     const int warp_size = device.warp_size;
     const int num_warps = 4;
-    const bool use_multi_col = !KDA && !keep_rs_t && S_v == 128 && H * n_seqs >= 32 && n_tokens >= 32 && GGML_CUDA_CC_IS_RDNA2(device.cc);
-    const int cols_per_block = num_warps * (use_multi_col ? 4 : 1);
+    const bool use_multi_col = !KDA && !keep_rs_t && S_v == 128 && H * n_seqs >= 32;
+    const int cols_per_warp = use_multi_col ? (n_tokens >= 128 ? 8 : 4) : 1;
+    const int cols_per_block = num_warps * cols_per_warp;
     dim3      grid_dims(H, n_seqs, (S_v + cols_per_block - 1) / cols_per_block);
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
@@ -228,8 +277,15 @@ static void launch_gated_delta_net(
         }
         case 128: {
             if constexpr (!KDA && !keep_rs_t) {
-                if (use_multi_col) {
+                if (cols_per_warp == 4) {
                     ggml_cuda_kernel_launch(gated_delta_net_cuda<128, false, false, 4>, launch_params,
+                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                        n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                    break;
+                }
+                if (cols_per_warp == 8) {
+                    ggml_cuda_kernel_launch(gated_delta_net_cuda<128, false, false, 8>, launch_params,
                         q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                         n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                         sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
