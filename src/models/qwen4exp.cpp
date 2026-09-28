@@ -945,13 +945,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_reshape_1d(ctx0, inp->update_cells, r*n_updates));
     members = ggml_reshape_3d(ctx0, members, idx_dim, r, n_updates);
 
-    // Preserve the old summation order so this patch changes the amount of work, not
-    // the arithmetic used to construct a block key.
+    // Add strided member views directly, preserving the summation order without
+    // materializing a contiguous copy of each member before pooling.
     ggml_tensor * update_keys = nullptr;
     for (int64_t i = 0; i < r; ++i) {
-        ggml_tensor * slice = ggml_cont(ctx0,
-                ggml_view_2d(ctx0, members, idx_dim, n_updates,
-                        members->nb[2], i*members->nb[1]));
+        ggml_tensor * slice = ggml_view_2d(ctx0, members, idx_dim, n_updates,
+                members->nb[2], i*members->nb[1]);
         update_keys = update_keys ? ggml_add(ctx0, update_keys, slice) : slice;
     }
     update_keys = ggml_scale(ctx0, update_keys, 1.0f/(float) r);

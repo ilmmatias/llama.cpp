@@ -1,5 +1,25 @@
 #include "common.cuh"
 #include "qsa-block-score.cuh"
+// Keep QSA's ordered reductions in registers on RDNA instead of using
+// LDS-backed shuffle instructions.
+template <int mask>
+static __device__ __forceinline__ float qsa_shuffle_xor(float x) {
+#if defined(GGML_USE_HIP) && defined(RDNA)
+    if constexpr (mask < 16) {
+        return __int_as_float(__builtin_amdgcn_update_dpp(
+                0, __float_as_int(x), 0x160 | mask, 0xf, 0xf, true));
+    } else {
+        float swapped = __int_as_float(__builtin_amdgcn_permlanex16(
+                __float_as_int(x), __float_as_int(x), 0x76543210, 0xFEDCBA98, true, false));
+        if constexpr (mask == 24) {
+            return qsa_shuffle_xor<8>(swapped);
+        }
+        return swapped;
+    }
+#else
+    return __shfl_xor_sync(0xffffffff, x, mask, 32);
+#endif
+}
 
 
 // Released Qwen4Exp indexer shape.  A Wave32 is split into four independent
@@ -79,18 +99,18 @@ static __global__ void qsa_block_score_f32_128x4_wave32(
     }
 
     // width=8 makes four independent reductions inside the Wave32.
-    dot += __shfl_xor_sync(0xffffffff, dot, 4, lanes_per_head);
-    dot += __shfl_xor_sync(0xffffffff, dot, 2, lanes_per_head);
-    dot += __shfl_xor_sync(0xffffffff, dot, 1, lanes_per_head);
+    dot += qsa_shuffle_xor<4>(dot);
+    dot += qsa_shuffle_xor<2>(dot);
+    dot += qsa_shuffle_xor<1>(dot);
 
     // ReLU is per head, before the head sum.  Keep only the four subgroup
     // leaders.  Lane 0 fetches lanes 8/16/24 and adds in head order, matching
     // the generic graph's left-to-right four-head reduction as closely as the
     // different dot-product reduction permits.
     const float head_score = il == 0 ? fmaxf(dot, 0.0f) : 0.0f;
-    const float h1 = __shfl_xor_sync(0xffffffff, head_score,  8, wave_size);
-    const float h2 = __shfl_xor_sync(0xffffffff, head_score, 16, wave_size);
-    const float h3 = __shfl_xor_sync(0xffffffff, head_score, 24, wave_size);
+    const float h1 = qsa_shuffle_xor<8>(head_score);
+    const float h2 = qsa_shuffle_xor<16>(head_score);
+    const float h3 = qsa_shuffle_xor<24>(head_score);
 
     if (valid && lane == 0) {
         const float score = ((head_score + h1) + h2) + h3;
@@ -176,23 +196,30 @@ static __global__ void qsa_block_score_f32_128x4_wave32_batched(
         }
     }
 
+    float scores[blocks_per_tile];
 #pragma unroll
     for (int jb = 0; jb < blocks_per_tile; ++jb) {
         float v = dot[jb];
-        v += __shfl_xor_sync(0xffffffff, v, 4, lanes_per_head);
-        v += __shfl_xor_sync(0xffffffff, v, 2, lanes_per_head);
-        v += __shfl_xor_sync(0xffffffff, v, 1, lanes_per_head);
+        v += qsa_shuffle_xor<4>(v);
+        v += qsa_shuffle_xor<2>(v);
+        v += qsa_shuffle_xor<1>(v);
 
         const float head_score = il == 0 ? fmaxf(v, 0.0f) : 0.0f;
-        const float h1 = __shfl_xor_sync(0xffffffff, head_score,  8, wave_size);
-        const float h2 = __shfl_xor_sync(0xffffffff, head_score, 16, wave_size);
-        const float h3 = __shfl_xor_sync(0xffffffff, head_score, 24, wave_size);
+        const float h1 = qsa_shuffle_xor<8>(head_score);
+        const float h2 = qsa_shuffle_xor<16>(head_score);
+        const float h3 = qsa_shuffle_xor<24>(head_score);
 
-        const int64_t ib = ib0 + jb;
-        if (valid_query && ib < n_blocks && lane == 0) {
-            const float score = ((head_score + h1) + h2) + h3;
-            dst[ib*sd0 + iq*sd1 + is*sd2] =
-                score*scale + mask[ib*sm0 + iq*sm1 + is*sm2];
+        scores[jb] = ((head_score + h1) + h2) + h3;
+    }
+
+    if (valid_query && lane == 0) {
+#pragma unroll
+        for (int jb = 0; jb < blocks_per_tile; ++jb) {
+            const int64_t ib = ib0 + jb;
+            if (ib < n_blocks) {
+                dst[ib*sd0 + iq*sd1 + is*sd2] =
+                    scores[jb]*scale + mask[ib*sm0 + iq*sm1 + is*sm2];
+            }
         }
     }
 }
