@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "qsa-kv.cuh"
 
 #include <cstdint>
 
@@ -39,7 +40,8 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+                            ggml_cuda_qsa_kv_view K_cache, ggml_cuda_qsa_kv_view V_cache);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -985,7 +987,7 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE
+    const int warp_size = WARP_SIZE, const bool use_paged = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1021,6 +1023,11 @@ void launch_fattn(
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
+    ggml_cuda_pool_alloc<char>   K_staging(pool);
+    ggml_cuda_pool_alloc<char>   V_staging(pool);
+
+    ggml_cuda_qsa_kv_view K_cache;
+    ggml_cuda_qsa_kv_view V_cache;
 
     const char * K_data = (const char *) K->data;
     size_t nb11 = K->nb[1];
@@ -1031,6 +1038,26 @@ void launch_fattn(
     size_t nb21 = V->nb[1];
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
+
+    if (ggml_cuda_qsa_kv_is_paged(K)) {
+        K_data = static_cast<const char *>(ggml_cuda_qsa_kv_device_ptr(K));
+
+        if (!use_paged) {
+            K_staging.alloc(ggml_nbytes(K));
+            CUDA_CHECK(cudaMemcpyAsync(K_staging.ptr, K->data, ggml_nbytes(K), cudaMemcpyHostToDevice, main_stream));
+            K_data = K_staging.ptr;
+        }
+    }
+
+    if (ggml_cuda_qsa_kv_is_paged(V)) {
+        V_data = static_cast<const char *>(ggml_cuda_qsa_kv_device_ptr(V));
+
+        if (!use_paged) {
+            V_staging.alloc(ggml_nbytes(V));
+            CUDA_CHECK(cudaMemcpyAsync(V_staging.ptr, V->data, ggml_nbytes(V), cudaMemcpyHostToDevice, main_stream));
+            V_data = V_staging.ptr;
+        }
+    }
 
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         const size_t bs = ggml_blck_size(K->type);
@@ -1120,6 +1147,15 @@ void launch_fattn(
         } else {
             ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
         }
+    }
+
+    if (use_paged) {
+        GGML_ASSERT(Q->ne[3] == 1 && (!mask || mask->ne[3] == 1));
+
+        const int n_indices = use_sparse ? n_kv_max*ntiles_x : K->ne[1];
+        const int32_t * indices = use_sparse ? KV_max.ptr : nullptr;
+
+        ggml_cuda_qsa_kv_prepare(ctx, K, V, indices, n_indices, K_cache, V_cache);
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
@@ -1273,7 +1309,8 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        K_cache, V_cache
     );
     CUDA_CHECK(cudaGetLastError());
 

@@ -26,6 +26,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/qsa-kv.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -1405,6 +1406,9 @@ ggml_backend_buffer_type_t ggml_backend_cuda_qsa_host_buffer_type(ggml_backend_d
 void * ggml_cuda_qsa_host_device_ptr(const ggml_tensor * tensor) {
     GGML_ASSERT(tensor != nullptr);
     GGML_ASSERT(tensor->buffer != nullptr);
+    if (ggml_cuda_qsa_kv_is_paged(tensor)) {
+        return ggml_cuda_qsa_kv_device_ptr(tensor);
+    }
 
     if (!ggml_backend_buft_is_cuda_qsa_host(ggml_backend_buffer_get_type(tensor->buffer))) {
         return tensor->data;
@@ -5085,13 +5089,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // handles. Allow that here, mirroring the src-tensor check below.
                 assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
                        (integrated && ggml_backend_buft_is_cuda_host(node->buffer->buft)) ||
-                       ggml_backend_buft_is_cuda_qsa_host(node->buffer->buft));
+                       ggml_backend_buft_is_cuda_qsa_host(node->buffer->buft) ||
+                       ggml_backend_buft_is_cuda_qsa_kv(node->buffer->buft));
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
                                (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)) ||
-                               ggml_backend_buft_is_cuda_qsa_host(node->src[j]->buffer->buft));
+                               ggml_backend_buft_is_cuda_qsa_host(node->src[j]->buffer->buft) ||
+                               ggml_backend_buft_is_cuda_qsa_kv(node->src[j]->buffer->buft));
                     }
                 }
 #else
@@ -6374,7 +6380,7 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
     return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) ||
         (integrated && ggml_backend_buft_is_cuda_host(buft)) ||
-        (ggml_backend_buft_is_cuda_qsa_host(buft) && buft->device == dev);
+        ((ggml_backend_buft_is_cuda_qsa_host(buft) || ggml_backend_buft_is_cuda_qsa_kv(buft)) && buft->device == dev);
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
@@ -6545,6 +6551,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_qsa_host_buffer_type") == 0) {
         return (void *)ggml_backend_cuda_qsa_host_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_qsa_kv_buffer_type") == 0) {
+        return (void *)ggml_backend_cuda_qsa_kv_buffer_type;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;

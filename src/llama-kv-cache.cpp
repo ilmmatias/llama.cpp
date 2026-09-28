@@ -182,6 +182,15 @@ llama_kv_cache::llama_kv_cache(
 
     bool qsa_indexer_host_logged = false;
 
+    const char * qsa_kv_env = getenv("LLAMA_QSA_KV_RESIDENT");
+    const int qsa_kv_resident = qsa_kv_env ? atoi(qsa_kv_env) : 0;
+    const bool qsa_kv_paged =
+        offload && !is_mla && !v_trans && n_stream == 1 &&
+        model.arch == LLM_ARCH_QWEN4EXP &&
+        type_k == GGML_TYPE_F16 && type_v == GGML_TYPE_F16 &&
+        qsa_kv_resident >= 4 && uint32_t(qsa_kv_resident) < kv_size;
+    bool qsa_kv_logged = false;
+
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -260,6 +269,30 @@ llama_kv_cache::llama_kv_cache(
                                     __func__);
                             qsa_indexer_host_logged = true;
                         }
+                    }
+                }
+            }
+
+            const bool qsa_kv_shape =
+                hparams.n_embd_head_k(il) == 256 && hparams.n_embd_head_v(il) == 256 &&
+                n_embd_k_gqa > 0 && (n_embd_k_gqa & (n_embd_k_gqa - 1)) == 0 &&
+                n_embd_v_gqa > 0 && (n_embd_v_gqa & (n_embd_v_gqa - 1)) == 0;
+
+            if (qsa_kv_paged && qsa_kv_shape) {
+                using qsa_kv_buft_fn_t = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t, uint32_t);
+
+                auto * reg = ggml_backend_dev_backend_reg(dev);
+                auto * fn = reinterpret_cast<qsa_kv_buft_fn_t>(
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_qsa_kv_buffer_type"));
+
+                if (fn) {
+                    buft = fn(dev, qsa_kv_resident);
+                    dev_name = ggml_backend_buft_name(buft);
+
+                    if (!qsa_kv_logged) {
+                        LLAMA_LOG_INFO("%s: QSA KV in pinned RAM with %d resident tokens per layer\n",
+                                __func__, 4*(qsa_kv_resident/4));
+                        qsa_kv_logged = true;
                     }
                 }
             }

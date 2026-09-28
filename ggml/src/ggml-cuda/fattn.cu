@@ -791,6 +791,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     const int cc = ggml_cuda_info().devices[device].cc;
+    if (Q->ne[1] <= 8 && K->ne[0] == 256 && V->ne[0] == 256 &&
+            ggml_cuda_qsa_kv_is_paged(K) && ggml_cuda_qsa_kv_is_paged(V)) {
+        return BEST_FATTN_KERNEL_TILE;
+    }
 
     switch (K->ne[0]) {
         case  40:

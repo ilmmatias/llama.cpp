@@ -1,5 +1,6 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
+#include "qsa-kv.cuh"
 
 void * ggml_cuda_qsa_host_device_ptr(const ggml_tensor * tensor);
 
@@ -403,4 +404,6 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(src0->type));
     }
+
+    ggml_cuda_qsa_kv_invalidate_rows(ctx, dst, src1);
 }

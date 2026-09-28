@@ -2,6 +2,7 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml.h"
 #include "rope.cuh"
+#include "qsa-kv.cuh"
 
 struct rope_corr_dims {
     float v[2];
@@ -540,21 +541,29 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * src2 = dst->src[2];
 
-    const float * src0_d = (const float *)src0->data;
+    const float * src0_d = (const float *) (ggml_cuda_qsa_kv_is_paged(src0) ?
+            ggml_cuda_qsa_kv_device_ptr(src0) : src0->data);
     const float * src1_d = (const float *)src1->data;
 
-    void *          dst_d           = dst->data;
+    void *          dst_d           = ggml_cuda_qsa_kv_is_paged(dst) ? ggml_cuda_qsa_kv_device_ptr(dst) : dst->data;
     const int64_t * row_indices     = nullptr;
     ggml_type       dst_type        = dst->type;
     int             set_rows_stride = 0;
 
     if (set_rows != nullptr) {
         GGML_ASSERT(forward);
-        dst_d           = set_rows->data;
+
+        dst_d           = ggml_cuda_qsa_kv_is_paged(set_rows) ?
+                ggml_cuda_qsa_kv_device_ptr(set_rows) : set_rows->data;
         row_indices     = (const int64_t *) set_rows->src[1]->data;
         dst_type        = set_rows->type;
         set_rows_stride = set_rows->nb[1] / ggml_type_size(set_rows->type);
+
+        ggml_cuda_qsa_kv_invalidate_rows(ctx, set_rows, set_rows->src[1]);
+    } else {
+        ggml_cuda_qsa_kv_invalidate(ctx, dst);
     }
+
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
@@ -585,7 +594,7 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
     mrope_sections sections;
 
     // when dst aliases src0, the channels outside the rotated window already hold the correct data
-    const bool inplace = dst_d == src0->data;
+    const bool inplace = dst_d == src0_d;
 
     // RoPE alteration for extended context
     float freq_base;
@@ -869,10 +878,13 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
     int             set_rows_stride = 0;
 
     if (set_rows != nullptr) {
-        dst_d           = set_rows->data;
+        dst_d           = ggml_cuda_qsa_kv_is_paged(set_rows) ?
+                ggml_cuda_qsa_kv_device_ptr(set_rows) : set_rows->data;
         dst_type        = set_rows->type;
         row_indices     = (const int64_t *) set_rows->src[1]->data;
         set_rows_stride = set_rows->nb[1] / ggml_type_size(set_rows->type);
+
+        ggml_cuda_qsa_kv_invalidate_rows(ctx, set_rows, set_rows->src[1]);
     }
 
     const int n_dims     = ((const int32_t *) rope->op_params)[1];

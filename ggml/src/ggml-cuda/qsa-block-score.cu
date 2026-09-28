@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "qsa-block-score.cuh"
+
 // Keep QSA's ordered reductions in registers on RDNA instead of using
 // LDS-backed shuffle instructions.
 template <int mask>
@@ -14,13 +15,13 @@ static __device__ __forceinline__ float qsa_shuffle_xor(float x) {
         if constexpr (mask == 24) {
             return qsa_shuffle_xor<8>(swapped);
         }
+
         return swapped;
     }
 #else
     return __shfl_xor_sync(0xffffffff, x, mask, 32);
 #endif
 }
-
 
 // Released Qwen4Exp indexer shape.  A Wave32 is split into four independent
 // 8-lane groups.  Each group owns one indexer head and reduces a 128-element
@@ -118,7 +119,6 @@ static __global__ void qsa_block_score_f32_128x4_wave32(
             score*scale + mask[ib*sm0 + iq*sm1 + is*sm2];
     }
 }
-
 
 // Batched prefill path for the released 128x4 indexer shape. Each 256-thread
 // workgroup covers an 8-block x 8-query tile. One wave stages one block key,
