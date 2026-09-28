@@ -2852,6 +2852,13 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+#ifdef GGML_USE_HIP
+    // HIP exec updates retain old kernarg allocations until the exec is destroyed.
+    CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+    graph->instance = nullptr;
+    CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+#else
+
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
     cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &result_info);
@@ -2875,6 +2882,7 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
+#endif // GGML_USE_HIP
 }
 #endif // USE_CUDA_GRAPH
 
@@ -5126,8 +5134,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
-        }
-        if (cuda_graph_update_required) { // Update graph executable
+        } else if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph

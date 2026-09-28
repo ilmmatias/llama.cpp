@@ -2802,7 +2802,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"-eca", "--expert-cache-admit-window"}, "N",
-        string_format("admit a missing expert after a repeat within N generated tokens; 0 admits every miss (default: %d)",
+        string_format("admit a missing expert after a repeat within N evaluated tokens in its layer (including speculative drafts); 0 admits every miss (default: %d)",
             params.expert_cache_admit_window),
         [](common_params & params, int value) {
             if (value < 0) {

@@ -15,11 +15,11 @@ void ggml_backend_cpu_expert_cache_configure(
         uint32_t convert_workers,
         ggml_backend_dev_t device);
 
-// CPU_REPACK cache hooks. begin() freezes the ready cache-hit set, launches
-// cached expert work on the GPU, and returns the route-position bit mask to
-// omit from CPU MUL_MAT_ID. end() joins the GPU result after CPU work.
-uint64_t ggml_backend_cpu_expert_cache_begin(struct ggml_tensor * op);
-void     ggml_backend_cpu_expert_cache_end  (struct ggml_tensor * op);
+// begin() freezes the batch's ready hits and launches cached expert work.
+// Returns one route-position mask per ids token, or NULL for CPU-only work.
+// Masks remain valid until end(), which joins GPU results after CPU work.
+const uint64_t * ggml_backend_cpu_expert_cache_begin(struct ggml_tensor * op);
+void             ggml_backend_cpu_expert_cache_end  (struct ggml_tensor * op);
 
 #ifdef __cplusplus
 }

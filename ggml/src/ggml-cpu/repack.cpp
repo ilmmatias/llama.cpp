@@ -5209,17 +5209,16 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int n_ids = ids->ne[0]; // n_expert_used
         const int n_as  = ne02;       // n_expert
 
-        // Expert cache is decode-only. Thread 0 freezes the ready cache-hit set,
-        // launches the full cached gate/up/GLU/down subgraph on the GPU, and
-        // removes those route positions from the CPU MUL_MAT_ID work.
-        uint64_t cached_route_mask = 0;
+        // Thread 0 freezes the batch's hits and launches cached expert work.
+        const uint64_t * cached_route_masks = nullptr;
         if (ith == 0) {
-            cached_route_mask = ggml_backend_cpu_expert_cache_begin(op);
-            if (cached_route_mask != 0) {
-                GGML_ASSERT(ids->ne[1] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1);
-                for (int id = 0; id < n_ids && id < 64; ++id) {
-                    if (cached_route_mask & (UINT64_C(1) << id)) {
-                        memset((char *) dst->data + (size_t) id * nb1, 0, (size_t) ne01 * sizeof(float));
+            cached_route_masks = ggml_backend_cpu_expert_cache_begin(op);
+            if (cached_route_masks != nullptr) {
+                for (int64_t token = 0; token < ids->ne[1]; ++token) {
+                    for (int id = 0; id < n_ids; ++id) {
+                        if (cached_route_masks[token] & (UINT64_C(1) << id)) {
+                            memset((char *) dst->data + token * nb2 + (size_t) id * nb1, 0, (size_t) ne01 * sizeof(float));
+                        }
                     }
                 }
             }
@@ -5281,7 +5280,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             // group rows by src0 matrix
             for (int32_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
                 for (int32_t id = 0; id < n_ids; ++id) {
-                    if (iid1 == 0 && id < 64 && (cached_route_mask & (UINT64_C(1) << id))) {
+                    if (cached_route_masks != nullptr && (cached_route_masks[iid1] & (UINT64_C(1) << id))) {
                         continue;
                     }
                     const int32_t i02 =
@@ -5298,6 +5297,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         ggml_barrier(params->threadpool);
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+        int64_t n_routed_rows = 0;
         if (use_znq_moe) {
             static_assert(QK8_0 == 32, "ZNQ MoE Q8 packing assumes QK8_0 == 32");
             GGML_ASSERT(ne00 % QK8_0 == 0);
@@ -5339,6 +5339,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 }
                 expert_row_base += cne1;
             }
+            n_routed_rows = expert_row_base;
 
             // All consumers must see the expert-grouped packed rows before GEMM.
             ggml_barrier(params->threadpool);
@@ -5376,7 +5377,6 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             const int64_t tail_cols = ne01 % znq_moe_task_cols;
             const int64_t tail_tasks = tail_cols == 0 ? 0 : (tail_cols == 24 ? 2 : 1);
             const int64_t tasks_per_expert = n_full_tiles + tail_tasks;
-            const int64_t n_routed_rows = (int64_t) n_ids * ne12;
 
             // Convert row counts in-place to expert start offsets.
             if (ith == 0) {
@@ -5462,6 +5462,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
 
             // matrix_row_counts now contains prefix offsets.
+            if (ith == 0) {
+                ggml_backend_cpu_expert_cache_end(op);
+            }
             return;
         }
 #endif

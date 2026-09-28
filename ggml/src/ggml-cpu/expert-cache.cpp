@@ -91,8 +91,11 @@ struct expert_cache_layer {
     std::vector<uint64_t> slot_generation;
     std::vector<uint8_t> slot_ready;
     std::vector<int64_t> last_seen;
+    std::vector<int32_t> admissions;
+    std::vector<uint8_t> admission_pending;
 
     uint64_t stamp = 0;
+    int64_t observed_tokens = 0;
     bool disabled = false;
 
     bool checked = false;
@@ -111,24 +114,21 @@ struct expert_cache_layer {
     std::vector<std::unique_ptr<expert_cache_template>> templates;
     std::vector<uint8_t> template_failed;
 
-    // One decode token is active from the first gate/up projection until down
-    // finishes. The ready set is frozen here so an admission that completes in
-    // the middle of the token only becomes visible on the next token.
+    // Freeze all token routes until down finishes. New admissions become
+    // visible only to the next batch.
     bool active = false;
     const ggml_tensor * active_ids = nullptr;
-    uint64_t active_mapped_mask = 0;
-    uint64_t active_ready_mask = 0;
+    std::vector<uint64_t> active_ready_masks;
     std::vector<int32_t> active_slots;
     std::vector<int32_t> active_route_positions;
     std::vector<int32_t> active_route_slots;
+    std::vector<size_t> active_token_offsets;
     int active_hits = 0;
     bool active_gpu_launched = false;
 };
 
 struct expert_cache_model {
     std::unordered_map<int, std::unique_ptr<expert_cache_layer>> layers;
-    int last_layer = -1;
-    int64_t token = -1;
 };
 
 struct expert_cache_request {
@@ -365,21 +365,21 @@ public:
 
 
 
-    uint64_t begin(ggml_tensor * op) {
+    const uint64_t * begin(ggml_tensor * op) {
         if (!valid || op == nullptr || op->op != GGML_OP_MUL_MAT_ID ||
             op->src[0] == nullptr || op->src[2] == nullptr || !is_cpu_repack_tensor(op->src[0])) {
-            return 0;
+            return nullptr;
         }
 
         int layer_id = -1;
         const auto part = expert_cache_parse_tensor(op->src[0]->name, layer_id);
-        if (part == expert_cache_part::none || layer_id < 0 || !is_decode_ids(op->src[2]) || op->src[2]->ne[0] > 64) {
-            return 0;
+        if (part == expert_cache_part::none || layer_id < 0 || !is_supported_ids(op->src[2])) {
+            return nullptr;
         }
 
         const void * model_key = op->src[0]->buffer != nullptr ? (const void *) op->src[0]->buffer : op->src[0]->data;
         if (model_key == nullptr) {
-            return 0;
+            return nullptr;
         }
 
         std::lock_guard<std::mutex> lock(state_mutex);
@@ -391,29 +391,28 @@ public:
             detect_locked(layer, op);
             if (!layer.compatible || !prepare_layer(layer, layer_id)) {
                 layer.compatible = false;
-                return 0;
+                return nullptr;
             }
-            // Gate/up for this token have already executed, so the first token
-            // after structural discovery stays fully on CPU.
+            // Gate/up have already executed, so the discovery batch stays on CPU.
             start_active_locked(layer, op->src[2], /*allow_gpu=*/ false, op);
-            return 0;
+            return nullptr;
         }
         if (!layer.compatible || layer.cache_buffer == nullptr) {
-            return 0;
+            return nullptr;
         }
 
         if (!layer.active) {
             if (part == expert_cache_part::down) {
                 // This should only happen after an unexpected graph/order change.
                 start_active_locked(layer, op->src[2], /*allow_gpu=*/ false, op);
-                return 0;
+                return nullptr;
             }
             start_active_locked(layer, op->src[2], /*allow_gpu=*/ true, op);
         } else if (layer.active_ids != op->src[2]) {
-            return 0;
+            return nullptr;
         }
 
-        return layer.active_ready_mask;
+        return layer.active_gpu_launched ? layer.active_ready_masks.data() : nullptr;
     }
 
     void end(ggml_tensor * op) {
@@ -424,7 +423,7 @@ public:
 
         int layer_id = -1;
         const auto part = expert_cache_parse_tensor(op->src[0]->name, layer_id);
-        if (part != expert_cache_part::down || layer_id < 0 || !is_decode_ids(op->src[2])) {
+        if (part != expert_cache_part::down || layer_id < 0 || !is_supported_ids(op->src[2])) {
             return;
         }
         const void * model_key = op->src[0]->buffer != nullptr ? (const void *) op->src[0]->buffer : op->src[0]->data;
@@ -433,10 +432,9 @@ public:
         }
 
         expert_cache_layer * layer_ptr = nullptr;
-        expert_cache_model * model_ptr = nullptr;
         bool launched = false;
         int hit_count = 0;
-        std::vector<int32_t> route_positions;
+        const std::vector<int32_t> * route_positions = nullptr;
         size_t output_row_bytes = 0;
 
         {
@@ -450,14 +448,13 @@ public:
                 return;
             }
             layer_ptr = lit->second.get();
-            model_ptr = &mit->second;
             auto & layer = *layer_ptr;
             if (!layer.compatible || !layer.active || layer.active_ids != op->src[2]) {
                 return;
             }
             launched = layer.active_gpu_launched;
             hit_count = layer.active_hits;
-            route_positions = layer.active_route_positions;
+            route_positions = &layer.active_route_positions;
             output_row_bytes = (size_t) layer.output_dim * sizeof(float);
         }
 
@@ -466,8 +463,10 @@ public:
 
             const uint8_t * src = (const uint8_t *) output_ptr;
             for (int i = 0; i < hit_count; ++i) {
-                const int32_t route = route_positions[(size_t) i];
-                memcpy((uint8_t *) op->data + (size_t) route * op->nb[1],
+                const int32_t route = (*route_positions)[(size_t) i];
+                const size_t token = route / op->ne[1];
+                const size_t id = route % op->ne[1];
+                memcpy((uint8_t *) op->data + id * op->nb[1] + token * op->nb[2],
                        src + (size_t) i * output_row_bytes, output_row_bytes);
             }
         }
@@ -476,15 +475,18 @@ public:
             std::lock_guard<std::mutex> lock(state_mutex);
             // model/layer storage cannot be erased while configured; use the
             // pointers obtained above after the GPU wait.
-            observe_locked(model_key, *model_ptr, *layer_ptr, layer_id, op->src[2]);
+            observe_locked(model_key, *layer_ptr, layer_id, op->src[2]);
             clear_active_locked(*layer_ptr);
         }
     }
 
 private:
 
-    static bool is_decode_ids(const ggml_tensor * ids) {
-        return ids != nullptr && ids->type == GGML_TYPE_I32 && ids->ne[1] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1;
+    static bool is_supported_ids(const ggml_tensor * ids) {
+        // Bulk prefill benefits from CPU expert-grouped GEMM, not per-token GPU graphs.
+        return ids != nullptr && ids->type == GGML_TYPE_I32 &&
+            ids->ne[0] > 0 && ids->ne[0] <= 64 && ids->ne[1] > 0 && ids->ne[1] <= 128 &&
+            ids->ne[2] == 1 && ids->ne[3] == 1;
     }
 
     static expert_cache_layer & get_layer(expert_cache_model & model, int layer_id) {
@@ -651,6 +653,8 @@ private:
         layer.slot_generation.assign(slots, 0);
         layer.slot_ready.assign(slots, 0);
         layer.last_seen.assign((size_t) layer.n_expert, -1);
+        layer.admissions.reserve((size_t) layer.n_expert);
+        layer.admission_pending.assign((size_t) layer.n_expert, 0);
 
         return true;
     }
@@ -693,9 +697,9 @@ private:
             }
 
             input = gate_up_op->src[1];
-            if (input->ne[1] != 1 || input->ne[2] != 1 || input->ne[3] != 1 ||
-                gate_up_op->ne[2] != 1 || gate_view->ne[2] != 1 ||
-                up_view->ne[2] != 1 || down_op->ne[2] != 1) {
+            if (input->ne[1] != 1 || input->ne[2] != down_op->src[2]->ne[1] || input->ne[3] != 1 ||
+                gate_up_op->ne[2] != input->ne[2] || gate_view->ne[2] != input->ne[2] ||
+                up_view->ne[2] != input->ne[2] || down_op->ne[2] != input->ne[2]) {
                 return;
             }
             if (gate_view->ne[0] != up_view->ne[0] ||
@@ -725,8 +729,8 @@ private:
             }
 
             input = gate_op->src[1];
-            if (input->ne[1] != 1 || input->ne[2] != 1 || input->ne[3] != 1 ||
-                gate_op->ne[2] != 1 || up_op->ne[2] != 1 || down_op->ne[2] != 1) {
+            if (input->ne[1] != 1 || input->ne[2] != down_op->src[2]->ne[1] || input->ne[3] != 1 ||
+                gate_op->ne[2] != input->ne[2] || up_op->ne[2] != input->ne[2] || down_op->ne[2] != input->ne[2]) {
                 return;
             }
             if (gate_op->ne[0] != up_op->ne[0] || gate_op->ne[1] != up_op->ne[1] ||
@@ -896,148 +900,136 @@ private:
     void start_active_locked(expert_cache_layer & layer, const ggml_tensor * ids, bool allow_gpu, ggml_tensor * op) {
         layer.active = true;
         layer.active_ids = ids;
-        layer.active_mapped_mask = 0;
-        layer.active_ready_mask = 0;
+        layer.active_ready_masks.assign((size_t) ids->ne[1], 0);
         layer.active_slots.clear();
         layer.active_route_positions.clear();
-        layer.active_route_slots.assign((size_t) ids->ne[0], -1);
+        layer.active_route_slots.assign((size_t) ids->ne[0] * ids->ne[1], -1);
+        layer.active_token_offsets.resize((size_t) ids->ne[1] + 1);
         layer.active_hits = 0;
         layer.active_gpu_launched = false;
 
-        for (int64_t i = 0; i < ids->ne[0]; ++i) {
-            const int32_t expert = *(const int32_t *) ((const char *) ids->data + i * ids->nb[0]);
-            if (expert < 0 || expert >= layer.n_expert) {
-                continue;
-            }
-            const int32_t slot = layer.expert_to_slot[(size_t) expert];
-            if (slot >= 0) {
-                layer.active_route_slots[(size_t) i] = slot;
-                layer.active_mapped_mask |= UINT64_C(1) << i;
-                if (layer.slot_ready[(size_t) slot]) {
-                    layer.active_ready_mask |= UINT64_C(1) << i;
-                    layer.active_slots.push_back(slot);
-                    layer.active_route_positions.push_back((int32_t) i);
+        for (int64_t token = 0; token < ids->ne[1]; ++token) {
+            layer.active_token_offsets[(size_t) token] = layer.active_slots.size();
+            for (int64_t i = 0; i < ids->ne[0]; ++i) {
+                const size_t route = (size_t) token * ids->ne[0] + i;
+                const int32_t expert = *(const int32_t *) ((const char *) ids->data + token * ids->nb[1] + i * ids->nb[0]);
+                if (expert < 0 || expert >= layer.n_expert) {
+                    continue;
+                }
+                const int32_t slot = layer.expert_to_slot[(size_t) expert];
+                if (slot >= 0) {
+                    layer.active_route_slots[route] = slot;
+                    if (layer.slot_ready[(size_t) slot]) {
+                        layer.active_ready_masks[(size_t) token] |= UINT64_C(1) << i;
+                        layer.active_slots.push_back(slot);
+                        layer.active_route_positions.push_back((int32_t) route);
+                    }
                 }
             }
         }
+        layer.active_token_offsets.back() = layer.active_slots.size();
         layer.active_hits = (int) layer.active_slots.size();
 
         if (!allow_gpu || layer.active_hits == 0 || op == nullptr || op->src[1] == nullptr ||
-            op->src[1]->type != GGML_TYPE_F32 || op->src[1]->ne[1] != 1 || op->src[1]->ne[2] != 1 || op->src[1]->ne[3] != 1) {
-            layer.active_ready_mask = 0;
-            layer.active_slots.clear();
-            layer.active_route_positions.clear();
-            layer.active_hits = 0;
+            op->src[1]->type != GGML_TYPE_F32 || op->src[1]->ne[1] != 1 ||
+            op->src[1]->ne[2] != ids->ne[1] || op->src[1]->ne[3] != 1) {
             return;
         }
 
-        auto * t = get_template_locked(layer, layer.active_hits);
-        if (t == nullptr) {
-            layer.active_ready_mask = 0;
-            layer.active_slots.clear();
-            layer.active_route_positions.clear();
-            layer.active_hits = 0;
+        const size_t output_row_bytes = (size_t) layer.output_dim * sizeof(float);
+        const bool input_q8 = layer.input_dim % ggml_blck_size(GGML_TYPE_Q8_1) == 0;
+        const size_t input_row_bytes = ggml_row_size(input_q8 ? GGML_TYPE_Q8_1 : GGML_TYPE_F32, layer.input_dim);
+        if (!ensure_output(output_row_bytes * layer.active_hits) ||
+            (input_q8 && !ensure_q8_input(input_row_bytes * ids->ne[1]))) {
             return;
         }
 
-        const size_t out_bytes = (size_t) layer.output_dim * (size_t) layer.active_hits * sizeof(float);
-        if (!ensure_output(out_bytes)) {
-            layer.active_ready_mask = 0;
-            layer.active_slots.clear();
-            layer.active_route_positions.clear();
-            layer.active_hits = 0;
-            return;
-        }
-
-        const void * input_data = op->src[1]->data;
-        if (t->input_q8) {
-            const size_t q8_bytes = ggml_nbytes(t->input);
-            if (!ensure_q8_input(q8_bytes)) {
-                layer.active_ready_mask = 0;
-                layer.active_slots.clear();
-                layer.active_route_positions.clear();
-                layer.active_hits = 0;
+        // Build all required templates before enqueuing work on their buffers.
+        for (int64_t token = 0; token < ids->ne[1]; ++token) {
+            const int hits = (int) (layer.active_token_offsets[(size_t) token + 1] - layer.active_token_offsets[(size_t) token]);
+            if (hits != 0 && get_template_locked(layer, hits) == nullptr) {
                 return;
             }
-            quantize_row_q8_1((const float *) op->src[1]->data, input_q8_ptr, layer.input_dim);
-            input_data = input_q8_ptr;
         }
 
-        ggml_backend_tensor_set_async(compute_backend, t->input, input_data, 0, ggml_nbytes(t->input));
-        ggml_backend_tensor_set_async(compute_backend, t->ids, layer.active_slots.data(), 0,
-                (size_t) layer.active_hits * sizeof(int32_t));
-        const enum ggml_status status = ggml_backend_graph_compute_async(compute_backend, t->graph);
-        if (status != GGML_STATUS_SUCCESS) {
-            ggml_backend_synchronize(compute_backend);
-            layer.active_ready_mask = 0;
-            layer.active_slots.clear();
-            layer.active_route_positions.clear();
-            layer.active_hits = 0;
-            return;
+        for (int64_t token = 0; token < ids->ne[1]; ++token) {
+            const size_t offset = layer.active_token_offsets[(size_t) token];
+            const int hits = (int) (layer.active_token_offsets[(size_t) token + 1] - offset);
+            if (hits == 0) {
+                continue;
+            }
+            auto * t = layer.templates[(size_t) hits].get();
+            const void * input_data = (const uint8_t *) op->src[1]->data + token * op->src[1]->nb[2];
+            if (t->input_q8) {
+                void * quantized = (uint8_t *) input_q8_ptr + token * input_row_bytes;
+                quantize_row_q8_1((const float *) input_data, quantized, layer.input_dim);
+                input_data = quantized;
+            }
+
+            // The stream orders reuse of a template; host inputs remain live until end().
+            ggml_backend_tensor_set_async(compute_backend, t->input, input_data, 0, ggml_nbytes(t->input));
+            ggml_backend_tensor_set_async(compute_backend, t->ids, layer.active_slots.data() + offset, 0,
+                    (size_t) hits * sizeof(int32_t));
+            const enum ggml_status status = ggml_backend_graph_compute_async(compute_backend, t->graph);
+            if (status != GGML_STATUS_SUCCESS) {
+                ggml_backend_synchronize(compute_backend);
+                return;
+            }
+            ggml_backend_tensor_get_async(compute_backend, t->output,
+                    (uint8_t *) output_ptr + offset * output_row_bytes, 0, hits * output_row_bytes);
         }
-        ggml_backend_tensor_get_async(compute_backend, t->output, output_ptr, 0, out_bytes);
         layer.active_gpu_launched = true;
     }
 
     static void clear_active_locked(expert_cache_layer & layer) {
         layer.active = false;
         layer.active_ids = nullptr;
-        layer.active_mapped_mask = 0;
-        layer.active_ready_mask = 0;
+        layer.active_ready_masks.clear();
         layer.active_slots.clear();
         layer.active_route_positions.clear();
         layer.active_route_slots.clear();
+        layer.active_token_offsets.clear();
         layer.active_hits = 0;
         layer.active_gpu_launched = false;
     }
 
-    int64_t begin_token_locked(expert_cache_model & model, int layer_id) {
-        if (model.last_layer < 0 || layer_id <= model.last_layer) {
-            ++model.token;
-        }
-        model.last_layer = layer_id;
-        return model.token;
-    }
+    void observe_locked(const void * model_key, expert_cache_layer & layer, int layer_id, const ggml_tensor * ids) {
+        const int64_t first_token = layer.observed_tokens;
+        layer.observed_tokens += ids->ne[1];
+        layer.admissions.clear();
 
-
-    void observe_locked(const void * model_key, expert_cache_model & model, expert_cache_layer & layer,
-                               int layer_id, const ggml_tensor * ids) {
-        const int64_t token = begin_token_locked(model, layer_id);
-        std::vector<int32_t> admit_after_observation;
-        admit_after_observation.reserve((size_t) ids->ne[0]);
-
-        // Classify the whole token against the frozen begin snapshot before
-        // admitting anything. This keeps a miss early in the top-k list from
-        // evicting a ready expert that was already used by the GPU later in
-        // the same token.
-        for (int64_t i = 0; i < ids->ne[0]; ++i) {
-            const int32_t expert = *(const int32_t *) ((const char *) ids->data + i * ids->nb[0]);
-            if (expert < 0 || expert >= layer.n_expert) {
-                continue;
-            }
-
-            const bool mapped_at_begin = (layer.active_mapped_mask & (UINT64_C(1) << i)) != 0;
-            const int32_t slot_at_begin = (size_t) i < layer.active_route_slots.size()
-                ? layer.active_route_slots[(size_t) i] : -1;
-
-            if (mapped_at_begin && slot_at_begin >= 0) {
-                if ((size_t) slot_at_begin < layer.slot_stamp.size() &&
-                    layer.slot_to_expert[(size_t) slot_at_begin] == expert) {
-                    layer.slot_stamp[(size_t) slot_at_begin] = ++layer.stamp;
+        // Classify all routes before admissions can replace any frozen slot.
+        for (int64_t t = 0; t < ids->ne[1]; ++t) {
+            const int64_t token = first_token + t;
+            for (int64_t i = 0; i < ids->ne[0]; ++i) {
+                const int32_t expert = *(const int32_t *) ((const char *) ids->data + t * ids->nb[1] + i * ids->nb[0]);
+                if (expert < 0 || expert >= layer.n_expert) {
+                    continue;
                 }
-            } else {
-                const int64_t prev = layer.last_seen[(size_t) expert];
-                const bool admit = admit_window == 0 ||
-                    (prev >= 0 && token >= prev && (uint64_t) (token - prev) <= admit_window);
-                if (admit) {
-                    admit_after_observation.push_back(expert);
-                }
-            }
 
-            layer.last_seen[(size_t) expert] = token;
+                const int32_t slot_at_begin = layer.active_route_slots[(size_t) t * ids->ne[0] + i];
+
+                if (slot_at_begin >= 0) {
+                    if ((size_t) slot_at_begin < layer.slot_stamp.size() &&
+                        layer.slot_to_expert[(size_t) slot_at_begin] == expert) {
+                        layer.slot_stamp[(size_t) slot_at_begin] = ++layer.stamp;
+                    }
+                } else {
+                    const int64_t prev = layer.last_seen[(size_t) expert];
+                    const bool admit = admit_window == 0 ||
+                        (prev >= 0 && token >= prev && (uint64_t) (token - prev) <= admit_window);
+                    if (admit && !layer.admission_pending[(size_t) expert]) {
+                        layer.admission_pending[(size_t) expert] = 1;
+                        layer.admissions.push_back(expert);
+                    }
+                }
+
+                layer.last_seen[(size_t) expert] = token;
+            }
         }
 
-        for (const int32_t expert : admit_after_observation) {
+        for (const int32_t expert : layer.admissions) {
+            layer.admission_pending[(size_t) expert] = 0;
             if (layer.expert_to_slot[(size_t) expert] < 0) {
                 admit_expert_locked(model_key, layer, layer_id, expert);
             }
@@ -1338,9 +1330,9 @@ extern "C" void ggml_backend_cpu_expert_cache_configure(
 }
 
 
-extern "C" uint64_t ggml_backend_cpu_expert_cache_begin(ggml_tensor * op) {
+extern "C" const uint64_t * ggml_backend_cpu_expert_cache_begin(ggml_tensor * op) {
     std::lock_guard<std::mutex> lock(g_expert_cache_mutex);
-    return g_expert_cache ? g_expert_cache->begin(op) : 0;
+    return g_expert_cache ? g_expert_cache->begin(op) : nullptr;
 }
 
 extern "C" void ggml_backend_cpu_expert_cache_end(ggml_tensor * op) {

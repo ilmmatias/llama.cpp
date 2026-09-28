@@ -4,6 +4,12 @@ llama.cpp supports speculative decoding, a technique that can significantly acce
 
 [Speculative decoding](https://en.wikipedia.org/wiki/Transformer_(deep_learning)#Speculative_decoding) leverages the fact that computing n tokens in a batch (as in prompt processing) is more efficient than computing n sequentially (as in response generation). By generating draft tokens quickly and then verifying them with the target model in a single batch, this approach can achieve substantial speedups when the draft predictions are frequently correct.
 
+With `--expert-cache-slots`, supported CPU-resident MoE experts can use the GPU cache during multi-token verification and MTP drafting. Each token has its own cache-hit set; misses stay on CPU, and cache slots remain fixed until the batch finishes. The cache uses token-sized GPU graphs for batches of up to 128 tokens. Larger batches retain the CPU bulk-prefill path.
+
+`--expert-cache-admit-window` counts tokens in cache-eligible batches separately for each layer, including speculative tokens that are later rejected. Repeated draft-head evaluations do not age the trunk layers' admission windows.
+
+On HIP, changed graph executables are rebuilt rather than updated in place. This releases the old kernel-argument storage and avoids [ROCm's accumulating graph-update allocations](https://github.com/ROCm/rocm-systems/issues/10021), which speculative batch-size changes can exhaust.
+
 ## Implementations
 
 The `llama-server` application supports several implementations of speculative decoding. An implementation with draft model can be mixed with an implementation without draft model.
