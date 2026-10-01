@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml.h"
 
 #include <stdint.h>

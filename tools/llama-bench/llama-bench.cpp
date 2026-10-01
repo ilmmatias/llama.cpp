@@ -14,6 +14,7 @@
 #include <numeric>
 #include <regex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -24,6 +25,7 @@
 #include "common.h"
 #include "download.h"
 #include "fit.h"
+#include "ggml-cpu.h"
 #include "ggml.h"
 #include "llama.h"
 #include "log.h"
@@ -497,7 +499,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --no-host <0|1>                                   (default: %s)\n", join(cmd_params_defaults.no_host, ",").c_str());
     printf("\n");
     printf(
-        "Multiple values can be given for each parameter by separating them with ','\n"
+        "Multiple values can be given for sweep parameters by separating them with ','\n"
         "or by specifying the parameter multiple times. Ranges can be given as\n"
         "'first-last' or 'first-last+step' or 'first-last*mult'.\n");
 }
@@ -2361,9 +2363,13 @@ int llama_bench(int argc, char ** argv) {
     auto * ggml_threadpool_new_fn = (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_new");
     auto * ggml_threadpool_free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_free");
 
-    using expert_cache_configure_fn_t = void (*)(uint32_t, uint32_t, uint32_t, ggml_backend_dev_t);
-    auto * expert_cache_configure_fn = reinterpret_cast<expert_cache_configure_fn_t>(
+    auto * expert_cache_configure_fn = reinterpret_cast<ggml_backend_cpu_expert_cache_configure_t>(
         ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_expert_cache_configure"));
+    auto reset_expert_cache = [&]() {
+        if (expert_cache_configure_fn != nullptr) {
+            expert_cache_configure_fn(0, 0, 1, nullptr);
+        }
+    };
     const bool expert_cache_enabled =
         std::any_of(params.expert_cache_slots.begin(), params.expert_cache_slots.end(), [](int n) { return n > 0; });
     if (expert_cache_enabled) {
@@ -2526,6 +2532,7 @@ int llama_bench(int argc, char ** argv) {
         if (do_fit) {
             // free the previous model so fit sees full free VRAM
             if (lmodel) {
+                reset_expert_cache();
                 llama_model_free(lmodel);
                 lmodel    = nullptr;
                 prev_inst = nullptr;
@@ -2571,6 +2578,7 @@ int llama_bench(int argc, char ** argv) {
         // keep the same model between tests when possible
         if (!lmodel || !prev_inst || !inst.equal_mparams(*prev_inst)) {
             if (lmodel) {
+                reset_expert_cache();
                 llama_model_free(lmodel);
             }
 
@@ -2585,12 +2593,14 @@ int llama_bench(int argc, char ** argv) {
         llama_context * ctx = llama_init_from_model(lmodel, cparams);
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
+            reset_expert_cache();
             llama_model_free(lmodel);
             return 1;
         }
 
         if (!configure_expert_cache(inst)) {
             llama_free(ctx);
+            reset_expert_cache();
             llama_model_free(lmodel);
             return 1;
         }
@@ -2608,6 +2618,7 @@ int llama_bench(int argc, char ** argv) {
         if (!parse_cpu_mask(t.cpu_mask, tpp.cpumask)) {
             fprintf(stderr, "%s: failed to parse cpu-mask: %s\n", __func__, t.cpu_mask.c_str());
             llama_free(ctx);
+            reset_expert_cache();
             llama_model_free(lmodel);
             exit(1);
         }
@@ -2623,6 +2634,7 @@ int llama_bench(int argc, char ** argv) {
             if (!threadpool_batch) {
                 fprintf(stderr, "%s: batch threadpool create failed : n_threads %d\n", __func__, tpp_batch.n_threads);
                 llama_free(ctx);
+                reset_expert_cache();
                 llama_model_free(lmodel);
                 exit(1);
             }
@@ -2637,6 +2649,7 @@ int llama_bench(int argc, char ** argv) {
             fprintf(stderr, "%s: threadpool create failed : n_threads %d\n", __func__, tpp.n_threads);
             ggml_threadpool_free_fn(threadpool_batch);
             llama_free(ctx);
+            reset_expert_cache();
             llama_model_free(lmodel);
             exit(1);
         }
@@ -2654,6 +2667,7 @@ int llama_bench(int argc, char ** argv) {
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt warmup\n", __func__);
                     llama_free(ctx);
+                    reset_expert_cache();
                     llama_model_free(lmodel);
                     exit(1);
                 }
@@ -2666,6 +2680,7 @@ int llama_bench(int argc, char ** argv) {
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen warmup\n", __func__);
                     llama_free(ctx);
+                    reset_expert_cache();
                     llama_model_free(lmodel);
                     exit(1);
                 }
@@ -2696,6 +2711,7 @@ int llama_bench(int argc, char ** argv) {
                     if (!res) {
                         fprintf(stderr, "%s: error: failed to run depth\n", __func__);
                         llama_free(ctx);
+                        reset_expert_cache();
                         llama_model_free(lmodel);
                         exit(1);
                     }
@@ -2723,6 +2739,7 @@ int llama_bench(int argc, char ** argv) {
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt\n", __func__);
                     llama_free(ctx);
+                    reset_expert_cache();
                     llama_model_free(lmodel);
                     exit(1);
                 }
@@ -2736,6 +2753,7 @@ int llama_bench(int argc, char ** argv) {
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen\n", __func__);
                     llama_free(ctx);
+                    reset_expert_cache();
                     llama_model_free(lmodel);
                     exit(1);
                 }
@@ -2760,13 +2778,14 @@ int llama_bench(int argc, char ** argv) {
         llama_free(ctx);
 
         if (inst.expert_cache_slots > 0) {
-            expert_cache_configure_fn(0, 0, 1, nullptr);
+            reset_expert_cache();
         }
 
         ggml_threadpool_free_fn(threadpool_batch);
         ggml_threadpool_free_fn(threadpool);
     }
 
+    reset_expert_cache();
     llama_model_free(lmodel);
 
     if (p) {
@@ -2775,10 +2794,6 @@ int llama_bench(int argc, char ** argv) {
 
     if (p_err) {
         p_err->print_footer();
-    }
-
-    if (expert_cache_enabled) {
-        expert_cache_configure_fn(0, 0, 1, nullptr);
     }
 
     llama_backend_free();

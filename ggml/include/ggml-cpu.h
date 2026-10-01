@@ -7,6 +7,10 @@
 extern "C" {
 #endif
 
+    typedef void (*ggml_backend_cpu_expert_cache_configure_t)(
+        uint32_t slots, uint32_t admit_window, uint32_t convert_workers,
+        ggml_backend_dev_t device);
+
     // the compute plan that needs to be prepared for ggml_graph_compute()
     // since https://github.com/ggml-org/ggml/issues/287
     struct ggml_cplan {

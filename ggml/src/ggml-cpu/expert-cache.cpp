@@ -1309,7 +1309,8 @@ private:
 std::mutex g_expert_cache_mutex;
 std::unique_ptr<expert_cache> g_expert_cache;
 
-static void configure_expert_cache(uint32_t slots, uint32_t admit_window, uint32_t convert_workers, ggml_backend_dev_t device) {
+static void configure_expert_cache(uint32_t slots, uint32_t admit_window, uint32_t convert_workers,
+                                   ggml_backend_dev_t device) {
     std::lock_guard<std::mutex> lock(g_expert_cache_mutex);
     g_expert_cache.reset();
     if (slots == 0 || device == nullptr) {
