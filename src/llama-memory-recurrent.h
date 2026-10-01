@@ -91,6 +91,8 @@ public:
         int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
         int32_t   tail = -1;
 
+        uint32_t rs_valid = 0; // highest valid rollback group from the latest ubatch
+
         std::set<llama_seq_id> seq_id;
 
         bool has_seq_id(const llama_seq_id & id) const {
@@ -119,6 +121,7 @@ private:
     const llama_hparams & hparams;
 
     const uint32_t n_seq_max = 1;
+    const bool rs_has_initial_state;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;

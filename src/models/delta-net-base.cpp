@@ -506,10 +506,9 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
-        // only the snapshot slots reachable by a rollback inside this batch are
-        // useful: rollback <= n_seq_tokens - 1, so slots beyond the batch repeat
-        // the pre-batch state and would only waste kernel launches per round
-        const int64_t t_min = std::max<int64_t>(1, K - ubatch.n_seq_tokens + 1);
+        // Include the pre-ubatch history at slot n_seq_tokens when it fits.
+        // Older slots are not valid for rollback from this ubatch.
+        const int64_t t_min = std::max<int64_t>(1, K - ubatch.n_seq_tokens);
 
         for (int64_t t = t_min; t <= K; ++t) {
             const int64_t s_idx  = std::max<int64_t>(0, n_time - (conv_kernel_size - 1) - K + t);
@@ -572,8 +571,19 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
+    const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 
-    // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
+    // Keep the pre-ubatch state at slot n_seq_tokens before the recurrence
+    // writes its newer snapshots into the cache.
+    if (n_seq_tokens < K) {
+        ggml_tensor * initial_state = ggml_reshape_2d(ctx0, s, D, n_seqs);
+        ggml_tensor * initial_slot = ggml_view_2d(ctx0, ssm_states_all,
+                D, n_seqs, ssm_states_all->nb[1],
+                ((size_t) n_seq_tokens * mem_size + kv_head) * row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, initial_state, initial_slot));
+    }
+
+    // state s is 4D [S_v, S_v, H_v, n_seqs]; the output reserves K snapshot slots.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
@@ -591,8 +601,6 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
         0);
     cb(output, "attn_output", il);
-
-    const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 
     // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
     const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
