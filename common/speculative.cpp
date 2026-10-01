@@ -1762,6 +1762,38 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+
+        const auto & h = pending_h[seq_id];
+        if (h.size() != (size_t) n_embd) {
+            return false;
+        }
+
+        data.resize((size_t) n_embd * sizeof(float));
+        std::memcpy(data.data(), h.data(), data.size());
+
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        const size_t expected = (size_t) n_embd * sizeof(float);
+        if (data.size() != expected) {
+            return;
+        }
+
+        std::memcpy(pending_h[seq_id].data(), data.data(), expected);
+
+        verify_h[seq_id].clear();
+        verify_h_rows[seq_id] = 0;
+    }
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
