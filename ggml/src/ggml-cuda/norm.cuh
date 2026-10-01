@@ -15,6 +15,10 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                                      ggml_tensor *               mul_tensor,
                                      ggml_tensor *               add_tensor);
 
+void ggml_cuda_op_rms_norm_sigmoid_gate_fused(
+    ggml_backend_cuda_context & ctx, const ggml_tensor * rms_node,
+    const ggml_tensor * gamma, const ggml_tensor * gate, ggml_tensor * dst);
+
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

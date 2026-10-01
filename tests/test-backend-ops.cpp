@@ -25,6 +25,7 @@
 #include <array>
 #include <cfloat>
 #include <cinttypes>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -5028,6 +5029,284 @@ struct test_gated_delta_net_cache_fusion : public test_case {
                 init_tensor_uniform(t);
             }
         }
+    }
+};
+
+// RMS_NORM -> MUL(gamma) -> SIGMOID(z) -> MUL, including material-gate and recurrent producers.
+struct test_gdn_gated_norm : public test_case {
+    enum source { PRIMITIVE, MATERIAL_GATE, UNEXPANDED_GATE, GDN_ATTENTION };
+    enum data { VARIED, ONES, NEAR_ZERO };
+
+    static constexpr int64_t head_count = 48;
+    static constexpr int64_t key_head_count = 16;
+    static constexpr int64_t projection_size = 32;
+
+    const source input_source;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const bool strided;
+    const int64_t K;
+    const int64_t head_size;
+    const bool expose_intermediate;
+    const data input_data;
+    const float eps;
+
+    ggml_tensor * x_storage = nullptr;
+    ggml_tensor * z_storage = nullptr;
+    ggml_tensor * z_view = nullptr;
+    ggml_tensor * projection_input = nullptr;
+    ggml_tensor * projection_weight = nullptr;
+    ggml_tensor * input_node = nullptr;
+    ggml_tensor * gate_node = nullptr;
+    ggml_tensor * gamma_node = nullptr;
+    ggml_tensor * weighted_node = nullptr;
+    ggml_tensor * out_node = nullptr;
+    ggml_tensor * written_snapshots = nullptr;
+
+    test_gdn_gated_norm(source input_source = PRIMITIVE, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
+                       bool strided = false, int64_t K = 1, int64_t head_size = 128,
+                       bool expose_intermediate = false, data input_data = VARIED, float eps = 1e-6f)
+        : input_source(input_source), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), strided(strided), K(K),
+          head_size(head_size), expose_intermediate(expose_intermediate), input_data(input_data), eps(eps) {}
+
+    std::string op_desc(ggml_tensor *) override { return "GDN_GATED_NORM"; }
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        const std::string kind = input_source == PRIMITIVE ? "primitive" :
+                                 input_source == MATERIAL_GATE ? "expanded_material_gate" :
+                                 input_source == UNEXPANDED_GATE ? "unexpanded_material_gate" : "gdn_attention";
+        const std::string values = input_data == ONES ? "ones" : input_data == NEAR_ZERO ? "near_zero" : "varied";
+        return VARS_TO_STR10(kind, head_size, head_count, n_seq_tokens, n_seqs, K, eps,
+                            strided, expose_intermediate, values);
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> nodes = { out_node };
+        if (expose_intermediate) {
+            nodes.push_back(weighted_node);
+        }
+        if (written_snapshots != nullptr) {
+            nodes.push_back(written_snapshots);
+        }
+        return nodes;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        if (input_source == GDN_ATTENTION) {
+            ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, key_head_count, n_seq_tokens, n_seqs);
+            ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, key_head_count, n_seq_tokens, n_seqs);
+            ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+            ggml_tensor * decay = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count, n_seq_tokens, n_seqs);
+            ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count, n_seq_tokens, n_seqs);
+            ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_size, head_count, n_seqs);
+            ggml_set_name(q, "gdn_norm_q");
+            ggml_set_name(k, "gdn_norm_k");
+            ggml_set_name(v, "gdn_norm_v");
+            ggml_set_name(decay, "gdn_norm_decay");
+            ggml_set_name(beta, "gdn_norm_beta");
+            ggml_set_name(state, "gdn_norm_state");
+            q = ggml_l2_norm(ctx, q, 1e-6f);
+            k = ggml_l2_norm(ctx, k, 1e-6f);
+            ggml_tensor * packed = ggml_gated_delta_net(ctx, q, k, v, decay, beta, state, K);
+
+            input_node = ggml_view_4d(ctx, packed, head_size, head_count, n_seq_tokens, n_seqs,
+                    ggml_row_size(GGML_TYPE_F32, head_size),
+                    ggml_row_size(GGML_TYPE_F32, head_size * head_count),
+                    ggml_row_size(GGML_TYPE_F32, head_size * head_count * n_seq_tokens), 0);
+            if (strided) {
+                // A real packed attention view with contiguous features and exchanged head/token strides.
+                input_node = ggml_permute(ctx, input_node, 0, 2, 1, 3);
+            }
+
+            const int64_t D = head_size * head_size * head_count;
+            const int64_t attention_elems = head_size * head_count * n_seq_tokens * n_seqs;
+            written_snapshots = ggml_view_3d(ctx, packed, D, n_seqs, std::min<int64_t>(n_seq_tokens, K),
+                    ggml_row_size(GGML_TYPE_F32, D),
+                    ggml_row_size(GGML_TYPE_F32, D * n_seqs),
+                    ggml_row_size(GGML_TYPE_F32, attention_elems));
+        } else {
+            x_storage = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                    head_size + (strided ? 11 : 0), head_count + (strided ? 2 : 0),
+                    n_seq_tokens + (strided ? 1 : 0), n_seqs + (strided ? 1 : 0));
+            input_node = x_storage;
+            if (strided) {
+                input_node = ggml_view_4d(ctx, x_storage, head_size, head_count, n_seq_tokens, n_seqs,
+                        x_storage->nb[1], x_storage->nb[2], x_storage->nb[3],
+                        5 * sizeof(float) + x_storage->nb[1] + x_storage->nb[2] + x_storage->nb[3]);
+            }
+        }
+
+        if (input_source == PRIMITIVE) {
+            z_storage = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                    head_size + (strided ? 19 : 0), head_count + (strided ? 3 : 0),
+                    n_seq_tokens + (strided ? 2 : 0), n_seqs + (strided ? 1 : 0));
+            z_view = z_storage;
+            if (strided) {
+                // Prepare a strided gate independently, then make SIGMOID's pre-fusion input contiguous.
+                z_view = ggml_view_4d(ctx, z_storage, head_size, head_count, n_seq_tokens, n_seqs,
+                        z_storage->nb[1], z_storage->nb[2], z_storage->nb[3],
+                        3 * sizeof(float) + z_storage->nb[1] + z_storage->nb[2] + z_storage->nb[3]);
+            }
+            gate_node = strided ? ggml_cont(ctx, z_view) : z_view;
+        } else {
+            projection_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, projection_size, n_seq_tokens * n_seqs);
+            projection_weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, projection_size, head_size * head_count);
+            ggml_tensor * z = ggml_mul_mat(ctx, projection_weight, projection_input);
+            gate_node = ggml_reshape_4d(ctx, z, head_size, head_count, n_seq_tokens, n_seqs);
+            if (input_source == GDN_ATTENTION && strided) {
+                gate_node = ggml_cont(ctx, ggml_permute(ctx, gate_node, 0, 2, 1, 3));
+            }
+        }
+        gamma_node = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_size);
+
+        if (input_source != UNEXPANDED_GATE) {
+            // Expand the passed view, not only its raw projection, before creating the normalization chain.
+            ggml_build_forward_expand(gf, gate_node);
+        }
+        weighted_node = ggml_mul(ctx, ggml_rms_norm(ctx, input_node, eps), gamma_node);
+        if (expose_intermediate) {
+            ggml_set_output(weighted_node);
+        }
+        out_node = ggml_mul(ctx, weighted_node, ggml_sigmoid(ctx, gate_node));
+        ggml_set_name(out_node, "gdn_gated_norm_out");
+        ggml_set_output(out_node);
+
+        if (written_snapshots != nullptr) {
+            // Compare the raw written tail after the post-op. Do not copy it beforehand, which could hide
+            // a post-op overwrite; do not compare the packed tensor's unwritten K - min(T, K) slots.
+            ggml_build_forward_expand(gf, out_node);
+            ggml_build_forward_expand(gf, written_snapshots);
+        }
+        return out_node;
+    }
+
+    float input_value(int64_t feature, int64_t head, int64_t token, int64_t seq) const {
+        if (input_data == ONES) {
+            return 1.0f;
+        }
+        if (input_data == NEAR_ZERO) {
+            return 1e-8f;
+        }
+        return 0.0625f * ((feature * 7 + head * 13 + token * 17 + seq * 19) % 31 - 15) +
+               0.0078125f * (1 + head % 5) + 0.015625f * (token % 7) + 0.03125f * seq;
+    }
+
+    float gate_value(int64_t feature, int64_t head, int64_t token, int64_t seq) const {
+        if (input_data != VARIED) {
+            return 0.0f;
+        }
+        switch ((feature + head * 3 + token * 5 + seq * 7) % 7) {
+            case 0: return 0.0f;
+            case 1: return 80.0f;
+            case 2: return -80.0f;
+            default: return 0.25f * ((feature * 3 + head * 5 + token * 7 + seq * 11) % 25 - 12);
+        }
+    }
+
+    template <typename F>
+    static void fill_f32(ggml_tensor * t, F value) {
+        std::vector<float> values(ggml_nelements(t));
+        size_t index = 0;
+        for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
+            for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
+                for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+                    for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+                        values[index++] = value(i0, i1, i2, i3);
+                    }
+                }
+            }
+        }
+        ggml_backend_tensor_set(t, values.data(), 0, values.size() * sizeof(float));
+    }
+
+    void fill_input_storage(ggml_tensor * storage, ggml_tensor * view, bool gate) {
+        std::vector<float> values(ggml_nelements(storage), -113.0f);
+        for (int64_t i3 = 0; i3 < view->ne[3]; ++i3) {
+            for (int64_t i2 = 0; i2 < view->ne[2]; ++i2) {
+                for (int64_t i1 = 0; i1 < view->ne[1]; ++i1) {
+                    for (int64_t i0 = 0; i0 < view->ne[0]; ++i0) {
+                        const size_t offset = view->view_offs + i0 * view->nb[0] + i1 * view->nb[1] +
+                                              i2 * view->nb[2] + i3 * view->nb[3];
+                        values[offset / sizeof(float)] = gate ? gate_value(i0, i1, i2, i3) : input_value(i0, i1, i2, i3);
+                    }
+                }
+            }
+        }
+        ggml_backend_tensor_set(storage, values.data(), 0, values.size() * sizeof(float));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr) {
+                continue;
+            }
+            if (t == x_storage) {
+                fill_input_storage(t, input_node, false);
+            } else if (t == z_storage) {
+                fill_input_storage(t, z_view, true);
+            } else if (t == gamma_node) {
+                fill_f32(t, [&](int64_t feature, int64_t, int64_t, int64_t) {
+                    return input_data != VARIED ? 2.0f :
+                           (feature % 2 == 0 ? 1.0f : -1.0f) * (0.5f + 0.125f * ((feature * 3) % 11));
+                });
+            } else if (t == projection_input) {
+                fill_f32(t, [](int64_t feature, int64_t token, int64_t, int64_t) {
+                    return feature == 0 ? 1.0f : 0.0625f * ((feature * 7 + token * 3) % 17 - 8);
+                });
+            } else if (t == projection_weight) {
+                fill_f32(t, [&](int64_t feature, int64_t row, int64_t, int64_t) {
+                    return feature == 0 ? gate_value(row % head_size, row / head_size, 0, 0) :
+                           0.0078125f * ((feature * 3 + row * 5) % 13 - 6);
+                });
+            } else if (strcmp(t->name, "gdn_norm_q") == 0) {
+                fill_f32(t, [](int64_t i0, int64_t i1, int64_t i2, int64_t i3) {
+                    return 0.03125f * ((i0 * 5 + i1 * 7 + i2 * 3 + i3 * 11) % 23 - 11);
+                });
+            } else if (strcmp(t->name, "gdn_norm_k") == 0) {
+                fill_f32(t, [](int64_t i0, int64_t i1, int64_t i2, int64_t i3) {
+                    return 0.03125f * ((i0 * 7 + i1 * 3 + i2 * 5 + i3 * 13) % 29 - 14);
+                });
+            } else if (strcmp(t->name, "gdn_norm_v") == 0) {
+                fill_f32(t, [](int64_t i0, int64_t i1, int64_t i2, int64_t i3) {
+                    return 0.0625f * ((i0 * 3 + i1 * 11 + i2 * 7 + i3 * 13) % 19 - 9);
+                });
+            } else if (strcmp(t->name, "gdn_norm_decay") == 0) {
+                fill_f32(t, [](int64_t, int64_t head, int64_t token, int64_t seq) {
+                    return -0.03125f * (1 + (head + token * 3 + seq * 5) % 5);
+                });
+            } else if (strcmp(t->name, "gdn_norm_beta") == 0) {
+                fill_f32(t, [](int64_t, int64_t head, int64_t token, int64_t seq) {
+                    return 0.125f + 0.0625f * ((head * 3 + token * 2 + seq) % 7);
+                });
+            } else if (strcmp(t->name, "gdn_norm_state") == 0) {
+                fill_f32(t, [](int64_t i0, int64_t i1, int64_t i2, int64_t i3) {
+                    return 0.0078125f * ((i0 * 3 + i1 * 5 + i2 * 7 + i3 * 11) % 17 - 8);
+                });
+            } else {
+                // Material results start poisoned, so omitting the z producer cannot masquerade as a zero gate.
+                fill_f32(t, [](int64_t i0, int64_t i1, int64_t i2, int64_t i3) {
+                    return -113.0f + 0.015625f * ((i0 + i1 * 3 + i2 * 5 + i3 * 7) % 17);
+                });
+            }
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        const double backend_error = nmse(a, b, n);
+        if (input_data == VARIED) {
+            return backend_error;
+        }
+        // gamma=2 and sigmoid(0)=1/2 cancel; keep epsilon inside the RMS square root.
+        const double x = input_data == ONES ? 1.0 : double(1e-8f);
+        const float expected = float(x / std::sqrt(x * x + double(eps)));
+        double worst = backend_error;
+        for (size_t i = 0; i < n; ++i) {
+            const double da = (double(a[i]) - expected) / expected;
+            const double db = (double(b[i]) - expected) / expected;
+            worst = std::max(worst, std::max(da * da, db * db));
+        }
+        return worst;
     }
 };
 
@@ -12227,6 +12506,46 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
 
+    {
+        using norm = test_gdn_gated_norm;
+
+        // Independent analytic oracle: x / sqrt(x*x + eps), with gamma=2 and z=0.
+        for (norm::data values : { norm::ONES, norm::NEAR_ZERO }) {
+            test_cases.emplace_back(new norm(norm::PRIMITIVE, 1, 1, false, 1, 128, false, values));
+            test_cases.emplace_back(new norm(norm::PRIMITIVE, 4, 2, true, 1, 128, false, values));
+        }
+
+        for (int64_t tokens : { 1, 4, 7, 32 }) {
+            for (int64_t seqs : { 1, 2 }) {
+                // Signed shared gamma, z=0/+80/-80 and finite non-saturated gates, distinct rows/sequences.
+                for (bool strided : { false, true }) {
+                    test_cases.emplace_back(new norm(norm::PRIMITIVE, tokens, seqs, strided));
+                }
+                test_cases.emplace_back(new norm(norm::MATERIAL_GATE, tokens, seqs));
+                // Real grouped 16 -> 48 head recurrence; only min(tokens, K) snapshots are read and compared.
+                for (int64_t K : { 1, 4 }) {
+                    test_cases.emplace_back(new norm(norm::GDN_ATTENTION, tokens, seqs, false, K));
+                }
+            }
+        }
+
+        // Feature-contiguous strided x/attention views; material/CONT producers keep the sigmoid gate contiguous.
+        test_cases.emplace_back(new norm(norm::MATERIAL_GATE, 1, 1, true));
+        test_cases.emplace_back(new norm(norm::MATERIAL_GATE, 7, 2, true));
+        test_cases.emplace_back(new norm(norm::GDN_ATTENTION, 7, 2, true, 4));
+        test_cases.emplace_back(new norm(norm::GDN_ATTENTION, 32, 1, true, 1));
+
+        // Unsupported feature widths retain the original primitive graph.
+        test_cases.emplace_back(new norm(norm::PRIMITIVE, 4, 2, false, 1, 64));
+        test_cases.emplace_back(new norm(norm::PRIMITIVE, 7, 1, true, 1, 256));
+        // An exposed weighted intermediate must remain a numerically valid separate graph output.
+        test_cases.emplace_back(new norm(norm::PRIMITIVE, 4, 2, false, 1, 128, true));
+        test_cases.emplace_back(new norm(norm::MATERIAL_GATE, 7, 1, true, 1, 128, true));
+        // Deliberately leave the material z producer on the sigmoid DFS branch, between weight and sigmoid.
+        test_cases.emplace_back(new norm(norm::UNEXPANDED_GATE, 1, 1));
+        test_cases.emplace_back(new norm(norm::UNEXPANDED_GATE, 7, 2, true));
+    }
+
     // gdn alpha/beta producer fusion
     for (ggml_type w : {GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
         test_cases.emplace_back(new test_gated_delta_net_ab_fusion(w, 8, 32, 4, 128));
@@ -12703,6 +13022,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {256, 16, 2, 3}, 1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {128, 16, 2, 3}, 2));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {64, 16, 2, 3}, 3));
+
+    {
+        using norm = test_gdn_gated_norm;
+        // Isolate the complete four-op post-norm chain at Tinfield's 128-feature / 48-head shape.
+        for (int64_t tokens : { 1, 4, 7, 32 }) {
+            for (int64_t seqs : { 1, 2 }) {
+                test_cases.emplace_back(new norm(norm::PRIMITIVE, tokens, seqs));
+            }
+        }
+        // Material gate production and the real grouped attention/snapshot graph are timed in full as well.
+        test_cases.emplace_back(new norm(norm::MATERIAL_GATE, 1, 1));
+        test_cases.emplace_back(new norm(norm::MATERIAL_GATE, 32, 1));
+        for (int64_t tokens : { 1, 4, 7, 32 }) {
+            test_cases.emplace_back(new norm(norm::GDN_ATTENTION, tokens, 1, false, 4));
+        }
+        test_cases.emplace_back(new norm(norm::PRIMITIVE, 7, 2, true));
+    }
 
     // GATED_DELTA_NET: realistic model configurations
     for (int64_t n_query : {1, 8, 64, 1024}) {

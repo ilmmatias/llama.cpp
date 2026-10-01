@@ -1,5 +1,41 @@
 #include "norm.cuh"
+#include "unary.cuh"
 #include <cstdint>
+
+static __global__ void rms_norm_sigmoid_gate_f32(
+        const float * x, const float * gamma, const float * gate, float * dst,
+        const int64_t xs1, const int64_t xs2, const int64_t xs3,
+        const int64_t zs1, const int64_t zs2, const int64_t zs3, const float eps) {
+    const int64_t row     = blockIdx.x;
+    const int64_t channel = blockIdx.y;
+    const int64_t sample  = blockIdx.z;
+    const int     feature = threadIdx.x;
+
+    x    += row*xs1 + channel*xs2 + sample*xs3;
+    gate += row*zs1 + channel*zs2 + sample*zs3;
+    dst  += ((sample*gridDim.y + channel)*gridDim.x + row)*128;
+
+    const float value = x[feature];
+    extern __shared__ float s_sum[];
+    const float sum      = block_reduce<block_reduce_method::SUM, 128>(value*value, s_sum);
+    const float scale    = rsqrtf(sum/128.0f + eps);
+    const float weighted = (scale*value)*gamma[feature];
+    dst[feature] = weighted*ggml_cuda_op_sigmoid_single(gate[feature]);
+}
+
+void ggml_cuda_op_rms_norm_sigmoid_gate_fused(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * rms_node,
+        const ggml_tensor * gamma, const ggml_tensor * gate, ggml_tensor * dst) {
+    const ggml_tensor * x = rms_node->src[0];
+    const dim3 blocks(x->ne[1], x->ne[2], x->ne[3]);
+    rms_norm_sigmoid_gate_f32<<<blocks, 128, 32*sizeof(float), ctx.stream()>>>(
+        (const float *) x->data, (const float *) gamma->data,
+        (const float *) gate->data, (float *) dst->data,
+        x->nb[1]/sizeof(float), x->nb[2]/sizeof(float), x->nb[3]/sizeof(float),
+        gate->nb[1]/sizeof(float), gate->nb[2]/sizeof(float), gate->nb[3]/sizeof(float),
+        ggml_get_op_params_f32(rms_node, 0));
+    CUDA_CHECK(cudaGetLastError());
+}
 
 template <int block_size>
 static __global__ void norm_f32(

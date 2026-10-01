@@ -3329,15 +3329,13 @@ static int ggml_cuda_try_gdn_ab_fusion(
         ggml_backend_cuda_context * cuda_ctx,
         const ggml_cgraph * cgraph,
         int node_idx,
-        bool use_cuda_graph,
         ggml_cuda_gated_delta_net_ab & ab) {
     static bool disable_gdn_ab_fusion = getenv("GGML_CUDA_DISABLE_GDN_AB_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_GDN_AB_FUSION"));
     if (disable_gdn_ab_fusion) {
         return 0;
     }
 
-    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
-    if (!use_cuda_graph || cuda_ctx->curr_stream_no != 0) {
+    if (cuda_ctx->curr_stream_no != 0) {
         return 0;
     }
 
@@ -3869,6 +3867,43 @@ struct ggml_cuda_qsa_refine_match {
           ggml_tensor * dst;
 };
 
+struct ggml_cuda_gdn_norm_match {
+    const ggml_tensor * rms;
+    const ggml_tensor * gamma;
+    const ggml_tensor * gate;
+          ggml_tensor * dst;
+};
+
+static bool ggml_cuda_match_gdn_norm(
+        const ggml_cgraph * graph, int i, ggml_cuda_gdn_norm_match & match) {
+    if (!ggml_can_fuse_subgraph(graph, i,
+                { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL }, { i + 3 }) ||
+            !ggml_check_edges(graph, i, {{1, 0, 0}, {3, 0, 1}, {3, 1, 2}})) {
+        return false;
+    }
+
+    const ggml_tensor * rms      = graph->nodes[i];
+    const ggml_tensor * weighted = graph->nodes[i + 1];
+    const ggml_tensor * sigmoid  = graph->nodes[i + 2];
+    const ggml_tensor * x        = rms->src[0];
+    const ggml_tensor * gamma    = weighted->src[1];
+    const ggml_tensor * gate     = sigmoid->src[0];
+          ggml_tensor * dst     = graph->nodes[i + 3];
+
+    if (ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID ||
+            !(ggml_get_op_params_f32(rms, 0) >= 0.0f) ||
+            x->type != GGML_TYPE_F32 || gamma->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
+            x->ne[0] != 128 || gamma->ne[0] != 128 || !ggml_is_vector(gamma) ||
+            x->nb[0] != sizeof(float) || gate->nb[0] != sizeof(float) || !ggml_is_contiguous(gamma) ||
+            !ggml_are_same_shape(x, gate) || !ggml_is_contiguous(dst) ||
+            gate == rms || gate == weighted) {
+        return false;
+    }
+
+    match = { rms, gamma, gate, dst };
+    return true;
+}
+
 // Shared by allocation and execution so every early read stays live until dst.
 static bool ggml_cuda_match_qsa_refine(
         const ggml_cgraph * graph, int i, ggml_cuda_qsa_refine_match & match) {
@@ -3989,7 +4024,7 @@ static int ggml_cuda_try_qsa_mask_fusion(ggml_backend_cuda_context & ctx, ggml_c
 }
 
 // try and fuse nodes and return the number of nodes to skip
-static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, bool use_cuda_graph) {
+static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
@@ -4022,7 +4057,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // mul_mat x2 -> gated_delta_net: the alpha/beta projections and their activation tails
     if (node->op == GGML_OP_MUL_MAT) {
         ggml_cuda_gated_delta_net_ab ab;
-        const int nodes_to_skip = ggml_cuda_try_gdn_ab_fusion(cuda_ctx, cgraph, i, use_cuda_graph, ab);
+        const int nodes_to_skip = ggml_cuda_try_gdn_ab_fusion(cuda_ctx, cgraph, i, ab);
         if (nodes_to_skip > 0) {
 #ifdef GGML_CUDA_DEBUG
             GGML_LOG_INFO("%s: fused gated_delta_net alpha/beta projections for %s (skipped %d nodes)\n",
@@ -4977,6 +5012,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    if (node->op == GGML_OP_RMS_NORM) {
+        ggml_cuda_gdn_norm_match match;
+        const int output = i + 3;
+        if (ggml_cuda_match_gdn_norm(cgraph, i, match) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, &output, 1) &&
+                ggml_cuda_fusion_inputs_disjoint(match.dst, { match.rms->src[0], match.gamma, match.gate }) &&
+                ggml_cuda_fusion_same_stream(*cuda_ctx, cgraph, i, output)) {
+            ggml_cuda_op_rms_norm_sigmoid_gate_fused(*cuda_ctx, match.rms, match.gamma, match.gate, match.dst);
+            return 3;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
@@ -5180,7 +5227,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, use_cuda_graph);
+                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -5404,6 +5451,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_gdn_norm_match gdn;
+            if (ggml_cuda_match_gdn_norm(cgraph, i, gdn)) {
+                params->add_alloc_dep(params->user_data, gdn.rms->src[0], gdn.dst);
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(gdn.gamma), gdn.dst);
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(gdn.gate), gdn.dst);
+            }
             ggml_cuda_qsa_refine_match qsa;
             if (ggml_cuda_match_qsa_refine(cgraph, i, qsa)) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(qsa.scores), qsa.dst);
