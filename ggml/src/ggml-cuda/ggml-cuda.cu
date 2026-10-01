@@ -3830,6 +3830,101 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// A skipped span must not swallow a stream transition or a fork/join boundary.
+static bool ggml_cuda_fusion_same_stream(
+        ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int first, int last) {
+    for (const auto & [fork, event] : ctx.stream_context().concurrent_events) {
+        const auto start = event.stream_mapping.find(graph->nodes[first]);
+        const int stream = start == event.stream_mapping.end() ? 0 : start->second;
+        for (int j = first; j <= last; ++j) {
+            const ggml_tensor * node = graph->nodes[j];
+            const auto mapped = event.stream_mapping.find(node);
+            if ((j < last && node == fork) || (j > first && node == event.join_node) ||
+                    (mapped == event.stream_mapping.end() ? 0 : mapped->second) != stream) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Include leaf inputs too: the general fusion range check exempts GGML_OP_NONE.
+static bool ggml_cuda_fusion_inputs_disjoint(
+        const ggml_tensor * dst, std::initializer_list<const ggml_tensor *> inputs) {
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(dst->data);
+    const uintptr_t end = begin + ggml_nbytes(dst);
+    for (const ggml_tensor * src : inputs) {
+        const uintptr_t src_begin = reinterpret_cast<uintptr_t>(src->data);
+        if (begin < src_begin + ggml_nbytes(src) && src_begin < end) {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct ggml_cuda_qsa_refine_match {
+    const ggml_tensor * scores;
+    const ggml_tensor * cells;
+    const ggml_tensor * mask;
+          ggml_tensor * dst;
+};
+
+// Shared by allocation and execution so every early read stays live until dst.
+static bool ggml_cuda_match_qsa_refine(
+        const ggml_cgraph * graph, int i, ggml_cuda_qsa_refine_match & match) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_CUDA_USE_CUB)
+    GGML_UNUSED(graph);
+    GGML_UNUSED(i);
+    GGML_UNUSED(match);
+    return false;
+#else
+    // ggml_set_output propagates a reshape's output flag to its storage source.
+    if (!ggml_can_fuse_subgraph(graph, i,
+                { GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_RESHAPE,
+                  GGML_OP_TOP_K, GGML_OP_CONT, GGML_OP_GET_ROWS, GGML_OP_RESHAPE }, { i + 6, i + 7 }) ||
+            !ggml_check_edges(graph, i,
+                {{1, 0, 0}, {2, 1, 1}, {3, 0, 2}, {4, 0, 3}, {5, 0, 4}, {6, 1, 5}, {7, 0, 6}}) ||
+            ggml_node_get_use_count(graph, i + 6) != 1) {
+        return false;
+    }
+
+    const ggml_tensor * gather    = graph->nodes[i];
+    const ggml_tensor * gathered  = graph->nodes[i + 1];
+    const ggml_tensor * add       = graph->nodes[i + 2];
+    const ggml_tensor * flat      = graph->nodes[i + 3];
+    const ggml_tensor * top       = graph->nodes[i + 4];
+    const ggml_tensor * selected  = graph->nodes[i + 6];
+    const ggml_tensor * rows      = selected->src[0];
+          ggml_tensor * dst      = graph->nodes[i + 7];
+    const ggml_tensor * scores    = add->src[0];
+    const ggml_tensor * cells     = gather->src[1];
+    const ggml_tensor * mask      = gather->src[0];
+
+    if (rows->op != GGML_OP_RESHAPE || rows->src[0] != cells ||
+            scores == gather || scores == gathered) {
+        return false;
+    }
+    const int64_t n = cells->ne[0];
+    const int64_t queries = cells->ne[1];
+    const int64_t width = top->ne[0];
+    if (n <= 0 || n > 4096 || width <= 0 || width >= n || n - width > 7 || queries <= 0 ||
+            scores->type != GGML_TYPE_F32 || mask->type != GGML_TYPE_F16 ||
+            !ggml_is_contiguous(cells) || !ggml_is_contiguous(scores) || !ggml_is_contiguous(dst) ||
+            !ggml_is_matrix(cells) || ggml_nelements(scores) != ggml_nelements(cells) ||
+            scores->ne[2] != queries || scores->ne[3] != 1 ||
+            !ggml_are_same_shape(scores, gathered) ||
+            mask->ne[0] != 1 || mask->ne[2] != queries || mask->ne[3] != 1 ||
+            mask->nb[0] != sizeof(ggml_fp16_t) || mask->nb[1] != sizeof(ggml_fp16_t) ||
+            !ggml_are_same_shape(gather, rows) ||
+            !ggml_is_matrix(flat) || flat->ne[0] != n || flat->ne[1] != queries ||
+            !ggml_is_matrix(dst) || dst->ne[0] != width || dst->ne[1] != queries) {
+        return false;
+    }
+    match = { scores, cells, mask, dst };
+    return true;
+#endif
+}
+
 // Elide the dense QSA selection mask when the sparse tile kernel can consume its indices.
 static int ggml_cuda_try_qsa_mask_fusion(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
     static const bool enabled = getenv("GGML_CUDA_QSA_DIRECT_INDICES") == nullptr ||
@@ -3909,6 +4004,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return nodes_to_skip;
         }
     }
+
+#if defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
+    if (node->op == GGML_OP_GET_ROWS) {
+        ggml_cuda_qsa_refine_match match;
+        const int output = i + 7;
+        if (ggml_cuda_match_qsa_refine(cgraph, i, match) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 8, &output, 1) &&
+                ggml_cuda_fusion_inputs_disjoint(match.dst, { match.scores, match.cells, match.mask }) &&
+                ggml_cuda_fusion_same_stream(*cuda_ctx, cgraph, i, output)) {
+            ggml_cuda_qsa_refine(*cuda_ctx, match.scores, match.cells, match.mask, match.dst);
+            return 7;
+        }
+    }
+#endif
 
     // mul_mat x2 -> gated_delta_net: the alpha/beta projections and their activation tails
     if (node->op == GGML_OP_MUL_MAT) {
@@ -5295,6 +5404,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_qsa_refine_match qsa;
+            if (ggml_cuda_match_qsa_refine(cgraph, i, qsa)) {
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(qsa.scores), qsa.dst);
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(qsa.cells), qsa.dst);
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(qsa.mask), qsa.dst);
+            }
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);

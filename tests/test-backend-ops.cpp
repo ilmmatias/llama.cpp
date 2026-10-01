@@ -1592,6 +1592,8 @@ struct test_case {
         ggml_context_ptr ctx_weights(use_weights ? ggml_init(params) : nullptr);
         GGML_ASSERT(!use_weights || ctx_weights);
 
+        gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+
         ggml_tensor * out             = build_graph(ctx.get(), ctx_weights.get());
         current_op_name               = op_desc(out);
         if (!matches_filter(out, op_names_filter)) {
@@ -1634,7 +1636,6 @@ struct test_case {
         }
 
         // build graph
-        ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
         ggml_build_forward_expand(gf, out);
 
         // warmup run
@@ -1647,7 +1648,10 @@ struct test_case {
         // determine number of runs
         int n_runs;
         bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
-        if (op_flops(out) > 0) {
+        if (run_whole_graph()) {
+            // Repeating only the final node neither reruns nor times its producers.
+            n_runs = 1;
+        } else if (op_flops(out) > 0) {
             // based on flops
             const uint64_t GFLOP = 1000 * 1000 * 1000;
             const uint64_t target_flops_cpu =   8ULL * GFLOP;
@@ -7247,6 +7251,330 @@ struct test_topk_qsa : public test_case {
     }
 };
 
+// Compact qwen4exp refinement, with optional real block-score/shortlist producers.
+struct test_topk_qsa_compact : public test_case {
+    static constexpr int64_t ratio = 4;
+    static constexpr int64_t index_dim = 128;
+    static constexpr int64_t index_heads = 4;
+
+    const int64_t n_candidates;
+    const int width;
+    const int64_t n_query;
+    const bool full_graph;
+    const std::string profile;
+    const int tail_slots;
+    const bool hide_cell;
+    const int64_t n_blocks;
+    const int64_t n_kv;
+    const int64_t mask_pitch;
+
+    ggml_tensor * scores_input {};
+    ggml_tensor * cells_input {};
+    ggml_tensor * mask_storage {};
+    ggml_tensor * query_input {};
+    ggml_tensor * key_input {};
+    ggml_tensor * key_cells_input {};
+    ggml_tensor * block_bias_input {};
+    ggml_tensor * block_cells_input {};
+    ggml_tensor * slot_bias_input {};
+    ggml_tensor * out {};
+
+    std::vector<std::vector<int32_t>> allowed;
+    std::vector<std::vector<int32_t>> required;
+
+    test_topk_qsa_compact(int64_t n_candidates = 2056, int width = 2051, int64_t n_query = 1,
+                         bool full_graph = false, std::string profile = "unique", int tail_slots = 2,
+                         bool hide_cell = true, int64_t n_blocks = 2048) :
+        n_candidates(n_candidates), width(width), n_query(n_query), full_graph(full_graph),
+        profile(profile), tail_slots(tail_slots), hide_cell(hide_cell),
+        n_blocks(full_graph ? n_blocks : 0),
+        n_kv(full_graph ? ratio*n_blocks : (profile == "analytic" ? 16 : n_candidates + 31)),
+        mask_pitch(n_kv + 13) {
+        GGML_ASSERT(n_candidates % ratio == 0 && width > 0 && width < n_candidates && n_query > 0);
+        GGML_ASSERT(profile == "unique" || profile == "ties" || profile == "analytic");
+        GGML_ASSERT(tail_slots >= 0 && tail_slots < ratio);
+        GGML_ASSERT(width <= n_candidates - tail_slots - (hide_cell ? 1 : 0));
+        GGML_ASSERT(!full_graph || (n_blocks > n_candidates/ratio &&
+                    n_candidates/ratio == (width + ratio - 1)/ratio + 1));
+        GGML_ASSERT(profile != "analytic" || (!full_graph && n_candidates == 16 && width == 9 &&
+                    tail_slots == 0 && !hide_cell));
+    }
+
+    std::string op_desc(ggml_tensor *) override { return "TOPK_QSA_COMPACT"; }
+    std::string vars() override {
+        return VARS_TO_STR9(n_candidates, width, n_query, full_graph, profile, tail_slots, hide_cell, n_blocks, n_kv);
+    }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_top = n_candidates/ratio;
+        ggml_tensor * candidate_cells;
+        ggml_tensor * candidate_scores;
+        if (full_graph) {
+            query_input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, index_dim, index_heads, n_query, 1);
+            key_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, index_dim, n_blocks + 17);
+            key_cells_input = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_blocks, 1);
+            block_bias_input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_query, 1);
+            block_cells_input = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, ratio, n_blocks, 1);
+            slot_bias_input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ratio, n_blocks, 1);
+
+            ggml_tensor * score = ggml_qsa_block_score(ctx, query_input, key_input,
+                    key_cells_input, block_bias_input, 1.0f);
+            ggml_tensor * top_blocks = ggml_cont(ctx, ggml_top_k(ctx, score, n_top));
+            ggml_tensor * top_flat = ggml_reshape_1d(ctx, top_blocks, n_top*n_query);
+            candidate_cells = ggml_reshape_2d(ctx,
+                    ggml_get_rows(ctx, block_cells_input, top_flat), n_candidates, n_query);
+            ggml_tensor * candidate_slot_bias = ggml_reshape_3d(ctx,
+                    ggml_get_rows(ctx, slot_bias_input, top_flat), ratio, n_top, n_query);
+            ggml_tensor * score_rows = ggml_reshape_3d(ctx, ggml_cont(ctx, score), 1, n_blocks, n_query);
+            candidate_scores = ggml_repeat_4d(ctx, ggml_get_rows(ctx, score_rows, top_blocks),
+                    ratio, n_top, n_query, 1);
+            candidate_scores = ggml_add(ctx, candidate_scores, candidate_slot_bias);
+        } else {
+            scores_input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ratio, n_top, n_query);
+            cells_input = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_candidates, n_query);
+            candidate_scores = scores_input;
+            candidate_cells = cells_input;
+        }
+
+        // Pad query rows so a launcher must use the actual mask query stride.
+        mask_storage = full_graph ?
+                ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 1, mask_pitch, n_query) :
+                ggml_new_tensor_2d(ctx, GGML_TYPE_F16, mask_pitch, n_query);
+        ggml_tensor * mask_cells = mask_storage;
+        if (!full_graph) {
+            ggml_tensor * kq_mask = ggml_view_4d(ctx, mask_storage, n_kv, n_query, 1, 1,
+                    mask_storage->nb[1], mask_storage->nb[1]*n_query, mask_storage->nb[1]*n_query, 0);
+            mask_cells = ggml_view_3d(ctx, kq_mask, 1, n_kv, n_query,
+                    kq_mask->nb[0], kq_mask->nb[1], 0);
+        }
+        ggml_tensor * candidate_rows = ggml_reshape_3d(ctx, candidate_cells, 1, n_candidates, n_query);
+
+        // Source-first traversal visits candidate_rows before this exact eight-node suffix.
+        ggml_tensor * candidate_mask = ggml_get_rows(ctx, mask_cells, candidate_cells);
+        candidate_mask = ggml_reshape_3d(ctx, candidate_mask, ratio, n_top, n_query);
+        candidate_scores = ggml_add(ctx, candidate_scores, candidate_mask);
+        candidate_scores = ggml_reshape_2d(ctx, candidate_scores, n_candidates, n_query);
+        ggml_tensor * candidate_top = ggml_cont(ctx, ggml_top_k(ctx, candidate_scores, width));
+        out = ggml_reshape_4d(ctx, ggml_get_rows(ctx, candidate_rows, candidate_top), width, n_query, 1, 1);
+        ggml_set_name(out, "qsa_compact_physical_cells");
+        ggml_set_output(out);
+        return out;
+    }
+
+    int32_t physical_cell(int64_t ordinal, int64_t query) const {
+        if (profile == "analytic") {
+            static const int32_t cells[16] = {15, 0, 7, 3, 9, 2, 14, 5, 1, 10, 6, 4, 13, 8, 12, 11};
+            return (cells[ordinal] + 5*query) % 16;
+        }
+        return (n_kv + 11 - ordinal + (full_graph ? 0 : 37*query)) % n_kv;
+    }
+
+    int64_t block_rank(int64_t block, int64_t query) const {
+        const int64_t rank = (block + 37*query) % n_blocks;
+        // Keep the partially filled final block in every query's shortlist.
+        if (block == n_blocks - 1) {
+            return n_blocks - 1;
+        }
+        return rank == n_blocks - 1 ? (n_blocks - 1 + 37*query) % n_blocks : rank;
+    }
+
+    float query_feature(int64_t head, int64_t query, int feature) const {
+        return feature == 0 ? (head + 1)*0.25f : ((query % 5) - 2)*(head + 1)*0.03125f;
+    }
+    float key_feature(int64_t block, int feature) const {
+        return feature == 0 ? ((block % 7) - 3)*0.125f : ((block % 11) - 5)*0.0625f;
+    }
+    float block_score(int64_t block, int64_t query) const {
+        float score = 0.0f;
+        for (int64_t head = 0; head < index_heads; ++head) {
+            const float dot = query_feature(head, query, 0)*key_feature(block, 0) +
+                              query_feature(head, query, 1)*key_feature(block, 1);
+            score += std::max(dot, 0.0f);
+        }
+        return score + 8.0f*block_rank(block, query);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // Initialize sentinels and unused key-cache rows deterministically too.
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_F32) {
+                std::vector<float> data(ggml_nelements(t), 0.125f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                GGML_ASSERT(t->type == GGML_TYPE_F16);
+                std::vector<ggml_fp16_t> data(ggml_nelements(t), ggml_fp32_to_fp16(-256.0f));
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+            }
+        }
+
+        std::vector<int32_t> candidate_cells(n_candidates*n_query);
+        std::vector<float> candidate_scores(n_candidates*n_query);
+        if (full_graph) {
+            std::vector<float> queries(index_dim*index_heads*n_query, 0.0f);
+            for (int64_t query = 0; query < n_query; ++query) {
+                for (int64_t head = 0; head < index_heads; ++head) {
+                    for (int feature = 0; feature < 2; ++feature) {
+                        queries[(query*index_heads + head)*index_dim + feature] = query_feature(head, query, feature);
+                    }
+                }
+            }
+            std::vector<float> keys(index_dim*(n_blocks + 17), 0.0f);
+            std::vector<int32_t> key_cells(n_blocks), block_cells(ratio*n_blocks);
+            std::vector<float> biases(n_blocks*n_query), slot_biases(ratio*n_blocks);
+            for (int64_t block = 0; block < n_blocks; ++block) {
+                key_cells[block] = n_blocks + 16 - block;
+                for (int feature = 0; feature < 2; ++feature) {
+                    keys[key_cells[block]*index_dim + feature] = key_feature(block, feature);
+                }
+                for (int64_t slot = 0; slot < ratio; ++slot) {
+                    block_cells[block*ratio + slot] = physical_cell(block*ratio + slot, 0);
+                    slot_biases[block*ratio + slot] = block == n_blocks - 1 && slot >= ratio - tail_slots ?
+                            -INFINITY : (profile == "ties" ? 0.0f : slot*0.0625f);
+                }
+                for (int64_t query = 0; query < n_query; ++query) {
+                    biases[query*n_blocks + block] = 8.0f*block_rank(block, query);
+                }
+            }
+            ggml_backend_tensor_set(query_input, queries.data(), 0, queries.size()*sizeof(float));
+            ggml_backend_tensor_set(key_input, keys.data(), 0, keys.size()*sizeof(float));
+            ggml_backend_tensor_set(key_cells_input, key_cells.data(), 0, key_cells.size()*sizeof(int32_t));
+            ggml_backend_tensor_set(block_bias_input, biases.data(), 0, biases.size()*sizeof(float));
+            ggml_backend_tensor_set(block_cells_input, block_cells.data(), 0, block_cells.size()*sizeof(int32_t));
+            ggml_backend_tensor_set(slot_bias_input, slot_biases.data(), 0, slot_biases.size()*sizeof(float));
+
+            std::vector<int32_t> blocks(n_blocks);
+            std::vector<float> block_scores(n_blocks);
+            for (int64_t query = 0; query < n_query; ++query) {
+                for (int64_t block = 0; block < n_blocks; ++block) {
+                    blocks[block] = block;
+                    block_scores[block] = block_score(block, query);
+                }
+                std::sort(blocks.begin(), blocks.end(), [&](int32_t a, int32_t b) {
+                    const float sa = block_scores[a], sb = block_scores[b];
+                    return sa == sb ? a < b : sa > sb;
+                });
+                for (int64_t selected = 0; selected < n_candidates/ratio; ++selected) {
+                    const int32_t block = blocks[selected];
+                    for (int64_t slot = 0; slot < ratio; ++slot) {
+                        const int64_t ordinal = query*n_candidates + selected*ratio + slot;
+                        candidate_cells[ordinal] = block_cells[block*ratio + slot];
+                        candidate_scores[ordinal] = block_scores[block] + slot_biases[block*ratio + slot];
+                    }
+                }
+            }
+        } else {
+            for (int64_t query = 0; query < n_query; ++query) {
+                for (int64_t ordinal = 0; ordinal < n_candidates; ++ordinal) {
+                    const int64_t rank = (ordinal + 17*query) % n_candidates;
+                    candidate_cells[query*n_candidates + ordinal] = physical_cell(ordinal, query);
+                    float score = profile == "analytic" ? float(ordinal) :
+                            (profile == "ties" && rank < 4 ? 0.0f : 4.0f*rank) + 0.125f*(query % 3);
+                    candidate_scores[query*n_candidates + ordinal] = ordinal >= n_candidates - tail_slots ? -INFINITY : score;
+                }
+            }
+            ggml_backend_tensor_set(cells_input, candidate_cells.data(), 0, candidate_cells.size()*sizeof(int32_t));
+            ggml_backend_tensor_set(scores_input, candidate_scores.data(), 0, candidate_scores.size()*sizeof(float));
+        }
+
+        std::vector<ggml_fp16_t> mask(mask_pitch*n_query, ggml_fp32_to_fp16(-256.0f));
+        for (int64_t query = 0; query < n_query; ++query) {
+            for (int64_t cell = 0; cell < n_kv; ++cell) {
+                const float value = profile == "unique" ? -0.25f*((cell + 3*query) % 7) : 0.0f;
+                mask[query*mask_pitch + cell] = ggml_fp32_to_fp16(value);
+            }
+            if (profile == "analytic") {
+                mask[query*mask_pitch + (12 + 5*query) % 16] = ggml_fp32_to_fp16(-INFINITY);
+            } else if (hide_cell) {
+                const int64_t ordinal = full_graph ? ratio*(n_blocks - 1) + query % (ratio - tail_slots) :
+                        (n_candidates/2 + 13*query) % (n_candidates - tail_slots);
+                mask[query*mask_pitch + physical_cell(ordinal, query)] = ggml_fp32_to_fp16(-INFINITY);
+            }
+        }
+        ggml_backend_tensor_set(mask_storage, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
+
+        allowed.assign(n_query, {});
+        required.assign(n_query, {});
+        for (int64_t query = 0; query < n_query; ++query) {
+            std::vector<float> values(n_candidates);
+            for (int64_t ordinal = 0; ordinal < n_candidates; ++ordinal) {
+                const int64_t index = query*n_candidates + ordinal;
+                values[ordinal] = candidate_scores[index] +
+                        ggml_fp16_to_fp32(mask[query*mask_pitch + candidate_cells[index]]);
+            }
+            std::vector<float> ranked = values;
+            std::sort(ranked.begin(), ranked.end(), [](float a, float b) { return a > b; });
+            const float cutoff = ranked[width - 1];
+            GGML_ASSERT(std::isfinite(cutoff));
+            for (int64_t ordinal = 0; ordinal < n_candidates; ++ordinal) {
+                const int32_t cell = candidate_cells[query*n_candidates + ordinal];
+                if (values[ordinal] >= cutoff) {
+                    allowed[query].push_back(cell);
+                }
+                if (values[ordinal] > cutoff) {
+                    required[query].push_back(cell);
+                }
+            }
+            std::sort(allowed[query].begin(), allowed[query].end());
+            std::sort(required[query].begin(), required[query].end());
+            GGML_ASSERT(std::adjacent_find(allowed[query].begin(), allowed[query].end()) == allowed[query].end());
+            GGML_ASSERT(profile == "ties" ? allowed[query].size() > size_t(width) : allowed[query].size() == size_t(width));
+        }
+    }
+
+    // Validate both backends against the host top-k criterion, independently per query.
+    // At a tied cutoff any winner is valid, but all strictly higher scores must survive.
+    double err(const float * a, const float * b, size_t n) override {
+        if (n != size_t(width*n_query)) {
+            return 1.0;
+        }
+        for (const float * result : {a, b}) {
+            for (int64_t query = 0; query < n_query; ++query) {
+                std::vector<int32_t> cells(width);
+                for (int i = 0; i < width; ++i) {
+                    const float value = result[query*width + i];
+                    if (!std::isfinite(value) || value < 0.0f || value >= n_kv || value != float(int32_t(value))) {
+                        return 1.0;
+                    }
+                    cells[i] = int32_t(value);
+                }
+                std::sort(cells.begin(), cells.end());
+                if (std::adjacent_find(cells.begin(), cells.end()) != cells.end()) {
+                    return 1.0;
+                }
+                for (int32_t cell : cells) {
+                    if (!std::binary_search(allowed[query].begin(), allowed[query].end(), cell)) {
+                        return 1.0;
+                    }
+                }
+                for (int32_t cell : required[query]) {
+                    if (!std::binary_search(cells.begin(), cells.end(), cell)) {
+                        return 1.0;
+                    }
+                }
+                if (profile == "analytic") {
+                    std::vector<int32_t> expected = {1, 4, 5, 6, 8, 10, 11, 13, 14};
+                    for (int32_t & cell : expected) {
+                        cell = (cell + 5*query) % 16;
+                    }
+                    std::sort(expected.begin(), expected.end());
+                    if (cells != expected) {
+                        return 1.0;
+                    }
+                }
+            }
+        }
+        return 0.0;
+    }
+};
+
 enum MoeGatingFunc {
     GATING_FUNC_SOFTMAX,
     GATING_FUNC_SIGMOID,
@@ -11296,6 +11624,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
     test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
 
+    // Compact refinement: analytic physical-cell sets, independently per query.
+    test_cases.emplace_back(new test_topk_qsa_compact(16, 9, 1, false, "analytic", 0, false));
+    test_cases.emplace_back(new test_topk_qsa_compact(16, 9, 4, false, "analytic", 0, false));
+
+    // Tinfield's 2056 -> 2051 candidate surface: padded mask query strides,
+    // two unfilled tail slots, a query-specific hidden cell, and unique cutoffs.
+    for (int64_t n_query : {1, 4, 32}) {
+        test_cases.emplace_back(new test_topk_qsa_compact(2056, 2051, n_query));
+        test_cases.emplace_back(new test_topk_qsa_compact(2056, 2051, n_query, true));
+    }
+
+    // Tied cutoffs require valid membership, not the CPU's particular tied winner.
+    test_cases.emplace_back(new test_topk_qsa_compact(2056, 2051, 4, false, "ties"));
+    test_cases.emplace_back(new test_topk_qsa_compact(2056, 2051, 4, true, "ties"));
+
+    // Remaining prune counts and the shared-memory candidate boundary.
+    test_cases.emplace_back(new test_topk_qsa_compact(2056, 2052, 4)); // remove 4
+    test_cases.emplace_back(new test_topk_qsa_compact(2056, 2050, 4)); // remove 6
+    test_cases.emplace_back(new test_topk_qsa_compact(4096, 4091, 4));
+
+    // Unsupported complements/candidate counts retain the primitive graph.
+    test_cases.emplace_back(new test_topk_qsa_compact(4100, 4095, 4));
+    test_cases.emplace_back(new test_topk_qsa_compact(2056, 2053, 4, false, "unique", 0)); // remove 3
+    test_cases.emplace_back(new test_topk_qsa_compact(2056, 2048, 4)); // remove 8
+
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {
     //    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {i, 2, 1, 3}, rand() % i + 1));
@@ -12356,6 +12709,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int64_t n_blocks : {512, 2048}) {
             test_cases.emplace_back(new test_qsa_block_score(128, 4, n_blocks, n_query));
         }
+    }
+
+    // Compact refinement alone and the real block-score/shortlist/candidate graph.
+    // Full graphs use 32768 physical KV cells, with the same 2056 -> 2051 tail.
+    for (int64_t n_query : {1, 4, 32}) {
+        test_cases.emplace_back(new test_topk_qsa_compact(2056, 2051, n_query));
+        test_cases.emplace_back(new test_topk_qsa_compact(2056, 2051, n_query, true, "unique", 2, true, 8192));
     }
 
     // TG: n_seq_tokens=1 (autoregressive)
