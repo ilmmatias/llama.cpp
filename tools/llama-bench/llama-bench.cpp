@@ -2211,6 +2211,17 @@ struct markdown_printer : public printer {
 };
 
 struct sql_printer : public printer {
+    static void print_sql_value(FILE * fout, const std::string & value) {
+        fputc('\'', fout);
+        for (auto c : value) {
+            if (c == '\'') {
+                fputc('\'', fout);
+            }
+            fputc(c, fout);
+        }
+        fputc('\'', fout);
+    }
+
     static std::string get_sql_field_type(const std::string & field) {
         switch (test::get_field_type(field)) {
             case test::STRING:
@@ -2243,7 +2254,8 @@ struct sql_printer : public printer {
         fprintf(fout, "VALUES (");
         std::vector<std::string> values = t.get_values();
         for (size_t i = 0; i < values.size(); i++) {
-            fprintf(fout, "'%s'%s", values.at(i).c_str(), i < values.size() - 1 ? ", " : "");
+            print_sql_value(fout, values.at(i));
+            fprintf(fout, "%s", i < values.size() - 1 ? ", " : "");
         }
         fprintf(fout, ");\n");
     }
