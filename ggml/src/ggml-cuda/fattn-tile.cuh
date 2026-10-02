@@ -1234,6 +1234,14 @@ static __global__ void flash_attn_tile(
 #endif // FLASH_ATTN_AVAILABLE
 }
 
+static bool ggml_cuda_flash_attn_ext_tile_supported_type(ggml_type type) {
+#ifdef GGML_USE_HIP
+    return type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || type == GGML_TYPE_Q8_0;
+#else
+    return type == GGML_TYPE_F16;
+#endif
+}
+
 static bool ggml_cuda_flash_attn_ext_tile_shall_use_sparse(const ggml_tensor * dst, const int ncols1) {
 #ifdef GGML_USE_MUSA
     GGML_UNUSED_VARS(dst, ncols1);
@@ -1245,18 +1253,15 @@ static bool ggml_cuda_flash_attn_ext_tile_shall_use_sparse(const ggml_tensor * d
     const ggml_tensor * mask = dst->src[3];
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
 
-    const auto supported_type = [](ggml_type type) {
-#ifdef GGML_USE_HIP
-        return type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || type == GGML_TYPE_Q8_0;
-#else
-        return type == GGML_TYPE_F16;
-#endif
-    };
     if (dst->src[5]) {
-        return ncols1 == 1 && supported_type(K->type) && supported_type(V->type) &&
+        return !ggml_cuda_fattn_dense_mask(dst) && ncols1 == 1 &&
+            ggml_cuda_flash_attn_ext_tile_supported_type(K->type) &&
+            ggml_cuda_flash_attn_ext_tile_supported_type(V->type) &&
             (mask != nullptr || dst->src[6] != nullptr);
     }
-    return ncols1 <= 2 && n_kv_max > 0 && supported_type(K->type) && supported_type(V->type) &&
+    return ncols1 <= 2 && n_kv_max > 0 &&
+        ggml_cuda_flash_attn_ext_tile_supported_type(K->type) &&
+        ggml_cuda_flash_attn_ext_tile_supported_type(V->type) &&
         mask != nullptr && mask->type == GGML_TYPE_F16 && mask->nb[0] == sizeof(half) &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
         mask->ne[3] > 0 && Q->ne[3] % mask->ne[3] == 0 &&
@@ -1294,9 +1299,7 @@ static void launch_fattn_tile_case(
     if constexpr (ncols1 == 1 || (ncols1 == 2 && ncols2 == 1)) {
         if (ggml_cuda_flash_attn_ext_tile_shall_use_sparse(dst, ncols1)) {
             if constexpr (DKQ == 256 && DV == 256) {
-                if (dst->src[0]->ne[3] == 1 &&
-                        (!dst->src[3] || dst->src[3]->ne[3] == 1) &&
-                        ggml_cuda_qsa_kv_is_paged(dst->src[1]) && ggml_cuda_qsa_kv_is_paged(dst->src[2])) {
+                if (ggml_cuda_fattn_use_paged(dst)) {
                     fattn_kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap,
                             GGML_TYPE_F16, GGML_TYPE_F16, true, true>;
                     launch_fattn<DV, ncols1, ncols2>
@@ -1333,11 +1336,7 @@ static void launch_fattn_tile_case(
     }
 
     if constexpr (DKQ == 256 && DV == 256) {
-        const ggml_tensor * Q    = dst->src[0];
-        const ggml_tensor * mask = dst->src[3];
-
-        if (Q->ne[1] <= 8 && Q->ne[3] == 1 && (!mask || mask->ne[3] == 1) &&
-                ggml_cuda_qsa_kv_is_paged(dst->src[1]) && ggml_cuda_qsa_kv_is_paged(dst->src[2])) {
+        if (ggml_cuda_fattn_use_paged(dst)) {
             // Keep the normal dense reduction at short contexts. Forcing a
             // sparse reduction here changes the model's numerical behavior.
             fattn_kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap,
@@ -1373,7 +1372,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     const int warp_size = 32;
 
     // Direct indices are per query; sharing a union would lose each query's selection mask.
-    if (dst->src[5]) {
+    if (dst->src[5] && !ggml_cuda_fattn_dense_mask(dst)) {
         const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, ncols2, cc) / warp_size;
         const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols2, cc);
         launch_fattn_tile_case<DKQ, DV, 1, ncols2, use_logit_softcap>

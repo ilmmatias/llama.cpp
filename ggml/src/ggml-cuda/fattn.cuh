@@ -10,4 +10,5 @@ void ggml_cuda_flash_attn_ext_indices(
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst);
 
+// Includes bounded QSA mask and KV transfer workspace.
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst);

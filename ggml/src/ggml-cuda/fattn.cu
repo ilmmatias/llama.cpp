@@ -4,6 +4,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "fill.cuh"
 
 #ifdef GGML_USE_HIP
 #    include <hipcub/hipcub.hpp>
@@ -12,6 +13,94 @@ namespace fattn_cub = hipcub;
 #    include <cub/cub.cuh>
 namespace fattn_cub = cub;
 #endif // GGML_USE_HIP
+
+template <typename index_t, bool has_selected>
+static __global__ void flash_attn_scatter_selection_mask(
+        const char * selected,
+        const half * mask,
+        const int32_t * positions,
+        half * dst,
+        const int n_kv,
+        const int width,
+        const int first,
+        const size_t column_stride_selected,
+        const size_t query_stride_selected,
+        const size_t query_stride_mask,
+        const size_t query_stride_dst) {
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    const int query = first + blockIdx.y;
+
+    if (column >= width) {
+        return;
+    }
+
+    index_t row = column;
+    if constexpr (has_selected) {
+        row = *(const index_t *) (selected + query * query_stride_selected + column * column_stride_selected);
+    }
+    if (row < 0 || row >= n_kv) {
+        return;
+    }
+
+    half value;
+    if (positions) {
+        const bool visible = ggml_qsa_is_visible(positions, n_kv, row, query);
+        value = __float2half(visible ? 0.0f : -INFINITY);
+    } else {
+        value = mask[query * query_stride_mask + row];
+    }
+
+    dst[blockIdx.y * query_stride_dst + row] = value;
+}
+
+void ggml_cuda_flash_attn_ext_materialize_mask(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * dst,
+        ggml_tensor * mask,
+        int first,
+        int n_queries) {
+    const ggml_tensor * selected  = dst->src[5];
+    const ggml_tensor * base_mask = dst->src[3];
+    const int32_t * positions = nullptr;
+    const half * mask_data = nullptr;
+    size_t query_stride_mask = 0;
+
+    if (dst->src[6]) {
+        positions = (const int32_t *) dst->src[6]->data;
+    }
+    if (base_mask) {
+        mask_data = (const half *) base_mask->data;
+        query_stride_mask = base_mask->nb[1] / sizeof(half);
+    }
+
+    mask->ne[1] = GGML_PAD(n_queries, GGML_CUDA_QSA_MASK_QUERY_PAD);
+    mask->nb[2] = mask->ne[1] * mask->nb[1];
+    mask->nb[3] = mask->nb[2];
+
+    ggml_set_op_params_f32(mask, 0, -INFINITY);
+    ggml_cuda_op_fill(ctx, mask);
+
+    auto kernel = flash_attn_scatter_selection_mask<int32_t, false>;
+    if (selected) {
+        if (selected->type == GGML_TYPE_I64) {
+            kernel = flash_attn_scatter_selection_mask<int64_t, true>;
+        } else {
+            kernel = flash_attn_scatter_selection_mask<int32_t, true>;
+        }
+    }
+
+    const int width = selected ? selected->ne[0] : dst->src[1]->ne[1];
+    const dim3 block_dim(256, 1, 1);
+    const dim3 blocks_num((width + block_dim.x - 1) / block_dim.x, n_queries, 1);
+    const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, ctx.stream());
+
+    ggml_cuda_kernel_launch(kernel, launch_params,
+            selected ? (const char *) selected->data : nullptr, mask_data, positions, (half *) mask->data,
+            (int) dst->src[1]->ne[1], width, first,
+            selected ? selected->nb[0] : 0, selected ? selected->nb[1] : 0,
+            query_stride_mask, mask->nb[1] / sizeof(half));
+    CUDA_CHECK(cudaGetLastError());
+}
 
 #if defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
 // Preserve the dense-mask traversal order and SET_ROWS semantics for repeated indices.
@@ -810,7 +899,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
 #endif
         const bool supported_kv = dst->src[5] ?
-            ggml_cuda_flash_attn_ext_tile_shall_use_sparse(dst, 1) :
+            ggml_cuda_flash_attn_ext_tile_supported_type(K->type) &&
+            ggml_cuda_flash_attn_ext_tile_supported_type(V->type) &&
+            (mask || dst->src[6]) :
             K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
         const bool supported_head = dst->src[6] ? K->ne[0] == 256 :
             K->ne[0] == 64 || K->ne[0] == 128 || K->ne[0] == 256;
@@ -997,7 +1088,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-            if (dst->src[5] || ggml_cuda_fattn_tile_q8_0_KV_supported(dst)) {
+            if (!ggml_cuda_fattn_dense_mask(dst) &&
+                    (dst->src[5] || ggml_cuda_fattn_tile_q8_0_KV_supported(dst))) {
                 break;
             }
             need_f16_K = true;
@@ -1048,9 +1140,9 @@ bool ggml_cuda_flash_attn_ext_indices_supported(
 #if defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
     const ggml_tensor * Q = dst->src[0];
 
-    // Multi-query MMA tiles still need the per-query selection mask alongside their shared index list.
+    // Keep dense fallbacks on the original graph's allocated mask.
     return !dst->src[5] && ggml_cuda_get_best_fattn_kernel(device, dst) == BEST_FATTN_KERNEL_TILE &&
-        ggml_cuda_flash_attn_ext_tile_shall_use_sparse(dst, 1) &&
+        !ggml_cuda_fattn_dense_mask(dst, indices) && ggml_cuda_flash_attn_ext_tile_shall_use_sparse(dst, 1) &&
         mask->type == GGML_TYPE_F16 && ggml_are_same_shape(mask, dst->src[3]) && mask->nb[0] == sizeof(half) &&
         (indices->type == GGML_TYPE_I32 || indices->type == GGML_TYPE_I64) &&
         indices->nb[0] == ggml_type_size(indices->type) && indices->ne[0] == ggml_get_op_params_i32(dst, 4) &&

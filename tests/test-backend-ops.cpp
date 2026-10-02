@@ -7624,10 +7624,12 @@ struct test_topk_qsa_compact : public test_case {
     const int64_t n_blocks;
     const int64_t n_kv;
     const int64_t mask_pitch;
+    const bool compact_visibility;
 
     ggml_tensor * scores_input {};
     ggml_tensor * cells_input {};
     ggml_tensor * mask_storage {};
+    ggml_tensor * positions_input {};
     ggml_tensor * query_input {};
     ggml_tensor * key_input {};
     ggml_tensor * key_cells_input {};
@@ -7641,12 +7643,12 @@ struct test_topk_qsa_compact : public test_case {
 
     test_topk_qsa_compact(int64_t n_candidates = 2056, int width = 2051, int64_t n_query = 1,
                          bool full_graph = false, std::string profile = "unique", int tail_slots = 2,
-                         bool hide_cell = true, int64_t n_blocks = 2048) :
+                         bool hide_cell = true, int64_t n_blocks = 2048, bool compact_visibility = false) :
         n_candidates(n_candidates), width(width), n_query(n_query), full_graph(full_graph),
         profile(profile), tail_slots(tail_slots), hide_cell(hide_cell),
         n_blocks(full_graph ? n_blocks : 0),
         n_kv(full_graph ? ratio*n_blocks : (profile == "analytic" ? 16 : n_candidates + 31)),
-        mask_pitch(n_kv + 13) {
+        mask_pitch(n_kv + 13), compact_visibility(compact_visibility) {
         GGML_ASSERT(n_candidates % ratio == 0 && width > 0 && width < n_candidates && n_query > 0);
         GGML_ASSERT(profile == "unique" || profile == "ties" || profile == "analytic");
         GGML_ASSERT(tail_slots >= 0 && tail_slots < ratio);
@@ -7655,11 +7657,12 @@ struct test_topk_qsa_compact : public test_case {
                     n_candidates/ratio == (width + ratio - 1)/ratio + 1));
         GGML_ASSERT(profile != "analytic" || (!full_graph && n_candidates == 16 && width == 9 &&
                     tail_slots == 0 && !hide_cell));
+        GGML_ASSERT(!compact_visibility || profile != "analytic");
     }
 
     std::string op_desc(ggml_tensor *) override { return "TOPK_QSA_COMPACT"; }
     std::string vars() override {
-        return VARS_TO_STR9(n_candidates, width, n_query, full_graph, profile, tail_slots, hide_cell, n_blocks, n_kv);
+        return VARS_TO_STR10(n_candidates, width, n_query, full_graph, profile, tail_slots, hide_cell, n_blocks, n_kv, compact_visibility);
     }
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
@@ -7695,21 +7698,27 @@ struct test_topk_qsa_compact : public test_case {
             candidate_cells = cells_input;
         }
 
-        // Pad query rows so a launcher must use the actual mask query stride.
-        mask_storage = full_graph ?
-                ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 1, mask_pitch, n_query) :
-                ggml_new_tensor_2d(ctx, GGML_TYPE_F16, mask_pitch, n_query);
-        ggml_tensor * mask_cells = mask_storage;
-        if (!full_graph) {
-            ggml_tensor * kq_mask = ggml_view_4d(ctx, mask_storage, n_kv, n_query, 1, 1,
-                    mask_storage->nb[1], mask_storage->nb[1]*n_query, mask_storage->nb[1]*n_query, 0);
-            mask_cells = ggml_view_3d(ctx, kq_mask, 1, n_kv, n_query,
-                    kq_mask->nb[0], kq_mask->nb[1], 0);
+        ggml_tensor * candidate_mask;
+        if (compact_visibility) {
+            positions_input = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, n_kv + n_query);
+            candidate_mask = ggml_qsa_mask(ctx, positions_input, candidate_cells, n_kv);
+        } else {
+            // Pad query rows so a launcher must use the actual mask query stride.
+            mask_storage = full_graph ?
+                    ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 1, mask_pitch, n_query) :
+                    ggml_new_tensor_2d(ctx, GGML_TYPE_F16, mask_pitch, n_query);
+            ggml_tensor * mask_cells = mask_storage;
+            if (!full_graph) {
+                ggml_tensor * kq_mask = ggml_view_4d(ctx, mask_storage, n_kv, n_query, 1, 1,
+                        mask_storage->nb[1], mask_storage->nb[1]*n_query, mask_storage->nb[1]*n_query, 0);
+                mask_cells = ggml_view_3d(ctx, kq_mask, 1, n_kv, n_query,
+                        kq_mask->nb[0], kq_mask->nb[1], 0);
+            }
+            candidate_mask = ggml_get_rows(ctx, mask_cells, candidate_cells);
         }
         ggml_tensor * candidate_rows = ggml_reshape_3d(ctx, candidate_cells, 1, n_candidates, n_query);
 
         // Source-first traversal visits candidate_rows before this exact eight-node suffix.
-        ggml_tensor * candidate_mask = ggml_get_rows(ctx, mask_cells, candidate_cells);
         candidate_mask = ggml_reshape_3d(ctx, candidate_mask, ratio, n_top, n_query);
         candidate_scores = ggml_add(ctx, candidate_scores, candidate_mask);
         candidate_scores = ggml_reshape_2d(ctx, candidate_scores, n_candidates, n_query);
@@ -7842,20 +7851,47 @@ struct test_topk_qsa_compact : public test_case {
         }
 
         std::vector<ggml_fp16_t> mask(mask_pitch*n_query, ggml_fp32_to_fp16(-256.0f));
-        for (int64_t query = 0; query < n_query; ++query) {
-            for (int64_t cell = 0; cell < n_kv; ++cell) {
-                const float value = profile == "unique" ? -0.25f*((cell + 3*query) % 7) : 0.0f;
-                mask[query*mask_pitch + cell] = ggml_fp32_to_fp16(value);
+        if (compact_visibility) {
+            std::vector<int32_t> positions(4*(n_kv + n_query), 0);
+            positions[4*candidate_cells[0]] = -1;
+            positions[4*candidate_cells[1]] = 2;
+            positions[4*candidate_cells[4] + 0] = 1;
+            positions[4*candidate_cells[4] + 1] = 1;
+            positions[4*candidate_cells[4] + 2] = 1;
+
+            for (int64_t query = 0; query < n_query; ++query) {
+                int32_t * query_pos = positions.data() + 4*(n_kv + query);
+                query_pos[0] = 1;
+                query_pos[1] = query % 2;
+                query_pos[2] = query/2 % 2;
+                query_pos[3] = query % 4;
+
+                for (int64_t cell = 0; cell < n_kv; ++cell) {
+                    const int32_t * cell_pos = positions.data() + 4*cell;
+                    const bool causal_ok = !(query_pos[3] & 1) || cell_pos[0] <= query_pos[0];
+                    const bool spatial_ok = !(query_pos[3] & 2) || cell_pos[0] != query_pos[0] ||
+                        cell_pos[2] < query_pos[2] || (cell_pos[2] == query_pos[2] && cell_pos[1] <= query_pos[1]);
+                    const bool visible = cell_pos[0] >= 0 && causal_ok && spatial_ok;
+                    mask[query*mask_pitch + cell] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+                }
             }
-            if (profile == "analytic") {
-                mask[query*mask_pitch + (12 + 5*query) % 16] = ggml_fp32_to_fp16(-INFINITY);
-            } else if (hide_cell) {
-                const int64_t ordinal = full_graph ? ratio*(n_blocks - 1) + query % (ratio - tail_slots) :
-                        (n_candidates/2 + 13*query) % (n_candidates - tail_slots);
-                mask[query*mask_pitch + physical_cell(ordinal, query)] = ggml_fp32_to_fp16(-INFINITY);
+            ggml_backend_tensor_set(positions_input, positions.data(), 0, positions.size()*sizeof(int32_t));
+        } else {
+            for (int64_t query = 0; query < n_query; ++query) {
+                for (int64_t cell = 0; cell < n_kv; ++cell) {
+                    const float value = profile == "unique" ? -0.25f*((cell + 3*query) % 7) : 0.0f;
+                    mask[query*mask_pitch + cell] = ggml_fp32_to_fp16(value);
+                }
+                if (profile == "analytic") {
+                    mask[query*mask_pitch + (12 + 5*query) % 16] = ggml_fp32_to_fp16(-INFINITY);
+                } else if (hide_cell) {
+                    const int64_t ordinal = full_graph ? ratio*(n_blocks - 1) + query % (ratio - tail_slots) :
+                            (n_candidates/2 + 13*query) % (n_candidates - tail_slots);
+                    mask[query*mask_pitch + physical_cell(ordinal, query)] = ggml_fp32_to_fp16(-INFINITY);
+                }
             }
+            ggml_backend_tensor_set(mask_storage, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
         }
-        ggml_backend_tensor_set(mask_storage, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
 
         allowed.assign(n_query, {});
         required.assign(n_query, {});
@@ -12050,11 +12086,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n_query : {1, 4, 32}) {
         test_cases.emplace_back(new test_topk_qsa_compact(2056, 2051, n_query));
         test_cases.emplace_back(new test_topk_qsa_compact(2056, 2051, n_query, true));
+        test_cases.emplace_back(new test_topk_qsa_compact(2056, 2051, n_query, false, "unique", 2, true, 2048, true));
+        test_cases.emplace_back(new test_topk_qsa_compact(2056, 2051, n_query, true, "unique", 2, true, 2048, true));
     }
 
     // Tied cutoffs require valid membership, not the CPU's particular tied winner.
     test_cases.emplace_back(new test_topk_qsa_compact(2056, 2051, 4, false, "ties"));
     test_cases.emplace_back(new test_topk_qsa_compact(2056, 2051, 4, true, "ties"));
+    test_cases.emplace_back(new test_topk_qsa_compact(2056, 2051, 4, false, "ties", 2, true, 2048, true));
 
     // Remaining prune counts and the shared-memory candidate boundary.
     test_cases.emplace_back(new test_topk_qsa_compact(2056, 2052, 4)); // remove 4
@@ -12065,6 +12104,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa_compact(4100, 4095, 4));
     test_cases.emplace_back(new test_topk_qsa_compact(2056, 2053, 4, false, "unique", 0)); // remove 3
     test_cases.emplace_back(new test_topk_qsa_compact(2056, 2048, 4)); // remove 8
+    test_cases.emplace_back(new test_topk_qsa_compact(2056, 2048, 4, false, "unique", 2, true, 2048, true));
 
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {
@@ -12393,6 +12433,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_qsa(256,  8192, 3, 1025, 8, 1, false, 20.0f));
     test_cases.emplace_back(new test_flash_attn_qsa(128, 16384, 1, 4096));
     test_cases.emplace_back(new test_flash_attn_qsa(128,   512, 3,  129));
+    test_cases.emplace_back(new test_flash_attn_qsa(64, 2048, 9, 513, 1, 1, false, 0, 0, 0, GGML_TYPE_I64));
 
     // Direct indices without grouped heads, with odd GQA, ALiBi, and an unpadded KV length.
     test_cases.emplace_back(new test_flash_attn_qsa( 64,  4096, 3,   33, 1, 2));

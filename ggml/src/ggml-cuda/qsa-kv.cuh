@@ -31,6 +31,8 @@ size_t ggml_backend_cuda_qsa_kv_tensor_device_size(ggml_backend_buffer_type_t bu
 
 void * ggml_cuda_qsa_kv_device_ptr(const ggml_tensor * tensor);
 bool ggml_cuda_qsa_kv_is_paged(const ggml_tensor * tensor);
+// Counts all physical pages in the view, including partial pages at either end.
+bool ggml_cuda_qsa_kv_fits(const ggml_tensor * tensor);
 
 void ggml_cuda_qsa_kv_prepare(
         ggml_backend_cuda_context & ctx, const ggml_tensor * K, const ggml_tensor * V,

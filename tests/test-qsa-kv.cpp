@@ -331,12 +331,12 @@ static void test_bounded_staging(ggml_backend_dev_t dev, ggml_backend_buffer_typ
 
 static void test_compact_visibility(
         ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft, int n_queries, int n_selected = 128,
-        bool explicit_selection = true) {
+        bool explicit_selection = true, bool dense_reference = false, int row_count = 0, bool causal_only = false) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     GGML_ASSERT(backend);
 
     {
-        const int n_rows = n_selected > rows ? 8192 : rows;
+        const int n_rows = row_count ? row_count : n_selected > rows ? 8192 : rows;
         cache kv(buft, n_rows);
         kv.restore(0);
 
@@ -359,7 +359,7 @@ static void test_compact_visibility(
 
         ggml_tensor * expected = ggml_flash_attn_ext(ctx, q, k, v, dense_mask, 1.0f/16, 0, 0);
         // Each pair of input indices names one physical cell.
-        ggml_flash_attn_ext_set_n_kv_max(expected, explicit_selection ? n_selected/2 : 0);
+        ggml_flash_attn_ext_set_n_kv_max(expected, explicit_selection && !dense_reference ? n_selected/2 : 0);
         ggml_build_forward_expand(graph, expected);
 
         ggml_tensor * actual = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f/16, 0, 0);
@@ -379,7 +379,7 @@ static void test_compact_visibility(
 
         std::vector<int32_t> metadata(4*(n_rows + n_queries), 0);
         for (int i = 0; i < n_rows; ++i) {
-            metadata[4*i + 0] = i % 7 == 0 ? -1 : i/4;
+            metadata[4*i + 0] = i % 7 == 0 ? -1 : ((i*17) % n_rows)/4;
             metadata[4*i + 1] = i % 2;
             metadata[4*i + 2] = i/2 % 2;
         }
@@ -393,7 +393,7 @@ static void test_compact_visibility(
             query_pos[0] = query == n_queries - 1 ? -1 : 96 + query*3;
             query_pos[1] = query % 2;
             query_pos[2] = query/2 % 2;
-            query_pos[3] = query == n_queries - 1 ? 3 : query % 4;
+            query_pos[3] = query == n_queries - 1 ? 3 : causal_only ? 1 : query % 4;
 
             const auto visible = [&](int cell) {
                 if (cell < 0 || cell >= n_rows) {
@@ -508,6 +508,12 @@ int main() {
             test_compact_visibility(dev, fn(dev, 64), 33);
             test_compact_visibility(dev, fn(dev, 64), 5, 4097);
             test_compact_visibility(dev, fn(dev, 64), 33, 128, false);
+            test_compact_visibility(dev, ggml_backend_dev_buffer_type(dev), 1024, 128, false, true, 2048);
+            test_compact_visibility(dev, ggml_backend_dev_buffer_type(dev), 33, 2051, true, true);
+            test_compact_visibility(dev, fn(dev, 64), 33, 2051, true, true);
+            test_compact_visibility(dev, ggml_backend_dev_buffer_type(dev), 4097, 2051, true, true);
+            test_compact_visibility(dev, fn(dev, 64), 1025, 128, false, true, 32768, true);
+            test_compact_visibility(dev, fn(dev, 64), 33, 2051, true, false, 32768);
             ++tested;
         }
     }

@@ -72,9 +72,17 @@ static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
 
 // Compact QSA keeps almost every candidate: prune the small complement, then
 // emit physical cells in candidate order rather than sorting the survivors.
+template <bool compact>
 static __global__ __launch_bounds__(256, 1) void qsa_refine_cuda(
-        const float * scores, const int32_t * cells, const half * mask, int32_t * dst,
-        const int n_candidates, const int width, const size_t mask_query_stride) {
+        const float * scores,
+        const int32_t * cells,
+        const half * mask,
+        const int32_t * positions,
+        int32_t * dst,
+        const int n_candidates,
+        const int width,
+        const size_t mask_query_stride,
+        const int n_kv) {
     using reduce_t = qsa_cub::BlockReduce<uint64_t, 256>;
     using scan_t   = qsa_cub::BlockScan<int, 256>;
     __shared__ uint64_t keys[4096];
@@ -84,10 +92,18 @@ static __global__ __launch_bounds__(256, 1) void qsa_refine_cuda(
     const int tid = threadIdx.x;
     scores += int64_t(blockIdx.x)*n_candidates;
     cells  += int64_t(blockIdx.x)*n_candidates;
-    mask = (const half *) ((const char *) mask + size_t(blockIdx.x)*mask_query_stride);
+    if constexpr (!compact) {
+        mask = (const half *) ((const char *) mask + size_t(blockIdx.x) * mask_query_stride);
+    }
     dst += int64_t(blockIdx.x)*width;
     for (int i = tid; i < n_candidates; i += 256) {
-        const float value = scores[i] + __half2float(mask[cells[i]]);
+        float value = scores[i];
+        if constexpr (compact) {
+            const bool visible = ggml_qsa_is_visible(positions, n_kv, cells[i], blockIdx.x);
+            value += visible ? 0.0f : -INFINITY;
+        } else {
+            value += __half2float(mask[cells[i]]);
+        }
         keys[i] = (uint64_t(top_k_float_to_ordered(value)) << 32) | uint32_t(i);
     }
     __syncthreads();
@@ -118,12 +134,35 @@ static __global__ __launch_bounds__(256, 1) void qsa_refine_cuda(
     }
 }
 
-void ggml_cuda_qsa_refine(ggml_backend_cuda_context & ctx, const ggml_tensor * scores,
-                          const ggml_tensor * cells, const ggml_tensor * mask, ggml_tensor * dst) {
-    qsa_refine_cuda<<<cells->ne[1], 256, 0, ctx.stream()>>>(
-        (const float *) scores->data, (const int32_t *) cells->data,
-        (const half *) mask->data, (int32_t *) dst->data,
-        int(cells->ne[0]), int(dst->ne[0]), mask->nb[2]);
+void ggml_cuda_qsa_refine(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * scores,
+        const ggml_tensor * cells,
+        const ggml_tensor * mask,
+        ggml_tensor * dst) {
+    const bool compact = mask->type == GGML_TYPE_I32;
+    const half * mask_data = nullptr;
+    const int32_t * positions = nullptr;
+    size_t query_stride_mask = 0;
+    int n_kv = 0;
+
+    if (compact) {
+        positions = (const int32_t *) mask->data;
+        n_kv = mask->ne[1] - cells->ne[1];
+    } else {
+        mask_data = (const half *) mask->data;
+        query_stride_mask = mask->nb[2];
+    }
+
+    const auto kernel = compact ? qsa_refine_cuda<true> : qsa_refine_cuda<false>;
+    const dim3 blocks_num(cells->ne[1], 1, 1);
+    const dim3 block_dim(256, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, ctx.stream());
+
+    ggml_cuda_kernel_launch(kernel, launch_params,
+            (const float *) scores->data, (const int32_t *) cells->data,
+            mask_data, positions, (int32_t *) dst->data,
+            (int) cells->ne[0], (int) dst->ne[0], query_stride_mask, n_kv);
     CUDA_CHECK(cudaGetLastError());
 }
 

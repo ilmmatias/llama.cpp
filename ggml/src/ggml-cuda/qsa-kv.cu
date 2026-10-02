@@ -456,6 +456,25 @@ bool ggml_cuda_qsa_kv_is_paged(const ggml_tensor * tensor) {
     return tensor && tensor->buffer && ggml_backend_buft_is_cuda_qsa_kv(ggml_backend_buffer_get_type(tensor->buffer));
 }
 
+bool ggml_cuda_qsa_kv_fits(const ggml_tensor * tensor) {
+    const ggml_tensor * storage = tensor;
+    size_t offset = 0;
+    while (storage->view_src) {
+        offset += storage->view_offs;
+        storage = storage->view_src;
+    }
+
+    const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(storage->buffer);
+    const auto & type = *static_cast<type_context *>(buft->context);
+    const size_t page_bytes = 4 * storage->nb[1];
+    const size_t n_pages = (storage->ne[1] + 3) / 4;
+    const size_t n_slots = std::min<size_t>(n_pages, type.resident_tokens / 4);
+    const size_t first_page = offset / page_bytes;
+    const size_t last_page = (offset + ggml_nbytes(tensor) - 1) / page_bytes;
+
+    return last_page - first_page + 1 <= n_slots;
+}
+
 ggml_backend_buffer_type_t ggml_backend_cuda_qsa_kv_buffer_type(ggml_backend_dev_t dev, uint32_t resident_tokens) {
     GGML_ASSERT(resident_tokens >= 4);
 

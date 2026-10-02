@@ -3929,9 +3929,14 @@ static bool ggml_cuda_match_qsa_refine(
     GGML_UNUSED(match);
     return false;
 #else
+    const ggml_op mask_op = graph->nodes[i]->op;
+    if (mask_op != GGML_OP_GET_ROWS && mask_op != GGML_OP_QSA_MASK) {
+        return false;
+    }
+
     // ggml_set_output propagates a reshape's output flag to its storage source.
     if (!ggml_can_fuse_subgraph(graph, i,
-                { GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_RESHAPE,
+                { mask_op, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_RESHAPE,
                   GGML_OP_TOP_K, GGML_OP_CONT, GGML_OP_GET_ROWS, GGML_OP_RESHAPE }, { i + 6, i + 7 }) ||
             !ggml_check_edges(graph, i,
                 {{1, 0, 0}, {2, 1, 1}, {3, 0, 2}, {4, 0, 3}, {5, 0, 4}, {6, 1, 5}, {7, 0, 6}}) ||
@@ -3959,18 +3964,32 @@ static bool ggml_cuda_match_qsa_refine(
     const int64_t queries = cells->ne[1];
     const int64_t width = top->ne[0];
     if (n <= 0 || n > 4096 || width <= 0 || width >= n || n - width > 7 || queries <= 0 ||
-            scores->type != GGML_TYPE_F32 || mask->type != GGML_TYPE_F16 ||
+            scores->type != GGML_TYPE_F32 || cells->type != GGML_TYPE_I32 ||
             !ggml_is_contiguous(cells) || !ggml_is_contiguous(scores) || !ggml_is_contiguous(dst) ||
             !ggml_is_matrix(cells) || ggml_nelements(scores) != ggml_nelements(cells) ||
             scores->ne[2] != queries || scores->ne[3] != 1 ||
             !ggml_are_same_shape(scores, gathered) ||
-            mask->ne[0] != 1 || mask->ne[2] != queries || mask->ne[3] != 1 ||
-            mask->nb[0] != sizeof(ggml_fp16_t) || mask->nb[1] != sizeof(ggml_fp16_t) ||
-            !ggml_are_same_shape(gather, rows) ||
             !ggml_is_matrix(flat) || flat->ne[0] != n || flat->ne[1] != queries ||
             !ggml_is_matrix(dst) || dst->ne[0] != width || dst->ne[1] != queries) {
         return false;
     }
+
+    if (mask_op == GGML_OP_QSA_MASK) {
+        const int32_t n_kv = ggml_get_op_params_i32(gather, 0);
+        if (mask->type != GGML_TYPE_I32 || !ggml_is_contiguous(mask) ||
+                !ggml_is_matrix(mask) || mask->ne[0] != 4 || mask->ne[1] != n_kv + queries ||
+                !ggml_is_matrix(gather) || gather->ne[0] != n || gather->ne[1] != queries) {
+            return false;
+        }
+    } else {
+        if (mask->type != GGML_TYPE_F16 ||
+                mask->ne[0] != 1 || mask->ne[2] != queries || mask->ne[3] != 1 ||
+                mask->nb[0] != sizeof(ggml_fp16_t) || mask->nb[1] != sizeof(ggml_fp16_t) ||
+                !ggml_are_same_shape(gather, rows)) {
+            return false;
+        }
+    }
+
     match = { scores, cells, mask, dst };
     return true;
 #endif
@@ -4057,7 +4076,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
 #if defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
-    if (node->op == GGML_OP_GET_ROWS) {
+    if (node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_QSA_MASK) {
         ggml_cuda_qsa_refine_match match;
         const int output = i + 7;
         if (ggml_cuda_match_qsa_refine(cgraph, i, match) &&
