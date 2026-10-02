@@ -2968,7 +2968,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         { "--fit-prefer" }, "{layers,cache}",
-        "when --fit distributes the free device memory with an expert cache: 'layers' offloads as many layers as possible first, 'cache' fills useful expert-cache slots first (default: layers)",
+        "when --fit distributes the free device memory with an expert cache: 'layers' offloads as many layers as possible first, 'cache' fills expert-cache slots first, up to the total expert count while respecting --fit-target (default: layers)",
         [](common_params & params, const std::string & value) {
             if (value == "layers") {
                 params.fit_prefer_cache = false;

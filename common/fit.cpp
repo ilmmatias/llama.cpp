@@ -980,19 +980,14 @@ enum common_params_fit_status common_fit_params(
     return status;
 }
 
-uint32_t common_fit_expert_cache_slots_from_surplus(int64_t surplus_bytes, size_t slot_bytes, uint32_t n_expert, uint32_t n_expert_used_max) {
-    // beyond a handful of slots per layer, the hit rate of the routed-expert cache has diminishing returns:
-    // sizing the cache to cover a multiple of the max. experts used per token is more useful than more VRAM held idle
-    constexpr uint32_t EXPERT_CACHE_FIT_USEFUL_MULTIPLE = 4;
-
+uint32_t common_fit_expert_cache_slots_from_surplus(int64_t surplus_bytes, size_t slot_bytes, uint32_t n_expert) {
     if (slot_bytes == 0 || n_expert == 0 || surplus_bytes < (int64_t)slot_bytes) {
         return 0;
     }
 
-    const uint32_t useful_cap = std::min(n_expert, EXPERT_CACHE_FIT_USEFUL_MULTIPLE * std::max((uint32_t)1, n_expert_used_max));
     const uint64_t slots = (uint64_t)surplus_bytes / slot_bytes;
 
-    return (uint32_t)std::min<uint64_t>(slots, useful_cap);
+    return (uint32_t)std::min<uint64_t>(slots, n_expert);
 }
 
 void common_memory_breakdown_print(const struct llama_context * ctx) {

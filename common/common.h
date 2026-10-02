@@ -484,7 +484,7 @@ struct common_params {
     bool    expert_cache_moe_placement_explicit = false;
 
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
-    bool    fit_prefer_cache   = false; // with expert-cache fit, fill useful cache slots before offloading more layers
+    bool    fit_prefer_cache   = false; // with expert-cache fit, fill cache slots before offloading more layers
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
 

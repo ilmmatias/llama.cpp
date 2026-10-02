@@ -89,7 +89,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-fit, --fit [on\|off]` | whether to adjust unset arguments to fit in device memory ('on' or 'off', default: 'on')<br/>(env: LLAMA_ARG_FIT) |
 | `-fitt, --fit-target MiB0,MiB1,MiB2,...` | target margin per device for --fit, comma-separated list of values, single value is broadcast across all devices, default: 1024<br/>(env: LLAMA_ARG_FIT_TARGET) |
 | `-fitc, --fit-ctx N` | minimum ctx size that can be set by --fit option, default: 4096<br/>(env: LLAMA_ARG_FIT_CTX) |
-| `--fit-prefer {layers,cache}` | how --fit distributes free device memory when the expert cache is sized with -ecs auto: 'layers' offloads as many layers as possible first, 'cache' fills useful expert-cache slots first (default: layers)<br/>(env: LLAMA_ARG_FIT_PREFER) |
+| `--fit-prefer {layers,cache}` | how --fit distributes free device memory when the expert cache is sized with -ecs auto: 'layers' offloads as many layers as possible first, 'cache' fills expert-cache slots first, up to the total expert count while respecting --fit-target (default: layers)<br/>(env: LLAMA_ARG_FIT_PREFER) |
 | `--check-tensors` | check model tensor data for invalid values (default: false) |
 | `--override-kv KEY=TYPE:VALUE,...` | advanced option to override model metadata by key. to specify multiple overrides, either use comma-separated values.<br/>types: int, float, bool, str. example: --override-kv tokenizer.ggml.add_bos_token=bool:false,tokenizer.ggml.add_eos_token=bool:false |
 | `--op-offload, --no-op-offload` | whether to offload host tensor operations to device (default: true) |

@@ -1227,8 +1227,7 @@ static size_t common_expert_cache_fit_reserve(
         uint32_t slots,
         ggml_backend_dev_t cache_dev,
         size_t & cache_device_index,
-        uint32_t & n_expert_out,
-        uint32_t & n_expert_used_max_out) {
+        uint32_t & n_expert_out) {
     if (slots == 0 || cache_dev == nullptr || mparams_cpu_moe.tensor_buft_overrides == nullptr) {
         return 0;
     }
@@ -1275,7 +1274,6 @@ static size_t common_expert_cache_fit_reserve(
     }
 
     n_expert_out = nex_full;
-    n_expert_used_max_out = nxu_full;
 
     const size_t n_expert = (size_t) nex_full;
     return (expert_bytes / n_expert) * slots + ((expert_bytes % n_expert) * slots + n_expert - 1) / n_expert;
@@ -1411,10 +1409,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         if (cache_fixed) {
             uint32_t n_expert_unused = 0;
-            uint32_t n_expert_used_max_unused = 0;
             const size_t reserve = common_expert_cache_fit_reserve(
                 params.model.path.c_str(), mparams, cparams, (uint32_t) params.expert_cache_slots, cache_dev, cache_device_index,
-                n_expert_unused, n_expert_used_max_unused);
+                n_expert_unused);
             if (cache_device_index >= fit_targets.size()) {
                 throw std::runtime_error("expert cache device index exceeds fit target array");
             }
@@ -1436,18 +1433,16 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 fit_log_level,
                 cache_fixed);
         } else {
-            // auto cache sizing: size the cache from the memory the fit leaves on the cache device,
-            // capped at the slot count that is still useful for the model's routing
+            // Size the cache from available memory, up to the model's full expert count.
             uint32_t n_expert = 0;
-            uint32_t n_expert_used_max = 0;
             const size_t slot_bytes = common_expert_cache_fit_reserve(
-                params.model.path.c_str(), mparams, cparams, 1, cache_dev, cache_device_index, n_expert, n_expert_used_max);
+                params.model.path.c_str(), mparams, cparams, 1, cache_dev, cache_device_index, n_expert);
             if (cache_device_index >= fit_targets.size()) {
                 throw std::runtime_error("expert cache device index exceeds fit target array");
             }
 
             // one cache slot across all MoE layers: expert_bytes / n_expert
-            const uint32_t slot_cap = common_fit_expert_cache_slots_from_surplus(INT64_MAX, slot_bytes, n_expert, n_expert_used_max);
+            const uint32_t slot_cap = common_fit_expert_cache_slots_from_surplus(INT64_MAX, slot_bytes, n_expert);
             uint32_t slots = 0;
 
             const auto fit_with_cache_reserve = [&](uint32_t cache_slots, llama_model_params & mparams_o, llama_context_params & cparams_o, std::vector<int64_t> * surplus_out) {
@@ -1499,7 +1494,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 std::vector<int64_t> surplus(fit_targets.size(), 0);
                 fit_with_cache_reserve(0, mparams_f, cparams_f, &surplus);
 
-                slots = common_fit_expert_cache_slots_from_surplus(surplus[cache_device_index], slot_bytes, n_expert, n_expert_used_max);
+                slots = common_fit_expert_cache_slots_from_surplus(surplus[cache_device_index], slot_bytes, n_expert);
                 if (slots == 0) {
                     COM_WRN("expert cache auto-fit: %.1f MiB left on %s after layer offloading is not enough for a slot, disabling the cache\n",
                         (double) std::max<int64_t>(surplus[cache_device_index], 0) / (1024.0 * 1024.0), ggml_backend_dev_name(cache_dev));
@@ -1508,7 +1503,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                     fit_with_cache_reserve(slots, mparams_f, cparams_f, nullptr);
                 }
             } else {
-                // maximize useful cache slots first: binary-search the largest slot count that keeps the fit feasible
+                // Maximize cache slots first: binary-search the largest count that keeps the fit feasible.
                 uint32_t lo = 0;
                 uint32_t hi = slot_cap + 1;
 
