@@ -64,6 +64,14 @@ struct expert_cache_template {
     bool input_q8 = false;
 };
 
+static constexpr int EXPERT_CACHE_BATCH_SIZES = 4;
+
+struct expert_cache_batch {
+    expert_cache_template * t;
+    size_t route_offset;
+    size_t input_offset;
+};
+
 struct expert_cache_layer {
     const ggml_tensor * gate    = nullptr;
     const ggml_tensor * up      = nullptr;
@@ -122,7 +130,7 @@ struct expert_cache_layer {
     std::vector<int32_t> active_slots;
     std::vector<int32_t> active_route_positions;
     std::vector<int32_t> active_route_slots;
-    std::vector<size_t> active_token_offsets;
+    std::vector<expert_cache_batch> active_batches;
     int active_hits = 0;
     bool active_gpu_launched = false;
 };
@@ -344,8 +352,8 @@ public:
                 s->buffer = nullptr;
             }
         }
-        if (input_q8_buffer != nullptr) {
-            ggml_backend_buffer_free(input_q8_buffer);
+        if (input_buffer != nullptr) {
+            ggml_backend_buffer_free(input_buffer);
         }
         if (output_buffer != nullptr) {
             ggml_backend_buffer_free(output_buffer);
@@ -483,7 +491,7 @@ public:
 private:
 
     static bool is_supported_ids(const ggml_tensor * ids) {
-        // Bulk prefill benefits from CPU expert-grouped GEMM, not per-token GPU graphs.
+        // Bound the cache graph and host staging sizes for verification batches.
         return ids != nullptr && ids->type == GGML_TYPE_I32 &&
             ids->ne[0] > 0 && ids->ne[0] <= 64 && ids->ne[1] > 0 && ids->ne[1] <= 128 &&
             ids->ne[2] == 1 && ids->ne[3] == 1;
@@ -753,18 +761,24 @@ private:
         layer.glu_op = ggml_get_glu_op(act);
         memcpy(layer.glu_params.data(), act->op_params, GGML_MAX_OP_PARAMS);
         memcpy(layer.down_params.data(), down_op->op_params, GGML_MAX_OP_PARAMS);
-        layer.templates.resize((size_t) layer.n_expert_used + 1);
-        layer.template_failed.assign((size_t) layer.n_expert_used + 1, 0);
+        layer.templates.resize(((size_t) layer.n_expert_used + 1) * EXPERT_CACHE_BATCH_SIZES);
+        layer.template_failed.assign(layer.templates.size(), 0);
         layer.compatible = true;
     }
 
-    expert_cache_template * get_template_locked(expert_cache_layer & layer, int hit_count) {
+    expert_cache_template * get_template_locked(expert_cache_layer & layer, int hit_count, int batch_size) {
+        int batch_idx = 0;
+        while ((1 << batch_idx) < batch_size) {
+            ++batch_idx;
+        }
+        GGML_ASSERT(batch_idx < EXPERT_CACHE_BATCH_SIZES && batch_size == (1 << batch_idx));
+        const size_t key = (size_t) hit_count * EXPERT_CACHE_BATCH_SIZES + batch_idx;
         if (hit_count <= 0 || hit_count > layer.n_expert_used ||
-            (size_t) hit_count >= layer.templates.size() || layer.template_failed[(size_t) hit_count]) {
+            key >= layer.templates.size() || layer.template_failed[key]) {
             return nullptr;
         }
-        if (layer.templates[(size_t) hit_count]) {
-            return layer.templates[(size_t) hit_count].get();
+        if (layer.templates[key]) {
+            return layer.templates[key].get();
         }
 
         auto t = std::make_unique<expert_cache_template>();
@@ -776,18 +790,15 @@ private:
         };
         t->ctx = ggml_init(params);
         if (t->ctx == nullptr) {
-            layer.template_failed[(size_t) hit_count] = 1;
+            layer.template_failed[key] = 1;
             return nullptr;
         }
 
-        // Quantize that one activation on CPU and upload native Q8_1 so the
-        // GPU can enter MMVQ directly instead of launching its own F32 -> Q8_1
-        // conversion kernel. This is independent of the number of routed cache
-        // hits: MUL_MAT_ID's MMVQ batch limit applies to tokens (ne[2]), not
-        // expert routes.
-        t->input_q8 = layer.input_dim % ggml_blck_size(GGML_TYPE_Q8_1) == 0;
-        t->input = ggml_new_tensor_3d(t->ctx, t->input_q8 ? GGML_TYPE_Q8_1 : GGML_TYPE_F32, layer.input_dim, 1, 1);
-        t->ids = ggml_new_tensor_2d(t->ctx, GGML_TYPE_I32, hit_count, 1);
+        // Native Q8_1 skips the decode conversion. Batched inputs use F32 so
+        // backends can choose MMQ when the batch exceeds their MMVQ limit.
+        t->input_q8 = batch_size == 1 && layer.input_dim % ggml_blck_size(GGML_TYPE_Q8_1) == 0;
+        t->input = ggml_new_tensor_3d(t->ctx, t->input_q8 ? GGML_TYPE_Q8_1 : GGML_TYPE_F32, layer.input_dim, 1, batch_size);
+        t->ids = ggml_new_tensor_2d(t->ctx, GGML_TYPE_I32, hit_count, batch_size);
 
         ggml_tensor * act = nullptr;
 
@@ -829,7 +840,7 @@ private:
         t->buffer = ggml_backend_alloc_ctx_tensors_from_buft(t->ctx, device_buft);
         if (t->buffer == nullptr) {
             free_template(*t);
-            layer.template_failed[(size_t) hit_count] = 1;
+            layer.template_failed[key] = 1;
             return nullptr;
         }
         ggml_backend_buffer_set_usage(t->buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
@@ -837,39 +848,39 @@ private:
         for (int i = 0; i < ggml_graph_n_nodes(t->graph); ++i) {
             if (!ggml_backend_supports_op(compute_backend, ggml_graph_node(t->graph, i))) {
                 free_template(*t);
-                layer.template_failed[(size_t) hit_count] = 1;
+                layer.template_failed[key] = 1;
                 return nullptr;
             }
         }
 
         auto * ret = t.get();
-        layer.templates[(size_t) hit_count] = std::move(t);
+        layer.templates[key] = std::move(t);
         return ret;
     }
 
-    bool ensure_q8_input(size_t size) {
-        if (input_q8_size >= size) {
+    bool ensure_input(size_t size) {
+        if (input_size >= size) {
             return true;
         }
-        if (input_q8_buffer != nullptr) {
-            ggml_backend_buffer_free(input_q8_buffer);
-            input_q8_buffer = nullptr;
-            input_q8_ptr = nullptr;
+        if (input_buffer != nullptr) {
+            ggml_backend_buffer_free(input_buffer);
+            input_buffer = nullptr;
+            input_ptr = nullptr;
         }
-        input_q8_fallback.clear();
+        input_fallback.clear();
 
         if (host_buft != nullptr) {
-            input_q8_buffer = ggml_backend_buft_alloc_buffer(host_buft, size);
-            if (input_q8_buffer != nullptr) {
-                input_q8_ptr = ggml_backend_buffer_get_base(input_q8_buffer);
-                input_q8_size = size;
+            input_buffer = ggml_backend_buft_alloc_buffer(host_buft, size);
+            if (input_buffer != nullptr) {
+                input_ptr = ggml_backend_buffer_get_base(input_buffer);
+                input_size = size;
                 return true;
             }
         }
-        input_q8_fallback.resize(size);
-        input_q8_ptr = input_q8_fallback.data();
-        input_q8_size = size;
-        return input_q8_ptr != nullptr;
+        input_fallback.resize(size);
+        input_ptr = input_fallback.data();
+        input_size = size;
+        return input_ptr != nullptr;
     }
 
     bool ensure_output(size_t size) {
@@ -904,12 +915,11 @@ private:
         layer.active_slots.clear();
         layer.active_route_positions.clear();
         layer.active_route_slots.assign((size_t) ids->ne[0] * ids->ne[1], -1);
-        layer.active_token_offsets.resize((size_t) ids->ne[1] + 1);
+        layer.active_batches.clear();
         layer.active_hits = 0;
         layer.active_gpu_launched = false;
 
         for (int64_t token = 0; token < ids->ne[1]; ++token) {
-            layer.active_token_offsets[(size_t) token] = layer.active_slots.size();
             for (int64_t i = 0; i < ids->ne[0]; ++i) {
                 const size_t route = (size_t) token * ids->ne[0] + i;
                 const int32_t expert = *(const int32_t *) ((const char *) ids->data + token * ids->nb[1] + i * ids->nb[0]);
@@ -927,7 +937,6 @@ private:
                 }
             }
         }
-        layer.active_token_offsets.back() = layer.active_slots.size();
         layer.active_hits = (int) layer.active_slots.size();
 
         if (!allow_gpu || layer.active_hits == 0 || op == nullptr || op->src[1] == nullptr ||
@@ -937,46 +946,85 @@ private:
         }
 
         const size_t output_row_bytes = (size_t) layer.output_dim * sizeof(float);
-        const bool input_q8 = layer.input_dim % ggml_blck_size(GGML_TYPE_Q8_1) == 0;
-        const size_t input_row_bytes = ggml_row_size(input_q8 ? GGML_TYPE_Q8_1 : GGML_TYPE_F32, layer.input_dim);
+        const size_t input_row_bytes = (size_t) layer.input_dim * sizeof(float);
         if (!ensure_output(output_row_bytes * layer.active_hits) ||
-            (input_q8 && !ensure_q8_input(input_row_bytes * ids->ne[1]))) {
+            !ensure_input(GGML_PAD(input_row_bytes, 64) * ids->ne[1])) {
             return;
         }
 
-        // Build all required templates before enqueuing work on their buffers.
+        // Group tokens with equal hit counts; keep all upload storage live until end().
+        std::vector<std::vector<int64_t>> token_groups((size_t) layer.n_expert_used + 1);
         for (int64_t token = 0; token < ids->ne[1]; ++token) {
-            const int hits = (int) (layer.active_token_offsets[(size_t) token + 1] - layer.active_token_offsets[(size_t) token]);
-            if (hits != 0 && get_template_locked(layer, hits) == nullptr) {
-                return;
+            int hits = 0;
+            for (int id = 0; id < ids->ne[0]; ++id) {
+                hits += (layer.active_ready_masks[(size_t) token] >> id) & 1;
+            }
+            if (hits != 0) {
+                token_groups[(size_t) hits].push_back(token);
             }
         }
 
-        for (int64_t token = 0; token < ids->ne[1]; ++token) {
-            const size_t offset = layer.active_token_offsets[(size_t) token];
-            const int hits = (int) (layer.active_token_offsets[(size_t) token + 1] - offset);
-            if (hits == 0) {
-                continue;
-            }
-            auto * t = layer.templates[(size_t) hits].get();
-            const void * input_data = (const uint8_t *) op->src[1]->data + token * op->src[1]->nb[2];
-            if (t->input_q8) {
-                void * quantized = (uint8_t *) input_q8_ptr + token * input_row_bytes;
-                quantize_row_q8_1((const float *) input_data, quantized, layer.input_dim);
-                input_data = quantized;
-            }
+        layer.active_slots.clear();
+        layer.active_route_positions.clear();
+        size_t input_offset = 0;
+        for (int hits = 1; hits <= layer.n_expert_used; ++hits) {
+            const auto & tokens = token_groups[(size_t) hits];
+            for (size_t first = 0; first < tokens.size();) {
+                int batch_size = 1;
+                while (batch_size < (1 << (EXPERT_CACHE_BATCH_SIZES - 1)) &&
+                        first + 2 * batch_size <= tokens.size()) {
+                    batch_size *= 2;
+                }
 
-            // The stream orders reuse of a template; host inputs remain live until end().
-            ggml_backend_tensor_set_async(compute_backend, t->input, input_data, 0, ggml_nbytes(t->input));
-            ggml_backend_tensor_set_async(compute_backend, t->ids, layer.active_slots.data() + offset, 0,
-                    (size_t) hits * sizeof(int32_t));
+                auto * t = get_template_locked(layer, hits, batch_size);
+                while (t == nullptr && batch_size > 1) {
+                    batch_size /= 2;
+                    t = get_template_locked(layer, hits, batch_size);
+                }
+                if (t == nullptr) {
+                    return;
+                }
+
+                const size_t route_offset = layer.active_slots.size();
+                for (int i = 0; i < batch_size; ++i) {
+                    const int64_t token = tokens[first + i];
+                    const auto * input_data = (const uint8_t *) op->src[1]->data + token * op->src[1]->nb[2];
+                    auto * packed = (uint8_t *) input_ptr + input_offset + i * t->input->nb[2];
+                    if (t->input_q8) {
+                        quantize_row_q8_1((const float *) input_data, packed, layer.input_dim);
+                    } else {
+                        memcpy(packed, input_data, input_row_bytes);
+                    }
+
+                    for (int id = 0; id < ids->ne[0]; ++id) {
+                        if (layer.active_ready_masks[(size_t) token] & (UINT64_C(1) << id)) {
+                            const size_t route = (size_t) token * ids->ne[0] + id;
+                            layer.active_slots.push_back(layer.active_route_slots[route]);
+                            layer.active_route_positions.push_back((int32_t) route);
+                        }
+                    }
+                }
+
+                layer.active_batches.push_back({ t, route_offset, input_offset });
+                input_offset += GGML_PAD(ggml_nbytes(t->input), 64);
+                first += batch_size;
+            }
+        }
+
+        // Templates and host buffers are complete before any asynchronous use.
+        for (const auto & batch : layer.active_batches) {
+            auto * t = batch.t;
+            ggml_backend_tensor_set_async(compute_backend, t->input,
+                    (const uint8_t *) input_ptr + batch.input_offset, 0, ggml_nbytes(t->input));
+            ggml_backend_tensor_set_async(compute_backend, t->ids,
+                    layer.active_slots.data() + batch.route_offset, 0, ggml_nbytes(t->ids));
             const enum ggml_status status = ggml_backend_graph_compute_async(compute_backend, t->graph);
             if (status != GGML_STATUS_SUCCESS) {
                 ggml_backend_synchronize(compute_backend);
                 return;
             }
             ggml_backend_tensor_get_async(compute_backend, t->output,
-                    (uint8_t *) output_ptr + offset * output_row_bytes, 0, hits * output_row_bytes);
+                    (uint8_t *) output_ptr + batch.route_offset * output_row_bytes, 0, ggml_nbytes(t->output));
         }
         layer.active_gpu_launched = true;
     }
@@ -988,7 +1036,7 @@ private:
         layer.active_slots.clear();
         layer.active_route_positions.clear();
         layer.active_route_slots.clear();
-        layer.active_token_offsets.clear();
+        layer.active_batches.clear();
         layer.active_hits = 0;
         layer.active_gpu_launched = false;
     }
@@ -1293,10 +1341,10 @@ private:
     std::thread upload_thread;
 
 
-    ggml_backend_buffer_t input_q8_buffer = nullptr;
-    void * input_q8_ptr = nullptr;
-    size_t input_q8_size = 0;
-    std::vector<uint8_t> input_q8_fallback;
+    ggml_backend_buffer_t input_buffer = nullptr;
+    void * input_ptr = nullptr;
+    size_t input_size = 0;
+    std::vector<uint8_t> input_fallback;
 
     ggml_backend_buffer_t output_buffer = nullptr;
     void * output_ptr = nullptr;
