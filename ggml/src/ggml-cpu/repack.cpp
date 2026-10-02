@@ -5461,8 +5461,23 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                             src0_cur + col*nb01, expert_q8, (int) gemm_rows, tile);
                     }
 
+                    // Reuse ZNQ3 weight decode across the unpacked two/three-row tail.
+                    int64_t ir1 = gemm_rows;
+                    if (src0->type == GGML_TYPE_ZNQ3 && nr1 - ir1 > 1 && tile >= 16) {
+                        float tail[3 * znq_moe_task_cols];
+                        const int tail_rows = (int) (nr1 - ir1);
+                        ggml_gemv_znq3_8x8_q8_0(
+                            ne00, tail, tile, src0_cur + col*nb01, expert_q8 + ir1*nbw1, tail_rows, tile);
+                        for (int r = 0; r < tail_rows; ++r) {
+                            const mmid_row_mapping row = MMID_MATRIX_ROW(cur_a, ir1 + r);
+                            float * out = (float *) ((char *) dst->data + row.i1*nb1 + row.i2*nb2);
+                            memcpy(out + col, tail + r*tile, tile*sizeof(float));
+                        }
+                        ir1 = nr1;
+                    }
+
                     // Up to three rows remain outside block_q8_0x4.
-                    for (int64_t ir1 = gemm_rows; ir1 < nr1; ++ir1) {
+                    for (; ir1 < nr1; ++ir1) {
                         const mmid_row_mapping row = MMID_MATRIX_ROW(cur_a, ir1);
                         const char * src1_col = expert_q8 + ir1*nbw1;
                         float * out = (float *) ((char *) dst->data + row.i1*nb1 + row.i2*nb2);

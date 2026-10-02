@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "ggml-cpp.h"
 
 #undef NDEBUG
 #include <assert.h>
@@ -248,6 +249,102 @@ static int test_vec_dot_q(bool verbose) {
     return num_failed;
 }
 
+static int test_znq3_repack(bool verbose) {
+    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    assert(backend);
+    auto * dev = ggml_backend_get_device(backend.get());
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    auto get_bufts = (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    ggml_backend_buffer_type_t repack_buft = nullptr;
+    if (get_bufts != nullptr) {
+        for (auto * buft = get_bufts(dev); buft != nullptr && *buft != nullptr; ++buft) {
+            if (std::string(ggml_backend_buft_name(*buft)) == "CPU_REPACK") {
+                repack_buft = *buft;
+                break;
+            }
+        }
+    }
+    if (repack_buft == nullptr) {
+        return 0;
+    }
+
+    int num_failed = 0;
+    // Two/three-row batches, GEMM tails, output tiles, and long K dimensions.
+    const int shapes[][3] = { {32, 56, 2}, {256, 280, 3}, {256, 56, 6}, {4128, 56, 7} };
+    for (const auto & shape : shapes) {
+        const int k = shape[0], m = shape[1], n = shape[2];
+        constexpr int n_expert = 4, n_used = 2;
+        ggml_init_params params = { 1024*1024, nullptr, true };
+        ggml_context_ptr weight_ctx[2] = { ggml_context_ptr(ggml_init(params)), ggml_context_ptr(ggml_init(params)) };
+        ggml_tensor * weights[2];
+        ggml_backend_buffer_ptr weight_buf[2];
+        for (int i = 0; i < 2; ++i) {
+            weights[i] = ggml_new_tensor_3d(weight_ctx[i].get(), GGML_TYPE_ZNQ3, k, m, n_expert);
+            weight_buf[i].reset(ggml_backend_alloc_ctx_tensors_from_buft(weight_ctx[i].get(), i == 0 ? ggml_backend_cpu_buffer_type() : repack_buft));
+            assert(weight_buf[i]);
+            ggml_backend_buffer_set_usage(weight_buf[i].get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        }
+
+        for (bool broadcast : { false, true }) {
+            ggml_context_ptr ctx(ggml_init(params));
+            auto * input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, k, broadcast ? 1 : n_used, n);
+            auto * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_used, n);
+            ggml_tensor * out[2] = {
+                ggml_mul_mat_id(ctx.get(), weights[0], input, ids),
+                ggml_mul_mat_id(ctx.get(), weights[1], input, ids),
+            };
+            if (!ggml_backend_supports_op(backend.get(), out[1])) {
+                return num_failed;
+            }
+
+            auto * graph = ggml_new_graph(ctx.get());
+            ggml_build_forward_expand(graph, out[0]);
+            ggml_build_forward_expand(graph, out[1]);
+            ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
+            assert(buf);
+
+            std::vector<float> data(ggml_nelements(weights[0]));
+            generate_data(0.0f, data.size(), data.data());
+            std::vector<uint8_t> quantized(ggml_nbytes(weights[0]));
+            ggml_quantize_chunk(GGML_TYPE_ZNQ3, data.data(), quantized.data(), 0, m*n_expert, k, nullptr);
+            for (auto * weight : weights) {
+                ggml_backend_tensor_set(weight, quantized.data(), 0, quantized.size());
+            }
+            data.resize(ggml_nelements(input));
+            generate_data(1.0f, data.size(), data.data());
+            ggml_backend_tensor_set(input, data.data(), 0, ggml_nbytes(input));
+            std::vector<int32_t> routes(n*n_used);
+            for (int t = 0; t < n; ++t) {
+                routes[2*t + 0] = t % 2 == 0 ? 0 : n_expert - 1;
+                routes[2*t + 1] = t % 2 == 0 ? n_expert - 1 : 0;
+            }
+            ggml_backend_tensor_set(ids, routes.data(), 0, ggml_nbytes(ids));
+
+            std::vector<float> expected(ggml_nelements(out[0])), actual(expected.size());
+            for (int threads : { 1, 3 }) {
+                ggml_backend_cpu_set_n_threads(backend.get(), threads);
+                std::fill(actual.begin(), actual.end(), NAN);
+                ggml_backend_tensor_set(out[1], actual.data(), 0, ggml_nbytes(out[1]));
+                assert(ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS);
+                ggml_backend_tensor_get(out[0], expected.data(), 0, ggml_nbytes(out[0]));
+                ggml_backend_tensor_get(out[1], actual.data(), 0, ggml_nbytes(out[1]));
+                double error = 0, norm = 0;
+                for (size_t i = 0; i < actual.size(); ++i) {
+                    const double diff = actual[i] - expected[i];
+                    error += diff * diff;
+                    norm += (double) expected[i] * expected[i];
+                }
+                const bool failed = !(error <= 1e-6 * std::max(norm, 1e-20));
+                num_failed += failed;
+                if (failed || verbose) {
+                    printf("znq3 repack k=%d m=%d n=%d broadcast=%d threads=%d: %s\n", k, m, n, broadcast, threads, RESULT_STR[failed]);
+                }
+            }
+        }
+    }
+    return num_failed;
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -269,6 +366,7 @@ int main(int argc, char * argv[]) {
 
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_vec_dot_q(verbose);
+    num_failed += test_znq3_repack(verbose);
 
     if (num_failed || verbose) {
         printf("%d tests failed\n", num_failed);
