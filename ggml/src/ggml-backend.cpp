@@ -640,6 +640,12 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
 
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && (op->src[5] || op->src[6])) {
+        using supports_qsa_t = bool (*)(ggml_backend_dev_t, const ggml_tensor *);
+        auto supports = reinterpret_cast<supports_qsa_t>(ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(device), "ggml_backend_flash_attn_ext_qsa_supported"));
+        return supports && supports(device, op);
+    }
     return device->iface.supports_op(device, op);
 }
 

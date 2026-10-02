@@ -1192,7 +1192,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * selected = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1210,7 +1211,7 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
-    llm_graph_input_attn_kv * build_attn_inp_kv() const;
+    llm_graph_input_attn_kv * build_attn_inp_kv(const llama_kv_cache_context * mctx_cur = nullptr) const;
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv * inp,

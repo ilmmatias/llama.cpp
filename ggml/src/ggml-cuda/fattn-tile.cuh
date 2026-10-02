@@ -689,7 +689,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
         const int k_VKQ_max,
         const int col_Q_0,
         const int32_t * const __restrict__ indices,
-        const ggml_cuda_qsa_kv_view & K_cache, const ggml_cuda_qsa_kv_view & V_cache) {
+        const ggml_cuda_qsa_kv_view & K_cache, const ggml_cuda_qsa_kv_view & V_cache,
+        const ggml_cuda_fattn_visibility & visibility) {
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
@@ -750,7 +751,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 
             if (!oob_check || i_KQ < k_VKQ_sup) {
                 const int row = use_sparse ? indices[k_VKQ_0 + i_KQ] : k_VKQ_0 + i_KQ;
-                const float mask_val = ncols2 > 1 || mask ? __half2float(mask[int64_t(j)*stride_mask + row]) : 0.0f;
+                const float mask_val = visibility.positions ?
+                    (ggml_qsa_is_visible(visibility.positions, visibility.n_kv, row + visibility.row_offset, j) ? 0.0f : -INFINITY) :
+                    (mask ? __half2float(mask[int64_t(j)*stride_mask + row]) : 0.0f);
                 if (use_sparse && !isfinite(mask_val)) {
                     KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] = -INFINITY;
                 } else {
@@ -924,7 +927,8 @@ static __global__ void flash_attn_tile(
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33,
-                            ggml_cuda_qsa_kv_view K_cache, ggml_cuda_qsa_kv_view V_cache) {
+                            ggml_cuda_qsa_kv_view K_cache, ggml_cuda_qsa_kv_view V_cache,
+                            ggml_cuda_fattn_visibility visibility) {
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
     const char * GGML_CUDA_RESTRICT K        = K_ptr;
@@ -1088,7 +1092,7 @@ static __global__ void flash_attn_tile(
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_K, type_V, use_sparse>
                 (Q_tmp, K_data, V_data, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 nb11, nb21, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, indices,
-                use_paged ? K_cache : ggml_cuda_qsa_kv_view{}, use_paged ? V_cache : ggml_cuda_qsa_kv_view{});
+                use_paged ? K_cache : ggml_cuda_qsa_kv_view{}, use_paged ? V_cache : ggml_cuda_qsa_kv_view{}, visibility);
             k_VKQ_0 += gridDim.y*nbatch_fa;
         }
         if (k_VKQ_0 < k_VKQ_max) {
@@ -1096,7 +1100,7 @@ static __global__ void flash_attn_tile(
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_K, type_V, use_sparse>
                 (Q_tmp, K_data, V_data, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 nb11, nb21, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, indices,
-                use_paged ? K_cache : ggml_cuda_qsa_kv_view{}, use_paged ? V_cache : ggml_cuda_qsa_kv_view{});
+                use_paged ? K_cache : ggml_cuda_qsa_kv_view{}, use_paged ? V_cache : ggml_cuda_qsa_kv_view{}, visibility);
         }
     } else {
         // Branch without out-of-bounds checks.
@@ -1105,7 +1109,7 @@ static __global__ void flash_attn_tile(
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_K, type_V, use_sparse>
                 (Q_tmp, K_data, V_data, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 nb11, nb21, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, indices,
-                use_paged ? K_cache : ggml_cuda_qsa_kv_view{}, use_paged ? V_cache : ggml_cuda_qsa_kv_view{});
+                use_paged ? K_cache : ggml_cuda_qsa_kv_view{}, use_paged ? V_cache : ggml_cuda_qsa_kv_view{}, visibility);
         }
     }
 
@@ -1248,6 +1252,10 @@ static bool ggml_cuda_flash_attn_ext_tile_shall_use_sparse(const ggml_tensor * d
         return type == GGML_TYPE_F16;
 #endif
     };
+    if (dst->src[5]) {
+        return ncols1 == 1 && supported_type(K->type) && supported_type(V->type) &&
+            (mask != nullptr || dst->src[6] != nullptr);
+    }
     return ncols1 <= 2 && n_kv_max > 0 && supported_type(K->type) && supported_type(V->type) &&
         mask != nullptr && mask->type == GGML_TYPE_F16 && mask->nb[0] == sizeof(half) &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
@@ -1286,7 +1294,8 @@ static void launch_fattn_tile_case(
     if constexpr (ncols1 == 1 || (ncols1 == 2 && ncols2 == 1)) {
         if (ggml_cuda_flash_attn_ext_tile_shall_use_sparse(dst, ncols1)) {
             if constexpr (DKQ == 256 && DV == 256) {
-                if (dst->src[0]->ne[1] <= 8 && dst->src[0]->ne[3] == 1 && dst->src[3]->ne[3] == 1 &&
+                if (dst->src[0]->ne[3] == 1 &&
+                        (!dst->src[3] || dst->src[3]->ne[3] == 1) &&
                         ggml_cuda_qsa_kv_is_paged(dst->src[1]) && ggml_cuda_qsa_kv_is_paged(dst->src[2])) {
                     fattn_kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap,
                             GGML_TYPE_F16, GGML_TYPE_F16, true, true>;
@@ -1472,7 +1481,8 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
     // However, for DKQ == 576, DV == 512 only the kernel variant with GQA optimizations is implemented.
     const bool nvidia = GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
     const int gqa_limit = nvidia && gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
-    const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    const bool use_gqa_opt = (mask || dst->src[6]) && max_bias == 0.0f &&
+        Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     if constexpr (DKQ == 320) {
         // This branch is only used for Mistral Small 4 which has a GQA ratio of 32.

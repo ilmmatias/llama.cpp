@@ -38,7 +38,12 @@ static ggml_tensor * build_attn_inp_kq_mask(
     // flash attention requires an f16 mask
     const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
-    ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
+    const bool compact = cparams.qsa_compact_mask && cparams.flash_attn &&
+        n_stream == 1 && ubatch.n_seqs_unq == 1;
+
+    ggml_tensor * res = compact ?
+        ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, n_kv + n_tokens) :
+        ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
     ggml_set_input(res);
     ggml_set_name(res, "attn_inp_kq_mask");
 
@@ -53,6 +58,11 @@ static bool can_reuse_kq_mask(
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+
+    if (kq_mask->type == GGML_TYPE_I32) {
+        return n_stream == 1 && ubatch.n_seqs_unq == 1 &&
+            kq_mask->ne[0] == 4 && kq_mask->ne[1] == n_kv + n_tokens;
+    }
 
     bool res = true;
 
@@ -487,7 +497,9 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
-    const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
+    const auto * mctx = params.cparams.mtp_qsa ?
+        static_cast<const llama_memory_hybrid_context *>(params.mctx)->get_attn() :
+        static_cast<const llama_kv_cache_context *>(params.mctx);
 
     this->mctx = mctx;
 
@@ -2635,7 +2647,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * selected) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2666,8 +2679,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+        ggml_tensor * positions = kq_mask && kq_mask->type == GGML_TYPE_I32 ? kq_mask : nullptr;
+
+        cur = ggml_flash_attn_ext(ctx0, q, k, v, positions ? nullptr : kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+
+        if (selected || positions) {
+            ggml_flash_attn_ext_set_qsa(cur, selected, positions);
+        }
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
@@ -2866,8 +2885,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     return inp;
 }
 
-llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
-    const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
+llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv(const llama_kv_cache_context * mctx_cur) const {
+    if (mctx_cur == nullptr) {
+        mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
+    }
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
 

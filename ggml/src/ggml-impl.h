@@ -35,6 +35,21 @@ void ggml_print_backtrace(void);
 
 uint64_t ggml_graph_next_uid(void);
 
+#if defined(__CUDACC__) || defined(__HIPCC__) || defined(__MUSACC__)
+__host__ __device__
+#endif
+static inline bool ggml_qsa_is_visible(const int32_t * positions, int32_t n_kv, int32_t cell, int32_t query) {
+    if (cell < 0 || cell >= n_kv) {
+        return false;
+    }
+
+    const int32_t * k = positions + 4*(int64_t) cell;
+    const int32_t * q = positions + 4*((int64_t) n_kv + query);
+
+    return k[0] >= 0 && (!(q[3] & 1) || k[0] <= q[0]) &&
+        (!(q[3] & 2) || k[0] != q[0] || k[2] < q[2] || (k[2] == q[2] && k[1] <= q[1]));
+}
+
 #ifndef MIN
 #    define MIN(a, b) ((a) < (b) ? (a) : (b))
 #endif

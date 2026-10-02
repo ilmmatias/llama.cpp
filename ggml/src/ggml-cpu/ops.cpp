@@ -8868,6 +8868,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * selected = dst->src[5];
+    const int32_t * positions = dst->src[6] ? (const int32_t *) dst->src[6]->data : nullptr;
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8951,10 +8953,24 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         float S = 0.0f;      // sum
         float M = -INFINITY; // maximum KQ value
 
-        float       * VKQ32 = (float       *) params->wdata + ith*ggml_fa_wdata_per_thread(DK, DV); // FP32 VKQ accumulator
+        const int64_t scratch_stride = ggml_fa_wdata_per_thread(DK, DV) + (selected ? selected->ne[0] : 0);
+        float       * VKQ32 = (float       *) params->wdata + ith*scratch_stride; // FP32 VKQ accumulator
         float       * V32   =                 (VKQ32 + 1*DV); // (temporary) FP32 V buffer
         ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*DV); // (temporary) buffer for Q converted to quantized/FP16
         float       * KQ    =                 (VKQ32 + 2*DV + DK); // (temporary) one block of KQ scores
+        int32_t * cells = (int32_t *) (VKQ32 + ggml_fa_wdata_per_thread(DK, DV));
+        int64_t begin = ic_start;
+        int64_t end = ic_end;
+        if (selected) {
+            GGML_ASSERT(!write_partials);
+            const char * row = (const char *) selected->data + iq1*selected->nb[1];
+            for (int64_t i = 0; i < selected->ne[0]; ++i) {
+                cells[i] = *(const int32_t *) (row + i*selected->nb[0]);
+            }
+            std::sort(cells, cells + selected->ne[0]);
+            end = std::unique(cells, cells + selected->ne[0]) - cells;
+            begin = 0;
+        }
 
         // Without a vectorized mixed multiply add, keep the F16 accumulator: converting V per KV position is slower.
         // VKQ16 aliases the V32 scratch, which an F16 V does not use.
@@ -8991,20 +9007,21 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         // Score one KV block at a time, so the accumulator is rescaled at most once per block.
-        for (int64_t ic0 = ic_start; ic0 < ic_end; ic0 += GGML_FA_KQ_BLK) {
-            const int64_t nb = MIN((int64_t) GGML_FA_KQ_BLK, ic_end - ic0);
+        for (int64_t ic0 = begin; ic0 < end; ic0 += GGML_FA_KQ_BLK) {
+            const int64_t nb = MIN((int64_t) GGML_FA_KQ_BLK, end - ic0);
 
             float blk_max = -INFINITY;
 
             // Group four K rows into one dot call. The parallelism is across outputs, never inside a reduction.
             // KQ[] stores and blk_max run in increasing t, and a group never crosses a block.
             float blk_mv[GGML_FA_KQ_BLK];
-            if (mp) {
-                for (int64_t t = 0; t < nb; ++t) {
-                    blk_mv[t] = slope*GGML_CPU_FP16_TO_FP32(mp[ic0 + t]);
+            for (int64_t t = 0; t < nb; ++t) {
+                const int64_t cell = selected ? cells[ic0 + t] : ic0 + t;
+                if (cell < 0 || cell >= nek1 || (positions && !ggml_qsa_is_visible(positions, nek1, cell, iq1))) {
+                    blk_mv[t] = -INFINITY;
+                } else {
+                    blk_mv[t] = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[cell]) : 0.0f;
                 }
-            } else {
-                memset(blk_mv, 0, nb*sizeof(float));
             }
             for (int64_t t = 0; t < nb; ) {
                 if (blk_mv[t] == -INFINITY) {
@@ -9013,13 +9030,13 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                     continue;
                 }
 
-                const int grp = (GGML_HAS_INTERDOT_X4 && q_stays_f32 && t + 3 < nb &&
+                const int grp = (!selected && GGML_HAS_INTERDOT_X4 && q_stays_f32 && t + 3 < nb &&
                                  blk_mv[t + 1] != -INFINITY &&
                                  blk_mv[t + 2] != -INFINITY &&
                                  blk_mv[t + 3] != -INFINITY) ? 4 : 1;
 
                 float sv[4]; // KQ values, computed ahead
-                const int64_t ic = ic0 + t;
+                const int64_t ic = selected ? cells[ic0 + t] : ic0 + t;
                 if (grp == 4) {
                     const char * kd0 = (const char *) k->data + ((ic + 0)*nbk1 + ik2*nbk2 + ik3*nbk3);
                     const char * kd1 = (const char *) k->data + ((ic + 1)*nbk1 + ik2*nbk2 + ik3*nbk3);
@@ -9083,7 +9100,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                     continue;
                 }
 
-                const char * v_data = ((const char *) v->data + ((ic0 + t)*nbv1 + iv2*nbv2 + iv3*nbv3));
+                const int64_t cell = selected ? cells[ic0 + t] : ic0 + t;
+                const char * v_data = ((const char *) v->data + (cell*nbv1 + iv2*nbv2 + iv3*nbv3));
 
                 // V += v*expf(s - M)
                 if (use_f16_acc) {
@@ -9552,6 +9570,15 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+    if (dst->src[5] || dst->src[6]) {
+        const int64_t rows = neq1 * neq2 * neq3;
+        const int64_t per_thread = (rows + nth - 1) / nth;
+        const int64_t first = std::min(rows, ith * per_thread);
+        ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, first,
+                std::min(rows, first + per_thread), 0, nek1, nullptr, 0);
+        return;
+    }
 
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
     const bool use_ref = params->use_ref;
@@ -11732,6 +11759,25 @@ void ggml_compute_forward_dsv4_hc_post(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+void ggml_compute_forward_qsa_mask(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * indices   = dst->src[1];
+    const int32_t    * positions = (const int32_t *) dst->src[0]->data;
+    const int32_t      n_kv      = ggml_get_op_params_i32(dst, 0);
+
+    const int64_t width = dst->ne[0];
+    const int64_t count = width*dst->ne[1];
+    float * out = (float *) dst->data;
+
+    for (int64_t i = params->ith; i < count; i += params->nth) {
+        const int64_t query = i / width;
+        const int64_t column = i % width;
+        const int32_t cell = *(const int32_t *) ((const char *) indices->data +
+                column * indices->nb[0] + query * indices->nb[1]);
+
+        out[i] = ggml_qsa_is_visible(positions, n_kv, cell, query) ? 0.0f : -INFINITY;
     }
 }
 

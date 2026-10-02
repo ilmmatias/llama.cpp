@@ -49,7 +49,8 @@ struct cache {
 
 static std::vector<float> attention(
         ggml_backend_t backend, cache & kv, int n_queries, int first_page, int n_pages, int write_row,
-        int n_rows = rows, int n_seqs = 1, int row_offset = 0, bool alias_v = false) {
+        int n_rows = rows, int n_seqs = 1, int row_offset = 0, bool alias_v = false,
+        bool sparse = true, size_t * workspace = nullptr) {
     ggml_context * ctx =
         ggml_init({ 128 * ggml_tensor_overhead() + ggml_graph_overhead_custom(128, false), nullptr, true });
     ggml_cgraph * graph  = ggml_new_graph_custom(ctx, 128, false);
@@ -74,9 +75,13 @@ static std::vector<float> attention(
     ggml_tensor * v = alias_v ? view(kv.k, 4) : view(kv.v);
 
     ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f / 16, 0, 0);
-    ggml_flash_attn_ext_set_n_kv_max(out, 512);
+    ggml_flash_attn_ext_set_n_kv_max(out, sparse ? 512 : 0);
     ggml_prec_set_acc(out, GGML_PREC_F32);
     ggml_build_forward_expand(graph, out);
+
+    if (workspace) {
+        *workspace = ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(backend), out);
+    }
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     GGML_ASSERT(buffer);
@@ -295,6 +300,159 @@ static void test(ggml_backend_dev_t dev, ggml_backend_buffer_type_t paged_type) 
     ggml_backend_free(backend);
 }
 
+static void test_bounded_staging(ggml_backend_dev_t dev, ggml_backend_buffer_type_t paged_type) {
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    GGML_ASSERT(backend);
+
+    size_t previous_workspace = 0;
+
+    for (int n_rows : {32768, 65536}) {
+        cache resident(ggml_backend_dev_buffer_type(dev), n_rows);
+        cache paged(paged_type, n_rows);
+        resident.restore(0);
+        paged.restore(0);
+
+        size_t workspace = 0;
+        const auto expected = attention(backend, resident, 9, 4094, 8, -1, n_rows, 1, 0, false, false);
+        const auto actual = attention(backend, paged, 9, 4094, 8, -1, n_rows, 1, 0, false, false, &workspace);
+
+        compare(expected, actual, "attention crossing a staging chunk boundary");
+
+        if (previous_workspace) {
+            GGML_ASSERT(workspace == previous_workspace);
+        }
+
+        previous_workspace = workspace;
+        printf("Bounded staging: context %d, attention allocation %zu bytes\n", n_rows, workspace);
+    }
+
+    ggml_backend_free(backend);
+}
+
+static void test_compact_visibility(
+        ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft, int n_queries, int n_selected = 128,
+        bool explicit_selection = true) {
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    GGML_ASSERT(backend);
+
+    {
+        const int n_rows = n_selected > rows ? 8192 : rows;
+        cache kv(buft, n_rows);
+        kv.restore(0);
+
+        ggml_context * ctx = ggml_init({
+            32*ggml_tensor_overhead() + ggml_graph_overhead_custom(32, false), nullptr, true,
+        });
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32, false);
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dim, n_queries, 24, 1);
+        ggml_tensor * dense_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_rows, n_queries);
+        ggml_tensor * positions = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, n_rows + n_queries);
+        ggml_tensor * selected = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_selected, n_queries);
+
+        const auto view = [&](ggml_tensor * tensor) {
+            return ggml_view_4d(ctx, tensor, dim, n_rows, heads, 1,
+                    width*sizeof(ggml_fp16_t), dim*sizeof(ggml_fp16_t), ggml_nbytes(tensor), 0);
+        };
+        ggml_tensor * k = view(kv.k);
+        ggml_tensor * v = view(kv.v);
+
+        ggml_tensor * expected = ggml_flash_attn_ext(ctx, q, k, v, dense_mask, 1.0f/16, 0, 0);
+        // Each pair of input indices names one physical cell.
+        ggml_flash_attn_ext_set_n_kv_max(expected, explicit_selection ? n_selected/2 : 0);
+        ggml_build_forward_expand(graph, expected);
+
+        ggml_tensor * actual = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f/16, 0, 0);
+        ggml_flash_attn_ext_set_qsa(actual, explicit_selection ? selected : nullptr, positions);
+        ggml_build_forward_expand(graph, actual);
+
+        ggml_tensor * candidate_mask = ggml_qsa_mask(ctx, positions, selected, n_rows);
+        ggml_build_forward_expand(graph, candidate_mask);
+
+        ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        GGML_ASSERT(buffer);
+
+        std::vector<float> queries(ggml_nelements(q));
+        for (size_t i = 0; i < queries.size(); ++i) {
+            queries[i] = std::cos(float(i % 251)*0.0625f);
+        }
+
+        std::vector<int32_t> metadata(4*(n_rows + n_queries), 0);
+        for (int i = 0; i < n_rows; ++i) {
+            metadata[4*i + 0] = i % 7 == 0 ? -1 : i/4;
+            metadata[4*i + 1] = i % 2;
+            metadata[4*i + 2] = i/2 % 2;
+        }
+
+        std::vector<int32_t> indices(n_selected*n_queries);
+        std::vector<ggml_fp16_t> masks(n_rows*n_queries, ggml_fp32_to_fp16(-INFINITY));
+        std::vector<float> candidate_expected(indices.size(), -INFINITY);
+
+        for (int query = 0; query < n_queries; ++query) {
+            int32_t * query_pos = metadata.data() + 4*(n_rows + query);
+            query_pos[0] = query == n_queries - 1 ? -1 : 96 + query*3;
+            query_pos[1] = query % 2;
+            query_pos[2] = query/2 % 2;
+            query_pos[3] = query == n_queries - 1 ? 3 : query % 4;
+
+            const auto visible = [&](int cell) {
+                if (cell < 0 || cell >= n_rows) {
+                    return false;
+                }
+
+                const int32_t * cell_pos = metadata.data() + 4*cell;
+                const bool causal_ok = !(query_pos[3] & 1) || cell_pos[0] <= query_pos[0];
+                const bool spatial_ok = !(query_pos[3] & 2) || cell_pos[0] != query_pos[0] ||
+                    cell_pos[2] < query_pos[2] || (cell_pos[2] == query_pos[2] && cell_pos[1] <= query_pos[1]);
+
+                return cell_pos[0] >= 0 && causal_ok && spatial_ok;
+            };
+
+            if (!explicit_selection) {
+                for (int cell = 0; cell < n_rows; ++cell) {
+                    if (visible(cell)) {
+                        masks[query*n_rows + cell] = ggml_fp32_to_fp16(0.0f);
+                    }
+                }
+            }
+
+            for (int i = 0; i < n_selected; ++i) {
+                const int cell = i == 0 ? -1 : i == 1 ? n_rows : ((i/2)*17 + query*13) % n_rows;
+                const size_t offset = query*n_selected + i;
+                indices[offset] = cell;
+
+                if (visible(cell)) {
+                    masks[query*n_rows + cell] = ggml_fp32_to_fp16(0.0f);
+                    candidate_expected[offset] = 0.0f;
+                }
+            }
+        }
+
+        ggml_backend_tensor_set(q, queries.data(), 0, ggml_nbytes(q));
+        ggml_backend_tensor_set(positions, metadata.data(), 0, ggml_nbytes(positions));
+        ggml_backend_tensor_set(selected, indices.data(), 0, ggml_nbytes(selected));
+        ggml_backend_tensor_set(dense_mask, masks.data(), 0, ggml_nbytes(dense_mask));
+
+        GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+
+        std::vector<float> expected_values(ggml_nelements(expected));
+        std::vector<float> actual_values(ggml_nelements(actual));
+        std::vector<float> candidates(ggml_nelements(candidate_mask));
+
+        ggml_backend_tensor_get(expected, expected_values.data(), 0, ggml_nbytes(expected));
+        ggml_backend_tensor_get(actual, actual_values.data(), 0, ggml_nbytes(actual));
+        ggml_backend_tensor_get(candidate_mask, candidates.data(), 0, ggml_nbytes(candidate_mask));
+
+        compare(expected_values, actual_values, "compact visibility and duplicate selection");
+        GGML_ASSERT(candidates == candidate_expected);
+
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+
+    ggml_backend_free(backend);
+}
+
 static void test_clock_wrap(ggml_backend_dev_t dev, ggml_backend_buffer_type_t paged_type) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     GGML_ASSERT(backend);
@@ -345,8 +503,18 @@ int main() {
             printf("Testing %s\n", ggml_backend_dev_name(dev));
             test(dev, fn(dev, 64));
             test_clock_wrap(dev, fn(dev, 4100));
+            test_bounded_staging(dev, fn(dev, 64));
+            test_compact_visibility(dev, ggml_backend_dev_buffer_type(dev), 5);
+            test_compact_visibility(dev, fn(dev, 64), 33);
+            test_compact_visibility(dev, fn(dev, 64), 5, 4097);
+            test_compact_visibility(dev, fn(dev, 64), 33, 128, false);
             ++tested;
         }
+    }
+
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu) {
+        test_compact_visibility(cpu, ggml_backend_dev_buffer_type(cpu), 5);
     }
 
     if (!tested) {

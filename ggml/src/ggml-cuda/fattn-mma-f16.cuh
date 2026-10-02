@@ -1826,8 +1826,9 @@ static __global__ void flash_attn_ext_f16(
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33,
-                            ggml_cuda_qsa_kv_view K_cache, ggml_cuda_qsa_kv_view V_cache) {
-    GGML_UNUSED_VARS(K_cache, V_cache);
+                            ggml_cuda_qsa_kv_view K_cache, ggml_cuda_qsa_kv_view V_cache,
+                            ggml_cuda_fattn_visibility visibility) {
+    GGML_UNUSED_VARS(K_cache, V_cache, visibility);
     ggml_cuda_pdl_sync(); // TODO optimize placement
 #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
     const char * GGML_CUDA_RESTRICT Q              = Q_ptr;

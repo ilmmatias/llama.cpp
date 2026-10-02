@@ -1,6 +1,32 @@
 #include "common.cuh"
 #include "qsa-block-score.cuh"
 
+static __global__ void qsa_mask(
+        const int32_t * positions, const char * indices, float * dst,
+        int32_t n_kv, int64_t width, size_t nb0, size_t nb1) {
+    const int64_t column = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (column >= width) {
+        return;
+    }
+
+    const int32_t query = blockIdx.y;
+    const int32_t cell = *(const int32_t *) (indices + column * nb0 + query * nb1);
+
+    dst[query * width + column] = ggml_qsa_is_visible(positions, n_kv, cell, query) ? 0.0f : -INFINITY;
+}
+
+void ggml_cuda_op_qsa_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * indices = dst->src[1];
+    const int64_t width = dst->ne[0];
+
+    const ggml_cuda_kernel_launch_params launch_params(
+            dim3((width + 255) / 256, dst->ne[1], 1), dim3(256, 1, 1), 0, ctx.stream());
+
+    ggml_cuda_kernel_launch(qsa_mask, launch_params,
+            (const int32_t *) dst->src[0]->data, (const char *) indices->data, (float *) dst->data,
+            ggml_get_op_params_i32(dst, 0), width, indices->nb[0], indices->nb[1]);
+}
+
 // Keep QSA's ordered reductions in registers on RDNA instead of using
 // LDS-backed shuffle instructions.
 template <int mask>

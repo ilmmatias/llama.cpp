@@ -760,6 +760,18 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
             // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
             ret[buft] += ggml_backend_buffer_get_size(buf.get());
         }
+
+        // Paged KV has host storage plus a resident device cache.
+        if (auto * dev = ggml_backend_buft_get_device(buft)) {
+            using device_size_fn = size_t (*)(ggml_backend_buffer_type_t, const ggml_tensor *);
+            auto fn = reinterpret_cast<device_size_fn>(ggml_backend_reg_get_proc_address(
+                    ggml_backend_dev_backend_reg(dev), "ggml_backend_qsa_kv_tensor_device_size"));
+            if (fn) {
+                for (auto * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                    ret[ggml_backend_dev_buffer_type(dev)] += fn(buft, t);
+                }
+            }
+        }
     }
 
     return ret;
@@ -1878,6 +1890,43 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    if (dst->type == GGML_TYPE_I32) {
+        GGML_ASSERT(ubatch->n_seqs_unq == 1 && swa_type == LLAMA_SWA_TYPE_NONE);
+        GGML_ASSERT(dst->ne[0] == 4);
+
+        const int64_t n_kv = dst->ne[1] - n_tokens;
+        const llama_seq_id seq_id = ubatch->seq_id[0][0];
+        const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+        const bool is_2d = ubatch->is_pos_2d();
+        int32_t * data = (int32_t *) dst->data;
+
+        for (int64_t i = 0; i < n_kv; ++i) {
+            const bool valid = !cells.is_empty(i) && cells.seq_has(i, seq_id);
+            int32_t * row = data + 4*i;
+
+            row[0] = valid ? cells.pos_get(i) : -1;
+            row[1] = valid && is_2d ? cells.ext_get(i).x : 0;
+            row[2] = valid && is_2d ? cells.ext_get(i).y : 0;
+            row[3] = 0;
+        }
+
+        if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+            causal_attn = true;
+        }
+
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            GGML_ASSERT(ubatch->seq_id[i][0] == seq_id);
+            int32_t * row = data + 4*(n_kv + i);
+
+            row[0] = ubatch->pos[i];
+            row[1] = is_2d ? ubatch->pos[i + n_tokens*2] : 0;
+            row[2] = is_2d ? ubatch->pos[i + n_tokens] : 0;
+            row[3] = (causal_attn ? 1 : 0) | (is_2d ? 2 : 0);
+        }
+
+        return;
+    }
 
     const int64_t n_kv     = dst->ne[0];
     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch

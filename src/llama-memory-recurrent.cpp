@@ -1267,6 +1267,10 @@ bool llama_memory_recurrent_context::next() {
 bool llama_memory_recurrent_context::apply() {
     assert(!llama_memory_status_is_fail(status));
 
+    if (!mem->has_state()) {
+        return true;
+    }
+
     // no ubatches -> this is an update
     if (ubatches.empty()) {
         // recurrent cache never performs updates

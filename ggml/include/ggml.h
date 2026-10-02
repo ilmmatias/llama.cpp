@@ -592,6 +592,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_QSA_BLOCK_SCORE,
+        GGML_OP_QSA_MASK,
 
         GGML_OP_UNARY,
 
@@ -2526,6 +2527,14 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // Optional explicit KV selection and compact visibility metadata.
+    // indices is I32 [n_selected, n_query]; duplicates represent a set.
+    // positions follows ggml_qsa_mask's layout; either argument may be NULL.
+    GGML_API void ggml_flash_attn_ext_set_qsa(
+            struct ggml_tensor * a,
+            struct ggml_tensor * indices,
+            struct ggml_tensor * positions);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
@@ -2784,6 +2793,16 @@ extern "C" {
             struct ggml_tensor  * cells,
             struct ggml_tensor  * mask,
             float                 scale);
+
+    // Compact attention visibility: positions is I32 [4, n_kv + n_query].
+    // KV rows contain (position, x, y, unused); query rows contain
+    // (position, x, y, flags), with bit 0 causal and bit 1 two-dimensional.
+    // indices is I32 [n_selected, n_query]; result is F32, zero or -infinity.
+    GGML_API struct ggml_tensor * ggml_qsa_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * positions,
+            struct ggml_tensor  * indices,
+            int32_t               n_kv);
 
     // custom operators
 

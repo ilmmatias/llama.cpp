@@ -69,6 +69,10 @@ static cache_state * find_cache(const ggml_tensor * tensor) {
     return nullptr;
 }
 
+static size_t cache_metadata_size(size_t n_pages, size_t n_slots) {
+    return (2*n_pages + 3*n_slots + 3)*sizeof(int);
+}
+
 static void reset_cache(cache_state & state) {
     CUDA_CHECK(cudaMemset(state.pages, 0xff, (state.n_pages + state.n_slots) * sizeof(int)));
     CUDA_CHECK(cudaMemset(state.referenced, 0, state.n_slots * sizeof(int)));
@@ -141,7 +145,7 @@ static ggml_status init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tenso
         ++state->page_shift;
     }
 
-    const size_t metadata_size = (2*size_t(state->n_pages) + 3*size_t(state->n_slots) + 3)*sizeof(int);
+    const size_t metadata_size = cache_metadata_size(state->n_pages, state->n_slots);
     cudaError_t  err = cudaMalloc(reinterpret_cast<void **>(&state->cache), size_t(state->n_slots) * state->page_bytes);
     if (err == cudaSuccess) {
         err = cudaMalloc(reinterpret_cast<void **>(&state->storage), metadata_size);
@@ -445,6 +449,10 @@ bool ggml_backend_buft_is_cuda_qsa_kv(ggml_backend_buffer_type_t buft) {
 }
 
 bool ggml_cuda_qsa_kv_is_paged(const ggml_tensor * tensor) {
+    // Allocation probes run before views inherit their source buffer.
+    while (tensor && !tensor->buffer && tensor->view_src) {
+        tensor = tensor->view_src;
+    }
     return tensor && tensor->buffer && ggml_backend_buft_is_cuda_qsa_kv(ggml_backend_buffer_get_type(tensor->buffer));
 }
 
@@ -475,6 +483,17 @@ ggml_backend_buffer_type_t ggml_backend_cuda_qsa_kv_buffer_type(ggml_backend_dev
     }
 
     return buft.get();
+}
+
+size_t ggml_backend_cuda_qsa_kv_tensor_device_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    if (!ggml_backend_buft_is_cuda_qsa_kv(buft) || tensor->view_src) {
+        return 0;
+    }
+
+    const auto & type = *static_cast<type_context *>(buft->context);
+    const size_t n_pages = (tensor->ne[1] + 3) / 4;
+    const size_t n_slots = std::min<size_t>(n_pages, type.resident_tokens / 4);
+    return n_slots * 4 * tensor->nb[1] + cache_metadata_size(n_pages, n_slots);
 }
 
 void * ggml_cuda_qsa_kv_device_ptr(const ggml_tensor * tensor) {

@@ -1150,6 +1150,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "QSA_BLOCK_SCORE",
+    "QSA_MASK",
 
     "UNARY",
 
@@ -1167,7 +1168,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1267,6 +1268,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "qsa_block_score(q, k, cells, mask)",
+    "qsa_mask(positions, indices)",
 
     "unary(x)",
 
@@ -1284,7 +1286,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5654,6 +5656,32 @@ void ggml_flash_attn_ext_set_n_kv_max(
     ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
+void ggml_flash_attn_ext_set_qsa(
+        struct ggml_tensor * a,
+        struct ggml_tensor * indices,
+        struct ggml_tensor * positions) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[0]->ne[3] == 1);
+
+    if (indices) {
+        GGML_ASSERT(indices->type == GGML_TYPE_I32 && ggml_is_contiguous_rows(indices));
+        GGML_ASSERT(indices->ne[1] == a->src[0]->ne[1] && indices->ne[2] == 1 && indices->ne[3] == 1);
+        GGML_ASSERT(indices->ne[0] > 0 && indices->ne[0] <= a->src[1]->ne[1]);
+
+        ggml_flash_attn_ext_set_n_kv_max(a, indices->ne[0]);
+    }
+
+    if (positions) {
+        GGML_ASSERT(positions->type == GGML_TYPE_I32 && ggml_is_contiguous(positions));
+        GGML_ASSERT(positions->ne[0] == 4 && positions->ne[1] == a->src[1]->ne[1] + a->src[0]->ne[1]);
+        GGML_ASSERT(positions->ne[2] == 1 && positions->ne[3] == 1);
+        GGML_ASSERT(a->src[3] == NULL && ggml_get_op_params_f32(a, 1) == 0.0f);
+    }
+
+    a->src[5] = indices;
+    a->src[6] = positions;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {
@@ -6787,6 +6815,31 @@ struct ggml_tensor * ggml_qsa_block_score(
     result->src[3] = mask;
 
     ggml_set_op_params_f32(result, 0, scale);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_qsa_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * positions,
+        struct ggml_tensor  * indices,
+        int32_t               n_kv) {
+    GGML_ASSERT(positions->type == GGML_TYPE_I32);
+    GGML_ASSERT(indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(positions));
+    GGML_ASSERT(positions->ne[0] == 4 && positions->ne[1] == n_kv + indices->ne[1]);
+    GGML_ASSERT(positions->ne[2] == 1 && positions->ne[3] == 1);
+    GGML_ASSERT(indices->ne[2] == 1 && indices->ne[3] == 1);
+    GGML_ASSERT(n_kv > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, indices->ne[0], indices->ne[1]);
+
+    result->op     = GGML_OP_QSA_MASK;
+    result->src[0] = positions;
+    result->src[1] = indices;
+
+    ggml_set_op_params_i32(result, 0, n_kv);
 
     return result;
 }

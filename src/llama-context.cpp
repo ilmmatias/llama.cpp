@@ -130,6 +130,32 @@ llama_context::llama_context(
     cparams.rope_scaling_type = params.rope_scaling_type;
     cparams.pooling_type      = params.pooling_type;
 
+    cparams.qsa_compact_mask = model.arch == LLM_ARCH_QWEN4EXP &&
+        hparams.swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi && hparams.f_max_alibi_bias == 0.0f &&
+        hparams.n_embd_head_k() == 256 && hparams.n_embd_head_v() == 256 &&
+        params.type_k == GGML_TYPE_F16 && params.type_v == GGML_TYPE_F16;
+
+    if (model.arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        const char * mtp_qsa = getenv("LLAMA_QWEN4EXP_MTP_QSA");
+        cparams.mtp_qsa = mtp_qsa != nullptr && atoi(mtp_qsa) != 0;
+
+        if (cparams.mtp_qsa) {
+            if (hparams.n_layer_nextn == 0) {
+                throw std::runtime_error("LLAMA_QWEN4EXP_MTP_QSA requires an MTP head");
+            }
+
+            const auto & head = model.layers[hparams.n_layer()];
+            if (hparams.indexer_head_size == 0 || head.index_q_proj == nullptr || head.index_k_proj == nullptr) {
+                throw std::runtime_error("LLAMA_QWEN4EXP_MTP_QSA requires loaded MTP indexer q_proj and k_proj weights");
+            }
+
+            if (hparams.dsv4_compress_ratios[hparams.n_layer()] == 0) {
+                throw std::runtime_error("LLAMA_QWEN4EXP_MTP_QSA cannot determine the MTP block ratio: "
+                        "provide a nonzero MTP compression ratio or a shared nonzero trunk ratio");
+            }
+        }
+    }
+
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
     cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;
@@ -587,7 +613,7 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             ggml_tensor * src = node->src[j];
             if (!src) {
-                break;
+                continue;
             }
             if (src->flags & GGML_TENSOR_FLAG_INPUT) {
                 users[src].push_back(node);

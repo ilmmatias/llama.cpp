@@ -27,6 +27,7 @@ static __device__ __forceinline__ const char * ggml_cuda_qsa_kv_address(
 
 bool ggml_backend_buft_is_cuda_qsa_kv(ggml_backend_buffer_type_t buft);
 ggml_backend_buffer_type_t ggml_backend_cuda_qsa_kv_buffer_type(ggml_backend_dev_t dev, uint32_t resident_tokens);
+size_t ggml_backend_cuda_qsa_kv_tensor_device_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor);
 
 void * ggml_cuda_qsa_kv_device_ptr(const ggml_tensor * tensor);
 bool ggml_cuda_qsa_kv_is_paged(const ggml_tensor * tensor);

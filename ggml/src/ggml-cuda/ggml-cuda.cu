@@ -2582,6 +2582,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_QSA_BLOCK_SCORE:
             ggml_cuda_op_qsa_block_score(ctx, dst);
             break;
+        case GGML_OP_QSA_MASK:
+            ggml_cuda_op_qsa_mask(ctx, dst);
+            break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
             break;
@@ -6517,6 +6520,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_QSA_MASK:
+            return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
+                ggml_is_contiguous(op->src[0]) && op->type == GGML_TYPE_F32;
         case GGML_OP_QSA_BLOCK_SCORE:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_I32 && op->src[3]->type == GGML_TYPE_F32 &&
@@ -6702,6 +6708,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_flash_attn_ext_qsa_supported") == 0) {
+        return (void *) ggml_backend_cuda_device_supports_op;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
@@ -6722,6 +6731,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_qsa_kv_buffer_type") == 0) {
         return (void *)ggml_backend_cuda_qsa_kv_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_qsa_kv_tensor_device_size") == 0) {
+        return (void *)ggml_backend_cuda_qsa_kv_tensor_device_size;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;

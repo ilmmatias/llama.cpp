@@ -18,7 +18,7 @@ namespace fattn_cub = cub;
 template <typename index_t, int items_per_thread>
 __launch_bounds__(256, 1)
 static __global__ void flash_attn_prepare_selected_indices(
-        const half * mask, const index_t * selected, int32_t * indices, int32_t * counts,
+        const half * mask, const int32_t * positions, const index_t * selected, int32_t * indices, int32_t * counts,
         const int n_kv, const int n_selected, const int64_t ms1, const int64_t ms3,
         const int64_t is1, const int64_t is2) {
     ggml_cuda_pdl_sync();
@@ -33,7 +33,9 @@ static __global__ void flash_attn_prepare_selected_indices(
 
     const int     tid  = threadIdx.x;
     const int64_t list = int64_t(blockIdx.y)*gridDim.x + blockIdx.x;
-    mask     += blockIdx.y*ms3 + blockIdx.x*ms1;
+    if (mask) {
+        mask += blockIdx.y*ms3 + blockIdx.x*ms1;
+    }
     selected += blockIdx.y*is2 + blockIdx.x*is1;
     indices  += list*n_selected;
 
@@ -42,7 +44,8 @@ static __global__ void flash_attn_prepare_selected_indices(
     for (int j = 0; j < items_per_thread; ++j) {
         const int i   = tid + j*256;
         index_t   row = i < n_selected ? selected[i] : INT_MAX;
-        if (row < 0 || row >= n_kv || !isfinite(__half2float(mask[row]))) {
+        if (row < 0 || row >= n_kv || (positions ?
+                !ggml_qsa_is_visible(positions, n_kv, row, blockIdx.x) : !isfinite(__half2float(mask[row])))) {
             row = INT_MAX;
         }
         rows[j] = int32_t(row);
@@ -79,7 +82,7 @@ static __global__ void flash_attn_prepare_selected_indices(
 
 template <typename index_t>
 static __global__ void flash_attn_filter_selected_indices(
-        const half * mask, const index_t * selected, int32_t * rows, int32_t * offsets,
+        const half * mask, const int32_t * positions, const index_t * selected, int32_t * rows, int32_t * offsets,
         const int n_kv, const int n_selected, const int n_queries, const int64_t first_list,
         const int64_t ms1, const int64_t ms3, const int64_t is1, const int64_t is2) {
     ggml_cuda_pdl_sync();
@@ -87,13 +90,16 @@ static __global__ void flash_attn_filter_selected_indices(
     const int64_t list = first_list + blockIdx.x;
     const int64_t q    = list % n_queries;
     const int64_t s    = list / n_queries;
-    mask     += s*ms3 + q*ms1;
+    if (mask) {
+        mask += s*ms3 + q*ms1;
+    }
     selected += s*is2 + q*is1;
     rows     += int64_t(blockIdx.x)*n_selected;
 
     for (int i = threadIdx.x; i < n_selected; i += blockDim.x) {
         const index_t row = selected[i];
-        rows[i] = row >= 0 && row < n_kv && isfinite(__half2float(mask[row])) ? int32_t(row) : INT_MAX;
+        rows[i] = row >= 0 && row < n_kv && (positions ?
+            ggml_qsa_is_visible(positions, n_kv, row, q) : isfinite(__half2float(mask[row]))) ? int32_t(row) : INT_MAX;
     }
     if (threadIdx.x == 0) {
         offsets[blockIdx.x] = blockIdx.x*n_selected;
@@ -140,8 +146,13 @@ static void ggml_cuda_flash_attn_ext_prepare_indices_t(
         ggml_cuda_pool & pool, const ggml_tensor * mask, const ggml_tensor * selected,
         int32_t * indices, int32_t * counts, const int n_queries, cudaStream_t stream) {
     const int     n_selected = selected->ne[0];
-    const int64_t ms1        = mask->nb[1]/sizeof(half);
-    const int64_t ms3        = mask->nb[3]/sizeof(half);
+    const bool compact = mask->type == GGML_TYPE_I32;
+    const half * dense_mask = compact ? nullptr : (const half *) mask->data;
+    const int32_t * positions = compact ? (const int32_t *) mask->data : nullptr;
+    const int n_kv = compact ? mask->ne[1] - n_queries : mask->ne[0];
+    const int n_stream = compact ? 1 : mask->ne[3];
+    const int64_t ms1 = compact ? 0 : mask->nb[1]/sizeof(half);
+    const int64_t ms3 = compact ? 0 : mask->nb[3]/sizeof(half);
     const int64_t is1        = selected->nb[1]/sizeof(index_t);
     const int64_t is2        = selected->nb[2]/sizeof(index_t);
 
@@ -151,15 +162,15 @@ static void ggml_cuda_flash_attn_ext_prepare_indices_t(
                             n_selected <= 1024 ? flash_attn_prepare_selected_indices<index_t,  4> :
                             n_selected <= 2048 ? flash_attn_prepare_selected_indices<index_t,  8> :
                                                  flash_attn_prepare_selected_indices<index_t, 16>;
-        const ggml_cuda_kernel_launch_params launch_params(dim3(n_queries, mask->ne[3], 1), dim3(256, 1, 1), 0, stream);
-        ggml_cuda_kernel_launch(kernel, launch_params, (const half *) mask->data, (const index_t *) selected->data,
-            indices, counts, int(mask->ne[0]), n_selected, ms1, ms3, is1, is2);
+        const ggml_cuda_kernel_launch_params launch_params(dim3(n_queries, n_stream, 1), dim3(256, 1, 1), 0, stream);
+        ggml_cuda_kernel_launch(kernel, launch_params, dense_mask, positions, (const index_t *) selected->data,
+            indices, counts, n_kv, n_selected, ms1, ms3, is1, is2);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
 
     // Bound scratch space and keep segmented-sort offsets within int32_t.
-    const int64_t n_lists     = int64_t(n_queries)*mask->ne[3];
+    const int64_t n_lists = int64_t(n_queries)*n_stream;
     const int64_t max_lists   = std::max<int64_t>(1, (1 << 26)/(2*sizeof(int32_t)*n_selected));
     const int     chunk_lists = std::min(n_lists, max_lists);
     ggml_cuda_pool_alloc<int32_t> rows(pool, size_t(chunk_lists)*n_selected);
@@ -170,8 +181,8 @@ static void ggml_cuda_flash_attn_ext_prepare_indices_t(
         const int batch = std::min<int64_t>(chunk_lists, n_lists - first);
         const ggml_cuda_kernel_launch_params launch_params(dim3(batch, 1, 1), dim3(256, 1, 1), 0, stream);
         ggml_cuda_kernel_launch(flash_attn_filter_selected_indices<index_t>, launch_params,
-            (const half *) mask->data, (const index_t *) selected->data, rows.get(), offsets.get(),
-            int(mask->ne[0]), n_selected, n_queries, first, ms1, ms3, is1, is2);
+            dense_mask, positions, (const index_t *) selected->data, rows.get(), offsets.get(),
+            n_kv, n_selected, n_queries, first, ms1, ms3, is1, is2);
         CUDA_CHECK(cudaGetLastError());
 
         size_t temp_bytes = 0;
@@ -776,8 +787,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
     // The effective batch size for the kernel can be increased by gqa_ratio.
-    // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // Disable this optimization for ALiBi, absent visibility data, or an unpadded KV cache.
+    bool gqa_opt_applies = gqa_ratio >= 2 && (mask || dst->src[6]) &&
+        max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -791,8 +803,24 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     const int cc = ggml_cuda_info().devices[device].cc;
-    if (Q->ne[1] <= 8 && K->ne[0] == 256 && V->ne[0] == 256 &&
-            ggml_cuda_qsa_kv_is_paged(K) && ggml_cuda_qsa_kv_is_paged(V)) {
+    if (dst->src[5] || dst->src[6]) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_CUDA_USE_CUB)
+        if (dst->src[5]) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+#endif
+        const bool supported_kv = dst->src[5] ?
+            ggml_cuda_flash_attn_ext_tile_shall_use_sparse(dst, 1) :
+            K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
+        const bool supported_head = dst->src[6] ? K->ne[0] == 256 :
+            K->ne[0] == 64 || K->ne[0] == 128 || K->ne[0] == 256;
+
+        return supported_head && K->ne[0] == V->ne[0] && Q->ne[3] == 1 && supported_kv && max_bias == 0.0f ?
+            BEST_FATTN_KERNEL_TILE : BEST_FATTN_KERNEL_NONE;
+    }
+
+    if (K->ne[0] == 256 && V->ne[0] == 256 &&
+            (ggml_cuda_qsa_kv_is_paged(K) || ggml_cuda_qsa_kv_is_paged(V))) {
         return BEST_FATTN_KERNEL_TILE;
     }
 
@@ -966,7 +994,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-            if (ggml_cuda_fattn_tile_q8_0_KV_supported(dst)) {
+            if (dst->src[5] || ggml_cuda_fattn_tile_q8_0_KV_supported(dst)) {
                 break;
             }
             need_f16_K = true;
@@ -985,10 +1013,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             break;
     }
 
-    const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
+    const ggml_cuda_flash_attn_ext_extra_data extra =
+        ggml_cuda_flash_attn_ext_get_extra_data(dst, need_f16_K, need_f16_V);
 
-    return f16_extra.end - (uintptr_t) dst->data;
+    return extra.end - (uintptr_t) dst->data;
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

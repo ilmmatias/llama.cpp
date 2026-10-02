@@ -48,7 +48,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     hparams_idx(model.hparams),
     qsa_block_capacity(filter_idx == nullptr ? 0 : [&] {
         uint32_t min_ratio = std::numeric_limits<uint32_t>::max();
-        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
             if (!filter_idx(il)) {
                 continue;
             }
@@ -142,7 +142,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
         }
 
         // prepare the recurrent batches first
-        if (!get_mem_recr()->prepare(ubatches)) {
+        if (get_mem_recr()->has_state() && !get_mem_recr()->prepare(ubatches)) {
             // TODO: will the recurrent cache be in an undefined context at this point?
             LLAMA_LOG_ERROR("%s: failed to prepare recurrent ubatches\n", __func__);
             return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);

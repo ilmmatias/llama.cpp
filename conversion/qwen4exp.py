@@ -108,9 +108,9 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
         ratios = [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
-        # llama.cpp reads this array with length block_count, and the MTP blocks
-        # trailing the trunk attend densely, which is what a ratio of 0 selects
-        ratios += [0] * (self.block_count - n_layer)
+        # MTP uses the same configured indexer geometry as the trunk.
+        # Dense versus sparse draft attention is a runtime context choice.
+        ratios += [ratio] * (self.block_count - n_layer)
         self.gguf_writer.add_attention_compress_ratios(ratios)
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,

@@ -2150,6 +2150,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_qsa_block_score(params, tensor);
             } break;
+        case GGML_OP_QSA_MASK:
+            {
+                ggml_compute_forward_qsa_mask(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2334,6 +2338,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
         case GGML_OP_QSA_BLOCK_SCORE:
+        case GGML_OP_QSA_MASK:
             {
                 n_tasks = n_threads;
             } break;
@@ -3061,6 +3066,9 @@ struct ggml_cplan ggml_graph_plan(
                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV + GGML_FA_KQ_BLK));
 
                         cur += MAX(prefill, decode);
+                        if (node->src[5]) {
+                            cur += sizeof(int32_t)*node->src[5]->ne[0]*n_tasks;
+                        }
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {
