@@ -224,6 +224,7 @@ void ggml_gemm_znq2_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 void ggml_gemv_znq3_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_znq3_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+void ggml_repack_q8_0_4x8(const void * const vx[4], void * vy, int64_t k);
 // Quantize four non-contiguous routed activation rows directly into the 4x8
 // Q8_0 interleave consumed by the ZNQ GEMM kernels.
 void ggml_quantize_mat_znq4_q8_0_4x8(const float * x0, const float * x1,

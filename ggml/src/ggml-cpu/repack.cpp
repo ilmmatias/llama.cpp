@@ -4960,6 +4960,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                             const size_t row_size = ggml_row_size(PARAM_TYPE, op->src[1]->ne[0]);
                             const size_t routed_size = row_size * (size_t) n_ids * (size_t) ne12;
                             activation_size = MAX(activation_size, routed_size);
+                            if (src0_type == GGML_TYPE_ZNQ3 && op->src[1]->ne[1] == 1 && n_ids >= 4) {
+                                activation_size += row_size * (size_t) ne12;
+                            }
                         }
                     }
 #endif
@@ -5246,7 +5249,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         // Reserve the expert-grouped activation stream separately from the row map.
         const size_t routed_q8_size = nbw1 * (size_t) n_ids * (size_t) ne12;
-        const size_t activation_size = use_znq_moe ? MAX(nbw3, routed_q8_size) : nbw3;
+        const bool reuse_znq3_input = use_znq_moe && src0->type == GGML_TYPE_ZNQ3 && ne11 == 1 && n_ids >= 4;
+        const size_t activation_size = (use_znq_moe ? MAX(nbw3, routed_q8_size) : nbw3) +
+                                       (reuse_znq3_input ? nbw3 : 0);
 
         GGML_ASSERT(params->wsize >=
                 (GGML_PAD(activation_size, sizeof(int64_t)) +
@@ -5261,6 +5266,15 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *) (matrix_row_counts + n_as); // [n_as][ne12]
 
         auto * active_experts = (int32_t *) (matrix_rows + n_as*ne12); // [n_as], followed by count
+
+        // Broadcast gate/up inputs are shared by all selected experts.
+        char * shared_q8 = reuse_znq3_input ? wdata + routed_q8_size : nullptr;
+        if (reuse_znq3_input) {
+            for (int64_t i12 = ith; i12 < ne12; i12 += nth) {
+                from_float((const float *) ((const char *) src1->data + i12*nb12),
+                           shared_q8 + i12*nbw1, ne10);
+            }
+        }
 
         // ZNQ MoE routes activations before packing them into expert-grouped Q8_0 rows.
         // src1: float32 => param type
@@ -5327,6 +5341,16 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                         continue;
                     }
 
+                    if (reuse_znq3_input) {
+                        const void * rows[4];
+                        for (int r = 0; r < 4; ++r) {
+                            const mmid_row_mapping row = MMID_MATRIX_ROW(cur_a, ir1 + r);
+                            rows[r] = shared_q8 + row.i2*nbw1;
+                        }
+                        ggml_repack_q8_0_4x8(rows, wdata + (expert_row_base + ir1)*nbw1, ne10);
+                        continue;
+                    }
+
                     const float * xr[4];
                     for (int r = 0; r < 4; ++r) {
                         const mmid_row_mapping row = MMID_MATRIX_ROW(cur_a, ir1 + r);
@@ -5346,9 +5370,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     const mmid_row_mapping row = MMID_MATRIX_ROW(cur_a, ir1);
                     const int64_t i11 = row.i1 % ne11;
                     const int64_t i12 = row.i2;
-                    from_float(
-                        (float *) ((char *) src1->data + i12*nb12 + i11*nb11),
-                        wdata + (expert_row_base + ir1)*nbw1, ne10);
+                    if (reuse_znq3_input) {
+                        memcpy(wdata + (expert_row_base + ir1)*nbw1, shared_q8 + i12*nbw1, nbw1);
+                    } else {
+                        from_float(
+                            (float *) ((char *) src1->data + i12*nb12 + i11*nb11),
+                            wdata + (expert_row_base + ir1)*nbw1, ne10);
+                    }
                 }
                 expert_row_base += cne1;
             }

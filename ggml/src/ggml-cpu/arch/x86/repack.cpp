@@ -6696,6 +6696,53 @@ static inline __m256i znq4_moe_quantize_q8_0_block(const float * x, ggml_half * 
 }
 #endif
 
+#if (defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__)) || defined(__AVX2__)
+static inline void interleave_q8_0_4x8(__m256i q0, __m256i q1, __m256i q2, __m256i q3, int8_t * dst) {
+    // Transpose four rows into the 4x8 layout: [r0.0, r1.0, r2.0, r3.0, r0.1, ...].
+    const __m256i lo01 = _mm256_unpacklo_epi64(q0, q1);
+    const __m256i lo23 = _mm256_unpacklo_epi64(q2, q3);
+    const __m256i hi01 = _mm256_unpackhi_epi64(q0, q1);
+    const __m256i hi23 = _mm256_unpackhi_epi64(q2, q3);
+    const __m256i o0 = _mm256_permute2x128_si256(lo01, lo23, 0x20);
+    const __m256i o1 = _mm256_permute2x128_si256(hi01, hi23, 0x20);
+    const __m256i o2 = _mm256_permute2x128_si256(lo01, lo23, 0x31);
+    const __m256i o3 = _mm256_permute2x128_si256(hi01, hi23, 0x31);
+    _mm256_storeu_si256((__m256i *) (dst +  0), o0);
+    _mm256_storeu_si256((__m256i *) (dst + 32), o1);
+    _mm256_storeu_si256((__m256i *) (dst + 64), o2);
+    _mm256_storeu_si256((__m256i *) (dst + 96), o3);
+}
+#endif
+
+void ggml_repack_q8_0_4x8(const void * const vx[4], void * vy, int64_t k) {
+    assert(QK8_0 == 32);
+    assert(k % QK8_0 == 0);
+    const block_q8_0 * x[4];
+    for (int r = 0; r < 4; ++r) {
+        x[r] = (const block_q8_0 *) vx[r];
+    }
+    auto * y = (block_q8_0x4 *) vy;
+
+    for (int64_t ib = 0; ib < k/QK8_0; ++ib) {
+        for (int r = 0; r < 4; ++r) {
+            y[ib].d[r] = x[r][ib].d;
+        }
+#if (defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__)) || defined(__AVX2__)
+        interleave_q8_0_4x8(
+            _mm256_loadu_si256((const __m256i *) x[0][ib].qs),
+            _mm256_loadu_si256((const __m256i *) x[1][ib].qs),
+            _mm256_loadu_si256((const __m256i *) x[2][ib].qs),
+            _mm256_loadu_si256((const __m256i *) x[3][ib].qs), y[ib].qs);
+#else
+        for (int r = 0; r < 4; ++r) {
+            for (int j = 0; j < QK8_0/8; ++j) {
+                memcpy(y[ib].qs + j*32 + r*8, x[r][ib].qs + j*8, 8);
+            }
+        }
+#endif
+    }
+}
+
 void ggml_quantize_mat_znq4_q8_0_4x8(const float * x0, const float * x1,
         const float * x2, const float * x3, void * vy, int64_t k) {
     assert(QK8_0 == 32);
@@ -6710,20 +6757,7 @@ void ggml_quantize_mat_znq4_q8_0_4x8(const float * x0, const float * x1,
         const __m256i q2 = znq4_moe_quantize_q8_0_block(x2 + ib*QK8_0, &y[ib].d[2]);
         const __m256i q3 = znq4_moe_quantize_q8_0_block(x3 + ib*QK8_0, &y[ib].d[3]);
 
-        // Transpose four 32-byte row vectors at 8-byte granularity into the
-        // 4x8 layout: [r0.0, r1.0, r2.0, r3.0, r0.1, ...].
-        const __m256i lo01 = _mm256_unpacklo_epi64(q0, q1);
-        const __m256i lo23 = _mm256_unpacklo_epi64(q2, q3);
-        const __m256i hi01 = _mm256_unpackhi_epi64(q0, q1);
-        const __m256i hi23 = _mm256_unpackhi_epi64(q2, q3);
-        const __m256i o0 = _mm256_permute2x128_si256(lo01, lo23, 0x20);
-        const __m256i o1 = _mm256_permute2x128_si256(hi01, hi23, 0x20);
-        const __m256i o2 = _mm256_permute2x128_si256(lo01, lo23, 0x31);
-        const __m256i o3 = _mm256_permute2x128_si256(hi01, hi23, 0x31);
-        _mm256_storeu_si256((__m256i *) (y[ib].qs +  0), o0);
-        _mm256_storeu_si256((__m256i *) (y[ib].qs + 32), o1);
-        _mm256_storeu_si256((__m256i *) (y[ib].qs + 64), o2);
-        _mm256_storeu_si256((__m256i *) (y[ib].qs + 96), o3);
+        interleave_q8_0_4x8(q0, q1, q2, q3, y[ib].qs);
     }
 #else
     const float * rows[4] = { x0, x1, x2, x3 };

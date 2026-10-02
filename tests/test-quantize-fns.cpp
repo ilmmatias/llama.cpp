@@ -269,11 +269,14 @@ static int test_znq3_repack(bool verbose) {
     }
 
     int num_failed = 0;
-    // Two/three-row batches, GEMM tails, output tiles, and long K dimensions.
-    const int shapes[][3] = { {32, 56, 2}, {256, 280, 3}, {256, 56, 6}, {4128, 56, 7} };
+    // Short batches, GEMM tails, output tiles, and shared gate/up inputs.
+    const int shapes[][4] = {
+        {32, 56, 2, 2}, {256, 280, 3, 2}, {256, 56, 6, 2}, {4128, 56, 7, 2},
+        {32, 56, 1, 4}, {256, 56, 3, 4}, {256, 280, 4, 8}, {4128, 56, 7, 8},
+    };
     for (const auto & shape : shapes) {
         const int k = shape[0], m = shape[1], n = shape[2];
-        constexpr int n_expert = 4, n_used = 2;
+        const int n_used = shape[3], n_expert = 2*n_used;
         ggml_init_params params = { 1024*1024, nullptr, true };
         ggml_context_ptr weight_ctx[2] = { ggml_context_ptr(ggml_init(params)), ggml_context_ptr(ggml_init(params)) };
         ggml_tensor * weights[2];
@@ -315,8 +318,10 @@ static int test_znq3_repack(bool verbose) {
             ggml_backend_tensor_set(input, data.data(), 0, ggml_nbytes(input));
             std::vector<int32_t> routes(n*n_used);
             for (int t = 0; t < n; ++t) {
-                routes[2*t + 0] = t % 2 == 0 ? 0 : n_expert - 1;
-                routes[2*t + 1] = t % 2 == 0 ? n_expert - 1 : 0;
+                for (int r = 0; r < n_used; ++r) {
+                    routes[n_used*t + r] = n_used >= 4 && r == n_used - 1 && t % 3 == 0
+                                          ? n_expert - 1 : 2*((r + t) % n_used);
+                }
             }
             ggml_backend_tensor_set(ids, routes.data(), 0, ggml_nbytes(ids));
 
@@ -337,7 +342,7 @@ static int test_znq3_repack(bool verbose) {
                 const bool failed = !(error <= 1e-6 * std::max(norm, 1e-20));
                 num_failed += failed;
                 if (failed || verbose) {
-                    printf("znq3 repack k=%d m=%d n=%d broadcast=%d threads=%d: %s\n", k, m, n, broadcast, threads, RESULT_STR[failed]);
+                    printf("znq3 repack k=%d m=%d n=%d used=%d broadcast=%d threads=%d: %s\n", k, m, n, n_used, broadcast, threads, RESULT_STR[failed]);
                 }
             }
         }
