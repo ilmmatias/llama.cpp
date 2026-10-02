@@ -272,7 +272,8 @@ static int test_znq3_repack(bool verbose) {
     // Short batches, GEMM tails, output tiles, and shared gate/up inputs.
     const int shapes[][4] = {
         {32, 56, 2, 2}, {256, 280, 3, 2}, {256, 56, 6, 2}, {4128, 56, 7, 2},
-        {32, 56, 1, 4}, {256, 56, 3, 4}, {256, 280, 4, 8}, {4128, 56, 7, 8},
+        {32, 56, 1, 4}, {256, 24, 2, 4}, {256, 56, 3, 4},
+        {256, 280, 4, 8}, {256, 280, 6, 8}, {4128, 56, 7, 8},
     };
     for (const auto & shape : shapes) {
         const int k = shape[0], m = shape[1], n = shape[2];

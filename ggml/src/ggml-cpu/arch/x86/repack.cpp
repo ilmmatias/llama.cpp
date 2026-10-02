@@ -7999,7 +7999,8 @@ static_assert(sizeof(znq3x32_panel_block) == 1280, "wrong ZNQ3 x32 panel size/pa
 
 template <int nrows>
 static void ggml_gemv_znq3_8x8_q8_0_impl(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
-        const void * GGML_RESTRICT vy, int nr, int nc) {
+        const void * GGML_RESTRICT vy, int nr, int nc,
+        const int32_t * row_map, size_t dst_bs1, size_t dst_bs2) {
     assert(n % QK_ZNQ == 0);
     assert(nc % 8 == 0);
 
@@ -8012,7 +8013,15 @@ static void ggml_gemv_znq3_8x8_q8_0_impl(int n, float * GGML_RESTRICT s, size_t 
     const __m512i table8f = _mm512_loadu_si512((const void *) (kvalues_znq3 + 64));
 
     for (int y = 0; y < nr; y += nrows) {
-        const block_q8_0 * a_ptr = a_ptr_start + y * nb;
+        const block_q8_0 * a_rows[nrows];
+        float * dst_rows[nrows];
+        for (int r = 0; r < nrows; ++r) {
+            const int row = y + r;
+            const int input_row = row_map != nullptr ? row_map[2*row + 1] : row;
+            a_rows[r] = a_ptr_start + (size_t) input_row * nb;
+            dst_rows[r] = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row);
+        }
+
         int x = 0;
         for (; x + 1 < nc / 8; x += 2) {
             const block_znq3x8 * b0 = b_ptr_start + x * nb;
@@ -8036,7 +8045,7 @@ static void ggml_gemv_znq3_8x8_q8_0_impl(int n, float * GGML_RESTRICT s, size_t 
                             znq3x16_unpack_group(b0[ib].planes[g], b1[ib].planes[g]),
                             g < 4 ? books_lo : books_hi, table07, table8f);
                     for (int r = 0; r < nrows; ++r) {
-                        const uint32_t q = znq4x8_load_u32(a_ptr[r * nb + ib].qs + 4 * g) ^ 0x80808080u;
+                        const uint32_t q = znq4x8_load_u32(a_rows[r][ib].qs + 4 * g) ^ 0x80808080u;
                         dot[r] = _mm512_dpbusd_epi32(dot[r], _mm512_set1_epi32((int) q), weights);
                     }
                     sumw = _mm512_dpbusd_epi32(sumw, _mm512_set1_epi8(1), weights);
@@ -8046,13 +8055,13 @@ static void ggml_gemv_znq3_8x8_q8_0_impl(int n, float * GGML_RESTRICT s, size_t 
                 const __m512 wd = znq4x8_ufp8x16_to_fp32(b0[ib].d, b1[ib].d);
                 for (int r = 0; r < nrows; ++r) {
                     dot[r] = _mm512_sub_epi32(dot[r], correction);
-                    const __m512 scales = _mm512_mul_ps(wd, _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[r * nb + ib].d)));
+                    const __m512 scales = _mm512_mul_ps(wd, _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a_rows[r][ib].d)));
                     acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dot[r]), scales, acc[r]);
                 }
             }
 
             for (int r = 0; r < nrows; ++r) {
-                _mm512_storeu_ps(s + (y + r) * bs + x * 8, acc[r]);
+                _mm512_storeu_ps(dst_rows[r] + x * 8, acc[r]);
             }
         }
         for (int r = 0; r < nrows; ++r) {
@@ -8069,17 +8078,17 @@ static void ggml_gemv_znq3_8x8_q8_0_impl(int n, float * GGML_RESTRICT s, size_t 
                         const __m256i weights = znq3x8_lookup_group(
                                 znq3x8_unpack_group(b_ptr[ib].planes[g]),
                                 g < 4 ? books_lo : books_hi, table07, table8f);
-                        const __m256i act = _mm256_set1_epi32((int) znq4x8_load_u32(a_ptr[r * nb + ib].qs + 4 * g));
+                        const __m256i act = _mm256_set1_epi32((int) znq4x8_load_u32(a_rows[r][ib].qs + 4 * g));
                         iacc = mul_sum_i8_pairs_acc_int32x8(iacc, weights, act);
                     }
 
                     const __m256 scales = _mm256_mul_ps(
                             znq4x8_ufp8x8_to_fp32(b_ptr[ib].d),
-                            _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[r * nb + ib].d)));
+                            _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_rows[r][ib].d)));
                     acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc), scales, acc);
                 }
 
-                _mm256_storeu_ps(s + (y + r) * bs + xt * 8, acc);
+                _mm256_storeu_ps(dst_rows[r] + xt * 8, acc);
             }
         }
     }
@@ -8087,7 +8096,9 @@ static void ggml_gemv_znq3_8x8_q8_0_impl(int n, float * GGML_RESTRICT s, size_t 
 #endif
 
     for (int y = 0; y < nr; ++y) {
-        const block_q8_0 * a_ptr = a_ptr_start + y * nb;
+        const int input_row = row_map != nullptr ? row_map[2*y + 1] : y;
+        const block_q8_0 * a_ptr = a_ptr_start + (size_t) input_row * nb;
+        float * dst_row = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, y);
         for (int x = 0; x < nc / 8; ++x) {
             const block_znq3x8 * b_ptr = b_ptr_start + x * nb;
             float out[8] = {};
@@ -8109,7 +8120,7 @@ static void ggml_gemv_znq3_8x8_q8_0_impl(int n, float * GGML_RESTRICT s, size_t 
                     out[r] += znq4x8_ufp8_to_fp32(b_ptr[ib].d[r]) * da * dot;
                 }
             }
-            memcpy(s + y * bs + x * 8, out, sizeof(out));
+            memcpy(dst_row + x * 8, out, sizeof(out));
         }
     }
 }
@@ -8117,9 +8128,20 @@ static void ggml_gemv_znq3_8x8_q8_0_impl(int n, float * GGML_RESTRICT s, size_t 
 void ggml_gemv_znq3_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
         const void * GGML_RESTRICT vy, int nr, int nc) {
     switch (nr) {
-        case 2: ggml_gemv_znq3_8x8_q8_0_impl<2>(n, s, bs, vx, vy, nr, nc); break;
-        case 3: ggml_gemv_znq3_8x8_q8_0_impl<3>(n, s, bs, vx, vy, nr, nc); break;
-        default: ggml_gemv_znq3_8x8_q8_0_impl<1>(n, s, bs, vx, vy, nr, nc); break;
+        case 2: ggml_gemv_znq3_8x8_q8_0_impl<2>(n, s, bs, vx, vy, nr, nc, nullptr, 0, 0); break;
+        case 3: ggml_gemv_znq3_8x8_q8_0_impl<3>(n, s, bs, vx, vy, nr, nc, nullptr, 0, 0); break;
+        default: ggml_gemv_znq3_8x8_q8_0_impl<1>(n, s, bs, vx, vy, nr, nc, nullptr, 0, 0); break;
+    }
+}
+
+void ggml_gemv_znq3_8x8_q8_0_moe(
+        int n, float * GGML_RESTRICT s, size_t dst_bs1, size_t dst_bs2, const int32_t * row_map,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    GGML_ASSERT(row_map != nullptr && nr >= 1 && nr <= 3);
+    switch (nr) {
+        case 1: ggml_gemv_znq3_8x8_q8_0_impl<1>(n, s, 0, vx, vy, nr, nc, row_map, dst_bs1, dst_bs2); break;
+        case 2: ggml_gemv_znq3_8x8_q8_0_impl<2>(n, s, 0, vx, vy, nr, nc, row_map, dst_bs1, dst_bs2); break;
+        case 3: ggml_gemv_znq3_8x8_q8_0_impl<3>(n, s, 0, vx, vy, nr, nc, row_map, dst_bs1, dst_bs2); break;
     }
 }
 

@@ -5373,7 +5373,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                         xr[0], xr[1], xr[2], xr[3],
                         wdata + (expert_row_base + ir1)*nbw1, ne10);
                 }
-                for (; ir1 < cne1; ++ir1) {
+                // Shared-input tails are read directly by GEMV.
+                for (; !reuse_znq3_input && ir1 < cne1; ++ir1) {
                     const int64_t task = qtask++;
                     if (task % nth != ith) {
                         continue;
@@ -5381,13 +5382,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     const mmid_row_mapping row = MMID_MATRIX_ROW(cur_a, ir1);
                     const int64_t i11 = row.i1 % ne11;
                     const int64_t i12 = row.i2;
-                    if (reuse_znq3_input) {
-                        memcpy(wdata + (expert_row_base + ir1)*nbw1, shared_q8 + i12*nbw1, nbw1);
-                    } else {
-                        from_float(
-                            (float *) ((char *) src1->data + i12*nb12 + i11*nb11),
-                            wdata + (expert_row_base + ir1)*nbw1, ne10);
-                    }
+                    from_float(
+                        (float *) ((char *) src1->data + i12*nb12 + i11*nb11),
+                        wdata + (expert_row_base + ir1)*nbw1, ne10);
                 }
                 expert_row_base += cne1;
             }
@@ -5484,7 +5481,14 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
                     // Reuse ZNQ3 weight decode across the unpacked two/three-row tail.
                     int64_t ir1 = gemm_rows;
-                    if (src0->type == GGML_TYPE_ZNQ3 && nr1 - ir1 > 1 && tile >= 16) {
+                    if (reuse_znq3_input && ir1 < nr1) {
+                        const int32_t * row_map =
+                            reinterpret_cast<const int32_t *>(&MMID_MATRIX_ROW(cur_a, ir1));
+                        ggml_gemv_znq3_8x8_q8_0_moe(
+                            ne00, (float *) dst->data + col, dst_bs1, dst_bs2, row_map,
+                            src0_cur + col*nb01, shared_q8, (int) (nr1 - ir1), tile);
+                        ir1 = nr1;
+                    } else if (src0->type == GGML_TYPE_ZNQ3 && nr1 - ir1 > 1 && tile >= 16) {
                         float tail[3 * znq_moe_task_cols];
                         const int tail_rows = (int) (nr1 - ir1);
                         ggml_gemv_znq3_8x8_q8_0(

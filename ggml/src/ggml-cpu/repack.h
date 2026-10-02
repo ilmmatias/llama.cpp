@@ -234,6 +234,10 @@ void ggml_quantize_mat_znq4_q8_0_4x8(const float * x0, const float * x1,
 void ggml_gemm_znq2_8x8_q8_0_moe(
         int n, float * GGML_RESTRICT s, size_t dst_bs1, size_t dst_bs2, const int32_t * row_map,
         const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+// GEMV tails read shared Q8_0 input rows by token and scatter through row_map.
+void ggml_gemv_znq3_8x8_q8_0_moe(
+        int n, float * GGML_RESTRICT s, size_t dst_bs1, size_t dst_bs2, const int32_t * row_map,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_znq3_8x8_q8_0_moe(
         int n, float * GGML_RESTRICT s, size_t dst_bs1, size_t dst_bs2, const int32_t * row_map,
         const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
