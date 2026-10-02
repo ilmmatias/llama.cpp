@@ -5311,19 +5311,30 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
 
             int n_active = 0;
+            int64_t row_offset = 0;
             for (int cur_a = 0; cur_a < n_as; ++cur_a) {
-                if (matrix_row_counts[cur_a] != 0) {
+                const int64_t count = matrix_row_counts[cur_a];
+                if (count != 0) {
                     active_experts[n_active++] = cur_a;
+                }
+                if (use_znq_moe) {
+                    // End offsets serve both activation packing and GEMM scheduling.
+                    row_offset += count;
+                    matrix_row_counts[cur_a] = row_offset;
                 }
             }
             active_experts[n_as] = n_active;
+
+            if (use_znq_moe) {
+                // Seed one task per worker before publishing the route map.
+                ggml_threadpool_chunk_set(params->threadpool, nth);
+            }
         }
 
         ggml_barrier(params->threadpool);
         const int n_active = active_experts[n_as];
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
-        int64_t n_routed_rows = 0;
         if (use_znq_moe) {
             static_assert(QK8_0 == 32, "ZNQ MoE Q8 packing assumes QK8_0 == 32");
             GGML_ASSERT(ne00 % QK8_0 == 0);
@@ -5333,7 +5344,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             int64_t expert_row_base = 0;
             for (int a = 0; a < n_active; ++a) {
                 const int cur_a = active_experts[a];
-                const int64_t cne1 = matrix_row_counts[cur_a];
+                const int64_t cne1 = matrix_row_counts[cur_a] - expert_row_base;
                 int64_t ir1 = 0;
                 for (; ir1 + 3 < cne1; ir1 += 4) {
                     const int64_t task = qtask++;
@@ -5380,7 +5391,6 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 }
                 expert_row_base += cne1;
             }
-            n_routed_rows = expert_row_base;
 
             // All consumers must see the expert-grouped packed rows before GEMM.
             ggml_barrier(params->threadpool);
@@ -5419,21 +5429,6 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             const int64_t tail_tasks = tail_cols == 0 ? 0 : (tail_cols == 24 ? 2 : 1);
             const int64_t tasks_per_expert = n_full_tiles + tail_tasks;
 
-            // Convert row counts in-place to expert start offsets.
-            if (ith == 0) {
-                int64_t row_offset = 0;
-                for (int cur_a = 0; cur_a < n_as; ++cur_a) {
-                    const int64_t count = matrix_row_counts[cur_a];
-                    matrix_row_counts[cur_a] = row_offset;
-                    row_offset += count;
-                }
-                GGML_ASSERT(row_offset == n_routed_rows);
-
-                // Seed one task per worker before using the shared counter.
-                ggml_threadpool_chunk_set(params->threadpool, nth);
-            }
-            ggml_barrier(params->threadpool);
-
             const size_t dst_bs1 = nb1 / sizeof(float);
             const size_t dst_bs2 = nb2 / sizeof(float);
             const int64_t total_tasks = (int64_t) n_active * tasks_per_expert;
@@ -5470,10 +5465,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     }
                 }
 
-                const int64_t expert_row_begin = matrix_row_counts[cur_a];
-                const int64_t expert_row_end = cur_a + 1 < n_as
-                    ? matrix_row_counts[cur_a + 1]
-                    : n_routed_rows;
+                const int64_t expert_row_begin = cur_a > 0 ? matrix_row_counts[cur_a - 1] : 0;
+                const int64_t expert_row_end = matrix_row_counts[cur_a];
                 const int64_t nr1 = expert_row_end - expert_row_begin;
 
                 if (nr1 > 0) {
@@ -5518,7 +5511,6 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 current_task = ggml_threadpool_chunk_add(params->threadpool, 1);
             }
 
-            // matrix_row_counts now contains prefix offsets.
             if (ith == 0) {
                 ggml_backend_cpu_expert_cache_end(op);
             }

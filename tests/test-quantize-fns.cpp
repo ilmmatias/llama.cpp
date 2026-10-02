@@ -326,8 +326,12 @@ static int test_znq3_repack(bool verbose) {
             ggml_backend_tensor_set(ids, routes.data(), 0, ggml_nbytes(ids));
 
             std::vector<float> expected(ggml_nelements(out[0])), actual(expected.size());
-            for (int threads : { 1, 3 }) {
+            for (int threads : { 1, 3, 8 }) {
                 ggml_backend_cpu_set_n_threads(backend.get(), threads);
+                for (auto & route : routes) {
+                    route = (route + 1) % n_expert;
+                }
+                ggml_backend_tensor_set(ids, routes.data(), 0, ggml_nbytes(ids));
                 std::fill(actual.begin(), actual.end(), NAN);
                 ggml_backend_tensor_set(out[1], actual.data(), 0, ggml_nbytes(out[1]));
                 assert(ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS);
