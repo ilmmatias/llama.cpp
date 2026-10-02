@@ -81,7 +81,7 @@
 #define ggml_gemv_iqp_8x8_q8_K_generic ggml_gemv_iqp_8x8_q8_K
 #define ggml_gemm_iqp_8x8_q8_K_generic ggml_gemm_iqp_8x8_q8_K
 #define ggml_gemm_iqp_8x8_q8_K_p4_generic ggml_gemm_iqp_8x8_q8_K_p4
-#elif defined(__aarch64__) || defined(__arm__) || defined(_M_ARM) || defined(_M_ARM64)
+#elif defined(__aarch64__) || defined(__arm__) || defined(_M_ARM) || defined(_M_ARM64) || defined(_M_ARM64EC)
 // quants.c
 #define ggml_vec_dot_znq2_q8_0_generic ggml_vec_dot_znq2_q8_0
 #define ggml_vec_dot_znq3_q8_0_generic ggml_vec_dot_znq3_q8_0

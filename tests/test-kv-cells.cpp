@@ -355,6 +355,39 @@ static void test_seq(testing & t) {
 }
 
 static void test_seq_pos(testing & t) {
+    t.test("ordered_append_after_edits", [&](testing & t) {
+        llama_kv_cells cells;
+        cells.resize(70);
+        for (const auto & entry : std::vector<std::pair<llama_pos, uint32_t>>{{8, 65}, {3, 4}, {8, 2}, {12, 1}}) {
+            cells.pos_set(entry.second, entry.first);
+            cells.seq_add(entry.second, 0);
+        }
+        cells.seq_add(65, 1);
+        using entries = std::vector<std::pair<llama_pos, uint32_t>>;
+        entries out;
+        cells.seq_pos_append(0, {-1, 0}, out);
+        t.assert_true(out == entries({{3, 4}, {8, 2}, {8, 65}, {12, 1}}));
+        t.assert_equal(size_t(4), cells.seq_pos_count(0));
+
+        out = {{8, 2}};
+        cells.seq_pos_append(0, out.back(), out);
+        t.assert_true(out == entries({{8, 2}, {8, 65}, {12, 1}}));
+        cells.rm(2);
+        cells.pos_add(65, -6);
+        out.clear();
+        cells.seq_pos_append(0, {-1, 0}, out);
+        t.assert_true(out == entries({{2, 65}, {3, 4}, {12, 1}}));
+        t.assert_equal(size_t(3), cells.seq_pos_count(0));
+        out.clear();
+        cells.seq_pos_append(1, {-1, 0}, out);
+        t.assert_true(out == entries({{2, 65}}));
+        cells.rm(65);
+        out.clear();
+        cells.seq_pos_append(1, {-1, 0}, out);
+        t.assert_true(out.empty());
+        t.assert_equal(size_t(0), cells.seq_pos_count(1));
+    });
+
     t.test("min_max_across_cells", [&](testing & t) {
         llama_kv_cells cells;
         cells.resize(8);

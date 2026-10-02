@@ -28,56 +28,36 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
 
+    # the MTP head: one full-attention QSA block after the trunk, fed by the trunk's hc-wide residual
+    supports_mtp_export = True
+
+    # MTP tensors the shared Qwen remapper does not know
+    _MTP_EXTRA = {
+        "fc_embedding":           "nextn_fc_embedding",
+        "fc_hidden":              "nextn_fc_hidden",
+        "hyper_connection_mixer": "nextn_hc_head",
+    }
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # only the shard names, so the table itself is never held
         self._ple_shards: dict[int, str] = {}
         self._ple_row_dim: int | None = None
-
-    # The MTP head is one trunk-shaped block (dense attention + MoE, wrapped in
-    # hyper-connections) plus a combiner, so once _QwenMtpMixin renames
-    # `mtp.layers.0.*` to the trailing block index its tensors ride the existing
-    # qwen4exp mappings unchanged. Only the two head-level pieces below differ.
-
-    _MTP_MIXER_PREFIX = "mtp.hyper_connection_mixer."
+        self._mtp_fc: dict[str, Tensor] = {}
 
     @classmethod
     def filter_tensors(cls, item):
-        # the head carries its own copy of the trunk's hc_head_* output mixer,
-        # which qwen4exp has in place of a final norm; it is unindexed in the
-        # checkpoint and per-block in the GGUF
         name, gen = item
-        if name.startswith("model." + cls._MTP_MIXER_PREFIX):
-            name = name.replace("model.", "", 1)
-        if name.startswith(cls._MTP_MIXER_PREFIX):
+        if name.startswith("model.mtp."):
+            name = name.removeprefix("model.")
+        part = name.split(".")[1] if name.startswith("mtp.") else None
+        if part in cls._MTP_EXTRA:
             if cls.no_mtp:
                 return None
             assert cls._original_block_count is not None
-            return f"model.layers.{cls._original_block_count}.{name[len('mtp.'):]}", gen
+            rest = name.split(".", 2)[2]
+            return f"model.layers.{cls._original_block_count}.{cls._MTP_EXTRA[part]}.{rest}", gen
         return super().filter_tensors((name, gen))
 
-    def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
-        # qwen4exp splits the combiner the shared NextN code calls eh_proj into
-        # fc_embedding and fc_hidden; W_e@e + W_h@h == [W_e|W_h] @ concat(e, h),
-        # so the two fuse back into the single expected matmul
-        tensors = super().index_tensors(remote_hf_model_id=remote_hf_model_id)
-
-        emb = tensors.pop("mtp.fc_embedding.weight", None)
-        hid = tensors.pop("mtp.fc_hidden.weight", None)
-        if emb is None and hid is None:
-            return tensors
-        if emb is None or hid is None:
-            raise ValueError(
-                "the qwen4exp MTP combiner needs both mtp.fc_embedding.weight and "
-                "mtp.fc_hidden.weight; pass --no-nextn to convert without the draft head"
-            )
-
-        assert self._original_block_count is not None
-        # fc_embedding first: the graph concatenates the token embedding ahead of
-        # the hidden state, so the fused weight has to be ordered to match
-        name = f"model.layers.{self._original_block_count}.eh_proj.weight"
-        tensors[name] = lambda: torch.cat([emb(), hid()], dim=1)
-        return tensors
 
     def _read_hash_constants(self, suffix: str) -> list[int]:
         """Read an int64 PLE constant straight from the checkpoint.
@@ -168,6 +148,14 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         if ".ngram_embedding.shard_" in name:
             return self._place_ple_shard(data_torch, name)
 
+        # eh_proj([e ; h_s]) = fc_embedding(e) + fc_hidden(h_s) for every hc stream s
+        if name.endswith((".nextn_fc_embedding.weight", ".nextn_fc_hidden.weight")):
+            self._mtp_fc[name.rsplit(".", 2)[1]] = data_torch
+            if len(self._mtp_fc) < 2:
+                return []
+            eh = torch.cat([self._mtp_fc.pop("nextn_fc_embedding"), self._mtp_fc.pop("nextn_fc_hidden")], dim=1)
+            return [(self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_EH_PROJ, bid, ".weight"), eh)]
+
         # one projection feeds indexer q and k; split it, as minimax-m3 does
         if ".indexer.index_qk_proj.weight" in name:
             n_q = self.hparams["indexer_n_heads"] * self.hparams["indexer_head_dim"]
@@ -230,6 +218,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     def prepare_tensors(self):
         super().prepare_tensors()
+        if self._mtp_fc:
+            raise ValueError(f"MTP projection missing its other half: {sorted(self._mtp_fc)}")
         n_parts = self.hparams.get("split_ngram_parts", 0)
         if self._ple_shards and len(self._ple_shards) != n_parts:
             raise ValueError(

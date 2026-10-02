@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <algorithm>
 #include <bit>
 #include <bitset>
 #include <cassert>
@@ -318,6 +319,47 @@ public:
         assert(seq_id >= 0);
 
         return seq[i].test(seq_id);
+    }
+
+    size_t seq_pos_count(llama_seq_id seq_id) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+        return seq_pos[seq_id].total;
+    }
+
+    // Append ordered (position, cell) pairs after the supplied pair.
+    void seq_pos_append(llama_seq_id seq_id, std::pair<llama_pos, uint32_t> after,
+                        std::vector<std::pair<llama_pos, uint32_t>> & out) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+        const auto & v = seq_pos[seq_id];
+        if (v.total == 0) {
+            return;
+        }
+        for (int64_t j = std::max<int64_t>(v.head, (int64_t) after.first - v.base); j <= v.tail; ++j) {
+            if (v.cnt[j] == 0) {
+                continue;
+            }
+            const llama_pos p = v.base + (llama_pos) j;
+            if (v.cnt[j] == 1) {
+                const auto entry = std::make_pair(p, v.row_max[j]);
+                if (entry > after) {
+                    out.push_back(entry);
+                }
+            } else {
+                // Repeated M-RoPE positions need every row, not only row_max.
+                // Gather the remaining range once rather than scanning per position.
+                const size_t begin = out.size();
+                for (size_t w = 0; w < used_bits.size(); ++w) {
+                    for (uint64_t bits = used_bits[w]; bits; bits &= bits - 1) {
+                        const uint32_t i = (uint32_t) (w*64 + llama_bits::countr_zero64(bits));
+                        if (pos[i] >= p && seq[i].test(seq_id) && std::make_pair(pos[i], i) > after) {
+                            out.emplace_back(pos[i], i);
+                        }
+                    }
+                }
+                std::sort(out.begin() + begin, out.end());
+                return;
+            }
+        }
     }
 
     // gather the token ids of the cells in `seqs` with position in [p0, p1)

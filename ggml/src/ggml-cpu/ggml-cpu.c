@@ -4,7 +4,6 @@
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "traits.h"
-#include "iqp.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "quants.h"
@@ -16,6 +15,7 @@
 #include "ggml.h"
 #include "common.h"
 #include "tiled/tiled.h"
+#include "iqp.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -478,7 +478,7 @@ typedef pthread_mutex_t    ggml_mutex_t;
 
 #define ggml_lock_init(x)    UNUSED(x)
 #define ggml_lock_destroy(x) UNUSED(x)
-#if defined(__x86_64__) || (defined(_MSC_VER) && defined(_M_AMD64))
+#if defined(__x86_64__) || (defined(_MSC_VER) && defined(_M_AMD64) && !defined(_M_ARM64EC))
 #define ggml_lock_lock(x)    _mm_pause()
 #else
 #define ggml_lock_lock(x)    UNUSED(x)
@@ -1351,9 +1351,11 @@ UseGgmlGemm1:;
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
-        // the F16 path below writes plain floats into wdata, so it needs an F32 vec_dot_type
-        GGML_ASSERT(src1->type == GGML_TYPE_F32 || vec_dot_type == GGML_TYPE_F32);
+        // src1 is either packed from F32 into vec_dot_type, or widened from F16 or BF16 into the F32 work buffer
+        const bool widen = src1->type != GGML_TYPE_F32;
+
+        GGML_ASSERT(!widen || vec_dot_type == GGML_TYPE_F32);
+        GGML_ASSERT(!widen || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16);
 
         // one thread per src1 row: splitting a row across threads makes several cores write the same
         // cache lines, and the vec_dot reads of the row stay slow for the whole matmul
@@ -1365,10 +1367,12 @@ UseGgmlGemm1:;
             const char * src1_row = (const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11;
             char * dst_row = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1;
 
-            if (src1->type == GGML_TYPE_F32) {
-                from_float((const float *) src1_row, dst_row, ne10);
-            } else {
+            if (src1->type == GGML_TYPE_F16) {
                 ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_row, (float *) dst_row, ne10);
+            } else if (src1->type == GGML_TYPE_BF16) {
+                ggml_cpu_bf16_to_fp32((const ggml_bf16_t *) src1_row, (float *) dst_row, ne10);
+            } else {
+                from_float((const float *) src1_row, dst_row, ne10);
             }
         }
     }
@@ -1380,9 +1384,7 @@ UseGgmlGemm1:;
 
     ggml_barrier(params->threadpool);
 
-    // IQ panel gemm (see iqp.h) - must come after the barrier above, it consumes the q8_K rows
-    // of src1 from the work buffer
-    if (ggml_cpu_iqp_supports_mul_mat(dst) && !params->use_ref) {
+    if (!params->use_ref && ggml_cpu_iqp_supports_mul_mat(dst)) {
         ggml_compute_forward_mul_mat_iqp(params, dst);
         return;
     }
@@ -1605,15 +1607,13 @@ static void ggml_compute_forward_mul_mat_id(
     char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
         incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
 
-    // IQ panel gemm (see iqp.h); per expert eligibility is decided below, but the work buffer is
-    // reserved for the whole node (ggml_graph_plan sizes it without params, use_ref only skips the dispatch)
-    const bool iqp = ggml_cpu_iqp_supports_mul_mat_id(dst) && !params->use_ref;
+    // Tiled matmul (see tiled.h); per-thread work buffers, 0 bytes when disabled. The
+    // reservation is unconditional, the per expert eligibility is decided at dispatch time
+    char * tiled_scratch = incr_ptr_aligned(&wdata_cur, ggml_tiled_wdata_size(nth, dst), 64);
 
-    char * iqp_panels = NULL;
-
-    if (iqp) {
-        iqp_panels = incr_ptr_aligned(&wdata_cur, nth * ggml_cpu_iqp_scratch_size(dst), 64);
-    }
+    const bool iqp = !params->use_ref && ggml_cpu_iqp_supports_mul_mat_id(dst);
+    void * iqp_scratch = iqp ?
+        incr_ptr_aligned(&wdata_cur, nth * ggml_cpu_iqp_scratch_size(dst), 64) : NULL;
 
     // single-token (decode) shape: one row of ids, src1 is [ne10, ne11, 1, 1]
     const bool single_token = ids->ne[1] == 1 && ne12 == 1 && ne13 == 1;
@@ -1710,10 +1710,14 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        if (iqp && ggml_cpu_iqp_mul_mat_id_min_batch(cne1)) {
-            ggml_compute_forward_mul_mat_id_iqp(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0),
-                                                iqp_panels);
+        // tiled takes over if profitable for this expert (see tiled.h)
+        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
+            continue;
+        }
 
+        if (iqp && ggml_cpu_iqp_mul_mat_id_min_batch(cne1)) {
+            ggml_compute_forward_mul_mat_id_iqp(params, dst, cur_a, cne1,
+                    (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), iqp_scratch);
             continue;
         }
 
@@ -2935,14 +2939,12 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_MUL_MAT:
                     {
                         const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
-
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
                         }
-
-                        // Extra reservation for tiled mat_mul, if any (VNNI case).  0 if VNNI not enabled.
-                        const int64_t r1 = node->src[1]->ne[1] * node->src[1]->ne[2] * node->src[1]->ne[3];
-                        cur += ggml_tiled_extra_wdata_len(node->src[1]->ne[0], r1);
+                        // Workspace for tiled (see tiled.h)
+                        cur = GGML_PAD(cur, 64);
+                        cur += ggml_tiled_wdata_size(n_tasks, node);
 
                         // the IQ panel path needs one scratch panel per thread past the q8_K rows
                         if (ggml_cpu_iqp_supports_mul_mat(node)) {
@@ -2976,6 +2978,9 @@ struct ggml_cplan ggml_graph_plan(
                         if (src1->type != vec_dot_type && ids->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1) {
                             cur += (size_t) n_tasks * src1->ne[1] * ggml_row_size(vec_dot_type, src1->ne[0]) + 64;
                         }
+                        // Workspace for tiled (see tiled.h)
+                        cur = GGML_PAD(cur, 64);
+                        cur += ggml_tiled_wdata_size(n_tasks, node);
                     } break;
                 case GGML_OP_OUT_PROD:
                     {

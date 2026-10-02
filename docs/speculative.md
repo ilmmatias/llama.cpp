@@ -10,6 +10,8 @@ With `--expert-cache-slots`, supported CPU-resident MoE experts can use the GPU 
 
 On HIP, changed graph executables are rebuilt rather than updated in place. This releases the old kernel-argument storage and avoids [ROCm's accumulating graph-update allocations](https://github.com/ROCm/rocm-systems/issues/10021), which speculative batch-size changes can exhaust.
 
+Qwen4Exp MTP supports both combined and detached draft-head GGUF files. Draft attention remains dense by default; set `LLAMA_QWEN4EXP_MTP_QSA=1` to use the branch's compact QSA block cache. The converter preserves the draft head's compression ratio in either mode.
+
 ## Implementations
 
 The `llama-server` application supports several implementations of speculative decoding. An implementation with draft model can be mixed with an implementation without draft model.
