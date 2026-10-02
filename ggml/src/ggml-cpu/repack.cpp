@@ -4969,6 +4969,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     const size_t sizeof_mmid_row_mapping = sizeof(int64_t);
 
                     size += sizeof_mmid_row_mapping*ne02*(ne12 + 1);
+                    size += (ne02 + 1)*sizeof(int32_t);
 
                     return true;
                 }
@@ -5249,7 +5250,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         GGML_ASSERT(params->wsize >=
                 (GGML_PAD(activation_size, sizeof(int64_t)) +
-                 n_as*(ne12 + 1)*sizeof(mmid_row_mapping))
+                 n_as*(ne12 + 1)*sizeof(mmid_row_mapping) + (n_as + 1)*sizeof(int32_t))
                 );
 
         auto * wdata          = (char *)params->wdata;
@@ -5258,6 +5259,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // total of [n_as][ne12 + 1] elements of type mmid_row_mapping (2*int32_t = int64_t)
         auto * matrix_row_counts = (int64_t *) (wdata_src1_end);                                        // [n_as]
         struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *) (matrix_row_counts + n_as); // [n_as][ne12]
+
+        auto * active_experts = (int32_t *) (matrix_rows + n_as*ne12); // [n_as], followed by count
 
         // ZNQ MoE routes activations before packing them into expert-grouped Q8_0 rows.
         // src1: float32 => param type
@@ -5292,9 +5295,18 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     matrix_row_counts[i02] += 1;
                 }
             }
+
+            int n_active = 0;
+            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                if (matrix_row_counts[cur_a] != 0) {
+                    active_experts[n_active++] = cur_a;
+                }
+            }
+            active_experts[n_as] = n_active;
         }
 
         ggml_barrier(params->threadpool);
+        const int n_active = active_experts[n_as];
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
         int64_t n_routed_rows = 0;
@@ -5305,7 +5317,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             // Pack routed activation rows directly in expert order.
             int64_t qtask = 0;
             int64_t expert_row_base = 0;
-            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+            for (int a = 0; a < n_active; ++a) {
+                const int cur_a = active_experts[a];
                 const int64_t cne1 = matrix_row_counts[cur_a];
                 int64_t ir1 = 0;
                 for (; ir1 + 3 < cne1; ir1 += 4) {
@@ -5395,19 +5408,20 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
             const size_t dst_bs1 = nb1 / sizeof(float);
             const size_t dst_bs2 = nb2 / sizeof(float);
-            const int64_t total_tasks = (int64_t) n_as * tasks_per_expert;
+            const int64_t total_tasks = (int64_t) n_active * tasks_per_expert;
 
             // Use tile-major ordering for large expert counts.
-            const bool znq_tile_major = n_as >= 256;
+            const bool znq_tile_major = n_active >= 256;
 
             int64_t current_task = ith;
             while (current_task < total_tasks) {
-                const int cur_a = znq_tile_major
-                    ? (int) (current_task % n_as)
+                const int active_a = znq_tile_major
+                    ? (int) (current_task % n_active)
                     : (int) (current_task / tasks_per_expert);
+                const int cur_a = active_experts[active_a];
                 const int64_t local_task = znq_tile_major
-                    ? current_task / n_as
-                    : current_task - (int64_t) cur_a * tasks_per_expert;
+                    ? current_task / n_active
+                    : current_task - (int64_t) active_a * tasks_per_expert;
 
                 int64_t col;
                 int tile;
@@ -5471,12 +5485,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         // compute each matrix multiplication in sequence
         int64_t expert_row_base = 0;
-        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+        for (int a = 0; a < n_active; ++a) {
+            const int cur_a = active_experts[a];
             const int64_t cne1 = matrix_row_counts[cur_a];
-
-            if (cne1 == 0) {
-                continue;
-            }
 
             const auto * src0_cur = (const char *) src0->data + cur_a*nb02;
 
