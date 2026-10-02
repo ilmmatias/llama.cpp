@@ -9,6 +9,7 @@
 #include "simd-mappings.h"
 #include "traits.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <cassert>
@@ -6844,9 +6845,32 @@ static inline __m512 znq4x8_ufp8x16_to_fp32(const uint8_t * p0, const uint8_t * 
     return _mm512_mask_blend_ps(is_subnormal, normal, subnormal);
 }
 
-// Transient prompt-processing panel for 32 output rows. The on-disk / CPU_REPACK
-// representation remains 4.5 bpw; this expands only one K-panel per worker so
-// the nonlinear book lookup is paid once and then reused across all prompt rows.
+// Bound decoded panels to 160 KiB per worker and reuse storage across calls.
+static constexpr int ZNQ_PANEL_BLOCKS = 128;
+
+struct znq_panel_scratch {
+    void * data = nullptr;
+    size_t size = 0;
+
+    ~znq_panel_scratch() {
+        std::free(data);
+    }
+
+    void * get(size_t bytes) {
+        if (bytes > size) {
+            void * next = std::realloc(data, bytes);
+            if (next == nullptr) {
+                return nullptr;
+            }
+            data = next;
+            size = bytes;
+        }
+        return data;
+    }
+};
+
+static thread_local znq_panel_scratch znq_scratch;
+
 struct znq4x32_panel_block {
     int8_t  weights[2][QK_ZNQ / 4][64];
     int32_t correction[2][16];
@@ -6992,9 +7016,6 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
     // avoiding the register-pressure/spill cliff seen with the 8-row tile while
     // preserving the same two 16-column VNNI halves and the same decoded panel.
     //
-    // For pp4096 and K=14336 the panel is 560 KiB per worker. It is transient,
-    // reused for every 4-row prompt tile, and does not inflate the model buffer.
-    //
     // CPU_REPACK only guarantees output chunks aligned to the physical x8
     // repack width. Do not require the entire scheduler chunk to be a multiple
     // of 32: use the panel kernel for the full x32 prefix and route only the
@@ -7003,8 +7024,9 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
     // whole chunk to the old narrow GEMM path.
     // Keep the direct 16-row tile; use a panel before repeating decode for its tail.
     if (nr >= 20 && nc >= 32) {
-        const size_t panel_size = (size_t) nb * sizeof(znq4x32_panel_block);
-        auto * panel = (znq4x32_panel_block *) std::malloc(panel_size);
+        const int panel_blocks = std::min(nb, ZNQ_PANEL_BLOCKS);
+        const size_t panel_size = (size_t) panel_blocks * sizeof(znq4x32_panel_block);
+        auto * panel = (znq4x32_panel_block *) znq_scratch.get(panel_size);
 
         if (panel != nullptr) {
             const __m512i ones = _mm512_set1_epi8(1);
@@ -7017,101 +7039,107 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
                     b_ptr_start + (4 * x32 + 3) * nb,
                 };
 
-                // One-time nonlinear decode for this 32-column K-panel.
-                for (int ib = 0; ib < nb; ++ib) {
-                    for (int h = 0; h < 2; ++h) {
-                        const block_znq4x8 & b0 = b_ptrs[2 * h + 0][ib];
-                        const block_znq4x8 & b1 = b_ptrs[2 * h + 1][ib];
-                        const __m512i books_lo = znq4x16_book_repeat4(b0.books, b1.books, false);
-                        const __m512i books_hi = znq4x16_book_repeat4(b0.books, b1.books, true);
-                        __m512i sumw = _mm512_setzero_si512();
+                for (int ib0 = 0; ib0 < nb; ib0 += panel_blocks) {
+                    const int ib_end = std::min(nb, ib0 + panel_blocks);
+                    for (int ib = ib0; ib < ib_end; ++ib) {
+                        for (int h = 0; h < 2; ++h) {
+                            const block_znq4x8 & b0 = b_ptrs[2 * h + 0][ib];
+                            const block_znq4x8 & b1 = b_ptrs[2 * h + 1][ib];
+                            const __m512i books_lo = znq4x16_book_repeat4(b0.books, b1.books, false);
+                            const __m512i books_hi = znq4x16_book_repeat4(b0.books, b1.books, true);
+                            __m512i sumw = _mm512_setzero_si512();
 
-                        for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                            const __m512i weights = znq4x16_lookup_group(
-                                    znq4x16_unpack_group(b0.qs + 16 * g, b1.qs + 16 * g),
-                                    g < 4 ? books_lo : books_hi, table03, table47, table8b, tablecf);
-                            _mm512_storeu_si512((void *) panel[ib].weights[h][g], weights);
-                            sumw = _mm512_dpbusd_epi32(sumw, ones, weights);
+                            for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                                const __m512i weights = znq4x16_lookup_group(
+                                        znq4x16_unpack_group(b0.qs + 16 * g, b1.qs + 16 * g),
+                                        g < 4 ? books_lo : books_hi, table03, table47, table8b, tablecf);
+                                _mm512_storeu_si512((void *) panel[ib - ib0].weights[h][g], weights);
+                                sumw = _mm512_dpbusd_epi32(sumw, ones, weights);
+                            }
+
+                            _mm512_storeu_si512((void *) panel[ib - ib0].correction[h], _mm512_slli_epi32(sumw, 7));
+                            _mm512_storeu_ps(panel[ib - ib0].weight_scale[h], znq4x8_ufp8x16_to_fp32(b0.d, b1.d));
                         }
-
-                        _mm512_storeu_si512((void *) panel[ib].correction[h], _mm512_slli_epi32(sumw, 7));
-                        _mm512_storeu_ps(panel[ib].weight_scale[h], znq4x8_ufp8x16_to_fp32(b0.d, b1.d));
-                    }
-                }
-
-                for (int y4 = 0; y4 < nr / 4; ++y4) {
-                    const block_q8_0x4 * a_ptr = a_ptr_start + y4 * nb;
-
-                    __m512 a0 = _mm512_setzero_ps(); __m512 b0 = _mm512_setzero_ps();
-                    __m512 a1 = _mm512_setzero_ps(); __m512 b1 = _mm512_setzero_ps();
-                    __m512 a2 = _mm512_setzero_ps(); __m512 b2 = _mm512_setzero_ps();
-                    __m512 a3 = _mm512_setzero_ps(); __m512 b3 = _mm512_setzero_ps();
-
-                    for (int ib = 0; ib < nb; ++ib) {
-                        const __m512i corr0 = _mm512_loadu_si512((const void *) panel[ib].correction[0]);
-                        const __m512i corr1 = _mm512_loadu_si512((const void *) panel[ib].correction[1]);
-                        const __m512 wd0 = _mm512_loadu_ps(panel[ib].weight_scale[0]);
-                        const __m512 wd1 = _mm512_loadu_ps(panel[ib].weight_scale[1]);
-
-                        __m512i d00 = _mm512_setzero_si512(); __m512i d10 = _mm512_setzero_si512();
-                        __m512i d01 = _mm512_setzero_si512(); __m512i d11 = _mm512_setzero_si512();
-                        __m512i d02 = _mm512_setzero_si512(); __m512i d12 = _mm512_setzero_si512();
-                        __m512i d03 = _mm512_setzero_si512(); __m512i d13 = _mm512_setzero_si512();
-                        const int8_t * qbase = a_ptr[ib].qs;
-
-                        // Four activation rows x two output halves give eight independent
-                        // VNNI chains without carrying a second 4-row FP accumulator set.
-                        for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                            const __m512i w0 = _mm512_loadu_si512((const void *) panel[ib].weights[0][g]);
-                            const __m512i w1 = _mm512_loadu_si512((const void *) panel[ib].weights[1][g]);
-                            const int chunk = g >> 1;
-                            const int within = (g & 1) * 4;
-                            const int off = chunk * 32 + within;
-
-                            const __m512i q0 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  0) ^ 0x80808080u));
-                            const __m512i q1 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  8) ^ 0x80808080u));
-                            const __m512i q2 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 16) ^ 0x80808080u));
-                            const __m512i q3 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 24) ^ 0x80808080u));
-
-                            d00 = _mm512_dpbusd_epi32(d00, q0, w0); d10 = _mm512_dpbusd_epi32(d10, q0, w1);
-                            d01 = _mm512_dpbusd_epi32(d01, q1, w0); d11 = _mm512_dpbusd_epi32(d11, q1, w1);
-                            d02 = _mm512_dpbusd_epi32(d02, q2, w0); d12 = _mm512_dpbusd_epi32(d12, q2, w1);
-                            d03 = _mm512_dpbusd_epi32(d03, q3, w0); d13 = _mm512_dpbusd_epi32(d13, q3, w1);
-                        }
-
-                        d00 = _mm512_sub_epi32(d00, corr0); d10 = _mm512_sub_epi32(d10, corr1);
-                        d01 = _mm512_sub_epi32(d01, corr0); d11 = _mm512_sub_epi32(d11, corr1);
-                        d02 = _mm512_sub_epi32(d02, corr0); d12 = _mm512_sub_epi32(d12, corr1);
-                        d03 = _mm512_sub_epi32(d03, corr0); d13 = _mm512_sub_epi32(d13, corr1);
-
-                        const float sd0 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[0]);
-                        const float sd1 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[1]);
-                        const float sd2 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[2]);
-                        const float sd3 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[3]);
-                        a0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d00), _mm512_mul_ps(wd0, _mm512_set1_ps(sd0)), a0);
-                        b0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d10), _mm512_mul_ps(wd1, _mm512_set1_ps(sd0)), b0);
-                        a1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d01), _mm512_mul_ps(wd0, _mm512_set1_ps(sd1)), a1);
-                        b1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d11), _mm512_mul_ps(wd1, _mm512_set1_ps(sd1)), b1);
-                        a2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d02), _mm512_mul_ps(wd0, _mm512_set1_ps(sd2)), a2);
-                        b2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d12), _mm512_mul_ps(wd1, _mm512_set1_ps(sd2)), b2);
-                        a3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d03), _mm512_mul_ps(wd0, _mm512_set1_ps(sd3)), a3);
-                        b3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d13), _mm512_mul_ps(wd1, _mm512_set1_ps(sd3)), b3);
                     }
 
-                    const int row = 4 * y4;
-                    float * d0 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 0) + 32 * x32;
-                    float * d1 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 1) + 32 * x32;
-                    float * d2 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 2) + 32 * x32;
-                    float * d3 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 3) + 32 * x32;
-                    _mm512_storeu_ps(d0,      a0); _mm512_storeu_ps(d0 + 16, b0);
-                    _mm512_storeu_ps(d1,      a1); _mm512_storeu_ps(d1 + 16, b1);
-                    _mm512_storeu_ps(d2,      a2); _mm512_storeu_ps(d2 + 16, b2);
-                    _mm512_storeu_ps(d3,      a3); _mm512_storeu_ps(d3 + 16, b3);
+                    for (int y4 = 0; y4 < nr / 4; ++y4) {
+                        const block_q8_0x4 * a_ptr = a_ptr_start + y4 * nb;
+
+                        const int row = 4 * y4;
+                        float * d0 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 0) + 32 * x32;
+                        float * d1 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 1) + 32 * x32;
+                        float * d2 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 2) + 32 * x32;
+                        float * d3 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 3) + 32 * x32;
+
+                        __m512 a0 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d0);
+                        __m512 b0 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d0 + 16);
+                        __m512 a1 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d1);
+                        __m512 b1 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d1 + 16);
+                        __m512 a2 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d2);
+                        __m512 b2 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d2 + 16);
+                        __m512 a3 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d3);
+                        __m512 b3 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d3 + 16);
+
+                        for (int ib = ib0; ib < ib_end; ++ib) {
+                            const __m512i corr0 = _mm512_loadu_si512((const void *) panel[ib - ib0].correction[0]);
+                            const __m512i corr1 = _mm512_loadu_si512((const void *) panel[ib - ib0].correction[1]);
+                            const __m512 wd0 = _mm512_loadu_ps(panel[ib - ib0].weight_scale[0]);
+                            const __m512 wd1 = _mm512_loadu_ps(panel[ib - ib0].weight_scale[1]);
+
+                            __m512i d00 = _mm512_setzero_si512(); __m512i d10 = _mm512_setzero_si512();
+                            __m512i d01 = _mm512_setzero_si512(); __m512i d11 = _mm512_setzero_si512();
+                            __m512i d02 = _mm512_setzero_si512(); __m512i d12 = _mm512_setzero_si512();
+                            __m512i d03 = _mm512_setzero_si512(); __m512i d13 = _mm512_setzero_si512();
+                            const int8_t * qbase = a_ptr[ib].qs;
+
+                            // Four activation rows x two output halves give eight independent
+                            // VNNI chains without carrying a second 4-row FP accumulator set.
+                            for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                                const __m512i w0 = _mm512_loadu_si512((const void *) panel[ib - ib0].weights[0][g]);
+                                const __m512i w1 = _mm512_loadu_si512((const void *) panel[ib - ib0].weights[1][g]);
+                                const int chunk = g >> 1;
+                                const int within = (g & 1) * 4;
+                                const int off = chunk * 32 + within;
+
+                                const __m512i q0 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  0) ^ 0x80808080u));
+                                const __m512i q1 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  8) ^ 0x80808080u));
+                                const __m512i q2 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 16) ^ 0x80808080u));
+                                const __m512i q3 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 24) ^ 0x80808080u));
+
+                                d00 = _mm512_dpbusd_epi32(d00, q0, w0); d10 = _mm512_dpbusd_epi32(d10, q0, w1);
+                                d01 = _mm512_dpbusd_epi32(d01, q1, w0); d11 = _mm512_dpbusd_epi32(d11, q1, w1);
+                                d02 = _mm512_dpbusd_epi32(d02, q2, w0); d12 = _mm512_dpbusd_epi32(d12, q2, w1);
+                                d03 = _mm512_dpbusd_epi32(d03, q3, w0); d13 = _mm512_dpbusd_epi32(d13, q3, w1);
+                            }
+
+                            d00 = _mm512_sub_epi32(d00, corr0); d10 = _mm512_sub_epi32(d10, corr1);
+                            d01 = _mm512_sub_epi32(d01, corr0); d11 = _mm512_sub_epi32(d11, corr1);
+                            d02 = _mm512_sub_epi32(d02, corr0); d12 = _mm512_sub_epi32(d12, corr1);
+                            d03 = _mm512_sub_epi32(d03, corr0); d13 = _mm512_sub_epi32(d13, corr1);
+
+                            const float sd0 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[0]);
+                            const float sd1 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[1]);
+                            const float sd2 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[2]);
+                            const float sd3 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[3]);
+                            a0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d00), _mm512_mul_ps(wd0, _mm512_set1_ps(sd0)), a0);
+                            b0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d10), _mm512_mul_ps(wd1, _mm512_set1_ps(sd0)), b0);
+                            a1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d01), _mm512_mul_ps(wd0, _mm512_set1_ps(sd1)), a1);
+                            b1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d11), _mm512_mul_ps(wd1, _mm512_set1_ps(sd1)), b1);
+                            a2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d02), _mm512_mul_ps(wd0, _mm512_set1_ps(sd2)), a2);
+                            b2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d12), _mm512_mul_ps(wd1, _mm512_set1_ps(sd2)), b2);
+                            a3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d03), _mm512_mul_ps(wd0, _mm512_set1_ps(sd3)), a3);
+                            b3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d13), _mm512_mul_ps(wd1, _mm512_set1_ps(sd3)), b3);
+                        }
+
+                        _mm512_storeu_ps(d0,      a0); _mm512_storeu_ps(d0 + 16, b0);
+                        _mm512_storeu_ps(d1,      a1); _mm512_storeu_ps(d1 + 16, b1);
+                        _mm512_storeu_ps(d2,      a2); _mm512_storeu_ps(d2 + 16, b2);
+                        _mm512_storeu_ps(d3,      a3); _mm512_storeu_ps(d3 + 16, b3);
+                    }
                 }
             }
 
             const int nc32 = nc - nc % 32;
-            std::free(panel);
 
             // Preserve the widest available tail kernel. A 24-column tail is
             // split as 16+8 so the first part reaches the 0029 16x16 path
@@ -7527,8 +7555,9 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
     // register-balanced Zen5 VNNI engine used by ZNQ3 and ZNQ4.
     // Keep the direct 16-row tile; use a panel before repeating decode for its tail.
     if (nr >= 20 && nc >= 32) {
-        const size_t panel_size = (size_t) nb * sizeof(znq2x32_panel_block);
-        auto * panel = (znq2x32_panel_block *) std::malloc(panel_size);
+        const int panel_blocks = std::min(nb, ZNQ_PANEL_BLOCKS);
+        const size_t panel_size = (size_t) panel_blocks * sizeof(znq2x32_panel_block);
+        auto * panel = (znq2x32_panel_block *) znq_scratch.get(panel_size);
 
         if (panel != nullptr) {
             const __m512i ones = _mm512_set1_epi8(1);
@@ -7541,98 +7570,105 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
                     b_ptr_start + (4 * x32 + 3) * nb,
                 };
 
-                for (int ib = 0; ib < nb; ++ib) {
-                    for (int h = 0; h < 2; ++h) {
-                        const block_znq2x8 & b0 = b_ptrs[2 * h + 0][ib];
-                        const block_znq2x8 & b1 = b_ptrs[2 * h + 1][ib];
-                        const __m512i books_lo = znq4x16_book_repeat4(b0.books, b1.books, false);
-                        const __m512i books_hi = znq4x16_book_repeat4(b0.books, b1.books, true);
-                        __m512i sumw = _mm512_setzero_si512();
+                for (int ib0 = 0; ib0 < nb; ib0 += panel_blocks) {
+                    const int ib_end = std::min(nb, ib0 + panel_blocks);
+                    for (int ib = ib0; ib < ib_end; ++ib) {
+                        for (int h = 0; h < 2; ++h) {
+                            const block_znq2x8 & b0 = b_ptrs[2 * h + 0][ib];
+                            const block_znq2x8 & b1 = b_ptrs[2 * h + 1][ib];
+                            const __m512i books_lo = znq4x16_book_repeat4(b0.books, b1.books, false);
+                            const __m512i books_hi = znq4x16_book_repeat4(b0.books, b1.books, true);
+                            __m512i sumw = _mm512_setzero_si512();
 
-                        for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                            const __m512i weights = znq2x16_lookup_group(
-                                    znq2x16_unpack_group(b0.qs[g], b1.qs[g]),
-                                    g < 4 ? books_lo : books_hi, table);
-                            _mm512_storeu_si512((void *) panel[ib].weights[h][g], weights);
-                            sumw = _mm512_dpbusd_epi32(sumw, ones, weights);
+                            for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                                const __m512i weights = znq2x16_lookup_group(
+                                        znq2x16_unpack_group(b0.qs[g], b1.qs[g]),
+                                        g < 4 ? books_lo : books_hi, table);
+                                _mm512_storeu_si512((void *) panel[ib - ib0].weights[h][g], weights);
+                                sumw = _mm512_dpbusd_epi32(sumw, ones, weights);
+                            }
+
+                            _mm512_storeu_si512((void *) panel[ib - ib0].correction[h], _mm512_slli_epi32(sumw, 7));
+                            _mm512_storeu_ps(panel[ib - ib0].weight_scale[h], znq4x8_ufp8x16_to_fp32(b0.d, b1.d));
                         }
-
-                        _mm512_storeu_si512((void *) panel[ib].correction[h], _mm512_slli_epi32(sumw, 7));
-                        _mm512_storeu_ps(panel[ib].weight_scale[h], znq4x8_ufp8x16_to_fp32(b0.d, b1.d));
-                    }
-                }
-
-                for (int y4 = 0; y4 < nr / 4; ++y4) {
-                    const block_q8_0x4 * a_ptr = a_ptr_start + y4 * nb;
-
-                    __m512 a0 = _mm512_setzero_ps(); __m512 b0 = _mm512_setzero_ps();
-                    __m512 a1 = _mm512_setzero_ps(); __m512 b1 = _mm512_setzero_ps();
-                    __m512 a2 = _mm512_setzero_ps(); __m512 b2 = _mm512_setzero_ps();
-                    __m512 a3 = _mm512_setzero_ps(); __m512 b3 = _mm512_setzero_ps();
-
-                    for (int ib = 0; ib < nb; ++ib) {
-                        const __m512i corr0 = _mm512_loadu_si512((const void *) panel[ib].correction[0]);
-                        const __m512i corr1 = _mm512_loadu_si512((const void *) panel[ib].correction[1]);
-                        const __m512 wd0 = _mm512_loadu_ps(panel[ib].weight_scale[0]);
-                        const __m512 wd1 = _mm512_loadu_ps(panel[ib].weight_scale[1]);
-
-                        __m512i d00 = _mm512_setzero_si512(); __m512i d10 = _mm512_setzero_si512();
-                        __m512i d01 = _mm512_setzero_si512(); __m512i d11 = _mm512_setzero_si512();
-                        __m512i d02 = _mm512_setzero_si512(); __m512i d12 = _mm512_setzero_si512();
-                        __m512i d03 = _mm512_setzero_si512(); __m512i d13 = _mm512_setzero_si512();
-                        const int8_t * qbase = a_ptr[ib].qs;
-
-                        for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                            const __m512i w0 = _mm512_loadu_si512((const void *) panel[ib].weights[0][g]);
-                            const __m512i w1 = _mm512_loadu_si512((const void *) panel[ib].weights[1][g]);
-                            const int chunk = g >> 1;
-                            const int within = (g & 1) * 4;
-                            const int off = chunk * 32 + within;
-
-                            const __m512i q0 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  0) ^ 0x80808080u));
-                            const __m512i q1 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  8) ^ 0x80808080u));
-                            const __m512i q2 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 16) ^ 0x80808080u));
-                            const __m512i q3 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 24) ^ 0x80808080u));
-
-                            d00 = _mm512_dpbusd_epi32(d00, q0, w0); d10 = _mm512_dpbusd_epi32(d10, q0, w1);
-                            d01 = _mm512_dpbusd_epi32(d01, q1, w0); d11 = _mm512_dpbusd_epi32(d11, q1, w1);
-                            d02 = _mm512_dpbusd_epi32(d02, q2, w0); d12 = _mm512_dpbusd_epi32(d12, q2, w1);
-                            d03 = _mm512_dpbusd_epi32(d03, q3, w0); d13 = _mm512_dpbusd_epi32(d13, q3, w1);
-                        }
-
-                        d00 = _mm512_sub_epi32(d00, corr0); d10 = _mm512_sub_epi32(d10, corr1);
-                        d01 = _mm512_sub_epi32(d01, corr0); d11 = _mm512_sub_epi32(d11, corr1);
-                        d02 = _mm512_sub_epi32(d02, corr0); d12 = _mm512_sub_epi32(d12, corr1);
-                        d03 = _mm512_sub_epi32(d03, corr0); d13 = _mm512_sub_epi32(d13, corr1);
-
-                        const float sd0 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[0]);
-                        const float sd1 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[1]);
-                        const float sd2 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[2]);
-                        const float sd3 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[3]);
-                        a0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d00), _mm512_mul_ps(wd0, _mm512_set1_ps(sd0)), a0);
-                        b0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d10), _mm512_mul_ps(wd1, _mm512_set1_ps(sd0)), b0);
-                        a1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d01), _mm512_mul_ps(wd0, _mm512_set1_ps(sd1)), a1);
-                        b1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d11), _mm512_mul_ps(wd1, _mm512_set1_ps(sd1)), b1);
-                        a2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d02), _mm512_mul_ps(wd0, _mm512_set1_ps(sd2)), a2);
-                        b2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d12), _mm512_mul_ps(wd1, _mm512_set1_ps(sd2)), b2);
-                        a3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d03), _mm512_mul_ps(wd0, _mm512_set1_ps(sd3)), a3);
-                        b3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d13), _mm512_mul_ps(wd1, _mm512_set1_ps(sd3)), b3);
                     }
 
-                    const int row = 4 * y4;
-                    float * d0 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 0) + 32 * x32;
-                    float * d1 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 1) + 32 * x32;
-                    float * d2 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 2) + 32 * x32;
-                    float * d3 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 3) + 32 * x32;
-                    _mm512_storeu_ps(d0,      a0); _mm512_storeu_ps(d0 + 16, b0);
-                    _mm512_storeu_ps(d1,      a1); _mm512_storeu_ps(d1 + 16, b1);
-                    _mm512_storeu_ps(d2,      a2); _mm512_storeu_ps(d2 + 16, b2);
-                    _mm512_storeu_ps(d3,      a3); _mm512_storeu_ps(d3 + 16, b3);
+                    for (int y4 = 0; y4 < nr / 4; ++y4) {
+                        const block_q8_0x4 * a_ptr = a_ptr_start + y4 * nb;
+
+                        const int row = 4 * y4;
+                        float * d0 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 0) + 32 * x32;
+                        float * d1 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 1) + 32 * x32;
+                        float * d2 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 2) + 32 * x32;
+                        float * d3 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 3) + 32 * x32;
+
+                        __m512 a0 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d0);
+                        __m512 b0 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d0 + 16);
+                        __m512 a1 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d1);
+                        __m512 b1 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d1 + 16);
+                        __m512 a2 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d2);
+                        __m512 b2 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d2 + 16);
+                        __m512 a3 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d3);
+                        __m512 b3 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d3 + 16);
+
+                        for (int ib = ib0; ib < ib_end; ++ib) {
+                            const __m512i corr0 = _mm512_loadu_si512((const void *) panel[ib - ib0].correction[0]);
+                            const __m512i corr1 = _mm512_loadu_si512((const void *) panel[ib - ib0].correction[1]);
+                            const __m512 wd0 = _mm512_loadu_ps(panel[ib - ib0].weight_scale[0]);
+                            const __m512 wd1 = _mm512_loadu_ps(panel[ib - ib0].weight_scale[1]);
+
+                            __m512i d00 = _mm512_setzero_si512(); __m512i d10 = _mm512_setzero_si512();
+                            __m512i d01 = _mm512_setzero_si512(); __m512i d11 = _mm512_setzero_si512();
+                            __m512i d02 = _mm512_setzero_si512(); __m512i d12 = _mm512_setzero_si512();
+                            __m512i d03 = _mm512_setzero_si512(); __m512i d13 = _mm512_setzero_si512();
+                            const int8_t * qbase = a_ptr[ib].qs;
+
+                            for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                                const __m512i w0 = _mm512_loadu_si512((const void *) panel[ib - ib0].weights[0][g]);
+                                const __m512i w1 = _mm512_loadu_si512((const void *) panel[ib - ib0].weights[1][g]);
+                                const int chunk = g >> 1;
+                                const int within = (g & 1) * 4;
+                                const int off = chunk * 32 + within;
+
+                                const __m512i q0 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  0) ^ 0x80808080u));
+                                const __m512i q1 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  8) ^ 0x80808080u));
+                                const __m512i q2 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 16) ^ 0x80808080u));
+                                const __m512i q3 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 24) ^ 0x80808080u));
+
+                                d00 = _mm512_dpbusd_epi32(d00, q0, w0); d10 = _mm512_dpbusd_epi32(d10, q0, w1);
+                                d01 = _mm512_dpbusd_epi32(d01, q1, w0); d11 = _mm512_dpbusd_epi32(d11, q1, w1);
+                                d02 = _mm512_dpbusd_epi32(d02, q2, w0); d12 = _mm512_dpbusd_epi32(d12, q2, w1);
+                                d03 = _mm512_dpbusd_epi32(d03, q3, w0); d13 = _mm512_dpbusd_epi32(d13, q3, w1);
+                            }
+
+                            d00 = _mm512_sub_epi32(d00, corr0); d10 = _mm512_sub_epi32(d10, corr1);
+                            d01 = _mm512_sub_epi32(d01, corr0); d11 = _mm512_sub_epi32(d11, corr1);
+                            d02 = _mm512_sub_epi32(d02, corr0); d12 = _mm512_sub_epi32(d12, corr1);
+                            d03 = _mm512_sub_epi32(d03, corr0); d13 = _mm512_sub_epi32(d13, corr1);
+
+                            const float sd0 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[0]);
+                            const float sd1 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[1]);
+                            const float sd2 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[2]);
+                            const float sd3 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[3]);
+                            a0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d00), _mm512_mul_ps(wd0, _mm512_set1_ps(sd0)), a0);
+                            b0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d10), _mm512_mul_ps(wd1, _mm512_set1_ps(sd0)), b0);
+                            a1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d01), _mm512_mul_ps(wd0, _mm512_set1_ps(sd1)), a1);
+                            b1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d11), _mm512_mul_ps(wd1, _mm512_set1_ps(sd1)), b1);
+                            a2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d02), _mm512_mul_ps(wd0, _mm512_set1_ps(sd2)), a2);
+                            b2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d12), _mm512_mul_ps(wd1, _mm512_set1_ps(sd2)), b2);
+                            a3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d03), _mm512_mul_ps(wd0, _mm512_set1_ps(sd3)), a3);
+                            b3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d13), _mm512_mul_ps(wd1, _mm512_set1_ps(sd3)), b3);
+                        }
+
+                        _mm512_storeu_ps(d0,      a0); _mm512_storeu_ps(d0 + 16, b0);
+                        _mm512_storeu_ps(d1,      a1); _mm512_storeu_ps(d1 + 16, b1);
+                        _mm512_storeu_ps(d2,      a2); _mm512_storeu_ps(d2 + 16, b2);
+                        _mm512_storeu_ps(d3,      a3); _mm512_storeu_ps(d3 + 16, b3);
+                    }
                 }
             }
 
             const int nc32 = nc - nc % 32;
-            std::free(panel);
 
             int done = nc32;
             if (nc - done >= 16) {
@@ -8051,8 +8087,9 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
     // two ZMM tables and require just one VPERMI2B per x16 group.
     // Keep the direct 16-row tile; use a panel before repeating decode for its tail.
     if (nr >= 20 && nc >= 32) {
-        const size_t panel_size = (size_t) nb * sizeof(znq3x32_panel_block);
-        auto * panel = (znq3x32_panel_block *) std::malloc(panel_size);
+        const int panel_blocks = std::min(nb, ZNQ_PANEL_BLOCKS);
+        const size_t panel_size = (size_t) panel_blocks * sizeof(znq3x32_panel_block);
+        auto * panel = (znq3x32_panel_block *) znq_scratch.get(panel_size);
 
         if (panel != nullptr) {
             const __m512i ones = _mm512_set1_epi8(1);
@@ -8065,98 +8102,105 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
                     b_ptr_start + (4 * x32 + 3) * nb,
                 };
 
-                for (int ib = 0; ib < nb; ++ib) {
-                    for (int h = 0; h < 2; ++h) {
-                        const block_znq3x8 & b0 = b_ptrs[2 * h + 0][ib];
-                        const block_znq3x8 & b1 = b_ptrs[2 * h + 1][ib];
-                        const __m512i books_lo = znq4x16_book_repeat4(b0.books, b1.books, false);
-                        const __m512i books_hi = znq4x16_book_repeat4(b0.books, b1.books, true);
-                        __m512i sumw = _mm512_setzero_si512();
+                for (int ib0 = 0; ib0 < nb; ib0 += panel_blocks) {
+                    const int ib_end = std::min(nb, ib0 + panel_blocks);
+                    for (int ib = ib0; ib < ib_end; ++ib) {
+                        for (int h = 0; h < 2; ++h) {
+                            const block_znq3x8 & b0 = b_ptrs[2 * h + 0][ib];
+                            const block_znq3x8 & b1 = b_ptrs[2 * h + 1][ib];
+                            const __m512i books_lo = znq4x16_book_repeat4(b0.books, b1.books, false);
+                            const __m512i books_hi = znq4x16_book_repeat4(b0.books, b1.books, true);
+                            __m512i sumw = _mm512_setzero_si512();
 
-                        for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                            const __m512i weights = znq3x16_lookup_group(
-                                    znq3x16_unpack_group(b0.planes[g], b1.planes[g]),
-                                    g < 4 ? books_lo : books_hi, table07, table8f);
-                            _mm512_storeu_si512((void *) panel[ib].weights[h][g], weights);
-                            sumw = _mm512_dpbusd_epi32(sumw, ones, weights);
+                            for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                                const __m512i weights = znq3x16_lookup_group(
+                                        znq3x16_unpack_group(b0.planes[g], b1.planes[g]),
+                                        g < 4 ? books_lo : books_hi, table07, table8f);
+                                _mm512_storeu_si512((void *) panel[ib - ib0].weights[h][g], weights);
+                                sumw = _mm512_dpbusd_epi32(sumw, ones, weights);
+                            }
+
+                            _mm512_storeu_si512((void *) panel[ib - ib0].correction[h], _mm512_slli_epi32(sumw, 7));
+                            _mm512_storeu_ps(panel[ib - ib0].weight_scale[h], znq4x8_ufp8x16_to_fp32(b0.d, b1.d));
                         }
-
-                        _mm512_storeu_si512((void *) panel[ib].correction[h], _mm512_slli_epi32(sumw, 7));
-                        _mm512_storeu_ps(panel[ib].weight_scale[h], znq4x8_ufp8x16_to_fp32(b0.d, b1.d));
-                    }
-                }
-
-                for (int y4 = 0; y4 < nr / 4; ++y4) {
-                    const block_q8_0x4 * a_ptr = a_ptr_start + y4 * nb;
-
-                    __m512 a0 = _mm512_setzero_ps(); __m512 b0 = _mm512_setzero_ps();
-                    __m512 a1 = _mm512_setzero_ps(); __m512 b1 = _mm512_setzero_ps();
-                    __m512 a2 = _mm512_setzero_ps(); __m512 b2 = _mm512_setzero_ps();
-                    __m512 a3 = _mm512_setzero_ps(); __m512 b3 = _mm512_setzero_ps();
-
-                    for (int ib = 0; ib < nb; ++ib) {
-                        const __m512i corr0 = _mm512_loadu_si512((const void *) panel[ib].correction[0]);
-                        const __m512i corr1 = _mm512_loadu_si512((const void *) panel[ib].correction[1]);
-                        const __m512 wd0 = _mm512_loadu_ps(panel[ib].weight_scale[0]);
-                        const __m512 wd1 = _mm512_loadu_ps(panel[ib].weight_scale[1]);
-
-                        __m512i d00 = _mm512_setzero_si512(); __m512i d10 = _mm512_setzero_si512();
-                        __m512i d01 = _mm512_setzero_si512(); __m512i d11 = _mm512_setzero_si512();
-                        __m512i d02 = _mm512_setzero_si512(); __m512i d12 = _mm512_setzero_si512();
-                        __m512i d03 = _mm512_setzero_si512(); __m512i d13 = _mm512_setzero_si512();
-                        const int8_t * qbase = a_ptr[ib].qs;
-
-                        for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                            const __m512i w0 = _mm512_loadu_si512((const void *) panel[ib].weights[0][g]);
-                            const __m512i w1 = _mm512_loadu_si512((const void *) panel[ib].weights[1][g]);
-                            const int chunk = g >> 1;
-                            const int within = (g & 1) * 4;
-                            const int off = chunk * 32 + within;
-
-                            const __m512i q0 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  0) ^ 0x80808080u));
-                            const __m512i q1 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  8) ^ 0x80808080u));
-                            const __m512i q2 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 16) ^ 0x80808080u));
-                            const __m512i q3 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 24) ^ 0x80808080u));
-
-                            d00 = _mm512_dpbusd_epi32(d00, q0, w0); d10 = _mm512_dpbusd_epi32(d10, q0, w1);
-                            d01 = _mm512_dpbusd_epi32(d01, q1, w0); d11 = _mm512_dpbusd_epi32(d11, q1, w1);
-                            d02 = _mm512_dpbusd_epi32(d02, q2, w0); d12 = _mm512_dpbusd_epi32(d12, q2, w1);
-                            d03 = _mm512_dpbusd_epi32(d03, q3, w0); d13 = _mm512_dpbusd_epi32(d13, q3, w1);
-                        }
-
-                        d00 = _mm512_sub_epi32(d00, corr0); d10 = _mm512_sub_epi32(d10, corr1);
-                        d01 = _mm512_sub_epi32(d01, corr0); d11 = _mm512_sub_epi32(d11, corr1);
-                        d02 = _mm512_sub_epi32(d02, corr0); d12 = _mm512_sub_epi32(d12, corr1);
-                        d03 = _mm512_sub_epi32(d03, corr0); d13 = _mm512_sub_epi32(d13, corr1);
-
-                        const float sd0 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[0]);
-                        const float sd1 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[1]);
-                        const float sd2 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[2]);
-                        const float sd3 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[3]);
-                        a0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d00), _mm512_mul_ps(wd0, _mm512_set1_ps(sd0)), a0);
-                        b0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d10), _mm512_mul_ps(wd1, _mm512_set1_ps(sd0)), b0);
-                        a1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d01), _mm512_mul_ps(wd0, _mm512_set1_ps(sd1)), a1);
-                        b1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d11), _mm512_mul_ps(wd1, _mm512_set1_ps(sd1)), b1);
-                        a2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d02), _mm512_mul_ps(wd0, _mm512_set1_ps(sd2)), a2);
-                        b2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d12), _mm512_mul_ps(wd1, _mm512_set1_ps(sd2)), b2);
-                        a3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d03), _mm512_mul_ps(wd0, _mm512_set1_ps(sd3)), a3);
-                        b3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d13), _mm512_mul_ps(wd1, _mm512_set1_ps(sd3)), b3);
                     }
 
-                    const int row = 4 * y4;
-                    float * d0 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 0) + 32 * x32;
-                    float * d1 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 1) + 32 * x32;
-                    float * d2 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 2) + 32 * x32;
-                    float * d3 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 3) + 32 * x32;
-                    _mm512_storeu_ps(d0,      a0); _mm512_storeu_ps(d0 + 16, b0);
-                    _mm512_storeu_ps(d1,      a1); _mm512_storeu_ps(d1 + 16, b1);
-                    _mm512_storeu_ps(d2,      a2); _mm512_storeu_ps(d2 + 16, b2);
-                    _mm512_storeu_ps(d3,      a3); _mm512_storeu_ps(d3 + 16, b3);
+                    for (int y4 = 0; y4 < nr / 4; ++y4) {
+                        const block_q8_0x4 * a_ptr = a_ptr_start + y4 * nb;
+
+                        const int row = 4 * y4;
+                        float * d0 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 0) + 32 * x32;
+                        float * d1 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 1) + 32 * x32;
+                        float * d2 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 2) + 32 * x32;
+                        float * d3 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 3) + 32 * x32;
+
+                        __m512 a0 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d0);
+                        __m512 b0 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d0 + 16);
+                        __m512 a1 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d1);
+                        __m512 b1 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d1 + 16);
+                        __m512 a2 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d2);
+                        __m512 b2 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d2 + 16);
+                        __m512 a3 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d3);
+                        __m512 b3 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d3 + 16);
+
+                        for (int ib = ib0; ib < ib_end; ++ib) {
+                            const __m512i corr0 = _mm512_loadu_si512((const void *) panel[ib - ib0].correction[0]);
+                            const __m512i corr1 = _mm512_loadu_si512((const void *) panel[ib - ib0].correction[1]);
+                            const __m512 wd0 = _mm512_loadu_ps(panel[ib - ib0].weight_scale[0]);
+                            const __m512 wd1 = _mm512_loadu_ps(panel[ib - ib0].weight_scale[1]);
+
+                            __m512i d00 = _mm512_setzero_si512(); __m512i d10 = _mm512_setzero_si512();
+                            __m512i d01 = _mm512_setzero_si512(); __m512i d11 = _mm512_setzero_si512();
+                            __m512i d02 = _mm512_setzero_si512(); __m512i d12 = _mm512_setzero_si512();
+                            __m512i d03 = _mm512_setzero_si512(); __m512i d13 = _mm512_setzero_si512();
+                            const int8_t * qbase = a_ptr[ib].qs;
+
+                            for (int g = 0; g < QK_ZNQ / 4; ++g) {
+                                const __m512i w0 = _mm512_loadu_si512((const void *) panel[ib - ib0].weights[0][g]);
+                                const __m512i w1 = _mm512_loadu_si512((const void *) panel[ib - ib0].weights[1][g]);
+                                const int chunk = g >> 1;
+                                const int within = (g & 1) * 4;
+                                const int off = chunk * 32 + within;
+
+                                const __m512i q0 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  0) ^ 0x80808080u));
+                                const __m512i q1 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  8) ^ 0x80808080u));
+                                const __m512i q2 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 16) ^ 0x80808080u));
+                                const __m512i q3 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 24) ^ 0x80808080u));
+
+                                d00 = _mm512_dpbusd_epi32(d00, q0, w0); d10 = _mm512_dpbusd_epi32(d10, q0, w1);
+                                d01 = _mm512_dpbusd_epi32(d01, q1, w0); d11 = _mm512_dpbusd_epi32(d11, q1, w1);
+                                d02 = _mm512_dpbusd_epi32(d02, q2, w0); d12 = _mm512_dpbusd_epi32(d12, q2, w1);
+                                d03 = _mm512_dpbusd_epi32(d03, q3, w0); d13 = _mm512_dpbusd_epi32(d13, q3, w1);
+                            }
+
+                            d00 = _mm512_sub_epi32(d00, corr0); d10 = _mm512_sub_epi32(d10, corr1);
+                            d01 = _mm512_sub_epi32(d01, corr0); d11 = _mm512_sub_epi32(d11, corr1);
+                            d02 = _mm512_sub_epi32(d02, corr0); d12 = _mm512_sub_epi32(d12, corr1);
+                            d03 = _mm512_sub_epi32(d03, corr0); d13 = _mm512_sub_epi32(d13, corr1);
+
+                            const float sd0 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[0]);
+                            const float sd1 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[1]);
+                            const float sd2 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[2]);
+                            const float sd3 = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[3]);
+                            a0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d00), _mm512_mul_ps(wd0, _mm512_set1_ps(sd0)), a0);
+                            b0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d10), _mm512_mul_ps(wd1, _mm512_set1_ps(sd0)), b0);
+                            a1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d01), _mm512_mul_ps(wd0, _mm512_set1_ps(sd1)), a1);
+                            b1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d11), _mm512_mul_ps(wd1, _mm512_set1_ps(sd1)), b1);
+                            a2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d02), _mm512_mul_ps(wd0, _mm512_set1_ps(sd2)), a2);
+                            b2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d12), _mm512_mul_ps(wd1, _mm512_set1_ps(sd2)), b2);
+                            a3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d03), _mm512_mul_ps(wd0, _mm512_set1_ps(sd3)), a3);
+                            b3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d13), _mm512_mul_ps(wd1, _mm512_set1_ps(sd3)), b3);
+                        }
+
+                        _mm512_storeu_ps(d0,      a0); _mm512_storeu_ps(d0 + 16, b0);
+                        _mm512_storeu_ps(d1,      a1); _mm512_storeu_ps(d1 + 16, b1);
+                        _mm512_storeu_ps(d2,      a2); _mm512_storeu_ps(d2 + 16, b2);
+                        _mm512_storeu_ps(d3,      a3); _mm512_storeu_ps(d3 + 16, b3);
+                    }
                 }
             }
 
             const int nc32 = nc - nc % 32;
-            std::free(panel);
 
             int done = nc32;
             if (nc - done >= 16) {
