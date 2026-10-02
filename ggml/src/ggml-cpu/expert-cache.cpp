@@ -800,9 +800,26 @@ private:
         t->input = ggml_new_tensor_3d(t->ctx, t->input_q8 ? GGML_TYPE_Q8_1 : GGML_TYPE_F32, layer.input_dim, 1, batch_size);
         t->ids = ggml_new_tensor_2d(t->ctx, GGML_TYPE_I32, hit_count, batch_size);
 
+        t->graph = ggml_new_graph_custom(t->ctx, graph_size, false);
         ggml_tensor * act = nullptr;
 
-        if (layer.cache_gate_up != nullptr) {
+        if (layer.cache_gate_up != nullptr && layer.cache_gate_up->type == GGML_TYPE_ZNQ3 && t->input_q8) {
+            auto * weights = layer.cache_gate_up;
+            const int64_t n_ff = weights->ne[1] / 2;
+            auto * gate_weights = ggml_view_3d(t->ctx, weights,
+                    weights->ne[0], n_ff, weights->ne[2], weights->nb[1], weights->nb[2], 0);
+            auto * up_weights = ggml_view_3d(t->ctx, weights,
+                    weights->ne[0], n_ff, weights->ne[2], weights->nb[1], weights->nb[2], n_ff * weights->nb[1]);
+
+            // Keep weight views before both matmuls so the native Q8_1 GLU/down fusion can match.
+            ggml_build_forward_expand(t->graph, gate_weights);
+            ggml_build_forward_expand(t->graph, up_weights);
+            auto * gate = ggml_mul_mat_id(t->ctx, gate_weights, t->input, t->ids);
+            auto * up   = ggml_mul_mat_id(t->ctx, up_weights,   t->input, t->ids);
+            memcpy(gate->op_params, layer.gate_up_params.data(), GGML_MAX_OP_PARAMS);
+            memcpy(up->op_params,   layer.gate_up_params.data(), GGML_MAX_OP_PARAMS);
+            act = ggml_glu_split(t->ctx, gate, up, layer.glu_op);
+        } else if (layer.cache_gate_up != nullptr) {
             auto * gate_up = ggml_mul_mat_id(t->ctx, layer.cache_gate_up, t->input, t->ids);
             memcpy(gate_up->op_params, layer.gate_up_params.data(), GGML_MAX_OP_PARAMS);
 
@@ -834,7 +851,6 @@ private:
 
         t->output = ggml_mul_mat_id(t->ctx, layer.cache_down, act, t->ids);
         memcpy(t->output->op_params, layer.down_params.data(), GGML_MAX_OP_PARAMS);
-        t->graph = ggml_new_graph_custom(t->ctx, graph_size, false);
         ggml_build_forward_expand(t->graph, t->output);
 
         t->buffer = ggml_backend_alloc_ctx_tensors_from_buft(t->ctx, device_buft);
