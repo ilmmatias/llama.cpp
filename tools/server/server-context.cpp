@@ -3170,6 +3170,9 @@ private:
 
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
 
+                    ckpt.data_spec.clear();
+                    common_speculative_get_state(spec.get(), slot.id, ckpt.data_spec);
+
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
 
@@ -4060,16 +4063,27 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
-                    : server_sample_and_accept_synth(
-                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
-                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+
+                // check for speculative replays
+                llama_tokens accepted;
+                if (slot.spec_is_replay && synth_probs.empty()) {
+                    accepted = slot.spec_draft;
+                    const llama_token id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch.back());
+                    common_sampler_accept(slot.smpl.get(), id, true);
+                    accepted.push_back(id);
+                } else if (synth_probs.empty()) {
+                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                } else {
+                    accepted = server_sample_and_accept_synth(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                }
+
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
+
+                GGML_ASSERT(!slot.spec_is_replay || n_rollback == 0);
 
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
@@ -4096,10 +4110,14 @@ private:
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
                         }
 
+                        common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
+
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
-                        common_sampler_copy(smpl_save.get(), slot.smpl.get());
+                        if (!synth_probs.empty()) {
+                            common_sampler_copy(smpl_save.get(), slot.smpl.get());
+                        }
 
                         return;
                     }
