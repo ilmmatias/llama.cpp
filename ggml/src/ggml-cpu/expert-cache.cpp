@@ -56,7 +56,6 @@ static expert_cache_part expert_cache_parse_tensor(const char * name, int & laye
 
 struct expert_cache_template {
     ggml_context * ctx = nullptr;
-    ggml_backend_buffer_t buffer = nullptr;
     ggml_cgraph * graph = nullptr;
     ggml_tensor * input = nullptr;
     ggml_tensor * ids = nullptr;
@@ -363,6 +362,10 @@ public:
                 free_layer(*layer_it.second);
             }
         }
+        if (workspace != nullptr) {
+            ggml_gallocr_free(workspace);
+            workspace = nullptr;
+        }
         if (compute_backend != nullptr) {
             ggml_backend_free(compute_backend);
         }
@@ -516,10 +519,6 @@ private:
     }
 
     void free_template(expert_cache_template & t) {
-        if (t.buffer != nullptr) {
-            ggml_backend_buffer_free(t.buffer);
-            t.buffer = nullptr;
-        }
         if (t.ctx != nullptr) {
             ggml_free(t.ctx);
             t.ctx = nullptr;
@@ -853,13 +852,15 @@ private:
         memcpy(t->output->op_params, layer.down_params.data(), GGML_MAX_OP_PARAMS);
         ggml_build_forward_expand(t->graph, t->output);
 
-        t->buffer = ggml_backend_alloc_ctx_tensors_from_buft(t->ctx, device_buft);
-        if (t->buffer == nullptr) {
+        if (workspace == nullptr) {
+            workspace = ggml_gallocr_new(device_buft);
+        }
+
+        if (!ggml_gallocr_alloc_graph(workspace, t->graph)) {
             free_template(*t);
             layer.template_failed[key] = 1;
             return nullptr;
         }
-        ggml_backend_buffer_set_usage(t->buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
 
         for (int i = 0; i < ggml_graph_n_nodes(t->graph); ++i) {
             if (!ggml_backend_supports_op(compute_backend, ggml_graph_node(t->graph, i))) {
@@ -965,6 +966,11 @@ private:
         const size_t input_row_bytes = (size_t) layer.input_dim * sizeof(float);
         if (!ensure_output(output_row_bytes * layer.active_hits) ||
             !ensure_input(GGML_PAD(input_row_bytes, 64) * ids->ne[1])) {
+            return;
+        }
+
+        const int max_batch = 1 << (EXPERT_CACHE_BATCH_SIZES - 1);
+        if (get_template_locked(layer, layer.n_expert_used, max_batch) == nullptr) {
             return;
         }
 
@@ -1338,6 +1344,7 @@ private:
     ggml_backend_t compute_backend = nullptr;
     ggml_backend_buffer_type_t device_buft = nullptr;
     ggml_backend_buffer_type_t host_buft = nullptr;
+    ggml_gallocr_t workspace = nullptr;
     bool valid = false;
 
     std::mutex state_mutex;
