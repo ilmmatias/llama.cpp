@@ -1416,8 +1416,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 throw std::runtime_error("expert cache device index exceeds fit target array");
             }
             fit_targets[cache_device_index] += reserve;
-            COM_TRC("expert cache reserves %.1f MiB on %s during fit\n",
-                (double) reserve / (1024.0 * 1024.0), ggml_backend_dev_name(cache_dev));
+            COM_TRC("expert cache reserves %d slots (%.1f MiB) on %s during fit\n",
+                params.expert_cache_slots, (double) reserve / (1024.0 * 1024.0), ggml_backend_dev_name(cache_dev));
         }
 
         const ggml_log_level fit_log_level = params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR;
@@ -1537,6 +1537,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
             params.expert_cache_slots = (int32_t) slots;
             params.expert_cache_slots_auto = false;
+            COM_TRC("expert cache reserved %d slots (%.1f MiB, %.2f MiB/slot) on %s after fit\n",
+                slots, (double) slots * slot_bytes / (1024.0 * 1024.0), (double) slot_bytes / (1024.0 * 1024.0), ggml_backend_dev_name(cache_dev));
         }
     }
 
