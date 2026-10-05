@@ -849,7 +849,8 @@ static bool ggml_cuda_fattn_tile_q8_0_KV_supported(const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    return Q->ne[1] == 1 && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && Q->ne[0] == K->ne[0] && K->ne[0] == V->ne[0] &&
+    return K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
+        Q->ne[0] == K->ne[0] && K->ne[0] == V->ne[0] &&
         (Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256);
 #else
     GGML_UNUSED(dst);
@@ -1018,7 +1019,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         gqa_ratio_eff *= 2;
     }
 
-    if (ggml_cuda_fattn_tile_q8_0_KV_supported(dst) && gqa_opt_applies && gqa_ratio_eff >= 2) {
+    if (ggml_cuda_fattn_tile_q8_0_KV_supported(dst)) {
         return BEST_FATTN_KERNEL_TILE;
     }
 
@@ -1083,13 +1084,36 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
 
+    const int gqa_ratio = Q->ne[2]/K->ne[2];
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+
+    const bool gqa_opt_applies =
+        gqa_ratio >= 2 && (dst->src[3] || dst->src[6]) &&
+        max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    const int sparse_ncols1 =
+        dst->src[5] ? 1 : (gqa_opt_applies && gqa_ratio % 2 == 0 ? 1 : 2);
+
+    const bool native_sparse =
+        ggml_cuda_flash_attn_ext_tile_shall_use_sparse(dst, sparse_ncols1);
+
+#ifdef GGML_USE_HIP
+    const bool native_paged_q8 =
+        ggml_cuda_fattn_use_paged(dst) &&
+        K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
+#else
+    const bool native_paged_q8 = false;
+#endif
+
     bool need_f16_K = false;
     bool need_f16_V = false;
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
             if (!ggml_cuda_fattn_dense_mask(dst) &&
-                    (dst->src[5] || ggml_cuda_fattn_tile_q8_0_KV_supported(dst))) {
+                    (native_sparse || native_paged_q8 || ggml_cuda_fattn_tile_q8_0_KV_supported(dst))) {
                 break;
             }
             need_f16_K = true;

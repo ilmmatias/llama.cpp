@@ -556,7 +556,7 @@ static __device__ __forceinline__ void flash_attn_tile_load_native(
             __align__(16) float v[4] = {};
             half2 h[2] = {};
             if (row >= 0) {
-                const char * data = KV + int64_t(row)*stride_KV;
+                const char * data = ggml_cuda_qsa_kv_address(KV + int64_t(row)*stride_KV, cache);
                 if constexpr (type == GGML_TYPE_Q8_0) {
                     const int col = column + j;
                     const block_q8_0 & block = ((const block_q8_0 *) data)[col/QK8_0];
@@ -751,9 +751,10 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 
             if (!oob_check || i_KQ < k_VKQ_sup) {
                 const int row = use_sparse ? indices[k_VKQ_0 + i_KQ] : k_VKQ_0 + i_KQ;
+                const int source_row = visibility.row_map ? visibility.row_map[row] : row;
                 const float mask_val = visibility.positions ?
-                    (ggml_qsa_is_visible(visibility.positions, visibility.n_kv, row + visibility.row_offset, j) ? 0.0f : -INFINITY) :
-                    (mask ? __half2float(mask[int64_t(j)*stride_mask + row]) : 0.0f);
+                    (ggml_qsa_is_visible(visibility.positions, visibility.n_kv, source_row + visibility.row_offset, j) ? 0.0f : -INFINITY) :
+                    (mask ? __half2float(mask[int64_t(j)*stride_mask + source_row]) : 0.0f);
                 if (use_sparse && !isfinite(mask_val)) {
                     KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] = -INFINITY;
                 } else {
@@ -1300,6 +1301,19 @@ static void launch_fattn_tile_case(
         if (ggml_cuda_flash_attn_ext_tile_shall_use_sparse(dst, ncols1)) {
             if constexpr (DKQ == 256 && DV == 256) {
                 if (ggml_cuda_fattn_use_paged(dst)) {
+#ifdef GGML_USE_HIP
+                    if (dst->src[1]->type == GGML_TYPE_Q8_0 && dst->src[2]->type == GGML_TYPE_Q8_0) {
+                        fattn_kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap,
+                                GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true, true>;
+                        const int native_nbatch = flash_attn_tile_native_nbatch(
+                                DKQ, ncols1*ncols2, false, nbatch_fa);
+                        launch_fattn<DV, ncols1, ncols2>
+                            (ctx, dst, fattn_kernel, nwarps, nbytes_shared, native_nbatch, false, false, false, true, warp_size, true);
+                        return;
+                    }
+#endif
+
+                    GGML_ASSERT(dst->src[1]->type == GGML_TYPE_F16 && dst->src[2]->type == GGML_TYPE_F16);
                     fattn_kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap,
                             GGML_TYPE_F16, GGML_TYPE_F16, true, true>;
                     launch_fattn<DV, ncols1, ncols2>
@@ -1339,6 +1353,17 @@ static void launch_fattn_tile_case(
         if (ggml_cuda_fattn_use_paged(dst)) {
             // Keep the normal dense reduction at short contexts. Forcing a
             // sparse reduction here changes the model's numerical behavior.
+#ifdef GGML_USE_HIP
+            if (dst->src[1]->type == GGML_TYPE_Q8_0 && dst->src[2]->type == GGML_TYPE_Q8_0) {
+                fattn_kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap,
+                        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false, true>;
+                launch_fattn<DV, ncols1, ncols2>
+                    (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, false, false, false, false, warp_size, true);
+                return;
+            }
+#endif
+
+            GGML_ASSERT(dst->src[1]->type == GGML_TYPE_F16 && dst->src[2]->type == GGML_TYPE_F16);
             fattn_kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap,
                     GGML_TYPE_F16, GGML_TYPE_F16, false, true>;
             launch_fattn<DV, ncols1, ncols2>
@@ -1349,7 +1374,7 @@ static void launch_fattn_tile_case(
 
 #ifdef GGML_USE_HIP
     if constexpr (DKQ == DV && (DKQ == 64 || DKQ == 128 || DKQ == 256)) {
-        use_q8_0_KV = dst->src[0]->ne[1] == 1 && dst->src[1]->type == GGML_TYPE_Q8_0 && dst->src[2]->type == GGML_TYPE_Q8_0;
+        use_q8_0_KV = dst->src[1]->type == GGML_TYPE_Q8_0 && dst->src[2]->type == GGML_TYPE_Q8_0;
         fattn_kernel = use_q8_0_KV
             ? flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false>
             : flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, GGML_TYPE_F16, GGML_TYPE_F16, false>;

@@ -9,6 +9,7 @@ struct ggml_cuda_qsa_kv_view {
     const char * host       = nullptr;
     const char * cache      = nullptr;
     const int  * pages      = nullptr;
+    size_t       page_bytes = 0;
     uint32_t     page_shift = 0;
 };
 
@@ -18,16 +19,18 @@ static __device__ __forceinline__ const char * ggml_cuda_qsa_kv_address(
         return address;
     }
 
-    const size_t offset    = address - view.host;
-    const int    slot      = view.pages[offset >> view.page_shift];
-    const size_t page_mask = (size_t(1) << view.page_shift) - 1;
+    const size_t offset = address - view.host;
+    const size_t page = view.page_shift ? offset >> view.page_shift : offset / view.page_bytes;
+    const size_t in_page = offset - page*view.page_bytes;
+    const int    slot = view.pages[page];
 
-    return slot < 0 ? address : view.cache + (size_t(slot) << view.page_shift) + (offset & page_mask);
+    return slot < 0 ? address : view.cache + size_t(slot)*view.page_bytes + in_page;
 }
 
 bool ggml_backend_buft_is_cuda_qsa_kv(ggml_backend_buffer_type_t buft);
 ggml_backend_buffer_type_t ggml_backend_cuda_qsa_kv_buffer_type(ggml_backend_dev_t dev, uint32_t resident_tokens);
 size_t ggml_backend_cuda_qsa_kv_tensor_device_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor);
+bool ggml_backend_cuda_qsa_kv_q8_supported();
 
 void * ggml_cuda_qsa_kv_device_ptr(const ggml_tensor * tensor);
 bool ggml_cuda_qsa_kv_is_paged(const ggml_tensor * tensor);

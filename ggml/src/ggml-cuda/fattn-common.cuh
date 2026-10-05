@@ -23,10 +23,18 @@ struct ggml_cuda_fattn_visibility {
     const int32_t * positions = nullptr;
     int32_t n_kv = 0;
     int32_t row_offset = 0;
+    const int32_t * row_map = nullptr;
 };
 
 // Bound temporary K/V transfer storage independently of the resident page window.
-static constexpr size_t GGML_CUDA_QSA_STAGING_BYTES = 32*1024*1024;
+static inline size_t ggml_cuda_qsa_staging_bytes() {
+    static const size_t bytes = []() {
+        const char * env = getenv("GGML_CUDA_QSA_STAGING_MIB");
+        return (env ? std::max(1, atoi(env)) : 32)*1024*1024;
+    }();
+
+    return bytes;
+}
 
 // A split kernel emits unnormalized sums only when gridDim.y is greater than one.
 static constexpr int GGML_CUDA_QSA_STAGING_PARTS = 2;
@@ -44,6 +52,14 @@ static inline bool ggml_cuda_fattn_dense_mask(const ggml_tensor * dst, const ggm
     if (Q->ne[1] <= 8 || Q->ne[3] != 1) {
         return false;
     }
+
+#ifdef GGML_USE_HIP
+    if (selected &&
+            K->type == GGML_TYPE_Q8_0 && dst->src[2]->type == GGML_TYPE_Q8_0 &&
+            ggml_cuda_qsa_kv_is_paged(K) && ggml_cuda_qsa_kv_is_paged(dst->src[2])) {
+        return false;
+    }
+#endif
 
     if (!selected) {
         const size_t row_bytes = K->ne[1] * sizeof(half);
@@ -88,9 +104,13 @@ static inline bool ggml_cuda_fattn_use_paged(const ggml_tensor * dst) {
     return ggml_cuda_qsa_kv_fits(K) && ggml_cuda_qsa_kv_fits(V);
 }
 
+static inline size_t ggml_cuda_fattn_row_bytes(const ggml_tensor * tensor) {
+    return tensor->ne[0]*ggml_type_size(tensor->type)/ggml_blck_size(tensor->type);
+}
+
 static inline int64_t ggml_cuda_qsa_staging_rows(const ggml_tensor * K, const ggml_tensor * V) {
-    const size_t row_bytes = (K->ne[0]*K->ne[2]*K->ne[3] + V->ne[0]*V->ne[2]*V->ne[3])*sizeof(half);
-    const int64_t rows = GGML_CUDA_QSA_STAGING_BYTES/row_bytes;
+    const size_t row_bytes = ggml_cuda_fattn_row_bytes(K)*K->ne[2]*K->ne[3] + ggml_cuda_fattn_row_bytes(V)*V->ne[2]*V->ne[3];
+    const int64_t rows = ggml_cuda_qsa_staging_bytes()/row_bytes;
     const int64_t aligned = std::max<int64_t>(FATTN_KQ_STRIDE, rows/FATTN_KQ_STRIDE*FATTN_KQ_STRIDE);
 
     return std::min<int64_t>(K->ne[1], aligned);
@@ -133,6 +153,9 @@ struct ggml_cuda_flash_attn_ext_extra_data {
     uintptr_t parts_meta;
     uintptr_t stream_meta;
     uintptr_t indices;
+    uintptr_t staging_needed;
+    uintptr_t staging_row_to_slot;
+    uintptr_t staging_slot_to_row;
     uintptr_t selection_mask;
     uintptr_t end;
 };
@@ -189,14 +212,14 @@ static inline ggml_cuda_flash_attn_ext_extra_data ggml_cuda_flash_attn_ext_get_e
             data.end = GGML_PAD(data.end, 128);
             data.K_staging = data.end;
             data.end += staging_rows*
-                K->ne[0]*K->ne[2]*K->ne[3]*sizeof(half);
+                ggml_cuda_fattn_row_bytes(K)*K->ne[2]*K->ne[3];
         }
 
         if (ggml_cuda_qsa_kv_is_paged(V)) {
             data.end = GGML_PAD(data.end, 128);
             data.V_staging = data.end;
             data.end += staging_rows*
-                V->ne[0]*V->ne[2]*V->ne[3]*sizeof(half);
+                ggml_cuda_fattn_row_bytes(V)*V->ne[2]*V->ne[3];
         }
 
         if ((data.K_staging || data.V_staging) && staging_rows < K->ne[1]) {
@@ -214,8 +237,22 @@ static inline ggml_cuda_flash_attn_ext_extra_data ggml_cuda_flash_attn_ext_get_e
             if (max_selected > 0 && !dense_mask) {
                 const int union_queries = dst->src[5] ? 1 : 2;
                 const int64_t width = std::min<int64_t>(K->ne[1], int64_t(union_queries) * max_selected);
+                const int64_t n_streams = dst->src[3] ? dst->src[3]->ne[3] : 1;
+
                 data.indices = data.end;
-                data.end += (width + 1)*Q->ne[1]*Q->ne[3]*sizeof(int32_t);
+                data.end += (width + 1)*Q->ne[1]*n_streams*sizeof(int32_t);
+
+                data.end = GGML_PAD(data.end, 128);
+                data.staging_needed = data.end;
+                data.end += ((staging_rows + 31)/32)*sizeof(uint32_t);
+
+                data.end = GGML_PAD(data.end, 128);
+                data.staging_row_to_slot = data.end;
+                data.end += staging_rows*sizeof(int32_t);
+
+                data.end = GGML_PAD(data.end, 128);
+                data.staging_slot_to_row = data.end;
+                data.end += staging_rows*sizeof(int32_t);
             }
         }
     }
@@ -1183,7 +1220,7 @@ static __global__ void flash_attn_merge_staged(
 }
 
 static __global__ void flash_attn_staged_indices(
-        const int32_t * selected, int32_t * indices,
+        const int32_t * selected, int32_t * indices, uint32_t * needed,
         const int width, const int n_lists, const int start, const int stop) {
     const int list = blockIdx.x;
     const int32_t * rows = selected + (int64_t) list*width;
@@ -1219,7 +1256,96 @@ static __global__ void flash_attn_staged_indices(
     __syncthreads();
 
     for (int i = threadIdx.x; i < width; i += blockDim.x) {
-        indices[(int64_t) list*width + i] = i < size ? rows[first + i] - start : -1;
+        const int row = i < size ? rows[first + i] - start : -1;
+        indices[(int64_t) list*width + i] = row;
+        if (row >= 0) {
+            atomicOr(needed + (row >> 5), 1u << (row & 31));
+        }
+    }
+}
+
+static __global__ void flash_attn_staged_build_map(
+        const uint32_t * needed, int32_t * row_to_slot, int32_t * slot_to_row, int rows) {
+    __shared__ int scan[256];
+    __shared__ int base;
+
+    const int tid = threadIdx.x;
+    const int words = (rows + 31)/32;
+    if (tid == 0) {
+        base = 0;
+    }
+    __syncthreads();
+
+    for (int first = 0; first < words; first += blockDim.x) {
+        const int word = first + tid;
+        const uint32_t bits = word < words ? needed[word] : 0;
+        scan[tid] = __popcll((unsigned long long) bits);
+        __syncthreads();
+
+        for (int offset = 1; offset < blockDim.x; offset <<= 1) {
+            const int add = tid >= offset ? scan[tid - offset] : 0;
+            __syncthreads();
+            if (tid >= offset) {
+                scan[tid] += add;
+            }
+            __syncthreads();
+        }
+
+        const int word_offset = base + (tid > 0 ? scan[tid - 1] : 0);
+        int local = 0;
+        for (int bit = 0; bit < 32; ++bit) {
+            const int row = word*32 + bit;
+            if (row < rows && (bits & (1u << bit))) {
+                const int slot = word_offset + local++;
+                row_to_slot[row] = slot;
+                slot_to_row[slot] = row;
+            }
+        }
+        __syncthreads();
+
+        if (tid == blockDim.x - 1) {
+            base += scan[tid];
+        }
+        __syncthreads();
+    }
+}
+
+static __global__ void flash_attn_stage_selected_rows(
+        const char * src, char * dst, const uint32_t * needed,
+        const int32_t * row_to_slot, int rows, int64_t start,
+        size_t src_nb1, size_t src_nb2, size_t src_nb3, size_t width,
+        size_t dst_pitch, size_t dst_stride, int n_heads, int n_streams) {
+    const int row = blockIdx.x;
+    const int hs  = blockIdx.y;
+    if (row >= rows || !(needed[row >> 5] & (1u << (row & 31)))) {
+        return;
+    }
+
+    const int slot = row_to_slot[row];
+    const int s = hs/n_heads;
+    const int h = hs - s*n_heads;
+    if (s >= n_streams) {
+        return;
+    }
+
+    const char * in = src + s*src_nb3 + h*src_nb2 + (start + row)*src_nb1;
+    char * out = dst + s*dst_stride + slot*dst_pitch + h*width;
+    for (size_t i = threadIdx.x*sizeof(uint4); i + sizeof(uint4) <= width; i += blockDim.x*sizeof(uint4)) {
+        *reinterpret_cast<uint4 *>(out + i) = *reinterpret_cast<const uint4 *>(in + i);
+    }
+    for (size_t i = width/sizeof(uint4)*sizeof(uint4) + threadIdx.x; i < width; i += blockDim.x) {
+        out[i] = in[i];
+    }
+}
+
+static __global__ void flash_attn_staged_remap_indices(
+        int32_t * indices, const int32_t * row_to_slot,
+        int width, int n_lists) {
+    const int list = blockIdx.x;
+    const int count = indices[(int64_t) n_lists*width + list];
+    for (int i = threadIdx.x; i < count; i += blockDim.x) {
+        const int64_t offset = (int64_t) list*width + i;
+        indices[offset] = row_to_slot[indices[offset]];
     }
 }
 
@@ -1267,6 +1393,11 @@ void launch_fattn(
     const int64_t staging_rows = staged ? ggml_cuda_qsa_staging_rows(K, V) : 0;
     const bool split_staging = staged && staging_rows < K->ne[1];
 
+    if (staged) {
+        GGML_ASSERT(!need_f16_K || K->type == GGML_TYPE_F16);
+        GGML_ASSERT(!need_f16_V || V->type == GGML_TYPE_F16);
+    }
+
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
@@ -1290,8 +1421,9 @@ void launch_fattn(
         if (!use_paged) {
             GGML_ASSERT(extra.K_staging != 0);
             K_data = reinterpret_cast<const char *>(extra.K_staging);
-            nb11 = K->ne[0]*K->ne[2]*sizeof(half);
-            nb12 = K->ne[0]*sizeof(half);
+            const size_t row_bytes = ggml_cuda_fattn_row_bytes(K);
+            nb11 = row_bytes*K->ne[2];
+            nb12 = row_bytes;
             nb13 = staging_rows*nb11;
         }
     }
@@ -1302,8 +1434,9 @@ void launch_fattn(
         if (!use_paged) {
             GGML_ASSERT(extra.V_staging != 0);
             V_data = reinterpret_cast<const char *>(extra.V_staging);
-            nb21 = V->ne[0]*V->ne[2]*sizeof(half);
-            nb22 = V->ne[0]*sizeof(half);
+            const size_t row_bytes = ggml_cuda_fattn_row_bytes(V);
+            nb21 = row_bytes*V->ne[2];
+            nb22 = row_bytes;
             nb23 = staging_rows*nb21;
         }
     }
@@ -1639,14 +1772,54 @@ void launch_fattn(
             CUDA_CHECK(cudaGetLastError());
         }
 
+        const int32_t * chunk_indices = KV_max.ptr;
+        const int32_t * staging_row_map = nullptr;
+
+        if (split_staging && use_sparse) {
+            GGML_ASSERT(extra.indices != 0);
+            GGML_ASSERT(extra.staging_needed != 0);
+            GGML_ASSERT(extra.staging_row_to_slot != 0);
+            GGML_ASSERT(extra.staging_slot_to_row != 0);
+
+            CUDA_CHECK(cudaMemsetAsync((void *) extra.staging_needed, 0, ((rows + 31)/32)*sizeof(uint32_t), main_stream));
+
+            const ggml_cuda_kernel_launch_params index_params(dim3(n_lists, 1, 1), dim3(256, 1, 1), 0, main_stream);
+            ggml_cuda_kernel_launch(flash_attn_staged_indices, index_params,
+                    KV_max.ptr, (int32_t *) extra.indices, (uint32_t *) extra.staging_needed,
+                    n_kv_max, (int) n_lists, (int) start, (int) (start + rows));
+            CUDA_CHECK(cudaGetLastError());
+
+            const ggml_cuda_kernel_launch_params map_params(dim3(1, 1, 1), dim3(256, 1, 1), 0, main_stream);
+            ggml_cuda_kernel_launch(flash_attn_staged_build_map, map_params,
+                    (const uint32_t *) extra.staging_needed, (int32_t *) extra.staging_row_to_slot,
+                    (int32_t *) extra.staging_slot_to_row, (int) rows);
+            CUDA_CHECK(cudaGetLastError());
+
+            chunk_indices = (const int32_t *) extra.indices;
+            staging_row_map = (const int32_t *) extra.staging_slot_to_row;
+        }
+
         auto stage = [&](const ggml_tensor * tensor, uintptr_t staging, const char * data, size_t row_stride) {
             if (!staging || !staged) {
                 return data + (staged ? start*row_stride : 0);
             }
 
-            const size_t width = tensor->ne[0]*sizeof(half);
+            const size_t width = ggml_cuda_fattn_row_bytes(tensor);
             const size_t pitch = width*tensor->ne[2];
             const size_t stride = step*pitch;
+
+            if (split_staging && use_sparse) {
+                const ggml_cuda_kernel_launch_params stage_params(
+                        dim3(rows, tensor->ne[2]*tensor->ne[3], 1), dim3(128, 1, 1), 0, main_stream);
+                ggml_cuda_kernel_launch(flash_attn_stage_selected_rows, stage_params,
+                        (const char *) ggml_cuda_qsa_kv_device_ptr(tensor), (char *) staging,
+                        (const uint32_t *) extra.staging_needed, (const int32_t *) extra.staging_row_to_slot,
+                        rows, start, tensor->nb[1], tensor->nb[2], tensor->nb[3],
+                        width, pitch, stride, tensor->ne[2], tensor->ne[3]);
+                CUDA_CHECK(cudaGetLastError());
+
+                return reinterpret_cast<const char *>(staging);
+            }
 
             for (int64_t s = 0; s < tensor->ne[3]; ++s) {
                 for (int64_t h = 0; h < tensor->ne[2]; ++h) {
@@ -1662,16 +1835,12 @@ void launch_fattn(
         const char * chunk_K = stage(K, extra.K_staging, K_data, nb11);
         const char * chunk_V = stage(V, extra.V_staging, V_data, nb21);
 
-        const int32_t * chunk_indices = KV_max.ptr;
         if (split_staging && use_sparse) {
-            GGML_ASSERT(extra.indices != 0);
-
-            const ggml_cuda_kernel_launch_params index_params(dim3(n_lists, 1, 1), dim3(256, 1, 1), 0, main_stream);
-            ggml_cuda_kernel_launch(flash_attn_staged_indices, index_params,
-                    KV_max.ptr, (int32_t *) extra.indices, n_kv_max, (int) n_lists, (int) start, (int) (start + rows));
+            const ggml_cuda_kernel_launch_params remap_params(dim3(n_lists, 1, 1), dim3(256, 1, 1), 0, main_stream);
+            ggml_cuda_kernel_launch(flash_attn_staged_remap_indices, remap_params,
+                    (int32_t *) extra.indices, (const int32_t *) extra.staging_row_to_slot,
+                    n_kv_max, (int) n_lists);
             CUDA_CHECK(cudaGetLastError());
-
-            chunk_indices = (const int32_t *) extra.indices;
         }
 
         const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
@@ -1692,7 +1861,7 @@ void launch_fattn(
             mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
             K_cache, V_cache,
             ggml_cuda_fattn_visibility{KQV->src[6] ? (const int32_t *) KQV->src[6]->data : nullptr,
-                (int32_t) K->ne[1], (int32_t) start}
+                (int32_t) K->ne[1], (int32_t) start, staging_row_map}
         );
         CUDA_CHECK(cudaGetLastError());
 

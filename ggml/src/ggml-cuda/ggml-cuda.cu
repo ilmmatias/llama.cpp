@@ -6784,6 +6784,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_qsa_kv_buffer_type") == 0) {
         return (void *)ggml_backend_cuda_qsa_kv_buffer_type;
     }
+    if (strcmp(name, "ggml_backend_qsa_kv_q8_supported") == 0) {
+        return (void *)ggml_backend_cuda_qsa_kv_q8_supported;
+    }
     if (strcmp(name, "ggml_backend_qsa_kv_tensor_device_size") == 0) {
         return (void *)ggml_backend_cuda_qsa_kv_tensor_device_size;
     }

@@ -73,6 +73,10 @@ static size_t cache_metadata_size(size_t n_pages, size_t n_slots) {
     return (2*n_pages + 3*n_slots + 3)*sizeof(int);
 }
 
+static __device__ __forceinline__ int cache_page_for_byte(const cache_state & state, size_t byte) {
+    return state.page_shift ? int(byte >> state.page_shift) : int(byte / state.page_bytes);
+}
+
 static void reset_cache(cache_state & state) {
     CUDA_CHECK(cudaMemset(state.pages, 0xff, (state.n_pages + state.n_slots) * sizeof(int)));
     CUDA_CHECK(cudaMemset(state.referenced, 0, state.n_slots * sizeof(int)));
@@ -127,7 +131,7 @@ static ggml_status init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tenso
     auto & ctx = context(buffer);
     ggml_cuda_set_device(ctx.device);
 
-    GGML_ASSERT(tensor->type == GGML_TYPE_F16 && ggml_is_contiguous(tensor));
+    GGML_ASSERT((tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_Q8_0) && ggml_is_contiguous(tensor));
     GGML_ASSERT(tensor->ne[2] == 1 && tensor->ne[3] == 1 && tensor->nb[1] % 16 == 0);
 
     auto state         = std::make_unique<cache_state>();
@@ -139,10 +143,12 @@ static ggml_status init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tenso
     state->n_slots     = std::min<int>(state->n_pages, ctx.resident_tokens / 4);
 
     GGML_ASSERT(state->n_slots > 0);
-    GGML_ASSERT((state->page_bytes & (state->page_bytes - 1)) == 0);
 
-    for (size_t bytes = state->page_bytes; bytes > 1; bytes >>= 1) {
-        ++state->page_shift;
+    state->page_shift = 0;
+    if ((state->page_bytes & (state->page_bytes - 1)) == 0) {
+        for (size_t bytes = state->page_bytes; bytes > 1; bytes >>= 1) {
+            ++state->page_shift;
+        }
     }
 
     const size_t metadata_size = cache_metadata_size(state->n_pages, state->n_slots);
@@ -282,7 +288,7 @@ static __global__ void resolve_pages(
             continue;
         }
 
-        const int page = byte >> state.page_shift;
+        const int page = cache_page_for_byte(state, byte);
 
         if (atomicExch(state.needed + page, epoch) != epoch) {
             const int slot = state.pages[page];
@@ -309,7 +315,7 @@ static __global__ void resolve_pages(
             continue;
         }
 
-        const int page = byte >> state.page_shift;
+        const int page = cache_page_for_byte(state, byte);
 
         if (state.pages[page] >= 0 || atomicCAS(state.pages + page, -1, -2) != -1) {
             continue;
@@ -433,7 +439,7 @@ static __global__ void invalidate_rows(cache_state state, const T * indices, int
         const size_t byte = offset + size_t(indices[i]) * row_bytes;
 
         if (byte < state.bytes) {
-            const int slot = atomicExch(state.pages + (byte >> state.page_shift), -1);
+            const int slot = atomicExch(state.pages + cache_page_for_byte(state, byte), -1);
 
             if (slot >= 0) {
                 state.owners[slot] = -1;
@@ -515,6 +521,14 @@ size_t ggml_backend_cuda_qsa_kv_tensor_device_size(ggml_backend_buffer_type_t bu
     return n_slots * 4 * tensor->nb[1] + cache_metadata_size(n_pages, n_slots);
 }
 
+bool ggml_backend_cuda_qsa_kv_q8_supported() {
+#ifdef GGML_USE_HIP
+    return true;
+#else
+    return false;
+#endif
+}
+
 void * ggml_cuda_qsa_kv_device_ptr(const ggml_tensor * tensor) {
     auto & ctx = context(tensor->buffer);
     return static_cast<char *>(ctx.device_host) +
@@ -548,8 +562,8 @@ void ggml_cuda_qsa_kv_prepare(
 
     CUDA_CHECK(cudaGetLastError());
 
-    K_cache = { state_k->device_host, state_k->cache, state_k->pages, state_k->page_shift };
-    V_cache = { state_v->device_host, state_v->cache, state_v->pages, state_v->page_shift };
+    K_cache = { state_k->device_host, state_k->cache, state_k->pages, state_k->page_bytes, state_k->page_shift };
+    V_cache = { state_v->device_host, state_v->cache, state_v->pages, state_v->page_bytes, state_v->page_shift };
 }
 
 void ggml_cuda_qsa_kv_invalidate_rows(

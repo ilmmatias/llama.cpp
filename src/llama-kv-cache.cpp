@@ -187,7 +187,6 @@ llama_kv_cache::llama_kv_cache(
     const bool qsa_kv_paged =
         offload && !is_mla && !v_trans && n_stream == 1 &&
         model.arch == LLM_ARCH_QWEN4EXP &&
-        type_k == GGML_TYPE_F16 && type_v == GGML_TYPE_F16 &&
         qsa_kv_resident >= 4 && uint32_t(qsa_kv_resident) < kv_size;
     bool qsa_kv_logged = false;
 
@@ -278,7 +277,21 @@ llama_kv_cache::llama_kv_cache(
                 n_embd_k_gqa > 0 && (n_embd_k_gqa & (n_embd_k_gqa - 1)) == 0 &&
                 n_embd_v_gqa > 0 && (n_embd_v_gqa & (n_embd_v_gqa - 1)) == 0;
 
-            if (qsa_kv_paged && qsa_kv_shape) {
+            bool qsa_kv_type_supported =
+                type_k == GGML_TYPE_F16 && type_v == GGML_TYPE_F16;
+
+            if (type_k == GGML_TYPE_Q8_0 && type_v == GGML_TYPE_Q8_0 &&
+                hparams.dsv4_compress_ratios[il] > 0) {
+                using qsa_kv_q8_supported_fn_t = bool (*)();
+
+                auto * reg = ggml_backend_dev_backend_reg(dev);
+                auto * fn = reinterpret_cast<qsa_kv_q8_supported_fn_t>(
+                    reg ? ggml_backend_reg_get_proc_address(reg, "ggml_backend_qsa_kv_q8_supported") : nullptr);
+
+                qsa_kv_type_supported = fn && fn();
+            }
+
+            if (qsa_kv_paged && qsa_kv_shape && qsa_kv_type_supported) {
                 using qsa_kv_buft_fn_t = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t, uint32_t);
 
                 auto * reg = ggml_backend_dev_backend_reg(dev);

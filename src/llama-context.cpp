@@ -130,10 +130,9 @@ llama_context::llama_context(
     cparams.rope_scaling_type = params.rope_scaling_type;
     cparams.pooling_type      = params.pooling_type;
 
-    cparams.qsa_compact_mask = model.arch == LLM_ARCH_QWEN4EXP &&
-        hparams.swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi && hparams.f_max_alibi_bias == 0.0f &&
-        hparams.n_embd_head_k() == 256 && hparams.n_embd_head_v() == 256 &&
-        params.type_k == GGML_TYPE_F16 && params.type_v == GGML_TYPE_F16;
+    cparams.qsa_compact_mask = model.arch == LLM_ARCH_QWEN4EXP && hparams.swa_type == LLAMA_SWA_TYPE_NONE &&
+        !hparams.use_alibi && hparams.f_max_alibi_bias == 0.0f &&
+        hparams.n_embd_head_k() == 256 && hparams.n_embd_head_v() == 256;
 
     if (model.arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
         const char * mtp_qsa = getenv("LLAMA_QWEN4EXP_MTP_QSA");
