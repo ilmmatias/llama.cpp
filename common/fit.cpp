@@ -291,6 +291,28 @@ static void common_params_fit_impl(
             }
         }
 
+        const bool shares_compute =
+            extra->shares_model && extra->cparams->ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+            cparams->n_seq_max == 1 && extra->cparams->n_seq_max == 1 && devs.size() == 1;
+
+        if (shares_compute) {
+            bool fits_target_compute = true;
+            for (size_t id = 0; id < dmds.size(); id++) {
+                if (dmds_extra[id].mb.compute > dmds[id].mb.compute) {
+                    fits_target_compute = false;
+                    break;
+                }
+            }
+
+            if (fits_target_compute) {
+                for (llama_device_memory_data & dmd : dmds_extra) {
+                    dmd.mb.compute = 0;
+                }
+                LOG_TRC("%s: extra context compute fits inside target compute buffers; no additional compute memory required\n",
+                    __func__);
+            }
+        }
+
         for (size_t id = 0; id < dmds.size(); id++) {
             dmds[id].mb.model   += dmds_extra[id].mb.model;
             dmds[id].mb.context += dmds_extra[id].mb.context;
