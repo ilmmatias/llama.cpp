@@ -4541,10 +4541,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return bias_node->src[1];
     };
 
-    // Cached single-token experts enter this backend with the common hidden
-    // activation already in native Q8_1. Fuse the complete gate/up/GLU prefix
-    // into a native Q8_1 scratch tensor for the down MMVQ, eliminating both
-    // the F32 GLU materialization and the down projection's quantization launch.
+    // Cached experts enter this backend with the common hidden
     if (i + 3 < cgraph->n_nodes) {
         const ggml_op ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU, GGML_OP_MUL_MAT_ID };
         const int out_nodes[] = { i + 3 };

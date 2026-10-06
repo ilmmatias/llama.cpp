@@ -444,7 +444,7 @@ public:
 
         expert_cache_layer * layer_ptr = nullptr;
         bool launched = false;
-        int hit_count = 0;
+        int output_rows = 0;
         const std::vector<int32_t> * route_positions = nullptr;
         size_t output_row_bytes = 0;
 
@@ -464,8 +464,8 @@ public:
                 return;
             }
             launched = layer.active_gpu_launched;
-            hit_count = layer.active_hits;
             route_positions = &layer.active_route_positions;
+            output_rows = (int) route_positions->size();
             output_row_bytes = (size_t) layer.output_dim * sizeof(float);
         }
 
@@ -473,8 +473,11 @@ public:
             ggml_backend_synchronize(compute_backend);
 
             const uint8_t * src = (const uint8_t *) output_ptr;
-            for (int i = 0; i < hit_count; ++i) {
+            for (int i = 0; i < output_rows; ++i) {
                 const int32_t route = (*route_positions)[(size_t) i];
+                if (route < 0) {
+                    continue;
+                }
                 const size_t token = route / op->ne[1];
                 const size_t id = route % op->ne[1];
                 memcpy((uint8_t *) op->data + id * op->nb[1] + token * op->nb[2],
@@ -793,16 +796,15 @@ private:
             return nullptr;
         }
 
-        // Native Q8_1 skips the decode conversion. Batched inputs use F32 so
-        // backends can choose MMQ when the batch exceeds their MMVQ limit.
-        t->input_q8 = batch_size == 1 && layer.input_dim % ggml_blck_size(GGML_TYPE_Q8_1) == 0;
+        // Native Q8_1 skips the input conversion.
+        t->input_q8 = layer.input_dim % ggml_blck_size(GGML_TYPE_Q8_1) == 0;
         t->input = ggml_new_tensor_3d(t->ctx, t->input_q8 ? GGML_TYPE_Q8_1 : GGML_TYPE_F32, layer.input_dim, 1, batch_size);
         t->ids = ggml_new_tensor_2d(t->ctx, GGML_TYPE_I32, hit_count, batch_size);
 
         t->graph = ggml_new_graph_custom(t->ctx, graph_size, false);
         ggml_tensor * act = nullptr;
 
-        if (layer.cache_gate_up != nullptr && layer.cache_gate_up->type == GGML_TYPE_ZNQ3 && t->input_q8) {
+        if (layer.cache_gate_up != nullptr && t->input_q8) {
             auto * weights = layer.cache_gate_up;
             const int64_t n_ff = weights->ne[1] / 2;
             auto * gate_weights = ggml_view_3d(t->ctx, weights,
@@ -964,8 +966,7 @@ private:
 
         const size_t output_row_bytes = (size_t) layer.output_dim * sizeof(float);
         const size_t input_row_bytes = (size_t) layer.input_dim * sizeof(float);
-        if (!ensure_output(output_row_bytes * layer.active_hits) ||
-            !ensure_input(GGML_PAD(input_row_bytes, 64) * ids->ne[1])) {
+        if (!ensure_input(GGML_PAD(input_row_bytes, 64) * ids->ne[1])) {
             return;
         }
 
@@ -974,63 +975,89 @@ private:
             return;
         }
 
-        // Group tokens with equal hit counts; keep all upload storage live until end().
-        std::vector<std::vector<int64_t>> token_groups((size_t) layer.n_expert_used + 1);
+        std::vector<int> token_hits((size_t) ids->ne[1], 0);
+        std::vector<int64_t> tokens;
+        tokens.reserve((size_t) ids->ne[1]);
         for (int64_t token = 0; token < ids->ne[1]; ++token) {
             int hits = 0;
             for (int id = 0; id < ids->ne[0]; ++id) {
                 hits += (layer.active_ready_masks[(size_t) token] >> id) & 1;
             }
+            token_hits[(size_t) token] = hits;
             if (hits != 0) {
-                token_groups[(size_t) hits].push_back(token);
+                tokens.push_back(token);
             }
         }
 
         layer.active_slots.clear();
         layer.active_route_positions.clear();
         size_t input_offset = 0;
-        for (int hits = 1; hits <= layer.n_expert_used; ++hits) {
-            const auto & tokens = token_groups[(size_t) hits];
-            for (size_t first = 0; first < tokens.size();) {
-                int batch_size = 1;
-                while (batch_size < (1 << (EXPERT_CACHE_BATCH_SIZES - 1)) &&
-                        first + 2 * batch_size <= tokens.size()) {
-                    batch_size *= 2;
-                }
-
-                auto * t = get_template_locked(layer, hits, batch_size);
-                while (t == nullptr && batch_size > 1) {
-                    batch_size /= 2;
-                    t = get_template_locked(layer, hits, batch_size);
-                }
-                if (t == nullptr) {
-                    return;
-                }
-
-                const size_t route_offset = layer.active_slots.size();
-                for (int i = 0; i < batch_size; ++i) {
-                    const int64_t token = tokens[first + i];
-                    const auto * input_data = (const uint8_t *) op->src[1]->data + token * op->src[1]->nb[2];
-                    auto * packed = (uint8_t *) input_ptr + input_offset + i * t->input->nb[2];
-                    if (t->input_q8) {
-                        quantize_row_q8_1((const float *) input_data, packed, layer.input_dim);
-                    } else {
-                        memcpy(packed, input_data, input_row_bytes);
-                    }
-
-                    for (int id = 0; id < ids->ne[0]; ++id) {
-                        if (layer.active_ready_masks[(size_t) token] & (UINT64_C(1) << id)) {
-                            const size_t route = (size_t) token * ids->ne[0] + id;
-                            layer.active_slots.push_back(layer.active_route_slots[route]);
-                            layer.active_route_positions.push_back((int32_t) route);
-                        }
-                    }
-                }
-
-                layer.active_batches.push_back({ t, route_offset, input_offset });
-                input_offset += GGML_PAD(ggml_nbytes(t->input), 64);
-                first += batch_size;
+        for (size_t first = 0; first < tokens.size();) {
+            int batch_size = 1;
+            while (batch_size < (1 << (EXPERT_CACHE_BATCH_SIZES - 1)) &&
+                    first + 2 * batch_size <= tokens.size()) {
+                batch_size *= 2;
             }
+
+            int padded_hits = 0;
+            expert_cache_template * t = nullptr;
+            while (true) {
+                padded_hits = 0;
+                for (int i = 0; i < batch_size; ++i) {
+                    padded_hits = std::max(padded_hits, token_hits[(size_t) tokens[first + i]]);
+                }
+
+                t = get_template_locked(layer, padded_hits, batch_size);
+                if (t != nullptr || batch_size == 1) {
+                    break;
+                }
+                batch_size /= 2;
+            }
+            if (t == nullptr) {
+                return;
+            }
+
+            const size_t route_offset = layer.active_slots.size();
+            for (int i = 0; i < batch_size; ++i) {
+                const int64_t token = tokens[first + i];
+                const auto * input_data = (const uint8_t *) op->src[1]->data + token * op->src[1]->nb[2];
+                auto * packed = (uint8_t *) input_ptr + input_offset + i * t->input->nb[2];
+                if (t->input_q8) {
+                    quantize_row_q8_1((const float *) input_data, packed, layer.input_dim);
+                } else {
+                    memcpy(packed, input_data, input_row_bytes);
+                }
+
+                int hits = 0;
+                int32_t pad_slot = -1;
+                for (int id = 0; id < ids->ne[0]; ++id) {
+                    if (layer.active_ready_masks[(size_t) token] & (UINT64_C(1) << id)) {
+                        const size_t route = (size_t) token * ids->ne[0] + id;
+                        const int32_t slot = layer.active_route_slots[route];
+                        layer.active_slots.push_back(slot);
+                        layer.active_route_positions.push_back((int32_t) route);
+                        if (pad_slot < 0) {
+                            pad_slot = slot;
+                        }
+                        ++hits;
+                    }
+                }
+
+                GGML_ASSERT(hits == token_hits[(size_t) token] && pad_slot >= 0);
+                for (; hits < padded_hits; ++hits) {
+                    layer.active_slots.push_back(pad_slot);
+                    layer.active_route_positions.push_back(-1);
+                }
+            }
+
+            layer.active_batches.push_back({ t, route_offset, input_offset });
+            input_offset += GGML_PAD(ggml_nbytes(t->input), 64);
+            first += batch_size;
+        }
+
+        GGML_ASSERT(layer.active_slots.size() == layer.active_route_positions.size());
+        if (!ensure_output(output_row_bytes * layer.active_route_positions.size())) {
+            return;
         }
 
         // Templates and host buffers are complete before any asynchronous use.

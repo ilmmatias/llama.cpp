@@ -1497,6 +1497,7 @@ static __global__ void mul_mat_vec_q_glu_q8_1(
         const void * gate_ptr, const void * up_ptr, const block_q8_1 * y, const int32_t * ids,
         block_q8_1 * dst,
         const uint32_t ncols_x, const uint32_t stride_row_x, const uint32_t stride_channel_x,
+        const uint32_t stride_sample_y, const uint32_t ids_stride, const uint32_t routes_per_token,
         const ggml_glu_op glu_op, const float glu_limit) {
     const void * GGML_CUDA_RESTRICT gate = gate_ptr;
     const void * GGML_CUDA_RESTRICT up   = up_ptr;
@@ -1510,10 +1511,14 @@ static __global__ void mul_mat_vec_q_glu_q8_1(
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
     const int route = blockIdx.y;
+    const int token = route / routes_per_token;
+    const int id = route - token*routes_per_token;
     const int row_base = blockIdx.x * QK8_1;
-    const int expert = ids[route];
+    const int expert = ids[token*ids_stride + id];
     const int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * warp_size / qi;
+
+    const block_q8_1 * y_token = y + token*stride_sample_y;
 
     __shared__ float values[QK8_1];
 
@@ -1529,8 +1534,8 @@ static __global__ void mul_mat_vec_q_glu_q8_1(
         for (int kbx = lane / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
             const int kby = kbx * (qk / QK8_1);
             const int kqs = vdr * (lane % (qi / vdr));
-            tmp_up += vec_dot_q_cuda(up, &y[kby], kbx_offset + kbx, kqs);
-            tmp_gate += vec_dot_q_cuda(gate, &y[kby], kbx_offset + kbx, kqs);
+            tmp_up += vec_dot_q_cuda(up, &y_token[kby], kbx_offset + kbx, kqs);
+            tmp_gate += vec_dot_q_cuda(gate, &y_token[kby], kbx_offset + kbx, kqs);
         }
 
         tmp_up   = warp_reduce_sum<warp_size>(tmp_up);
@@ -1588,18 +1593,22 @@ static void mul_mat_vec_q_glu_q8_1_launch(
     constexpr int nwarps = 8;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
     const int64_t blocks_per_route = dst_q8->ne[0] / QK8_1;
-    const dim3 block_nums(blocks_per_route, ids->ne[0], 1);
+    const int64_t n_routes = ids->ne[0]*ids->ne[1];
+    const dim3 block_nums(blocks_per_route, n_routes, 1);
     const dim3 block_dims(warp_size, nwarps, 1);
     const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, ctx.stream());
 
     const size_t ts = ggml_type_size(type);
     const uint32_t stride_row_x = up->nb[1] / ts;
     const uint32_t stride_channel_x = up->nb[2] / ts;
+    const uint32_t stride_sample_y = src1->nb[2] / sizeof(block_q8_1);
+    const uint32_t ids_stride = ids->nb[1] / sizeof(int32_t);
 
     ggml_cuda_kernel_launch(mul_mat_vec_q_glu_q8_1<type, nwarps>, launch_params,
         gate->data, up->data, (const block_q8_1 *) src1->data, (const int32_t *) ids->data,
         (block_q8_1 *) dst_q8->data,
-        (uint32_t) up->ne[0], stride_row_x, stride_channel_x, glu_op, glu_limit);
+        (uint32_t) up->ne[0], stride_row_x, stride_channel_x,
+        stride_sample_y, ids_stride, (uint32_t) ids->ne[0], glu_op, glu_limit);
 }
 
 bool ggml_cuda_mul_mat_vec_q_glu_q8_1(
@@ -1625,10 +1634,10 @@ bool ggml_cuda_mul_mat_vec_q_glu_q8_1(
 
     if (!ggml_are_same_shape(gate, up) || !ggml_are_same_stride(gate, up) ||
             gate->ne[3] != 1 || src1->ne[0] != up->ne[0] ||
-            src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
-            ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+            src1->ne[1] != 1 || src1->ne[2] != ids->ne[1] || src1->ne[3] != 1 ||
+            ids->ne[2] != 1 || ids->ne[3] != 1 ||
             dst_q8->ne[0] != up->ne[1] || dst_q8->ne[1] != ids->ne[0] ||
-            dst_q8->ne[2] != 1 || dst_q8->ne[3] != 1 ||
+            dst_q8->ne[2] != ids->ne[1] || dst_q8->ne[3] != 1 ||
             dst_q8->ne[0] % QK8_1 != 0 || src1->ne[0] % QK8_1 != 0 ||
             up->nb[0] != ggml_type_size(up->type) || ids->nb[0] != sizeof(int32_t)) {
         return false;
