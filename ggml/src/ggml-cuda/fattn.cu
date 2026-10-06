@@ -250,6 +250,7 @@ static void ggml_cuda_flash_attn_ext_prepare_indices_t(
                             n_selected <=  512 ? flash_attn_prepare_selected_indices<index_t,  2> :
                             n_selected <= 1024 ? flash_attn_prepare_selected_indices<index_t,  4> :
                             n_selected <= 2048 ? flash_attn_prepare_selected_indices<index_t,  8> :
+                            n_selected <= 2304 ? flash_attn_prepare_selected_indices<index_t,  9> :
                                                  flash_attn_prepare_selected_indices<index_t, 16>;
         const ggml_cuda_kernel_launch_params launch_params(dim3(n_queries, n_stream, 1), dim3(256, 1, 1), 0, stream);
         ggml_cuda_kernel_launch(kernel, launch_params, dense_mask, positions, (const index_t *) selected->data,

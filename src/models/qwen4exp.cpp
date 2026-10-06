@@ -875,8 +875,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // when the compact block-first selection would not be worthwhile.
     const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
     const int64_t n_block_top = std::min<int64_t>(n_blocks, (width + r - 1)/r + 1);
+    const bool qsa_select = width < n_kv && n_kv >= 8*hparams.indexer_top_k;
     const bool compact_select = blk_bias && n_stream == 1 && ubatch.n_seqs_unq == 1 && cparams.flash_attn &&
-        width < n_kv && (compact_mask || n_block_top < n_blocks);
+        qsa_select && (compact_mask || n_block_top < n_blocks);
 
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
@@ -960,7 +961,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     k_blocks = ggml_set_rows(ctx0, k_blocks, update_keys, inp->update_idxs);
     ggml_build_forward_expand(gf, k_blocks);
 
-    if (width == n_kv) {
+    if (!qsa_select) {
         ggml_build_forward_expand(gf, inp->cell_blk);
         ggml_build_forward_expand(gf, inp->bias);
         ggml_build_forward_expand(gf, inp->block_key_cells);
