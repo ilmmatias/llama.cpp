@@ -2354,11 +2354,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
         cb(experts, "ffn_moe_down_biased", il);
     }
-    const bool reduce_on_cpu = arch == LLM_ARCH_QWEN4EXP && n_tokens > 1 && !weight_before_ffn &&
+    bool reduce_on_cpu = n_tokens > 1 && !weight_before_ffn &&
         experts->op == GGML_OP_MUL_MAT_ID && down_exps_b == nullptr &&
-        backend_cpu != nullptr && down_exps->buffer != nullptr &&
-        ggml_backend_buft_get_device(ggml_backend_buffer_get_type(down_exps->buffer)) ==
-            ggml_backend_get_device(backend_cpu);
+        experts->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 &&
+        experts->ne[3] == 1 && weights->ne[0] == 1 && weights->ne[1] == experts->ne[1] &&
+        weights->ne[2] == experts->ne[2] && weights->ne[3] == 1 &&
+        ggml_is_contiguous(experts) && ggml_is_contiguous(weights) &&
+        backend_cpu != nullptr && down_exps->buffer != nullptr;
+
+    if (reduce_on_cpu) {
+        const auto buft = ggml_backend_buffer_get_type(down_exps->buffer);
+        const auto dev  = ggml_backend_buft_get_device(buft);
+        const auto cpu_dev = ggml_backend_get_device(backend_cpu);
+        reduce_on_cpu = ggml_backend_dev_supports_buft(cpu_dev, buft) &&
+            (dev == nullptr || dev == cpu_dev || !ggml_backend_dev_supports_buft(dev, buft));
+    }
 
     if (reduce_on_cpu) {
         ggml_tensor * moe_out = ggml_moe_reduce(ctx0, experts, weights);

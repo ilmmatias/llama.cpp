@@ -4065,23 +4065,33 @@ struct test_shared_mul_add : public test_case {
     const int64_t n_embd;
     const int64_t n_tokens;
 
-    test_shared_mul_add(int64_t n_embd, int64_t n_tokens) : n_embd(n_embd), n_tokens(n_tokens) {}
+    const bool swap;
+    const bool extra_consumer;
+    const bool strided;
+
+    test_shared_mul_add(int64_t n_embd, int64_t n_tokens, bool swap = false, bool extra_consumer = false, bool strided = false)
+        : n_embd(n_embd), n_tokens(n_tokens), swap(swap), extra_consumer(extra_consumer), strided(strided) {}
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "SHARED_MUL_ADD";
     }
 
-    std::string vars() override { return VARS_TO_STR2(n_embd, n_tokens); }
+    std::string vars() override { return VARS_TO_STR5(n_embd, n_tokens, swap, extra_consumer, strided); }
     bool run_whole_graph() override { return true; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, strided ? 2*n_embd : n_embd, n_tokens);
+        if (strided) {
+            src = ggml_view_2d(ctx, src, n_embd, n_tokens, src->nb[1], 0);
+        }
         ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_tokens);
         ggml_tensor * other = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
         ggml_tensor * residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
         ggml_tensor * mul = ggml_mul(ctx, src, gate);
-        return ggml_add(ctx, ggml_add(ctx, other, mul), residual);
+        ggml_tensor * add = swap ? ggml_add(ctx, mul, other) : ggml_add(ctx, other, mul);
+        ggml_tensor * out = ggml_add(ctx, add, residual);
+        return extra_consumer ? ggml_add(ctx, out, mul) : out;
     }
 };
 
@@ -8148,6 +8158,14 @@ struct test_moe_reduce : public test_case {
 };
 
 struct test_moe_reduce_cpu : public test_case {
+    const int64_t n_embd;
+    const int64_t n_used;
+    const int64_t n_tokens;
+
+    test_moe_reduce_cpu(int64_t n_embd, int64_t n_used, int64_t n_tokens)
+        : n_embd(n_embd), n_used(n_used), n_tokens(n_tokens) {}
+
+    std::string vars() override { return VARS_TO_STR3(n_embd, n_used, n_tokens); }
     std::string op_desc(ggml_tensor *) override { return "MOE_REDUCE_CPU"; }
     bool run_whole_graph() override { return true; }
     double max_err(ggml_backend_t) override { return 1e-5; }
@@ -8161,9 +8179,6 @@ struct test_moe_reduce_cpu : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        constexpr int64_t n_embd = 63;
-        constexpr int64_t n_used = 10;
-        constexpr int64_t n_tokens = 17;
         ggml_tensor * experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_used, n_tokens);
         ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
         ggml_tensor * weighted = ggml_mul(ctx, experts, weights);
@@ -11195,6 +11210,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_weighted_expert_sum(2048, 8, 32));
     test_cases.emplace_back(new test_shared_mul_add(127, 3));
     test_cases.emplace_back(new test_shared_mul_add(2048, 32));
+    test_cases.emplace_back(new test_shared_mul_add(257, 7));
+    test_cases.emplace_back(new test_shared_mul_add(127, 7, true));
+    test_cases.emplace_back(new test_shared_mul_add(127, 513, false, true));
+    test_cases.emplace_back(new test_shared_mul_add(127, 7, false, false, true));
     test_cases.emplace_back(new test_swiglu_q8_mmq(false, 1, 1, 2048, 32, 512));
     test_cases.emplace_back(new test_swiglu_q8_mmq(true, 16, 8, 2048, 32, 512));
 
@@ -12626,7 +12645,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
-    test_cases.emplace_back(new test_moe_reduce_cpu());
+    test_cases.emplace_back(new test_moe_reduce_cpu(63, 10, 17));
+    test_cases.emplace_back(new test_moe_reduce_cpu(63, 1, 17));
+    test_cases.emplace_back(new test_moe_reduce_cpu(33, 3, 129));
+    test_cases.emplace_back(new test_moe_reduce_cpu(17, 16, 513));
 
     for (int64_t n_query : {1, 7, 8, 9, 64}) {
         test_cases.emplace_back(new test_qsa_block_score(128, 4, 19, n_query, 2, true));
