@@ -390,6 +390,11 @@ This provides GPU acceleration on HIP-supported AMD GPUs.
 Make sure to have ROCm installed.
 You can download it from your Linux distro's package manager or from here: [ROCm Quick Start (Linux)](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/tutorial/quick-start.html#rocm-install-quick).
 
+Compatible MoE routers fuse activation, compact `TOP_K` selection, and weight normalization.
+Quantized projections sharing an input can reuse activation quantization even with different output widths or compatible mixed weight formats.
+On RDNA2 and RDNA3.5, supported SwiGLU-to-MMQ paths quantize the activation directly for Q8_0, Q6_K, and ZNQ down projections; incompatible layouts retain the separate operations.
+Sparse/paged and native-BF16 attention use conservative launch bounds instead of the dense-FP16 occupancy targets.
+
 - Using `CMake` for Linux (assuming a gfx1030-compatible AMD GPU):
   ```bash
   HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \

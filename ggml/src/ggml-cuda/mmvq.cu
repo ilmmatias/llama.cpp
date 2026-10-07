@@ -1804,6 +1804,31 @@ void ggml_cuda_mul_mat_vec_q(
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
 }
 
+void ggml_cuda_mul_mat_vec_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst0, ggml_tensor * dst1) {
+    const ggml_tensor * src1 = dst0->src[1];
+    GGML_ASSERT(src1 == dst1->src[1] && dst0->src[2] == dst1->src[2]);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && src1->nb[0] == sizeof(float));
+    const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    const size_t nbytes = src1->ne[3]*src1->ne[2]*src1->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    ggml_cuda_pool_alloc<char> quantized(ctx.pool(), nbytes);
+    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, quantized.get(), dst0->src[0]->type,
+        src1->ne[0], src1->nb[1]/sizeof(float), src1->nb[2]/sizeof(float), src1->nb[3]/sizeof(float),
+        ne10_padded, src1->ne[1], src1->ne[2], src1->ne[3], ctx.stream());
+
+    ggml_tensor q8 = *src1;
+    q8.type = GGML_TYPE_Q8_1;
+    q8.data = quantized.get();
+    q8.nb[0] = sizeof(block_q8_1);
+    q8.nb[1] = ne10_padded/QK8_1 * sizeof(block_q8_1);
+    q8.nb[2] = src1->ne[1]*q8.nb[1];
+    q8.nb[3] = src1->ne[2]*q8.nb[2];
+    q8.buffer = nullptr;
+    q8.view_src = nullptr;
+    q8.view_offs = 0;
+    ggml_cuda_mul_mat_vec_q(ctx, dst0->src[0], &q8, dst0->src[2], dst0);
+    ggml_cuda_mul_mat_vec_q(ctx, dst1->src[0], &q8, dst1->src[2], dst1);
+}
+
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,

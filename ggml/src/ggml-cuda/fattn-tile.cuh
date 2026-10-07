@@ -904,8 +904,23 @@ static constexpr __host__ __device__ int flash_attn_tile_native_nbatch(
     return bf16 && DKQ == 320 && ncols == 32 ? 32 : nbatch_fa;
 }
 
+static constexpr __device__ int flash_attn_tile_get_occupancy(
+        int DKQ, int DV, int ncols, bool sparse, bool paged, bool bf16) {
+#ifdef GGML_USE_HIP
+    // The dense FP16 targets do not cover sparse indexing, paging, or native BF16 storage.
+    if (sparse || paged || bf16) {
+        return 1;
+    }
+#else
+    GGML_UNUSED_VARS(sparse, paged, bf16);
+#endif
+    return ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols);
+}
+
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, ggml_type type_K, ggml_type type_V, bool use_sparse, bool use_paged = false>
-__launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
+__launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2),
+    flash_attn_tile_get_occupancy(DKQ, DV, ncols1*ncols2, use_sparse, use_paged,
+        type_K == GGML_TYPE_BF16 || type_V == GGML_TYPE_BF16))
 static __global__ void flash_attn_tile(
         const char * Q_ptr,
         const char * K_ptr,

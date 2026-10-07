@@ -11,6 +11,7 @@ struct ggml_cuda_topk_moe_args {
     bool sqrt_softplus{};
     bool softmax{};
     bool delayed_softmax{};
+    bool top_k{};
     bool prob_bias{};
     bool norm{};
     bool scale{};

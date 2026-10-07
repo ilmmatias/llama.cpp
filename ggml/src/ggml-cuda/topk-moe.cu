@@ -11,6 +11,7 @@ struct topk_moe_config {
     bool use_sqrt_softplus;
     bool with_norm;
     bool delayed_softmax;
+    int64_t ids_stride;
 };
 
 // Warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path.
@@ -110,7 +111,7 @@ __global__ void topk_moe_cuda(const float *         logits,
 
     logits += n_experts * row;
     weights += n_expert_used * row;
-    ids += n_experts * row;
+    ids += config.ids_stride * row;
 
     constexpr int experts_per_thread = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
 
@@ -374,7 +375,7 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
 
     float scale_val = scale ? ggml_get_op_params_f32(scale, 0) : 1.0f;
 
-    GGML_ASSERT(ids->nb[1] / ggml_type_size(ids->type) == (size_t) n_experts);
+    GGML_ASSERT(ids->nb[0] == sizeof(int32_t) && ids->nb[1] / sizeof(int32_t) >= (size_t) ids->ne[0]);
 
     const int n_expert_used = weights->ne[1];
 
@@ -390,6 +391,7 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     config.use_sqrt_softplus = args.sqrt_softplus;
     config.with_norm         = with_norm;
     config.delayed_softmax   = args.delayed_softmax;
+    config.ids_stride        = ids->nb[1] / sizeof(int32_t);
 
     if (bias) {
         launch_topk_moe_cuda<true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
@@ -406,12 +408,20 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
                                    const ggml_tensor * ids) {
     // must match an instantiation of launch_topk_moe_cuda: a power of 2 up to 512,
     // or one of the non-power-of-2 expert counts of supported models
-    const int n_expert = ids->nb[1] / ids->nb[0];
-    if (((n_expert & (n_expert - 1)) != 0 || n_expert > 512) && n_expert != 288 && n_expert != 576) {
+    const int64_t n_expert = logits->ne[0];
+    if (n_expert < 1 || (((n_expert & (n_expert - 1)) != 0 || n_expert > 512) &&
+            n_expert != 288 && n_expert != 576)) {
         return false;
     }
 
-    if (!ggml_is_contiguous(weights) || !ggml_is_contiguous(logits)) {
+    if (logits->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
+            !ggml_is_contiguous(weights) || !ggml_is_contiguous(logits) ||
+            logits->ne[2] != 1 || logits->ne[3] != 1 ||
+            weights->ne[0] != 1 || weights->ne[1] != ids->ne[0] || weights->ne[2] != logits->ne[1] ||
+            weights->ne[3] != 1 || ids->ne[0] < 1 || ids->ne[0] > n_expert ||
+            ids->ne[1] != logits->ne[1] || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+            ids->nb[0] != sizeof(int32_t) || ids->nb[1] % sizeof(int32_t) != 0 ||
+            ids->nb[1] / sizeof(int32_t) < (size_t) ids->ne[0]) {
         return false;
     }
 

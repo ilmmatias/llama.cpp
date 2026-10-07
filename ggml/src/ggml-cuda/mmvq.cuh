@@ -13,6 +13,8 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
+void ggml_cuda_mul_mat_vec_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst0, ggml_tensor * dst1);
+
 // Fused single-token MoE gate/up MMVQ + GLU that writes native Q8_1
 // blocks directly for a following MMVQ down projection. Returns false when
 // the tensor/layout/backend combination is not supported by this fast path.
