@@ -200,7 +200,7 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const bool fallback = src0_i->ne[1] % 128 != 0;
         nbytes_src1_q8_1 = std::max(nbytes_src1_q8_1,
             n_tokens*n_expert_used*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ +
-            ggml_cuda_mmq_get_J_max(src0_i->type, fallback, cc, src1->ne[1]) * sizeof(block_q8_1_mmq));
+            ggml_cuda_mmq_get_J_max(src0_i->type, fallback, cc, n_tokens) * sizeof(block_q8_1_mmq));
     }
 
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
@@ -419,7 +419,7 @@ static void ggml_cuda_mul_mat_q_impl(
     }
 
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne12) * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
     if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
