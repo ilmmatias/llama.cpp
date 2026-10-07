@@ -495,7 +495,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     if (table_id == MMVQ_PARAMETERS_RDNA2 && ncols_dst == 1) {
         switch (type) {
             case GGML_TYPE_Q8_0:
-                return small_k ? 1 : 8;
+                return small_k ? 1 : (halve_iters ? 8 : 4);
             default:
                 return 1;
         }
@@ -1154,7 +1154,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
     const auto should_use_small_k = [&](int c_ncols_dst) {
         if (table_id == MMVQ_PARAMETERS_RDNA2 && c_ncols_dst == 1 && calc_nwarps(type, c_ncols_dst, table_id) > 1) {
-            return nrows_x % 4 == 0 && (nrows_x >= 1024 || blocks_per_row_x < 4 * blocks_per_iter_1warp);
+            // Group medium-K rows only when enough rows remain to populate the device.
+            const int grouped_k_limit = nrows_x >= 128 ? 16 : 4;
+            return nrows_x % 4 == 0 &&
+                   (nrows_x >= 1024 || blocks_per_row_x < grouped_k_limit * blocks_per_iter_1warp);
         }
         // When K is small, increase rows_per_block to match nwarps so each warp has more work to do
         // Trigger when the full thread block covers all K blocks in a single loop iteration and few threads remain idle.
@@ -1194,6 +1197,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
     // Whether doubling nwarps pays off on the ncols_dst == 1 path, where K sets the K loop trip count.
     const auto should_halve_iters = [&] {
+        if (table_id == MMVQ_PARAMETERS_RDNA2) {
+            // Very thin, medium-K Q8 projections need more waves to hide dot-product latency.
+            return type == GGML_TYPE_Q8_0 && nrows_x < 128 &&
+                   blocks_per_row_x < 16 * blocks_per_iter_1warp;
+        }
         if (table_id != MMVQ_PARAMETERS_GB10) {
             return false;
         }
@@ -1235,7 +1243,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 // Types the table does not promote would compile a second, identical kernel.
                 constexpr bool c_promoted =
                     calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, true) !=
-                    calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, false);
+                    calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, false) ||
+                    calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA2, false, true) !=
+                    calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA2, false, false);
 
                 constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && c_promoted;
 
