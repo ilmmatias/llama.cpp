@@ -1920,10 +1920,12 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, bool
     }
     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
         static bool disable_dense_fusion = getenv("GGML_CUDA_DISABLE_DENSE_MMVQ_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_DENSE_MMVQ_FUSION"));
+        const bool supported_arch = GGML_CUDA_CC_IS_AMD(cc) ||
+                (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING);
 
         // multi-column fusion covers the epilogue only
         if (disable_dense_fusion || with_gate || dst->ne[1] > MMVQ_DENSE_FUSION_MAX_COLS ||
-                !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING) {
+                !supported_arch) {
             return false;
         }
 
