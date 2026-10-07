@@ -392,6 +392,7 @@ You can download it from your Linux distro's package manager or from here: [ROCm
 
 Compatible MoE routers fuse activation, compact `TOP_K` selection, and weight normalization.
 Quantized projections sharing an input can reuse activation quantization even with different output widths or compatible mixed weight formats.
+Compatible dense quantized matrix-vector operations with 2-4 input columns fuse full-shape FP32 bias and NVFP4 lane-scale epilogues on AMD; gate branches, unsupported layouts, and larger batches retain the separate operations. Set `GGML_CUDA_DISABLE_DENSE_MMVQ_FUSION=1` to disable this multi-column fusion.
 On RDNA2 and RDNA3.5, supported SwiGLU-to-MMQ paths quantize the activation directly for Q8_0, Q6_K, and ZNQ down projections; incompatible layouts retain the separate operations.
 Compatible RMS normalization, weight multiplication, and MRoPE/IMRoPE fuse into one dispatch, optionally writing directly to an FP16 or FP32 KV cache. Partial rotary dimensions, frequency factors, and broadcast norm weights are supported; vision RoPE retains the separate operations.
 Sparse/paged and native-BF16 attention use conservative launch bounds instead of the dense-FP16 occupancy targets.

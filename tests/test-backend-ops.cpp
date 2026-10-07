@@ -12682,7 +12682,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // multi-token dense fusion: epilogue only
-    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_NVFP4}) {
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_ZNQ2, GGML_TYPE_ZNQ3, GGML_TYPE_ZNQ4, GGML_TYPE_NVFP4}) {
         for (int64_t n_tokens : {2, 3, 4, 5, 8}) {
             for (bool with_bias : {false, true}) {
                 for (bool with_lane_scale : {false, true}) {
@@ -12701,6 +12701,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 2, 32, 256,
             false, 1, 1, false, /*with_bias =*/ true, /*with_gate =*/ false, false, {1, 1},
             /*full_bias_shape =*/ true, /*strided_bias =*/ false, /*bias_type =*/ GGML_TYPE_F16));
+    }
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_ZNQ2, GGML_TYPE_ZNQ3, GGML_TYPE_ZNQ4, GGML_TYPE_NVFP4}) {
+        for (int64_t n_tokens : {2, 3, 4, 5}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n_tokens, 33, 4096,
+                    false, 1, 1, false, true, false, type == GGML_TYPE_NVFP4, {3, 2}, true));
+        }
     }
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
