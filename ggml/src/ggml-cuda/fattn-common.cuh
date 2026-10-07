@@ -1354,7 +1354,7 @@ void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
     const int warp_size = WARP_SIZE, const bool use_paged = false, const uintptr_t workspace_begin = 0,
-    const int64_t scheduling_queries = 0
+    const int64_t scheduling_queries = 0, const bool async_kv_preload = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1628,10 +1628,17 @@ void launch_fattn(
 
     dim3 blocks_num;
     if (stream_k) {
-        auto should_use_stream_k = [](const int cc, const int ntiles_dst, const int max_blocks, const int DKQ) {
+        // Stream-K splits the work before the mask scan is applied, so skipped KV tiles make the blocks uneven.
+        const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK &&
+            async_kv_preload && use_kv_bounds && mask;
+
+        auto should_use_stream_k = [prefer_whole_tiles](const int cc, const int ntiles_dst, const int max_blocks, const int DKQ) {
             const int tiles_nwaves             = (ntiles_dst + max_blocks - 1) / max_blocks;
             const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
 
+            if (prefer_whole_tiles && tiles_efficiency_percent >= 75) {
+                return false;
+            }
             if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                 return true;
             }

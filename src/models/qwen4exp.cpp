@@ -191,15 +191,10 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const int64_t hc_dim = hc * n_embd;
     const int64_t hc_lr  = hparams.hc_low_rank;
 
-    // A detached draft head ships as its own GGUF: the nextn metadata and the trailing block
-    // are there, the trunk is not. Probe a trunk tensor to spot that, and the MTP block to spot
-    // the reverse -- nextn metadata kept but the head stripped -- exactly as deepseek2 does.
-    // Either way the block index is unchanged: the head is always blk.<n_layer>.
-    const std::string mtp_probe = "blk." + std::to_string(n_layer) + ".nextn.eh_proj.weight";
-    const bool mtp_only   = hparams.n_layer_nextn > 0 && ml.get_weight("blk.0.hc_attn_norm.weight") == nullptr;
-    const bool trunk_only = hparams.n_layer_nextn > 0 && ml.get_weight(mtp_probe.c_str())          == nullptr;
-
-    const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
+    const auto nf = nextn_flags(ml, LLM_TENSOR_HC_ATTN_NORM);
+    const int trunk_flags = nf.trunk;
+    const int mtp_flags   = nf.mtp;
+    const bool mtp_only  = (trunk_flags & TENSOR_NOT_REQUIRED) != 0;
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
@@ -236,11 +231,6 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                                            { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
     }
 
-    // MTP tensors sit in the trailing blocks; skip them entirely unless a draft head was asked for
-    int mtp_flags = trunk_only ? TENSOR_NOT_REQUIRED : 0;
-    if (!ml.load_mtp) {
-        mtp_flags |= TENSOR_SKIP;
-    }
 
     for (int il = 0; il < (int) hparams.n_layer_all; ++il) {
         auto & layer = layers[il];
@@ -525,11 +515,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
         }
 
-        // an unmasked MTP export needs a hidden row for every token, so in that case the
-        // gather is deferred until after t_h_nextn is taken below
-        const bool gather_now = !cparams.embeddings_nextn || cparams.embeddings_nextn_masked;
-
-        if (il == n_layer - 1 && inp_out_ids && gather_now) {
+        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
             // everything below is per token, so drop the rows that produce no output
             cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
             inject = ggml_get_rows(ctx0, inject, inp_out_ids);
@@ -557,21 +543,16 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         cb(res_hc, "l_last", il);
     }
 
-    // The MTP head consumes the wide residual, before the head mixer collapses it. Export the
-    // combine result itself rather than a reshape of it: a pure view gets no backend assignment
-    // from the scheduler, and the readback in llama_context looks one up. It is contiguous, so
-    // [n_embd, hc, rows] already has the [n_embd_out, rows] layout the reader expects, and it
-    // carries exactly the right rows either way -- gathered above when masked, ungathered when not.
+    // Export the compute tensor so hidden-state readback retains its backend assignment.
     if (cparams.embeddings_nextn) {
         cb(res_hc, "h_nextn", -1);
         res->t_h_nextn = res_hc;
+    }
 
-        // deferred from the last layer: collapse to the output rows now that the export is taken
-        if (!cparams.embeddings_nextn_masked && inp_out_ids) {
-            res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
-            res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
-            res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
-        }
+    if (crop_after_nextn(inp_out_ids)) {
+        res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+        res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
+        res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
     }
 
     // the final mixer is the output norm: there is no separate one
@@ -1480,7 +1461,8 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         ? (llama_token) hparams.ple_image_token_id
         : (llama_token) hparams.ple_eos_token_id;
     auto tok_of = [&](int64_t k) -> llama_token {
-        return ubatch->token ? ubatch->token[k] : img_tok;
+        const bool is_embd = !ubatch->token || (ubatch->is_mixed() && ubatch->type[k]);
+        return is_embd ? img_tok : ubatch->token[k];
     };
 
     const int64_t n_tokens = ubatch->n_tokens;

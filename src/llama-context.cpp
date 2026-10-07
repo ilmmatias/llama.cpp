@@ -21,6 +21,11 @@
 #include <string>
 #include <unordered_map>
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 //
 // llama_context
 //
@@ -87,7 +92,9 @@ llama_context::llama_context(
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
-    balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
+    // MTP uses the embd input for the hidden state
+    balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd(),
+                llm_arch_supports_mixed_batch(model.arch) && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT)) {
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
@@ -661,6 +668,7 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
 
     if (ctx_compute != nullptr) {
         int n_devices = 0;
@@ -718,6 +726,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -1269,6 +1278,11 @@ void llama_context::set_embeddings(bool value) {
 
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
+
+    if (cparams.embeddings_nextn != value || cparams.embeddings_nextn_masked != masked) {
+        // these flags change the graph shape
+        sched_need_reserve = true;
+    }
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
@@ -2446,6 +2460,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_BAILINGMOE3 ||
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
+        model.arch == LLM_ARCH_CLEF ||
         model.arch == LLM_ARCH_QWEN4EXP ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
@@ -2662,6 +2677,8 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    copy_experts.reset();
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -2670,6 +2687,99 @@ ggml_status llama_context::graph_compute(
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
+}
+
+bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
+    auto & st = static_cast<llama_context *>(user_data)->copy_experts;
+
+    // the ids must be computed before the split starts, so only the first node of the split is considered
+    if (ggml_graph_n_nodes(graph) == 0) {
+        return false;
+    }
+    const ggml_tensor * node = ggml_graph_node(graph, 0);
+    if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
+        return false;
+    }
+
+    const ggml_tensor * ids = node->src[2];
+    if (ggml_nelements(ids) == 0) {
+        return true;
+    }
+
+    const int64_t n_expert    = src->ne[2];
+    const size_t  expert_size = src->nb[2];
+
+    if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
+        st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
+        ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
+        ggml_backend_synchronize(backend);
+
+        st.used.assign(n_expert, false);
+        for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
+            for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
+                const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
+                GGML_ASSERT(id >= 0 && id < n_expert);
+                st.used[id] = true;
+            }
+        }
+
+        st.ids = ids;
+    }
+
+    static const bool prefetch = [] {
+        const char * env = getenv("GGML_MOE_OFFLOAD_PREFETCH");
+        return env != nullptr && atoi(env) != 0;
+    }();
+#if defined(__linux__)
+    static const size_t page_size = [] {
+        const long size = sysconf(_SC_PAGESIZE);
+        return size > 0 ? (size_t) size : (size_t) 4096;
+    }();
+    const int passes = prefetch && ids->ne[1] > 1 ? 2 : 1;
+#else
+    const int passes = 1;
+    if (prefetch && ids->ne[1] > 1) {
+        static bool warned = false;
+        if (!warned) {
+            LLAMA_LOG_WARN("%s: GGML_MOE_OFFLOAD_PREFETCH is only supported on Linux\n", __func__);
+            warned = true;
+        }
+    }
+#endif
+
+    // Prefetch all selected ranges before starting pageable weight copies.
+    for (int pass = 0; pass < passes; ++pass) {
+        for (int64_t first = 0; first < n_expert; ) {
+            if (!st.used[first]) {
+                first++;
+                continue;
+            }
+            int64_t last = first;
+            while (last + 1 < n_expert && st.used[last + 1]) {
+                last++;
+            }
+
+            // MMQ needs valid padding after the last copied expert.
+            const size_t offset  = first*expert_size;
+            const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
+            const size_t size = (last - first + 1)*expert_size + padding;
+            const uint8_t * data = (const uint8_t *) src->data + offset;
+#if defined(__linux__)
+            if (pass + 1 < passes) {
+                const uintptr_t begin = (uintptr_t) data;
+                const uintptr_t page_begin = begin - begin % page_size;
+                madvise((void *) page_begin, begin + size - page_begin, MADV_WILLNEED);
+            } else
+#endif
+            {
+                ggml_backend_tensor_set_async(backend, dst, data, offset, size);
+            }
+
+            first = last + 1;
+        }
+    }
+
+    return true;
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
@@ -3728,6 +3838,7 @@ void llama_context::opt_epoch_iter(
                     ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                 }
             }
+            copy_experts.reset();
             ggml_opt_eval(opt_ctx, result);
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
