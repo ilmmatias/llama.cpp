@@ -7661,6 +7661,7 @@ struct test_topk_qsa_compact : public test_case {
     const int64_t n_kv;
     const int64_t mask_pitch;
     const bool compact_visibility;
+    const bool lightning;
 
     ggml_tensor * scores_input {};
     ggml_tensor * cells_input {};
@@ -7679,12 +7680,14 @@ struct test_topk_qsa_compact : public test_case {
 
     test_topk_qsa_compact(int64_t n_candidates = 2056, int width = 2051, int64_t n_query = 1,
                          bool full_graph = false, std::string profile = "unique", int tail_slots = 2,
-                         bool hide_cell = true, int64_t n_blocks = 2048, bool compact_visibility = false) :
+                         bool hide_cell = true, int64_t n_blocks = 2048, bool compact_visibility = false,
+                         bool lightning = false) :
         n_candidates(n_candidates), width(width), n_query(n_query), full_graph(full_graph),
         profile(profile), tail_slots(tail_slots), hide_cell(hide_cell),
         n_blocks(full_graph ? n_blocks : 0),
         n_kv(full_graph ? ratio*n_blocks : (profile == "analytic" ? 16 : n_candidates + 31)),
-        mask_pitch(n_kv + 13), compact_visibility(compact_visibility) {
+        mask_pitch(n_kv + 13), compact_visibility(compact_visibility), lightning(lightning) {
+        GGML_ASSERT(!lightning || full_graph);
         GGML_ASSERT(n_candidates % ratio == 0 && width > 0 && width < n_candidates && n_query > 0);
         GGML_ASSERT(profile == "unique" || profile == "ties" || profile == "analytic");
         GGML_ASSERT(tail_slots >= 0 && tail_slots < ratio);
@@ -7698,7 +7701,7 @@ struct test_topk_qsa_compact : public test_case {
 
     std::string op_desc(ggml_tensor *) override { return "TOPK_QSA_COMPACT"; }
     std::string vars() override {
-        return VARS_TO_STR10(n_candidates, width, n_query, full_graph, profile, tail_slots, hide_cell, n_blocks, n_kv, compact_visibility);
+        return VARS_TO_STR11(n_candidates, width, n_query, full_graph, profile, tail_slots, hide_cell, n_blocks, n_kv, compact_visibility, lightning);
     }
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
@@ -7715,8 +7718,21 @@ struct test_topk_qsa_compact : public test_case {
             block_cells_input = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, ratio, n_blocks, 1);
             slot_bias_input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ratio, n_blocks, 1);
 
-            ggml_tensor * score = ggml_qsa_block_score(ctx, query_input, key_input,
-                    key_cells_input, block_bias_input, 1.0f);
+            ggml_tensor * score;
+            if (lightning) {
+                ggml_tensor * pooled = ggml_get_rows(ctx, key_input,
+                        ggml_reshape_1d(ctx, key_cells_input, n_blocks));
+                pooled = ggml_reshape_4d(ctx, pooled, index_dim, 1, n_blocks, 1);
+                ggml_tensor * weights = ggml_fill(ctx,
+                        ggml_new_tensor_4d(ctx, GGML_TYPE_F32, index_heads, n_query, 1, 1), 1.0f);
+                ggml_tensor * mask = ggml_fill(ctx,
+                        ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_blocks, n_query, 1, 1), 0.0f);
+                score = ggml_lightning_indexer(ctx, query_input, pooled, weights, mask);
+                score = ggml_add(ctx, ggml_reshape_3d(ctx, score, n_blocks, n_query, 1), block_bias_input);
+            } else {
+                score = ggml_qsa_block_score(ctx, query_input, key_input,
+                        key_cells_input, block_bias_input, 1.0f);
+            }
             ggml_tensor * top_blocks = ggml_cont(ctx, ggml_top_k(ctx, score, n_top));
             ggml_tensor * top_flat = ggml_reshape_1d(ctx, top_blocks, n_top*n_query);
             candidate_cells = ggml_reshape_2d(ctx,
@@ -7795,7 +7811,7 @@ struct test_topk_qsa_compact : public test_case {
                               query_feature(head, query, 1)*key_feature(block, 1);
             score += std::max(dot, 0.0f);
         }
-        return score + 8.0f*block_rank(block, query);
+        return score + (lightning && block == n_blocks - 1 ? 1e9f : 8.0f*block_rank(block, query));
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -7842,7 +7858,8 @@ struct test_topk_qsa_compact : public test_case {
                             -INFINITY : (profile == "ties" ? 0.0f : slot*0.0625f);
                 }
                 for (int64_t query = 0; query < n_query; ++query) {
-                    biases[query*n_blocks + block] = 8.0f*block_rank(block, query);
+                    biases[query*n_blocks + block] =
+                            lightning && block == n_blocks - 1 ? 1e9f : 8.0f*block_rank(block, query);
                 }
             }
             ggml_backend_tensor_set(query_input, queries.data(), 0, queries.size()*sizeof(float));
@@ -12289,6 +12306,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_topk_qsa_compact(2056, 2051, n_query, true));
         test_cases.emplace_back(new test_topk_qsa_compact(2056, 2051, n_query, false, "unique", 2, true, 2048, true));
         test_cases.emplace_back(new test_topk_qsa_compact(2056, 2051, n_query, true, "unique", 2, true, 2048, true));
+    }
+    // Lightning prefill must preserve finite forced-tail bias, reject unfilled
+    // tail slots, and return the right physical cells across a query-tile tail.
+    for (int64_t n_query : {128, 129}) {
+        test_cases.emplace_back(new test_topk_qsa_compact(
+                2056, 2051, n_query, true, "unique", 2, true, 4096, true, true));
     }
 
     // Tied cutoffs require valid membership, not the CPU's particular tied winner.

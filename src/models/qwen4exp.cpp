@@ -960,15 +960,32 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
     ggml_tensor * score = nullptr;
 
-    // Fuse the four rectified head dots, head reduction and block bias into one
-    // backend op. Wave32 uses the single-query kernel for decode and a tiled
-    // block/query kernel for batched prefill, avoiding the [block, head, query]
-    // score surface in both cases.
+    // Keep indexed scoring for decode and small batches. Large batches amortize
+    // the pooled-key gather and benefit from lightning's key reuse across queries.
     if (blk_bias && q->type == GGML_TYPE_F32) {
         ggml_tensor * q_score = ggml_reshape_4d(ctx0, ggml_cont(ctx0, q),
                 idx_dim, n_idx_h, n_tps, n_stream);
-        score = ggml_qsa_block_score(ctx0, q_score, k_blocks,
-                inp->block_key_cells, inp->bias, 1.0f);
+        if (cparams.fused_lid && idx_dim == 128 && n_idx_h == 4 &&
+                n_stream == 1 && n_blocks >= 4096 && n_tps >= 128) {
+            ggml_tensor * pooled = ggml_get_rows(ctx0, k_blocks,
+                    ggml_reshape_1d(ctx0, inp->block_key_cells, n_blocks));
+            pooled = ggml_reshape_4d(ctx0, pooled, idx_dim, 1, n_blocks, n_stream);
+            cb(pooled, "indexer_k", il);
+
+            ggml_tensor * weights = ggml_fill(ctx0,
+                    ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_idx_h, n_tps, 1, n_stream), 1.0f);
+            ggml_tensor * mask = ggml_fill(ctx0,
+                    ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_blocks, n_tps, 1, n_stream), 0.0f);
+            score = ggml_lightning_indexer(ctx0, q_score, pooled, weights, mask);
+            res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+
+            // Tail-forcing bias is finite 1e9: casting it to F16 would make
+            // +inf, which becomes NaN when an invisible candidate adds -inf.
+            score = ggml_add(ctx0, ggml_reshape_3d(ctx0, score, n_blocks, n_tps, n_stream), inp->bias);
+        } else {
+            score = ggml_qsa_block_score(ctx0, q_score, k_blocks,
+                    inp->block_key_cells, inp->bias, 1.0f);
+        }
         cb(score, "indexer_score", il);
     } else {
         ggml_tensor * pooled = ggml_get_rows(ctx0, k_blocks,
