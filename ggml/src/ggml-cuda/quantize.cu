@@ -564,9 +564,9 @@ static __global__ void quantize_mmq_q8_1_swiglu(
         return;
     }
 
-    const int64_t logical_row = ids ? ids[blockIdx.x] : blockIdx.x;
-    const int64_t slot = logical_row % logical_n1;
-    const int64_t token = logical_row / logical_n1;
+    const int logical_row = ids ? ids[blockIdx.x] : (int) blockIdx.x;
+    const int slot = logical_row % logical_n1;
+    const int token = logical_row / logical_n1;
     const int64_t gate_base = token * gate_st + slot * gate_s1;
     const int64_t up_base = token * up_st + slot * up_s1;
 
@@ -575,7 +575,13 @@ static __global__ void quantize_mmq_q8_1_swiglu(
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         if (i0 + i < ne00) {
-            volatile float value = ggml_cuda_op_silu_single(gate[gate_base + i0 + i]) * up[up_base + i0 + i];
+            float value = ggml_cuda_op_silu_single(gate[gate_base + i0 + i]) * up[up_base + i0 + i];
+            // Preserve the rounded activation without spilling a volatile local to scratch.
+#ifdef GGML_USE_HIP
+            asm volatile("" : "+v"(value));
+#else
+            asm volatile("" : "+f"(value));
+#endif
             values[i] = value;
         } else {
             values[i] = 0.0f;

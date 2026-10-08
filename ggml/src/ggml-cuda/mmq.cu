@@ -111,6 +111,16 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const ggml_tensor * src0 = src0s[0];
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    for (const ggml_tensor * weights : src0s) {
+        if (ggml_backend_buffer_get_usage(weights->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            const size_t size_data = ggml_nbytes(weights);
+            const size_t size_alloc = ggml_backend_buffer_get_alloc_size(weights->buffer, weights);
+            if (size_alloc > size_data) {
+                GGML_ASSERT(ggml_is_contiguously_allocated(weights) && !weights->view_src);
+                CUDA_CHECK(cudaMemsetAsync((char *) weights->data + size_data, 0, size_alloc - size_data, ctx.stream()));
+            }
+        }
+    }
     if (ids == nullptr) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         cudaStream_t stream = ctx.stream();
@@ -121,7 +131,7 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             const ggml_tensor * src0_i = src0s[i];
             ggml_tensor * dst_i = dsts[i];
             GGML_ASSERT(dst_i->type == GGML_TYPE_F32 && dst_i->src[1] == src1);
-            GGML_ASSERT(ggml_are_same_shape(src0, src0_i) && ggml_are_same_shape(dst0, dst_i));
+            GGML_ASSERT(src0->ne[0] == src0_i->ne[0] && src0->ne[2] == src0_i->ne[2] && src0->ne[3] == src0_i->ne[3]);
             GGML_ASSERT(src0_i->ne[0] == src1->ne[0]);
             GGML_ASSERT(mmq_get_q8_1_ds_layout(src0->type) == mmq_get_q8_1_ds_layout(src0_i->type));
             const bool fallback = src0_i->ne[1] % 128 != 0;
@@ -141,7 +151,6 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         for (int i = 0; i < 2; ++i) {
             const ggml_tensor * src0_i = src0s[i];
             ggml_tensor * dst_i = dsts[i];
-            GGML_ASSERT(ggml_are_same_shape(src0, src0_i) && ggml_are_same_shape(dst0, dst_i));
             const mmq_args args = {
                 (const char *) src0_i->data, src0_i->type, (const int *) src1_q8_1.get(), nullptr, nullptr, (float *) dst_i->data,
                 nullptr,
@@ -183,8 +192,7 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         ggml_tensor * dst_i = dsts[i];
         GGML_ASSERT(dst_i->type == GGML_TYPE_F32);
         GGML_ASSERT(dst_i->nb[2] % dst_i->nb[1] == 0);
-        GGML_ASSERT(ggml_are_same_shape(src0, src0_i));
-        GGML_ASSERT(ggml_are_same_shape(dst0, dst_i));
+        GGML_ASSERT(src0->ne[0] == src0_i->ne[0] && src0->ne[2] == src0_i->ne[2] && src0->ne[3] == src0_i->ne[3]);
         GGML_ASSERT(mmq_get_q8_1_ds_layout(src0->type) == mmq_get_q8_1_ds_layout(src0_i->type));
         GGML_ASSERT(src0_i->ne[0] == src1->ne[0]);
         GGML_ASSERT(dst_i->ne[1] == n_expert_used);
@@ -227,7 +235,7 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             src0_i->ne[0], src0_i->ne[1], ne_get_rows, s01, ne_get_rows, s1,
             src0_i->ne[2], src0_i->ne[2], s02, s12_q, s2,
             src0_i->ne[3], src1->ne[3], s03, s13_q, s3,
-            n_tokens, n_tokens};
+            n_tokens, ne_get_rows};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, GGML_PREC_Q8);
     }
 }
@@ -297,7 +305,7 @@ static void ggml_cuda_mul_mat_q_impl(
     const ggml_tensor * gate = swiglu ? swiglu->src[0] : nullptr;
     const ggml_tensor * up   = swiglu ? swiglu->src[1] : nullptr;
     if (swiglu) {
-        GGML_ASSERT(src0->type == GGML_TYPE_Q8_0);
+        GGML_ASSERT(mmq_get_q8_1_ds_layout(src0->type) == MMQ_Q8_1_DS_LAYOUT_D4);
         GGML_ASSERT(gate && up && gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_are_same_shape(gate, up) && ggml_are_same_shape(gate, src1));
     }
