@@ -94,6 +94,8 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
+// Changing these flags re-reserves the graph while retaining compatible compute
+// buffers, including buffers shared with a draft context.
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
 // Select which appended NextN block the DECODER_MTP graph runs (offset past

@@ -667,7 +667,13 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    ggml_backend_sched_ptr sched_new(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    if (sched && ctx_compute == nullptr) {
+        // Keep physical buffers when rebuilding scheduler metadata. A draft may
+        // still share them, so freeing this scheduler alone would not release them.
+        ggml_backend_sched_share_compute_buffers(sched_new.get(), sched.get());
+    }
+    sched = std::move(sched_new);
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
 
     if (ctx_compute != nullptr) {
