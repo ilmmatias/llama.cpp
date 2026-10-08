@@ -741,15 +741,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
     return ggml_mul(ctx0, normalized, gated);
 }
 
+static bool qwen4exp_qsa_select(int64_t n_kv, uint32_t top_k, uint32_t ratio) {
+    return n_kv > (int64_t) top_k + ratio - 1 && n_kv >= 8*(int64_t) top_k;
+}
+
 // Compact QSA inputs shared by layers with the same compression ratio.
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
 public:
-    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, bool compact_select) :
-        mctx(mctx), ratio(ratio), blk_bias(blk_bias), compact_select(compact_select) {}
+    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, uint32_t top_k,
+            bool qsa_select, bool blk_bias, bool compact_select) :
+        mctx(mctx), ratio(ratio), top_k(top_k), qsa_select(qsa_select), blk_bias(blk_bias), compact_select(compact_select) {}
     virtual ~llm_graph_input_qsa() = default;
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
+        if (!qsa_select) {
+            // Dense batches keep raw keys only; rebuild derived keys when selection resumes.
+            mctx->reset_qsa(ratio);
+            return;
+        }
         mctx->set_input_qsa(cell_blk, block_cells, block_cell_bias, bias, block_key_cells,
                 update_cells, update_pos, update_idxs, ubatch, ratio, blk_bias);
     }
@@ -765,6 +775,14 @@ public:
         const int64_t n_kv     = idx->get_n_kv();
         const int64_t n_stream = mctx->get_n_stream();
         const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
+
+        if (qsa_select != qwen4exp_qsa_select(n_kv, top_k, ratio) ||
+                k_idxs->ne[0] != params.ubatch.n_tokens || params.ubatch.n_tokens % n_stream != 0) {
+            return false;
+        }
+        if (!qsa_select) {
+            return true;
+        }
 
         const int64_t n_updates = mctx->get_qsa_update_capacity(params.ubatch, ratio, n_blocks);
         bool res = true;
@@ -812,6 +830,8 @@ public:
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t ratio;
+    const uint32_t top_k;
+    const bool qsa_select;
 
     // the per-cell half of the bias is the attention mask, so only the per-block half is uploaded
     const bool blk_bias;
@@ -842,7 +862,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     GGML_ASSERT(n_tokens % n_stream == 0);
     const int64_t n_tps = n_tokens/n_stream;
 
-    const int64_t n_updates = mctx_hyb->get_qsa_update_capacity(ubatch, r, n_blocks);
     // only the "which block is visible" half of the bias varies per block
     // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
     // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
@@ -856,7 +875,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // when the compact block-first selection would not be worthwhile.
     const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
     const int64_t n_block_top = std::min<int64_t>(n_blocks, (width + r - 1)/r + 1);
-    const bool qsa_select = width < n_kv && n_kv >= 8*hparams.indexer_top_k;
+    const bool qsa_select = qwen4exp_qsa_select(n_kv, hparams.indexer_top_k, r);
+    const int64_t n_updates = qsa_select ? mctx_hyb->get_qsa_update_capacity(ubatch, r, n_blocks) : 0;
     const bool compact_select = blk_bias && n_stream == 1 && ubatch.n_seqs_unq == 1 && cparams.flash_attn &&
         qsa_select && (compact_mask || n_block_top < n_blocks);
 
@@ -867,33 +887,36 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     if (it != qsa_inps.end()) {
         inp = it->second;
     } else {
-        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, compact_select);
+        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, hparams.indexer_top_k,
+                qsa_select, blk_bias, compact_select);
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-        if (compact_select) {
-            qsa->block_cells = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, r, n_blocks, n_stream);
-            qsa->block_cell_bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, r, n_blocks, n_stream);
-        } else {
-            qsa->cell_blk = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
-        }
-        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+        if (qsa_select) {
+            if (compact_select) {
+                qsa->block_cells = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, r, n_blocks, n_stream);
+                qsa->block_cell_bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, r, n_blocks, n_stream);
+            } else {
+                qsa->cell_blk = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+            }
+            qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 
-        qsa->block_key_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_blocks, n_stream);
-        qsa->update_cells    = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r, n_updates);
-        qsa->update_pos      = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_updates);
-        qsa->update_idxs     = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_updates);
-        if (compact_select) {
-            ggml_set_input(qsa->block_cells);
-            ggml_set_input(qsa->block_cell_bias);
-        } else {
-            ggml_set_input(qsa->cell_blk);
-        }
-        ggml_set_input(qsa->bias);
+            qsa->block_key_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_blocks, n_stream);
+            qsa->update_cells    = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r, n_updates);
+            qsa->update_pos      = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_updates);
+            qsa->update_idxs     = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_updates);
+            if (compact_select) {
+                ggml_set_input(qsa->block_cells);
+                ggml_set_input(qsa->block_cell_bias);
+            } else {
+                ggml_set_input(qsa->cell_blk);
+            }
+            ggml_set_input(qsa->bias);
 
-        ggml_set_input(qsa->block_key_cells);
-        ggml_set_input(qsa->update_cells);
-        ggml_set_input(qsa->update_pos);
-        ggml_set_input(qsa->update_idxs);
+            ggml_set_input(qsa->block_key_cells);
+            ggml_set_input(qsa->update_cells);
+            ggml_set_input(qsa->update_pos);
+            ggml_set_input(qsa->update_idxs);
+        }
         inp = qsa.get();
         res->add_input(std::move(qsa));
         qsa_inps.emplace((uint32_t) r, inp);
@@ -907,6 +930,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
 
     ggml_tensor * k_storage = mctx_idx->cpy_k(ctx0, k_raw, inp->k_idxs, il);
     ggml_build_forward_expand(gf, k_storage);
+    if (!qsa_select) {
+        return nullptr;
+    }
     k_storage = ggml_reshape_2d(ctx0, k_storage, idx_dim, k_storage->ne[1]*k_storage->ne[2]);
 
     ggml_tensor * members = ggml_get_rows(ctx0, k_storage,
@@ -941,13 +967,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     k_blocks = ggml_reshape_2d(ctx0, k_blocks, idx_dim, k_blocks->ne[1]*k_blocks->ne[2]);
     k_blocks = ggml_set_rows(ctx0, k_blocks, update_keys, inp->update_idxs);
     ggml_build_forward_expand(gf, k_blocks);
-
-    if (!qsa_select) {
-        ggml_build_forward_expand(gf, inp->cell_blk);
-        ggml_build_forward_expand(gf, inp->bias);
-        ggml_build_forward_expand(gf, inp->block_key_cells);
-        return nullptr;
-    }
 
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);

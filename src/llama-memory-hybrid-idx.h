@@ -132,7 +132,7 @@ private:
         uint32_t next_slot = 0;
     };
 
-    void qsa_reset() const;
+    void qsa_reset(uint32_t ratio = 0) const;
     uint32_t qsa_acquire_slot(uint32_t ratio, const std::vector<uint32_t> & cells, bool & is_new) const;
     void qsa_release_slot(uint32_t ratio, qsa_block & block) const;
 
@@ -226,6 +226,8 @@ public:
 
     uint32_t get_qsa_update_capacity(
             const llama_ubatch & ubatch, uint32_t ratio, uint32_t n_blocks) const;
+
+    void reset_qsa(uint32_t ratio) const;
 
     ggml_tensor * get_qsa_block_storage(int32_t il) const;
 

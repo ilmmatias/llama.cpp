@@ -376,7 +376,12 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
     qsa_reset();
 }
 
-void llama_memory_hybrid_idx::qsa_reset() const {
+void llama_memory_hybrid_idx::qsa_reset(uint32_t ratio) const {
+    if (ratio != 0) {
+        qsa_blocks.erase(ratio);
+        qsa_slots.erase(ratio);
+        return;
+    }
     qsa_blocks.clear();
     qsa_slots.clear();
 }
@@ -746,6 +751,11 @@ uint32_t llama_memory_hybrid_idx_context::get_qsa_update_capacity(
         uint32_t            n_blocks) const {
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
     return mem->get_qsa_update_capacity(ubatch, ratio, n_blocks);
+}
+
+void llama_memory_hybrid_idx_context::reset_qsa(uint32_t ratio) const {
+    GGML_ASSERT(mem != nullptr);
+    mem->qsa_reset(ratio);
 }
 
 
