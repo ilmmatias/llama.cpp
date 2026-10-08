@@ -123,6 +123,7 @@ private:
         std::vector<uint32_t> cells;
         uint32_t cache_slot = 0;
         bool valid = false;
+        bool dirty = false;
     };
 
     struct qsa_slot_state {
@@ -133,6 +134,8 @@ private:
     };
 
     void qsa_reset(uint32_t ratio = 0) const;
+    void qsa_trim(llama_seq_id seq_id, llama_pos p0) const;
+    void qsa_invalidate_rows(const llama_kv_cache::slot_info & sinfo) const;
     uint32_t qsa_acquire_slot(uint32_t ratio, const std::vector<uint32_t> & cells, bool & is_new) const;
     void qsa_release_slot(uint32_t ratio, qsa_block & block) const;
 
@@ -262,7 +265,7 @@ private:
     // declared first, so it is initialised while sinfos_idx is still intact
     const std::vector<uint32_t> ns_ubatch;
 
-    // the indexer cells of each ubatch, kept for pools in cache order (qwen4exp): token s*n + i of ubatch u
+    // the indexer cells of each ubatch, kept for QSA invalidation and pools in cache order: token s*n + i of ubatch u
     // sits in cell idxs[s][i] of stream strm[s] of sinfos_kpool[u], and several cells can share a position
     const slot_info_vec_t sinfos_kpool;
 

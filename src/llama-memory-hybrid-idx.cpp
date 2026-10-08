@@ -230,11 +230,26 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
 
     if (mem_idx) {
         const llama_pos stale = mem_idx_stale_pos(seq_id, p0);
+        bool tail = seq_id >= 0 && p0 > mem_idx->seq_pos_min(seq_id) &&
+            (p1 < 0 || p1 > mem_idx->seq_pos_max(seq_id));
+        if (tail && mem_idx->get_n_stream() == 1) {
+            const auto & cells = mem_idx->get_cells(seq_id);
+            for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (s != seq_id && cells.seq_pos_count(s) > 0) {
+                    tail = false;
+                    break;
+                }
+            }
+        }
+        // Shared-stream edits can change ranking; ordinary tails keep their prefix grouping.
+        if (tail) {
+            qsa_trim(seq_id, p0);
+        } else {
+            qsa_reset();
+        }
         mem_idx->seq_rm(seq_id, p0, p1);
         mem_idx_stale_set(seq_id, stale);
     }
-
-    qsa_reset();
 
     return get_mem_attn()->seq_rm(seq_id, p0, p1);
 }
@@ -386,6 +401,74 @@ void llama_memory_hybrid_idx::qsa_reset(uint32_t ratio) const {
     qsa_slots.clear();
 }
 
+void llama_memory_hybrid_idx::qsa_trim(llama_seq_id seq_id, llama_pos p0) const {
+    const auto & cells = mem_idx->get_cells(seq_id);
+    const uint32_t size = mem_idx->get_size();
+    for (auto & [ratio, by_seq] : qsa_blocks) {
+        const auto it = by_seq.find(seq_id);
+        if (it == by_seq.end()) {
+            continue;
+        }
+        auto & blocks = it->second;
+        size_t keep = blocks.size();
+        for (size_t b = 0; b < blocks.size(); ++b) {
+            for (const uint32_t row : blocks[b].cells) {
+                const uint32_t cell = row % size;
+                if (cells.is_empty(cell) || cells.pos_get(cell) >= p0) {
+                    keep = b;
+                    break;
+                }
+            }
+            if (keep != blocks.size()) {
+                break;
+            }
+        }
+        for (size_t b = keep; b < blocks.size(); ++b) {
+            qsa_release_slot(ratio, blocks[b]);
+        }
+        blocks.resize(keep);
+    }
+}
+
+void llama_memory_hybrid_idx::qsa_invalidate_rows(const llama_kv_cache::slot_info & sinfo) const {
+    if (qsa_blocks.empty()) {
+        return;
+    }
+    std::vector<uint32_t> rows;
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const uint64_t offset = (uint64_t) sinfo.strm[s]*mem_idx->get_size();
+        const auto & cells = mem_idx->get_cells(sinfo.strm[s]);
+        for (const uint32_t cell : sinfo.idxs[s]) {
+            if (cells.is_empty(cell)) {
+                continue;
+            }
+            GGML_ASSERT(offset + cell <= std::numeric_limits<uint32_t>::max());
+            rows.push_back((uint32_t) (offset + cell));
+        }
+    }
+    if (rows.empty()) {
+        return;
+    }
+    std::sort(rows.begin(), rows.end());
+    // Invalidate every alias before raw keys are rewritten, even when cell ids stay the same.
+    for (auto & [ratio, by_seq] : qsa_blocks) {
+        for (auto & [seq_id, blocks] : by_seq) {
+            for (auto & block : blocks) {
+                if (!block.valid) {
+                    continue;
+                }
+                for (const uint32_t row : block.cells) {
+                    if (std::binary_search(rows.begin(), rows.end(), row)) {
+                        qsa_release_slot(ratio, block);
+                        block.dirty = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 uint32_t llama_memory_hybrid_idx::qsa_acquire_slot(
         uint32_t ratio, const std::vector<uint32_t> & cells, bool & is_new) const {
     GGML_ASSERT(mem_qsa_blocks != nullptr);
@@ -475,6 +558,12 @@ uint32_t llama_memory_hybrid_idx::get_qsa_update_capacity(
         // During steady decode each active stream can complete at most one extra block
         // beyond the obvious n_tokens/ratio quotient.
         result = (uint64_t) ubatch.n_tokens/ratio + std::max(1u, ubatch.n_seqs_unq);
+        const auto & by_seq = qsa_blocks.at(ratio);
+        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+            for (const auto & block : by_seq.at(ubatch.seq_id_unq[s])) {
+                result += block.dirty;
+            }
+        }
     }
 
     result = std::max<uint64_t>(1, result);
@@ -681,7 +770,8 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
     llama_memory_hybrid_context(mem, std::move(sinfos_attn), ubatches),
     mem(mem),
     ns_ubatch(llama_memory_hybrid_idx_ns(sinfos_idx)),
-    sinfos_kpool(mem->get_mem_idx() != nullptr && mem->get_kpool() > 0 && mem->get_kpool_by_order() ? sinfos_idx : slot_info_vec_t()),
+    sinfos_kpool(mem->mem_qsa_blocks != nullptr ||
+        (mem->get_mem_idx() != nullptr && mem->get_kpool() > 0 && mem->get_kpool_by_order()) ? sinfos_idx : slot_info_vec_t()),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
         new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)) {
     // Sequence edits force the touched positions to re-pool.
@@ -706,6 +796,9 @@ bool llama_memory_hybrid_idx_context::next() {
 }
 
 bool llama_memory_hybrid_idx_context::apply() {
+    if (mem != nullptr && mem->mem_qsa_blocks != nullptr && !sinfos_kpool.empty()) {
+        mem->qsa_invalidate_rows(sinfos_kpool[i_cur]);
+    }
     bool res = llama_memory_hybrid_context::apply();
 
     if (ctx_idx) {
@@ -969,6 +1062,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
             if (filled[b] != r) {
                 mem->qsa_release_slot(ratio, cached[b]);
+                cached[b].dirty = false;
                 continue;
             }
 
