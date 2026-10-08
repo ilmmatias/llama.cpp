@@ -974,8 +974,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
 
             ggml_tensor * weights = ggml_fill(ctx0,
                     ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_idx_h, n_tps, 1, n_stream), 1.0f);
+            // Visibility is applied by the F32 bias below. Broadcast one zero
+            // row instead of retaining a context-by-batch mask for every layer.
             ggml_tensor * mask = ggml_fill(ctx0,
-                    ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_blocks, n_tps, 1, n_stream), 0.0f);
+                    ggml_new_tensor_1d(ctx0, GGML_TYPE_F16, n_blocks), 0.0f);
+            // The view constructor checks the dense size before setting strides,
+            // so expand the query dimension only after creating the zero-stride view.
+            mask = ggml_view_4d(ctx0, mask, n_blocks, 1, 1, n_stream, 0, 0, 0, 0);
+            mask->ne[1] = n_tps;
             score = ggml_lightning_indexer(ctx0, q_score, pooled, weights, mask);
             res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
 

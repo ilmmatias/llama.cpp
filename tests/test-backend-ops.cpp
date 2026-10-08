@@ -7774,7 +7774,9 @@ struct test_topk_qsa_compact : public test_case {
                 ggml_tensor * weights = ggml_fill(ctx,
                         ggml_new_tensor_4d(ctx, GGML_TYPE_F32, index_heads, n_query, 1, 1), 1.0f);
                 ggml_tensor * mask = ggml_fill(ctx,
-                        ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_blocks, n_query, 1, 1), 0.0f);
+                        ggml_new_tensor_1d(ctx, GGML_TYPE_F16, n_blocks), 0.0f);
+                mask = ggml_view_4d(ctx, mask, n_blocks, 1, 1, 1, 0, 0, 0, 0);
+                mask->ne[1] = n_query;
                 score = ggml_lightning_indexer(ctx, query_input, pooled, weights, mask);
                 score = ggml_add(ctx, ggml_reshape_3d(ctx, score, n_blocks, n_query, 1), block_bias_input);
             } else {
