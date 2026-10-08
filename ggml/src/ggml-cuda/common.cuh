@@ -414,8 +414,8 @@ template<int width = WARP_SIZE, typename T>
 static __device__ __forceinline__ T ggml_cuda_shfl_xor_sync(T x, int offset) {
 // clang (v20) will not unroll loops with just the plain `offset` in switch
 #if defined(GGML_USE_HIP)
- #if defined(RDNA) || defined(CDNA)
-    // row_xor_mask only availaible on GFX10+
+ #if defined(RDNA)
+    // row_xor_mask is only available on GFX10+.
     switch (~offset) {
         // subgroups (width) should not make a difference for a butterfly shuffle pattern
         case ~1: return hip_update_dpp<0x160 + 1>(x);  // row_xor_mask: offset
@@ -424,7 +424,7 @@ static __device__ __forceinline__ T ggml_cuda_shfl_xor_sync(T x, int offset) {
         case ~8: return hip_update_dpp<0x160 + 8>(x);
         default: return __shfl_xor_sync(0xffffffff, x, offset, width);
     }
- #else // Fallback for GCN5 and GCN4
+ #else // GCN and CDNA use the older DPP permutations.
     // For the power-of-two butterfly reductions used here, offset < width and offset is a single bit. Therefore XOR(offset) never leaves the
     // corresponding width-aligned subgroup.
     switch (~offset) {
@@ -437,7 +437,7 @@ static __device__ __forceinline__ T ggml_cuda_shfl_xor_sync(T x, int offset) {
         case ~8: return hip_update_dpp<0x128>(x);  // row_ror:8
         default: return __shfl_xor_sync(0xffffffff, x, offset, width);
     }
- #endif // defined(RDNA) || defined(CDNA)
+ #endif // defined(RDNA)
 #else
     return __shfl_xor_sync(0xffffffff, x, offset, width);
 #endif // defined(GGML_USE_HIP)
