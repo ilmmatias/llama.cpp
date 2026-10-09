@@ -1523,6 +1523,10 @@ struct ggml_cuda_stream_context {
     }
 };
 
+#ifdef GGML_HIP_RTC
+struct ggml_cuda_rtc_fusion;
+#endif
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1534,6 +1538,10 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
 
     int curr_stream_no = 0;
+
+#ifdef GGML_HIP_RTC
+    ggml_cuda_rtc_fusion * rtc_fusion = nullptr;
+#endif
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

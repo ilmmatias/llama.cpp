@@ -427,6 +427,16 @@ You can download it from your Linux distro's package manager or from here: [ROCm
 The environment variable [`HIP_VISIBLE_DEVICES`](https://rocm.docs.amd.com/en/latest/understand/gpu_isolation.html#hip-visible-devices) can be used to specify which GPU(s) will be used.
 If your GPU is not officially supported you can use the environment variable [`HSA_OVERRIDE_GFX_VERSION`] set to a similar GPU, for example 10.3.0 on RDNA2 (e.g. gfx1030, gfx1031, or gfx1035) or 11.0.0 on RDNA3. Note that [`HSA_OVERRIDE_GFX_VERSION`] is [not supported on Windows](https://github.com/ROCm/ROCm/issues/2654)
 
+### Experimental HIPRTC elementwise fusion
+
+Configure with `-DGGML_HIP_RTC=ON` to link the optional HIPRTC compiler, then set `GGML_HIP_RTC_FUSION=1` at runtime to enable fusion. Both switches default to off; ordinary HIP and CUDA builds do not require HIPRTC. CMake uses `hiprtc::hiprtc` when available, otherwise searches for `hip/hiprtc.h` and `libhiprtc` under the ROCm include/lib/lib64 paths.
+
+The prototype fuses 2-8 connected, consecutive F32 contiguous equal-shape ADD, MUL, SCALE, SQR, NEG, RELU and SiLU nodes after existing manual fusion declines. Requested outputs, external consumers, incompatible buffers/layouts, broadcast operands, view-backed results, shifted input/output overlap and concurrent stream regions retain ordinary execution. Exact equal-layout input/output aliasing is allowed. Intermediate allocation reservations are unchanged.
+
+Kernels compile synchronously for the device-reported target on first use and remain in a per-backend-context cache of at most 256 programs, including failed compilations. Current pointers, sizes and SCALE parameters are passed on each launch. Compiler/load failures log a warning and fall back; launch failures follow the backend's normal error handling. There is no application disk cache or fast-math mode.
+
+Enabling RTC fusion disables graph capture, including when `GGML_HIP_GRAPHS=ON`. `GGML_CUDA_DISABLE_FUSION=1` disables RTC fusion too. Compare cold compilation and warmed execution against both direct and graph-enabled baselines before enabling it for a workload; fewer launches do not guarantee a speedup.
+
 ### Unified Memory
 
 On Linux it is possible to use unified memory architecture (UMA) to share main memory between the CPU and integrated GPU by setting environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`. However, this hurts performance for non-integrated GPUs (but enables working with integrated GPUs).

@@ -3937,6 +3937,64 @@ struct test_add_add : public test_case {
     }
 };
 
+struct test_elementwise_chain : public test_case {
+    const std::string variant;
+    const std::array<int64_t, 4> ne;
+    ggml_tensor * intermediate = nullptr;
+    ggml_tensor * output = nullptr;
+
+    test_elementwise_chain(std::string variant, std::array<int64_t, 4> ne) : variant(variant), ne(ne) {}
+
+    std::string op_desc(ggml_tensor *) override { return "ELEMENTWISE_CHAIN"; }
+    std::string vars() override { return VARS_TO_STR2(variant, ne); }
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (variant == "exposed" || variant == "inplace") {
+            return {intermediate, output};
+        }
+        return {output};
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a;
+        if (variant == "strided") {
+            const std::array<int64_t, 4> parent = {ne[0] * 3, ne[1] * 2, ne[2], ne[3]};
+            a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, parent.data());
+            a = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], 0);
+        } else {
+            a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        }
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        const std::array<int64_t, 4> repeated = {ne[0] / 2, ne[1], 1, 1};
+        ggml_tensor * c = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, variant == "broadcast" ? repeated.data() : ne.data());
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_set_name(c, "c");
+        ggml_tensor * u = variant == "swapped" ? ggml_add(ctx, b, a) : ggml_add(ctx, a, b);
+        intermediate = u;
+        if (variant == "exposed") {
+            ggml_set_output(u);
+        }
+        ggml_tensor * v = variant == "swapped" ? ggml_mul(ctx, c, u) : ggml_mul(ctx, u, c);
+        if (variant == "reuse") {
+            output = ggml_add(ctx, v, u);
+        } else if (variant == "outside_consumer") {
+            output = ggml_add(ctx, ggml_sum(ctx, v), ggml_sum(ctx, u));
+        } else {
+            if (variant == "inplace") {
+                intermediate = v;
+                v = ggml_scale_bias_inplace(ctx, v, 0.5f, -1.0f);
+            } else {
+                v = ggml_scale_bias(ctx, v, 0.5f, -1.0f);
+            }
+            output = ggml_sqr(ctx, ggml_relu(ctx, v));
+        }
+        ggml_set_name(output, "out");
+        return output;
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_RMS_NORM (fused operation)
 struct test_add_rms_norm : public test_case {
     const ggml_type type;
@@ -10642,6 +10700,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
 
+    for (int64_t n : {1, 255, 256, 257, 513}) {
+        test_cases.emplace_back(new test_elementwise_chain("basic", {n, 1, 1, 1}));
+    }
+    test_cases.emplace_back(new test_elementwise_chain("basic", {5, 7, 3, 2}));
+    for (const char * variant : {"swapped", "reuse", "exposed", "outside_consumer", "strided", "broadcast", "inplace"}) {
+        test_cases.emplace_back(new test_elementwise_chain(variant, {64, 5, 4, 3}));
+    }
+
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
         for (int v : {0, 1}) {
@@ -13226,6 +13292,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    for (int64_t n : {256, 4096, 1048576}) {
+        test_cases.emplace_back(new test_elementwise_chain("basic", {n, 1, 1, 1}));
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

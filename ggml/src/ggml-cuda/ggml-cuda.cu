@@ -4,6 +4,9 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#ifdef GGML_HIP_RTC
+#include "ggml-cuda/fusion-rtc.h"
+#endif
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -708,6 +711,19 @@ static std::atomic<int> ggml_cuda_lock_counter;
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+#ifdef GGML_HIP_RTC
+    if (rtc_fusion) {
+        ggml_cuda_set_device(device);
+        if (streams[device][0]) {
+            CUDA_CHECK(cudaStreamSynchronize(streams[device][0]));
+        }
+#ifdef USE_CUDA_GRAPH
+        cuda_graphs.clear();
+#endif
+        ggml_cuda_rtc_fusion_free(*this);
+    }
+#endif
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -5321,6 +5337,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+#ifdef GGML_HIP_RTC
+                if (nodes_to_skip == 0) {
+                    nodes_to_skip = ggml_cuda_rtc_fusion_try(*cuda_ctx, cgraph, i);
+                }
+#endif
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -5366,8 +5387,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
 
 #ifdef USE_CUDA_GRAPH
-        ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
+            ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
             if (graph->graph != nullptr) {
                 CUDA_CHECK(cudaGraphDestroy(graph->graph));
                 graph->graph = nullptr;
@@ -5428,6 +5449,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
+#ifdef GGML_HIP_RTC
+    const bool rtc_enabled = ggml_cuda_rtc_fusion_enabled();
+    if (rtc_enabled) {
+        static const bool logged = [] {
+            GGML_LOG_INFO("HIPRTC fusion: graph capture disabled\n");
+            return true;
+        }();
+        GGML_UNUSED(logged);
+    }
+    if (!rtc_enabled) {
+#endif
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
@@ -5461,6 +5493,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
         }
     }
+#ifdef GGML_HIP_RTC
+    }
+#endif
 #endif // USE_CUDA_GRAPH
 
     if (use_cuda_graph && cuda_graph_update_required) {

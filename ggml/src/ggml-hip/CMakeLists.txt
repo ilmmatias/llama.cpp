@@ -75,10 +75,32 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS})
 ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda SRCS)
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 
+if (GGML_HIP_RTC)
+    find_package(hiprtc CONFIG QUIET)
+    if (NOT TARGET hiprtc::hiprtc)
+        find_path(GGML_HIP_RTC_INCLUDE_DIR hip/hiprtc.h HINTS "${ROCM_PATH}/include")
+        find_library(GGML_HIP_RTC_LIBRARY hiprtc HINTS "${ROCM_PATH}/lib" "${ROCM_PATH}/lib64")
+        if (NOT GGML_HIP_RTC_INCLUDE_DIR OR NOT GGML_HIP_RTC_LIBRARY)
+            message(FATAL_ERROR "GGML_HIP_RTC requires HIPRTC headers and library")
+        endif()
+    endif()
+    list(APPEND GGML_SOURCES_ROCM ../ggml-cuda/fusion-rtc.cpp)
+endif()
+
 ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
                          ${GGML_SOURCES_ROCM}
                         )
+
+if (GGML_HIP_RTC)
+    target_compile_definitions(ggml-hip PRIVATE GGML_HIP_RTC)
+    if (TARGET hiprtc::hiprtc)
+        target_link_libraries(ggml-hip PRIVATE hiprtc::hiprtc)
+    else()
+        target_include_directories(ggml-hip PRIVATE "${GGML_HIP_RTC_INCLUDE_DIR}")
+        target_link_libraries(ggml-hip PRIVATE "${GGML_HIP_RTC_LIBRARY}")
+    endif()
+endif()
 
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)
