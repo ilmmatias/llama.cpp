@@ -1337,7 +1337,14 @@ struct ggml_tensor_extra_gpu {
 #define USE_CUDA_GRAPH
 #endif
 
+#ifdef GGML_HIP_RTC
+struct ggml_cuda_rtc_plan;
+#endif
+
 struct ggml_cuda_graph {
+#ifdef GGML_HIP_RTC
+    std::shared_ptr<const ggml_cuda_rtc_plan> rtc_plan;
+#endif
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
         if (instance != nullptr) {
@@ -1525,6 +1532,11 @@ struct ggml_cuda_stream_context {
 
 #ifdef GGML_HIP_RTC
 struct ggml_cuda_rtc_fusion;
+
+struct ggml_cuda_rtc_setup_guard {
+    std::unique_lock<std::mutex> lock;
+    ggml_cuda_rtc_setup_guard();
+};
 #endif
 
 struct ggml_backend_cuda_context {
@@ -1550,8 +1562,7 @@ struct ggml_backend_cuda_context {
 
     int64_t last_graph_eviction_sweep = 0;
 
-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
-        const int64_t time_now = ggml_time_us();
+    void evict_cuda_graphs(int64_t time_now) {
 
         // sweep every 5s, evicting cuda graphs unused for >=10s
         if (time_now - last_graph_eviction_sweep >= 5'000'000) {
@@ -1564,6 +1575,11 @@ struct ggml_backend_cuda_context {
                 }
             }
         }
+    }
+
+    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
+        const int64_t time_now = ggml_time_us();
+        evict_cuda_graphs(time_now);
 
         auto it = cuda_graphs.find(first_node_ptr);
         if (it == cuda_graphs.end()) {

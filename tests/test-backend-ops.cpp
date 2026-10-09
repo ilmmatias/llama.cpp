@@ -3940,19 +3940,30 @@ struct test_add_add : public test_case {
 struct test_elementwise_chain : public test_case {
     const std::string variant;
     const std::array<int64_t, 4> ne;
+    const ggml_type type;
     ggml_tensor * intermediate = nullptr;
     ggml_tensor * output = nullptr;
 
-    test_elementwise_chain(std::string variant, std::array<int64_t, 4> ne) : variant(variant), ne(ne) {}
+    test_elementwise_chain(std::string variant, std::array<int64_t, 4> ne, ggml_type type = GGML_TYPE_F32)
+        : variant(variant), ne(ne), type(type) {}
 
-    std::string op_desc(ggml_tensor *) override { return "ELEMENTWISE_CHAIN"; }
-    std::string vars() override { return VARS_TO_STR2(variant, ne); }
-    bool run_whole_graph() override { return true; }
+    std::string op_desc(ggml_tensor *) override {
+        return "ELEMENTWISE_CHAIN";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(variant, type, ne);
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
 
     std::vector<ggml_tensor *> fusion_test_nodes() override {
         if (variant == "exposed" || variant == "inplace") {
             return {intermediate, output};
         }
+
         return {output};
     }
 
@@ -3960,22 +3971,25 @@ struct test_elementwise_chain : public test_case {
         ggml_tensor * a;
         if (variant == "strided") {
             const std::array<int64_t, 4> parent = {ne[0] * 3, ne[1] * 2, ne[2], ne[3]};
-            a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, parent.data());
+            a = ggml_new_tensor(ctx, type, 4, parent.data());
             a = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], 0);
         } else {
-            a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            a = ggml_new_tensor(ctx, type, 4, ne.data());
         }
-        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
         const std::array<int64_t, 4> repeated = {ne[0] / 2, ne[1], 1, 1};
-        ggml_tensor * c = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, variant == "broadcast" ? repeated.data() : ne.data());
+        ggml_tensor * c = ggml_new_tensor(ctx, type, 4, variant == "broadcast" ? repeated.data() : ne.data());
         ggml_set_name(a, "a");
         ggml_set_name(b, "b");
         ggml_set_name(c, "c");
+
         ggml_tensor * u = variant == "swapped" ? ggml_add(ctx, b, a) : ggml_add(ctx, a, b);
         intermediate = u;
         if (variant == "exposed") {
             ggml_set_output(u);
         }
+
         ggml_tensor * v = variant == "swapped" ? ggml_mul(ctx, c, u) : ggml_mul(ctx, u, c);
         if (variant == "reuse") {
             output = ggml_add(ctx, v, u);
@@ -3985,13 +3999,296 @@ struct test_elementwise_chain : public test_case {
             if (variant == "inplace") {
                 intermediate = v;
                 v = ggml_scale_bias_inplace(ctx, v, 0.5f, -1.0f);
-            } else {
+            } else if (type != GGML_TYPE_F16) {
                 v = ggml_scale_bias(ctx, v, 0.5f, -1.0f);
             }
             output = ggml_sqr(ctx, ggml_relu(ctx, v));
         }
+
         ggml_set_name(output, "out");
         return output;
+    }
+};
+
+struct test_elementwise_dag : public test_case {
+    const std::string variant;
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    std::vector<ggml_tensor *> observed;
+
+    test_elementwise_dag(std::string variant, ggml_type type, std::array<int64_t, 4> ne)
+        : variant(variant), type(type), ne(ne) {}
+
+    std::string op_desc(ggml_tensor *) override {
+        return "ELEMENTWISE_DAG";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(variant, type, ne);
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return observed;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        observed.clear();
+
+        auto * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        const ggml_type rhs_type = variant == "mixed_binary" ? GGML_TYPE_F32 : type;
+        auto * b = ggml_new_tensor(ctx, rhs_type, 4, ne.data());
+        auto * c = ggml_new_tensor(ctx, rhs_type, 4, ne.data());
+
+        ggml_tensor * out;
+        if (variant == "wide" || variant == "many_output") {
+            std::array<ggml_tensor *, 8> branches;
+            for (int i = 0; i < 8; ++i) {
+                ggml_tensor * input;
+                if (i == 0) {
+                    input = b;
+                } else if (i == 1) {
+                    input = c;
+                } else {
+                    input = ggml_new_tensor(ctx, type, 4, ne.data());
+                }
+
+                auto * branch = ggml_add(ctx, a, input);
+                if (variant == "many_output") {
+                    ggml_set_output(branch);
+                    observed.push_back(branch);
+                }
+
+                ggml_build_forward_expand(gf, branch);
+                branches[i] = branch;
+            }
+
+            out = branches[0];
+            for (int i = 1; i < 8; ++i) {
+                out = ggml_add(ctx, out, branches[i]);
+            }
+        } else if (variant == "disconnected") {
+            auto * left = ggml_neg(ctx, a);
+            out = ggml_sqr(ctx, b);
+            ggml_set_output(left);
+            ggml_set_output(out);
+            ggml_build_forward_expand(gf, left);
+            observed.push_back(left);
+        } else {
+            auto * u = ggml_add(ctx, a, b);
+            ggml_tensor * v;
+            if (variant == "independent") {
+                auto * d = ggml_new_tensor(ctx, type, 4, ne.data());
+                v = ggml_mul(ctx, c, d);
+                out = ggml_add(ctx, u, v);
+            } else {
+                v = ggml_mul(ctx, u, c);
+                auto * w = ggml_neg(ctx, u);
+                auto * t = ggml_sqr(ctx, w);
+                out = ggml_add(ctx, v, t);
+
+                if (variant == "multi_output") {
+                    ggml_set_output(v);
+                    ggml_set_output(t);
+                    observed.push_back(v);
+                    observed.push_back(t);
+                }
+            }
+
+            if (variant == "exposed") {
+                ggml_set_output(u);
+                observed.push_back(u);
+            }
+
+            if (variant == "outside_consumer") {
+                out = ggml_add(ctx, ggml_sum(ctx, out), ggml_sum(ctx, u));
+                observed.push_back(u);
+            }
+        }
+
+        observed.push_back(out);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        uint32_t state = 1;
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) {
+                continue;
+            }
+
+            const size_t n = ggml_nelements(t);
+            std::vector<float> values(n);
+            for (float & value : values) {
+                state = state * 1664525U + 1013904223U;
+                value = float(int(state >> 24) - 128) / 128.0f;
+            }
+
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(t, values.data(), 0, n * sizeof(float));
+            } else if (t->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> storage(n);
+                ggml_fp32_to_fp16_row(values.data(), storage.data(), n);
+                ggml_backend_tensor_set(t, storage.data(), 0, n * sizeof(ggml_fp16_t));
+            } else if (t->type == GGML_TYPE_BF16) {
+                std::vector<ggml_bf16_t> storage(n);
+                ggml_fp32_to_bf16_row_ref(values.data(), storage.data(), n);
+                ggml_backend_tensor_set(t, storage.data(), 0, n * sizeof(ggml_bf16_t));
+            }
+        }
+    }
+};
+
+struct test_fusion_layout : public test_elementwise_dag {
+    test_fusion_layout(std::string variant, ggml_type type, std::array<int64_t, 4> ne)
+        : test_elementwise_dag(variant, type, ne) {}
+
+    std::string op_desc(ggml_tensor *) override {
+        return "FUSION_LAYOUT";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        observed.clear();
+
+        auto * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * b;
+        if (variant == "repeat") {
+            const std::array<int64_t, 4> repeated = {5, 2, 2, 1};
+            b = ggml_new_tensor(ctx, type, 4, repeated.data());
+        } else if (variant == "large_stride" || variant == "tiny_indexed") {
+            const size_t stride = variant == "large_stride" ? 64 : 2;
+            b = ggml_new_tensor_4d(ctx, type, ne[0] * stride, ne[1], ne[2], ne[3]);
+            b = ggml_view_4d(ctx, b, ne[0], ne[1], ne[2], ne[3], b->nb[1], b->nb[2], b->nb[3], 0);
+            b->nb[0] = stride * ggml_type_size(type);
+        } else if (variant == "padded" || variant == "offset_view") {
+            b = ggml_new_tensor_4d(ctx, type, ne[0] * 3, ne[1] * 2, ne[2], ne[3]);
+            const size_t element = ggml_type_size(type);
+            b = ggml_view_4d(ctx, b, ne[0] * 2, ne[1], ne[2], ne[3],
+                            b->nb[1], b->nb[2], b->nb[3], variant == "offset_view" ? element : 0);
+            b = ggml_view_4d(ctx, b, ne[0], ne[1], ne[2], ne[3],
+                            b->nb[1], b->nb[2], b->nb[3], variant == "offset_view" ? element : 0);
+        } else if (variant == "rhs_permute") {
+            b = ggml_new_tensor_4d(ctx, type, ne[1], ne[2], ne[0], ne[3]);
+            b = ggml_permute(ctx, b, 1, 2, 0, 3);
+        } else {
+            b = ggml_new_tensor(ctx, type, 4, ne.data());
+        }
+
+        auto * u = ggml_add(ctx, a, b);
+        if (variant == "tiny_indexed") {
+            auto * out = ggml_neg(ctx, u);
+            observed.push_back(out);
+            return out;
+        }
+
+        if (variant == "view_boundary") {
+            u = ggml_mul(ctx, u, a);
+            observed.push_back(u);
+            b = ggml_transpose(ctx, u);
+            a = ggml_new_tensor_4d(ctx, type, ne[1], ne[0], ne[2], ne[3]);
+            u = ggml_add(ctx, a, b);
+        }
+
+        auto * v = ggml_mul(ctx, u, b);
+        if (variant == "inplace") {
+            v = ggml_add_inplace(ctx, v, a);
+            observed.push_back(v);
+        }
+
+        auto * out = ggml_sqr(ctx, ggml_neg(ctx, v));
+        observed.push_back(out);
+        return out;
+    }
+};
+
+struct test_fusion_reduction : public test_elementwise_dag {
+    const ggml_op reduction;
+
+    test_fusion_reduction(std::string variant, std::array<int64_t, 4> ne, ggml_op reduction)
+        : test_elementwise_dag(variant, GGML_TYPE_F32, ne), reduction(reduction) {}
+
+    std::string op_desc(ggml_tensor *) override {
+        return "FUSION_REDUCTION";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(variant, type, ne, reduction);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        observed.clear();
+
+        auto * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * b;
+        if (variant == "repeat") {
+            b = ggml_new_tensor_4d(ctx, type, 1, ne[1], 1, 1);
+        } else if (variant == "broadcast_producer") {
+            b = ggml_new_tensor_4d(ctx, type, ne[0] / 2, 1, 1, 1);
+        } else if (variant == "padded") {
+            b = ggml_new_tensor_4d(ctx, type, ne[0] * 2, ne[1] * 2, ne[2], ne[3]);
+            b = ggml_view_4d(ctx, b, ne[0], ne[1], ne[2], ne[3], b->nb[1], b->nb[2], b->nb[3], sizeof(float));
+        } else {
+            b = ggml_new_tensor(ctx, type, 4, ne.data());
+        }
+
+        auto * u = ggml_add(ctx, a, b);
+        ggml_tensor * producer;
+        if (variant == "sum" || variant == "sum_rows" || variant == "mean" || variant == "epilogue" ||
+            variant == "broadcast_producer" || variant == "exposed_producer") {
+            auto * c = ggml_new_tensor(ctx, type, 4, ne.data());
+            producer = ggml_mul(ctx, u, c);
+        } else if (variant == "silu_producer") {
+            producer = u;
+            for (int i = 0; i < 8; ++i) {
+                producer = ggml_silu(ctx, producer);
+            }
+        } else {
+            producer = ggml_add(ctx, ggml_mul(ctx, u, a), ggml_neg(ctx, u));
+        }
+
+        if (variant == "exposed_producer") {
+            ggml_set_output(u);
+            observed.push_back(u);
+        }
+
+        ggml_tensor * reduced;
+        switch (reduction) {
+            case GGML_OP_SUM:
+                reduced = ggml_sum(ctx, producer);
+                break;
+            case GGML_OP_MEAN:
+                reduced = ggml_mean(ctx, producer);
+                break;
+            default:
+                reduced = ggml_sum_rows(ctx, producer);
+                break;
+        }
+
+        if (variant == "multi_output") {
+            ggml_set_output(reduced);
+            observed.push_back(reduced);
+        }
+
+        ggml_tensor * out = reduced;
+        if (variant == "epilogue") {
+            out = ggml_scale_bias(ctx, reduced, 0.5f, -1.0f);
+        } else if (variant != "sum" && variant != "sum_rows" && variant != "mean" && variant != "broadcast_producer") {
+            auto * rhs = ggml_new_tensor_1d(ctx, type, 1);
+            out = ggml_scale_bias(ctx, ggml_add(ctx, reduced, rhs), 0.25f, 0.5f);
+        }
+
+        if (variant == "outside_consumer") {
+            observed.push_back(u);
+            out = ggml_add(ctx, ggml_sum(ctx, out), ggml_sum(ctx, u));
+        } else if (variant == "two_reductions") {
+            out = ggml_neg(ctx, ggml_sum(ctx, out));
+        }
+
+        observed.push_back(out);
+        return out;
     }
 };
 
@@ -10708,6 +11005,60 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_elementwise_chain(variant, {64, 5, 4, 3}));
     }
 
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int64_t n : {1, 255, 256, 257, 513}) {
+            if (type == GGML_TYPE_F32 || n == 257) {
+                test_cases.emplace_back(new test_elementwise_dag("diamond", type, {n, 1, 1, 1}));
+            }
+        }
+        if (type == GGML_TYPE_F32) {
+            test_cases.emplace_back(new test_elementwise_dag("diamond", type, {5, 7, 3, 2}));
+            test_cases.emplace_back(new test_elementwise_dag("outside_consumer", type, {257, 1, 1, 1}));
+            test_cases.emplace_back(new test_elementwise_dag("wide", type, {257, 1, 1, 1}));
+            test_cases.emplace_back(new test_elementwise_dag("many_output", type, {257, 1, 1, 1}));
+        } else {
+            test_cases.emplace_back(new test_elementwise_chain("basic", {257, 1, 1, 1}, type));
+            test_cases.emplace_back(new test_elementwise_dag("mixed_binary", type, {257, 1, 1, 1}));
+        }
+        for (const char * variant : {"independent", "exposed", "multi_output", "disconnected"}) {
+            test_cases.emplace_back(new test_elementwise_dag(variant, type, {257, 1, 1, 1}));
+        }
+        for (const char * variant : {"repeat", "padded", "rhs_permute", "offset_view", "view_boundary", "inplace"}) {
+            const std::array<int64_t, 4> shape = std::string(variant) == "repeat" ?
+                std::array<int64_t, 4>{10, 6, 4, 3} : std::array<int64_t, 4>{13, 3, 2, 2};
+            test_cases.emplace_back(new test_fusion_layout(variant, type, shape));
+        }
+    }
+    test_cases.emplace_back(new test_fusion_layout("large_stride", GGML_TYPE_F32, {257, 1, 1, 1}));
+    test_cases.emplace_back(new test_fusion_layout("tiny_indexed", GGML_TYPE_F32, {257, 1, 1, 1}));
+    test_cases.emplace_back(new test_fusion_reduction("silu_producer", {32, 3, 1, 1}, GGML_OP_SUM_ROWS));
+
+    for (ggml_op reduction : {GGML_OP_SUM_ROWS, GGML_OP_MEAN, GGML_OP_SUM}) {
+        for (int64_t columns : {1, 31, 32, 33, 255, 256, 257, 4095, 4096, 4097, 8193}) {
+            test_cases.emplace_back(new test_fusion_reduction("dense", {columns, 3, 2, 2}, reduction));
+        }
+        for (const char * variant : {"repeat", "padded", "multi_output", "exposed_producer", "outside_consumer", "two_reductions"}) {
+            test_cases.emplace_back(new test_fusion_reduction(variant, {257, 3, 2, 2}, reduction));
+        }
+    }
+    for (ggml_op reduction : {GGML_OP_SUM_ROWS, GGML_OP_MEAN}) {
+        for (int64_t columns : {1, 31, 32, 33, 63, 64, 65, 255, 256, 257, 1023, 1024, 1025, 4095, 4096, 4097}) {
+            for (int64_t rows : {1, 3, 64}) {
+                test_cases.emplace_back(new test_fusion_reduction(reduction == GGML_OP_MEAN ? "mean" : "sum_rows",
+                                                                 {columns, rows, 1, 1}, reduction));
+            }
+        }
+    }
+    for (int64_t n : {1, 255, 256, 257, 4095, 4096, 4097, 8193, 1048577}) {
+        test_cases.emplace_back(new test_fusion_reduction("sum", {n, 1, 1, 1}, GGML_OP_SUM));
+    }
+    for (ggml_op reduction : {GGML_OP_SUM_ROWS, GGML_OP_MEAN, GGML_OP_SUM}) {
+        test_cases.emplace_back(new test_fusion_reduction("epilogue", {257, 3, 2, 2}, reduction));
+        test_cases.emplace_back(new test_fusion_reduction("broadcast_producer", {256, 3, 2, 2}, reduction));
+    }
+    test_cases.emplace_back(new test_fusion_reduction("dense", {7, 65537, 1, 1}, GGML_OP_SUM_ROWS));
+    test_cases.emplace_back(new test_fusion_reduction("dense", {16777217, 1, 1, 1}, GGML_OP_SUM));
+
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
         for (int v : {0, 1}) {
@@ -13294,7 +13645,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
     for (int64_t n : {256, 4096, 1048576}) {
-        test_cases.emplace_back(new test_elementwise_chain("basic", {n, 1, 1, 1}));
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+            test_cases.emplace_back(new test_elementwise_chain("basic", {n, 1, 1, 1}, type));
+            test_cases.emplace_back(new test_elementwise_dag("diamond", type, {n, 1, 1, 1}));
+        }
+    }
+    for (int64_t n : {4096, 1048576}) {
+        for (const char * variant : {"wide", "many_output"}) {
+            test_cases.emplace_back(new test_elementwise_dag(variant, GGML_TYPE_F32, {n, 1, 1, 1}));
+        }
+    }
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        test_cases.emplace_back(new test_fusion_layout("repeat", type, {10, 2, 4, 3}));
+        test_cases.emplace_back(new test_fusion_layout("repeat", type, {1280, 6, 4, 32}));
+        for (const char * variant : {"padded", "rhs_permute", "large_stride"}) {
+            test_cases.emplace_back(new test_fusion_layout(variant, type, {257, 1, 1, 1}));
+            test_cases.emplace_back(new test_fusion_layout(variant, type, {256, 256, 4, 4}));
+        }
+    }
+    test_cases.emplace_back(new test_fusion_layout("tiny_indexed", GGML_TYPE_F32, {257, 1, 1, 1}));
+    for (const auto & shape : {std::array<int64_t, 4>{32, 64, 1, 1}, {257, 64, 1, 1}, {4096, 1, 1, 1}, {4096, 64, 1, 1}}) {
+        test_cases.emplace_back(new test_fusion_reduction("epilogue", shape, GGML_OP_SUM_ROWS));
+    }
+    test_cases.emplace_back(new test_fusion_reduction("silu_producer", {4096, 1, 1, 1}, GGML_OP_SUM_ROWS));
+    for (int64_t n : {4096, 4097, 8193, 1048576}) {
+        test_cases.emplace_back(new test_fusion_reduction("epilogue", {n, 1, 1, 1}, GGML_OP_SUM));
     }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands

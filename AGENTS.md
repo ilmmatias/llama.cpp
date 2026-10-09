@@ -83,6 +83,8 @@ These points are extremely important - failing to follow them won't necessarily 
 - Prefer reusing existing infrastructure over introducing new components. Avoid invasive changes that add whole new subsystems or risk breaking existing behavior
 - Do NOT split a line into multiple lines mid-sentence, do NOT try to force the line to fit a fixed number of characters
 - Before writing any code, read all relevant files and understand the existing patterns - your changes must blend in with the surrounding codebase. If the change is large or introduces a new pattern, **PAUSE and ask the user for confirmation** before proceeding; remind them that large changes submitted without prior discussion are likely to be rejected by maintainers
+    - This includes keeping the code readable and keeping logical blocks of code separate using blank lines
+    - Long stretches of code without blank lines serving as separation of concern can make functions hard to read and maintain, even though there are occasions when these are useful
 
 Common mistakes that AI agents usually make:
 - Write comments first then write code: this usually leads to extensive redundant comments. Instead, write code first, then add comments later to places that absolutely need them

@@ -708,6 +708,12 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+#ifdef GGML_HIP_RTC
+ggml_cuda_rtc_setup_guard::ggml_cuda_rtc_setup_guard() : lock(ggml_cuda_lock) {
+    ggml_cuda_lock_cv.wait(lock, [] { return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+}
+#endif
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
@@ -2881,7 +2887,11 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (cgraph->uid != 0 &&
-        cgraph->uid == graph->uid) {
+        cgraph->uid == graph->uid
+#ifdef GGML_HIP_RTC
+        && !ggml_cuda_rtc_fusion_enabled()
+#endif
+        ) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
         return false;
@@ -5339,7 +5349,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 #ifdef GGML_HIP_RTC
                 if (nodes_to_skip == 0) {
-                    nodes_to_skip = ggml_cuda_rtc_fusion_try(*cuda_ctx, cgraph, i);
+                    nodes_to_skip = ggml_cuda_rtc_fusion_try(*cuda_ctx, cgraph, i, !use_cuda_graph);
                 }
 #endif
 
@@ -5447,18 +5457,51 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
+#ifdef GGML_HIP_RTC
+    ggml_cuda_graph * rtc_graph = nullptr;
+#endif
 
 #ifdef USE_CUDA_GRAPH
 #ifdef GGML_HIP_RTC
     const bool rtc_enabled = ggml_cuda_rtc_fusion_enabled();
     if (rtc_enabled) {
-        static const bool logged = [] {
-            GGML_LOG_INFO("HIPRTC fusion: graph capture disabled\n");
-            return true;
-        }();
-        GGML_UNUSED(logged);
-    }
-    if (!rtc_enabled) {
+        cuda_ctx->evict_cuda_graphs(ggml_time_us());
+        if (cgraph->n_nodes > 0) {
+            graph_key = ggml_cuda_graph_get_key(cgraph);
+            const auto entry = cuda_ctx->cuda_graphs.find(graph_key);
+            if (entry != cuda_ctx->cuda_graphs.end()) {
+                rtc_graph = entry->second.get();
+                rtc_graph->last_used_time = ggml_time_us();
+            }
+        }
+        const bool ready = ggml_cuda_rtc_fusion_prepare(*cuda_ctx, cgraph, rtc_graph);
+        if (ready && !rtc_graph) {
+            rtc_graph = cuda_ctx->cuda_graph(graph_key);
+            ggml_cuda_rtc_fusion_record(*cuda_ctx, rtc_graph);
+        }
+        if (rtc_graph) {
+            const bool changed = !ready || ggml_cuda_graph_pool_flushed(rtc_graph);
+            if (changed) {
+                if (rtc_graph->instance || rtc_graph->graph) {
+                    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                    if (rtc_graph->instance) {
+                        CUDA_CHECK(cudaGraphExecDestroy(rtc_graph->instance));
+                        rtc_graph->instance = nullptr;
+                    }
+                    if (rtc_graph->graph) {
+                        CUDA_CHECK(cudaGraphDestroy(rtc_graph->graph));
+                        rtc_graph->graph = nullptr;
+                    }
+                }
+                rtc_graph->rtc_plan.reset();
+                rtc_graph->warmup_complete = false;
+            } else {
+                rtc_graph->warmup_complete = true;
+                use_cuda_graph = true;
+                cuda_graph_update_required = rtc_graph->instance == nullptr;
+            }
+        }
+    } else {
 #endif
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
@@ -5497,6 +5540,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif
 #endif // USE_CUDA_GRAPH
+#ifdef GGML_HIP_RTC
+#ifndef USE_CUDA_GRAPH
+    ggml_cuda_rtc_fusion_prepare(*cuda_ctx, cgraph, nullptr);
+#endif
+#endif
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
@@ -5509,6 +5557,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+#ifdef GGML_HIP_RTC
+    if (!use_cuda_graph) {
+        ggml_cuda_rtc_fusion_record(*cuda_ctx, rtc_graph);
+    }
+#endif
 
     return GGML_STATUS_SUCCESS;
 }
@@ -5660,8 +5713,18 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 
 #ifdef USE_CUDA_GRAPH
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
-    const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+    bool use_cuda_graph;
+#ifdef GGML_HIP_RTC
+    if (ggml_cuda_rtc_fusion_enabled()) {
+        ggml_cuda_graph permission;
+        permission.disable_due_to_gpu_arch = ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA;
+        use_cuda_graph = permission.is_enabled();
+    } else
+#endif
+    {
+        const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+        use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+    }
 #else
     const bool use_cuda_graph = false;
     GGML_UNUSED(cuda_ctx);
