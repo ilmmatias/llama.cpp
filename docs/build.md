@@ -432,6 +432,10 @@ If your GPU is not officially supported you can use the environment variable [`H
 
 Configure with `-DGGML_HIP_RTC=ON` to link the optional HIPRTC compiler, then set `GGML_HIP_RTC_FUSION=1` at runtime to enable fusion. Both switches default to off; ordinary HIP and CUDA builds do not require HIPRTC. CMake uses `hiprtc::hiprtc` when available, otherwise searches for `hip/hiprtc.h` and `libhiprtc` under the ROCm include/lib/lib64 paths.
 
+With `GGML_HIP_GRAPHS=ON`, RTC kernels and ordinary HIP kernels can share a captured graph. Plans are retained per backend subgraph, so interleaved CPU/GPU execution can reuse them. Tensor metadata and concurrent-stream topology are checked before replay; changing input values does not require recapture. Concurrent-stream graphs remain eligible for graph replay, but use ordinary kernels instead of RTC region fusion.
+
+Capture metadata is bounded to 32 MiB per backend context, without a fixed graph-size or graph-count limit. Compilation is synchronous and cached within the process. Compare RTC on/off with the same model, offload placement, expert-cache size and batch settings; faster individual kernels do not guarantee faster end-to-end inference.
+
 ### Unified Memory
 
 On Linux it is possible to use unified memory architecture (UMA) to share main memory between the CPU and integrated GPU by setting environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`. However, this hurts performance for non-integrated GPUs (but enables working with integrated GPUs).

@@ -166,7 +166,7 @@ static void rtc_instructions(std::string & source, const ggml_fusion_program & p
                 expression = a + " * " + a;
                 break;
             case GGML_OP_SCALE:
-                expression = "p" + std::to_string(instruction.param) + " * " + a + " + p" + std::to_string(instruction.param + 1);
+                expression = "fmaf(p" + std::to_string(instruction.param) + ", " + a + ", p" + std::to_string(instruction.param + 1) + ")";
                 break;
             case GGML_OP_UNARY:
                 switch (instruction.unary) {
@@ -564,6 +564,7 @@ struct ggml_cuda_rtc_fusion {
 
     bool recording = false;
     std::vector<uint64_t> signature;
+    std::vector<ggml_bitset_t> seen;
     std::vector<rtc_action> actions;
     std::vector<ggml_cuda_rtc_binding> bindings;
 
@@ -586,6 +587,7 @@ struct ggml_cuda_rtc_fusion {
 static size_t rtc_metadata_bytes(const ggml_backend_cuda_context & ctx) {
     const auto & state = *ctx.rtc_fusion;
     size_t bytes = state.signature.capacity() * sizeof(uint64_t) +
+        state.seen.capacity() * sizeof(ggml_bitset_t) +
         state.actions.capacity() * sizeof(rtc_action) + state.bindings.capacity() * sizeof(ggml_cuda_rtc_binding);
     bool direct_retained = false;
 
@@ -634,101 +636,91 @@ static bool rtc_signature_add(ggml_backend_cuda_context & ctx, uint64_t value) {
 }
 
 static bool rtc_signature_tensor(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, const ggml_tensor * tensor) {
+    auto & signature = ctx.rtc_fusion->signature;
     int depth = 0;
     do {
-        if (!rtc_signature_add(ctx, reinterpret_cast<uintptr_t>(tensor))) {
+        const size_t count = tensor ? 11 + 2 * GGML_MAX_DIMS + GGML_MAX_OP_PARAMS / sizeof(int32_t) + GGML_MAX_SRC : 1;
+        if (!rtc_reserve(ctx, signature, signature.size() + count)) {
             return false;
         }
+        const size_t start = signature.size();
+        signature.resize(start + count);
+        uint64_t * value = signature.data() + start;
+        *value++ = reinterpret_cast<uintptr_t>(tensor);
 
         if (!tensor) {
             return true;
         }
-
         if (++depth > 64) {
             return false;
         }
 
         const size_t hash = ggml_hash_find(&graph->visited_hash_set, tensor);
-        const uint64_t uses = ggml_bitset_get(graph->visited_hash_set.used, hash) ? graph->use_counts[hash] : 0;
-        if (!rtc_signature_add(ctx, uses) || !rtc_signature_add(ctx, tensor->op) ||
-            !rtc_signature_add(ctx, tensor->type) ||
-            !rtc_signature_add(ctx, tensor->flags & (GGML_TENSOR_FLAG_COMPUTE | GGML_TENSOR_FLAG_OUTPUT)) ||
-            !rtc_signature_add(ctx, reinterpret_cast<uintptr_t>(tensor->data)) ||
-            !rtc_signature_add(ctx, reinterpret_cast<uintptr_t>(tensor->buffer)) ||
-            !rtc_signature_add(ctx, reinterpret_cast<uintptr_t>(tensor->buffer ? ggml_backend_buffer_get_type(tensor->buffer) : nullptr)) ||
-            !rtc_signature_add(ctx, reinterpret_cast<uintptr_t>(tensor->buffer ? ggml_backend_buffer_get_base(tensor->buffer) : nullptr)) ||
-            !rtc_signature_add(ctx, tensor->buffer ? ggml_backend_buffer_get_size(tensor->buffer) : 0) ||
-            !rtc_signature_add(ctx, tensor->view_offs)) {
-            return false;
-        }
+        *value++ = ggml_bitset_get(graph->visited_hash_set.used, hash) ? graph->use_counts[hash] : 0;
+        *value++ = tensor->op;
+        *value++ = tensor->type;
+        *value++ = tensor->flags & (GGML_TENSOR_FLAG_COMPUTE | GGML_TENSOR_FLAG_OUTPUT);
+        *value++ = reinterpret_cast<uintptr_t>(tensor->data);
+        *value++ = reinterpret_cast<uintptr_t>(tensor->buffer);
+        *value++ = reinterpret_cast<uintptr_t>(tensor->buffer ? ggml_backend_buffer_get_type(tensor->buffer) : nullptr);
+        *value++ = reinterpret_cast<uintptr_t>(tensor->buffer ? ggml_backend_buffer_get_base(tensor->buffer) : nullptr);
+        *value++ = tensor->buffer ? ggml_backend_buffer_get_size(tensor->buffer) : 0;
+        *value++ = tensor->view_offs;
 
         for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-            if (!rtc_signature_add(ctx, uint64_t(tensor->ne[d])) || !rtc_signature_add(ctx, tensor->nb[d])) {
-                return false;
-            }
+            *value++ = uint64_t(tensor->ne[d]);
+            *value++ = tensor->nb[d];
         }
-
         for (int p = 0; p < GGML_MAX_OP_PARAMS / int(sizeof(int32_t)); ++p) {
-            if (!rtc_signature_add(ctx, uint32_t(tensor->op_params[p]))) {
-                return false;
-            }
+            *value++ = uint32_t(tensor->op_params[p]);
         }
-
         for (const auto * source : tensor->src) {
-            if (!rtc_signature_add(ctx, reinterpret_cast<uintptr_t>(source))) {
-                return false;
-            }
+            *value++ = reinterpret_cast<uintptr_t>(source);
         }
 
         tensor = tensor->view_src;
     } while (true);
 }
 
-static bool rtc_capture_supported(const ggml_backend_cuda_context & ctx, const ggml_cgraph * graph) {
-    if (graph->n_nodes <= 0 || graph->n_nodes > 4096 || ctx.curr_stream_no != 0 ||
-        !ctx.concurrent_stream_context.concurrent_events.empty()) {
+static bool rtc_signature_streams(ggml_backend_cuda_context & ctx) {
+    const auto & events = ctx.concurrent_stream_context.concurrent_events;
+    if (!rtc_signature_add(ctx, events.size())) {
         return false;
     }
 
-    for (int i = 0; i < graph->n_nodes; ++i) {
-        const auto * node = graph->nodes[i];
-        if (!(node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-            continue;
-        }
-
-        switch (node->op) {
-            case GGML_OP_NONE:
-            case GGML_OP_VIEW:
-            case GGML_OP_RESHAPE:
-            case GGML_OP_PERMUTE:
-            case GGML_OP_TRANSPOSE:
-                continue;
-            case GGML_OP_ADD:
-            case GGML_OP_MUL:
-            case GGML_OP_SCALE:
-            case GGML_OP_SQR:
-                break;
-            case GGML_OP_UNARY:
-                if (ggml_get_unary_op(node) != GGML_UNARY_OP_NEG && ggml_get_unary_op(node) != GGML_UNARY_OP_RELU &&
-                    ggml_get_unary_op(node) != GGML_UNARY_OP_SILU) {
-                    return false;
-                }
-                break;
-            case GGML_OP_SUM_ROWS:
-            case GGML_OP_MEAN:
-            case GGML_OP_SUM:
-                if (!node->src[0] || node->type != GGML_TYPE_F32 || node->src[0]->type != GGML_TYPE_F32 ||
-                    !ggml_is_contiguous(node->src[0]) ||
-                    (node->op == GGML_OP_SUM ? ggml_nelements(node->src[0]) > 16777216 : node->src[0]->ne[0] > 4096)) {
-                    return false;
-                }
-                break;
-            default:
-                return false;
-        }
-
-        if (node->view_src || !ggml_is_contiguous(node)) {
+    for (const auto & entry : events) {
+        const auto & event = entry.second;
+        if (!rtc_signature_add(ctx, reinterpret_cast<uintptr_t>(entry.first)) ||
+            !rtc_signature_add(ctx, reinterpret_cast<uintptr_t>(event.join_node)) ||
+            !rtc_signature_add(ctx, reinterpret_cast<uintptr_t>(event.fork_event)) ||
+            !rtc_signature_add(ctx, event.n_streams) ||
+            !rtc_signature_add(ctx, event.join_events.size())) {
             return false;
+        }
+
+        for (const auto join : event.join_events) {
+            if (!rtc_signature_add(ctx, reinterpret_cast<uintptr_t>(join))) {
+                return false;
+            }
+        }
+
+        if (!rtc_signature_add(ctx, event.stream_mapping.size())) {
+            return false;
+        }
+        for (const auto & mapping : event.stream_mapping) {
+            if (!rtc_signature_add(ctx, reinterpret_cast<uintptr_t>(mapping.first)) ||
+                !rtc_signature_add(ctx, mapping.second)) {
+                return false;
+            }
+        }
+
+        if (!rtc_signature_add(ctx, event.original_order.size())) {
+            return false;
+        }
+        for (const auto * node : event.original_order) {
+            if (!rtc_signature_add(ctx, reinterpret_cast<uintptr_t>(node))) {
+                return false;
+            }
         }
     }
 
@@ -764,7 +756,8 @@ static bool rtc_action_bind(ggml_backend_cuda_context & ctx, const ggml_cgraph *
     return rtc_bind(graph, ctx.device, region, program, binding);
 }
 
-bool ggml_cuda_rtc_fusion_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, ggml_cuda_graph * capture_graph) {
+bool ggml_cuda_rtc_fusion_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph,
+                                  ggml_cuda_graph * capture_graph, bool graph_compatible) {
     if (ctx.rtc_fusion) {
         ctx.rtc_fusion->recording = false;
         ctx.rtc_fusion->capture_plan.reset();
@@ -781,7 +774,7 @@ bool ggml_cuda_rtc_fusion_prepare(ggml_backend_cuda_context & ctx, const ggml_cg
         return false;
     }
 
-    if (!rtc_capture_supported(ctx, graph)) {
+    if (!graph_compatible || ctx.curr_stream_no != 0) {
         static const bool logged = [] {
             GGML_LOG_INFO("HIPRTC fusion: capture unsupported for this graph; using direct execution\n");
             return true;
@@ -795,23 +788,28 @@ bool ggml_cuda_rtc_fusion_prepare(ggml_backend_cuda_context & ctx, const ggml_cg
         return false;
     }
 
-    if (!capture_graph && ctx.cuda_graphs.size() >= 64) {
-        if (ctx.rtc_fusion) {
-            ctx.rtc_fusion->direct_plan.reset();
-        }
-
-        return false;
-    }
-
     if (!ctx.rtc_fusion) {
         ctx.rtc_fusion = new ggml_cuda_rtc_fusion;
     }
 
     auto & state = *ctx.rtc_fusion;
     state.signature.clear();
-    if (!rtc_signature_add(ctx, uint64_t(graph->n_nodes))) {
+    if (!rtc_signature_add(ctx, uint64_t(graph->n_nodes)) || !rtc_signature_streams(ctx)) {
         state.direct_plan.reset();
         return false;
+    }
+
+    const size_t words = ggml_bitset_size(graph->visited_hash_set.size);
+    if (!rtc_reserve(ctx, state.seen, words)) {
+        state.direct_plan.reset();
+        return false;
+    }
+    state.seen.assign(words, 0);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const size_t hash = ggml_hash_find(&graph->visited_hash_set, graph->nodes[i]);
+        if (ggml_bitset_get(graph->visited_hash_set.used, hash)) {
+            ggml_bitset_set(state.seen.data(), hash);
+        }
     }
 
     for (int i = 0; i < graph->n_nodes; ++i) {
@@ -822,9 +820,20 @@ bool ggml_cuda_rtc_fusion_prepare(ggml_backend_cuda_context & ctx, const ggml_cg
         }
 
         for (const auto * source : node->src) {
-            if (source && !rtc_signature_tensor(ctx, graph, source)) {
+            if (!source) {
+                continue;
+            }
+            const size_t hash = ggml_hash_find(&graph->visited_hash_set, source);
+            const bool visited = ggml_bitset_get(graph->visited_hash_set.used, hash);
+            if (visited && ggml_bitset_get(state.seen.data(), hash)) {
+                continue;
+            }
+            if (!rtc_signature_tensor(ctx, graph, source)) {
                 state.direct_plan.reset();
                 return false;
+            }
+            if (visited) {
+                ggml_bitset_set(state.seen.data(), hash);
             }
         }
     }
@@ -832,19 +841,25 @@ bool ggml_cuda_rtc_fusion_prepare(ggml_backend_cuda_context & ctx, const ggml_cg
     state.recording = true;
     const auto plan = capture_graph && capture_graph->rtc_plan ? capture_graph->rtc_plan : state.direct_plan;
     if (!plan || plan->signature != state.signature ||
-        (plan->scratch && plan->scratch != state.partial) || !rtc_reserve(ctx, state.bindings, plan->actions.size())) {
+        (plan->scratch && plan->scratch != state.partial)) {
         state.direct_plan.reset();
         return false;
     }
 
-    state.bindings.resize(plan->actions.size());
-    for (size_t i = 0; i < plan->actions.size(); ++i) {
-        const auto & action = plan->actions[i];
-        const auto entry = state.cache.find(action.key);
-        if (entry == state.cache.end() || entry->second != action.module ||
-            !rtc_action_bind(ctx, graph, action, state.bindings[i])) {
+    if (!capture_graph || !capture_graph->instance) {
+        if (!rtc_reserve(ctx, state.bindings, plan->actions.size())) {
             state.direct_plan.reset();
             return false;
+        }
+        state.bindings.resize(plan->actions.size());
+        for (size_t i = 0; i < plan->actions.size(); ++i) {
+            const auto & action = plan->actions[i];
+            const auto entry = state.cache.find(action.key);
+            if (entry == state.cache.end() || entry->second != action.module ||
+                !rtc_action_bind(ctx, graph, action, state.bindings[i])) {
+                state.direct_plan.reset();
+                return false;
+            }
         }
     }
 
@@ -859,6 +874,7 @@ bool ggml_cuda_rtc_fusion_prepare(ggml_backend_cuda_context & ctx, const ggml_cg
 #else
     GGML_UNUSED(graph);
     GGML_UNUSED(capture_graph);
+    GGML_UNUSED(graph_compatible);
     return false;
 #endif
 }

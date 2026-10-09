@@ -1468,7 +1468,7 @@ struct capture_limit_graph {
         }
         ggml_set_output(out);
 
-        graph = ggml_new_graph_custom(ctx, 4096, false);
+        graph = ggml_new_graph_custom(ctx, nodes, false);
         ggml_build_forward_expand(graph, out);
         graph->uid = 1;
         REQUIRE(graph->n_nodes == nodes);
@@ -1493,11 +1493,10 @@ struct capture_limit_graph {
 };
 
 static void capture_limits() {
-    for (int nodes : {16, 4096}) {
+    for (int nodes : {4096, 6144}) {
         auto backend = ggml_backend_cuda_init(0);
         REQUIRE(backend);
 
-        auto & cuda_ctx = *static_cast<ggml_backend_cuda_context *>(backend->context);
         std::vector<std::unique_ptr<capture_limit_graph>> fixtures;
         uint64_t start[HIPRTC_TEST_COUNTER_COUNT], before[HIPRTC_TEST_COUNTER_COUNT], after[HIPRTC_TEST_COUNTER_COUNT];
 
@@ -1529,9 +1528,6 @@ static void capture_limits() {
                 refused = true;
                 REQUIRE(after[HIPRTC_TEST_GRAPH_LAUNCH] == before[HIPRTC_TEST_GRAPH_LAUNCH]);
             }
-#ifdef USE_CUDA_GRAPH
-            REQUIRE(cuda_ctx.cuda_graphs.size() == captured);
-#endif
 
             for (size_t retained = 0; retained < captured; ++retained) {
                 observer_snapshot(before);
@@ -1545,7 +1541,7 @@ static void capture_limits() {
         }
 
         REQUIRE(refused);
-        REQUIRE(nodes == 16 ? captured == 64 : captured > 0 && captured < 64);
+        REQUIRE(captured > 0 && captured < fixtures.size());
         std::printf("capture limits: nodes=%d admitted=%zu refused=%zu live modules retained\n", nodes, captured, fixtures.size() - captured);
 
         ggml_backend_free(backend);
@@ -1554,7 +1550,90 @@ static void capture_limits() {
     }
 }
 
+static void capture_mixed() {
+    auto backend = ggml_backend_cuda_init(0);
+    REQUIRE(backend);
+    auto * ctx = ggml_init({2 << 20, nullptr, true});
+    REQUIRE(ctx);
+
+    auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 4);
+    auto * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 8);
+    auto * alternate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 8);
+    ggml_set_input(input);
+    ggml_set_input(weight);
+    auto * producer = ggml_neg(ctx, ggml_scale_bias(ctx, input, 2.0f, 1.0f));
+    auto * mm = ggml_mul_mat(ctx, weight, producer);
+    auto * out = ggml_neg(ctx, ggml_scale_bias(ctx, mm, 0.5f, 2.0f));
+    ggml_set_output(out);
+    auto * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+    graph->uid = 1;
+    auto * other_out = ggml_sqr(ctx, alternate);
+    ggml_set_output(other_out);
+    auto * other_graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(other_graph, other_out);
+    other_graph->uid = 1;
+    auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    REQUIRE(buffer);
+
+    std::vector<float> inputs(128, 1.0f);
+    std::vector<float> weights(256, 0.25f);
+    ggml_backend_tensor_set(input, inputs.data(), 0, inputs.size() * sizeof(float));
+    ggml_backend_tensor_set(weight, weights.data(), 0, weights.size() * sizeof(float));
+    std::fill(weights.begin(), weights.end(), 0.5f);
+    ggml_backend_tensor_set(alternate, weights.data(), 0, weights.size() * sizeof(float));
+
+    auto run = [&](float expected) {
+        REQUIRE(ggml_backend_graph_compute(backend, other_graph) == GGML_STATUS_SUCCESS);
+        float other_result[256];
+        ggml_backend_tensor_get(other_out, other_result, 0, sizeof(other_result));
+        for (float value : other_result) {
+            REQUIRE(value == 0.25f);
+        }
+        REQUIRE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+        float result[32];
+        ggml_backend_tensor_get(out, result, 0, sizeof(result));
+        for (float value : result) {
+            REQUIRE(value == expected);
+        }
+    };
+
+    for (int phase = 0; phase < 3; ++phase) {
+        if (phase == 1) {
+            std::fill(inputs.begin(), inputs.end(), 2.0f);
+            ggml_backend_tensor_set(input, inputs.data(), 0, inputs.size() * sizeof(float));
+        } else if (phase == 2) {
+            weight->data = alternate->data;
+        }
+        const float expected = phase == 0 ? 10.0f : phase == 1 ? 18.0f : 38.0f;
+        uint64_t before[HIPRTC_TEST_COUNTER_COUNT], after[HIPRTC_TEST_COUNTER_COUNT];
+        observer_snapshot(before);
+        run(expected);
+        if (phase != 1) {
+            run(expected);
+        }
+        observer_snapshot(after);
+        REQUIRE(after[HIPRTC_TEST_GRAPH_LAUNCH] == before[HIPRTC_TEST_GRAPH_LAUNCH] + (phase == 2 ? 3 : 2));
+        REQUIRE(after[HIPRTC_TEST_CAPTURE_BEGIN] == before[HIPRTC_TEST_CAPTURE_BEGIN] + (phase == 0 ? 2 : phase == 1 ? 0 : 1));
+        REQUIRE(after[HIPRTC_TEST_SETUP_DURING_CAPTURE] == 0);
+
+        observer_snapshot(before);
+        run(expected);
+        observer_snapshot(after);
+        REQUIRE(after[HIPRTC_TEST_GRAPH_LAUNCH] == before[HIPRTC_TEST_GRAPH_LAUNCH] + 2);
+        REQUIRE(after[HIPRTC_TEST_MODULE_LAUNCH] == before[HIPRTC_TEST_MODULE_LAUNCH]);
+        REQUIRE(after[HIPRTC_TEST_CAPTURE_BEGIN] == before[HIPRTC_TEST_CAPTURE_BEGIN]);
+    }
+
+    ggml_backend_free(backend);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    std::puts("capture: interleaved mixed graphs, input updates and same-UID weight rebinding passed");
+}
+
 static void capture() {
+    capture_mixed();
+
     for (bool diamond : {false, true}) {
 
         capture_fixture fixture(diamond);
@@ -1935,7 +2014,7 @@ static void streams() {
 
     uint64_t before[HIPRTC_TEST_COUNTER_COUNT], after[HIPRTC_TEST_COUNTER_COUNT];
     observer_snapshot(before);
-    for (int repeat = 0; repeat < 2; ++repeat) {
+    for (int repeat = 0; repeat < 4; ++repeat) {
         ggml_backend_tensor_set(a, input.data(), 0, input.size() * sizeof(float));
         REQUIRE(ggml_backend_sched_graph_compute(sched, g) == GGML_STATUS_SUCCESS);
 
@@ -1946,17 +2025,31 @@ static void streams() {
     }
 
     observer_snapshot(after);
-    REQUIRE(after[HIPRTC_TEST_EVENT_RECORD] - before[HIPRTC_TEST_EVENT_RECORD] == 8);
-    REQUIRE(after[HIPRTC_TEST_STREAM_WAIT] - before[HIPRTC_TEST_STREAM_WAIT] == 12);
     REQUIRE(after[HIPRTC_TEST_COMPILE] == before[HIPRTC_TEST_COMPILE]);
     REQUIRE(after[HIPRTC_TEST_MODULE_LAUNCH] == before[HIPRTC_TEST_MODULE_LAUNCH]);
+
+    for (float & value : input) {
+        value = -value;
+    }
+    observer_snapshot(before);
+    ggml_backend_tensor_set(a, input.data(), 0, input.size() * sizeof(float));
+    REQUIRE(ggml_backend_sched_graph_compute(sched, g) == GGML_STATUS_SUCCESS);
+    observer_snapshot(after);
+    const float expected[] = {18, 6, 0, 3};
+    check_pattern(out, expected, 513);
+    const float expected_root[] = {2, 1, 0, -1};
+    check_pattern(root, expected_root, 513);
+    REQUIRE(after[HIPRTC_TEST_GRAPH_LAUNCH] == before[HIPRTC_TEST_GRAPH_LAUNCH] + 1);
+    REQUIRE(after[HIPRTC_TEST_CAPTURE_BEGIN] == before[HIPRTC_TEST_CAPTURE_BEGIN]);
+    REQUIRE(after[HIPRTC_TEST_EVENT_RECORD] == before[HIPRTC_TEST_EVENT_RECORD]);
+    REQUIRE(after[HIPRTC_TEST_STREAM_WAIT] == before[HIPRTC_TEST_STREAM_WAIT]);
 
     ggml_backend_sched_free(sched);
     ggml_backend_free(cpu);
     ggml_backend_free(backend);
     ggml_free(ctx);
 
-    std::puts("streams: three real side streams, eight fork/join records and twelve waits; ordinary output preserved");
+    std::puts("streams: three real side streams replay changed inputs without host fork/join calls");
 }
 
 #include "hiprtc-fusion-bench.h"

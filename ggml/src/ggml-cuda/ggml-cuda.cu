@@ -5472,9 +5472,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             if (entry != cuda_ctx->cuda_graphs.end()) {
                 rtc_graph = entry->second.get();
                 rtc_graph->last_used_time = ggml_time_us();
+            } else {
+                rtc_graph = cuda_ctx->cuda_graph(graph_key);
             }
         }
-        const bool ready = ggml_cuda_rtc_fusion_prepare(*cuda_ctx, cgraph, rtc_graph);
+        const bool ready = ggml_cuda_rtc_fusion_prepare(*cuda_ctx, cgraph, rtc_graph,
+                                                       ggml_cuda_graph_check_compability(cgraph));
         if (ready && !rtc_graph) {
             rtc_graph = cuda_ctx->cuda_graph(graph_key);
             ggml_cuda_rtc_fusion_record(*cuda_ctx, rtc_graph);
@@ -5542,7 +5545,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #endif // USE_CUDA_GRAPH
 #ifdef GGML_HIP_RTC
 #ifndef USE_CUDA_GRAPH
-    ggml_cuda_rtc_fusion_prepare(*cuda_ctx, cgraph, nullptr);
+    ggml_cuda_rtc_fusion_prepare(*cuda_ctx, cgraph, nullptr, false);
 #endif
 #endif
 
@@ -5560,6 +5563,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #ifdef GGML_HIP_RTC
     if (!use_cuda_graph) {
         ggml_cuda_rtc_fusion_record(*cuda_ctx, rtc_graph);
+#ifdef USE_CUDA_GRAPH
+        if (rtc_graph && !rtc_graph->rtc_plan) {
+            cuda_ctx->cuda_graphs.erase(graph_key);
+        }
+#endif
     }
 #endif
 
