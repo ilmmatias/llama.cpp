@@ -2535,7 +2535,7 @@ static void limits() {
     std::puts("limits: 257 layout keys, 256 real compiles/modules, final ordinary fallback and teardown passed");
 }
 
-static void streams() {
+static void streams_case(int n, bool reduce) {
     auto backend = ggml_backend_cuda_init(0);
     auto cpu = ggml_backend_cpu_init();
     REQUIRE(backend && cpu);
@@ -2544,21 +2544,32 @@ static void streams() {
     auto * ctx = ggml_init({4 << 20, nullptr, true});
     REQUIRE(ctx);
 
-    auto * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 513);
+    auto * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
     ggml_set_input(a);
-    auto * root = ggml_scale(ctx, a, 0.5f);
+    ggml_set_name(a, "streams_input");
+    auto * root = ggml_scale(ctx, ggml_neg(ctx, a), 0.5f);
     ggml_set_name(root, "attn_norm");
     ggml_set_output(root); // keep the shared fork input out of branch storage
 
     auto * v = ggml_sqr(ctx, ggml_neg(ctx, root));
     auto * t = ggml_scale(ctx, ggml_sqr(ctx, root), 2.0f);
     auto * q = ggml_scale(ctx, ggml_relu(ctx, root), 3.0f);
+    if (reduce) {
+        v = ggml_sum(ctx, v);
+        t = ggml_sum(ctx, t);
+        q = ggml_sum(ctx, q);
+    }
+    for (auto * branch : {v, t, q}) {
+        ggml_set_output(branch);
+    }
 
     auto * g = ggml_new_graph(ctx);
     ggml_build_forward_expand(g, v);
     ggml_build_forward_expand(g, t);
     ggml_build_forward_expand(g, q);
-    auto * out = ggml_add(ctx, ggml_add(ctx, v, t), q);
+    auto * joined = ggml_add(ctx, ggml_add(ctx, v, t), q);
+    auto * out = ggml_scale(ctx, ggml_sqr(ctx, ggml_neg(ctx, joined)), 0.25f);
+    ggml_set_name(out, "streams_output");
     ggml_set_output(out);
     ggml_build_forward_expand(g, out);
 
@@ -2572,52 +2583,63 @@ static void streams() {
 
     auto & cuda_ctx = *static_cast<ggml_backend_cuda_context *>(backend->context);
     REQUIRE(cuda_ctx.stream_context().concurrent_events.size() == 1);
-    const auto & event = cuda_ctx.stream_context().concurrent_events.at(root);
+    auto & event = cuda_ctx.stream_context().concurrent_events.at(root);
     REQUIRE(event.n_streams == 3);
 
-    std::vector<float> input(513);
-    for (int i = 0; i < 513; ++i) {
+    auto reference = ggml_backend_graph_copy(cpu, g);
+    REQUIRE(reference.buffer);
+    auto * reference_root = ggml_graph_get_tensor(reference.graph, "attn_norm");
+    REQUIRE(reference_root);
+    auto * reference_input = reference_root->src[0]->src[0];
+
+    std::vector<float> input(n);
+    for (int i = 0; i < n; ++i) {
         input[i] = float(2 * (i % 4) - 4);
     }
 
-    uint64_t before[HIPRTC_TEST_COUNTER_COUNT], after[HIPRTC_TEST_COUNTER_COUNT];
-    observer_snapshot(before);
-    for (int repeat = 0; repeat < 4; ++repeat) {
-        ggml_backend_tensor_set(a, input.data(), 0, input.size() * sizeof(float));
-        REQUIRE(ggml_backend_sched_graph_compute(sched, g) == GGML_STATUS_SUCCESS);
+    for (int phase = 0; phase < 3; ++phase) {
+        if (phase == 1) {
+            for (float & value : input) {
+                value = -value;
+            }
+        } else if (phase == 2) {
+            for (auto & mapping : event.stream_mapping) {
+                if (mapping.second == 1 || mapping.second == 2) {
+                    mapping.second = 3 - mapping.second;
+                }
+            }
+        }
+        for (int repeat = 0; repeat < 4; ++repeat) {
+            ggml_backend_tensor_set(a, input.data(), 0, input.size() * sizeof(float));
+            ggml_backend_tensor_set(reference_input, input.data(), 0, input.size() * sizeof(float));
+            REQUIRE(ggml_backend_sched_graph_compute(sched, g) == GGML_STATUS_SUCCESS);
+            REQUIRE(ggml_backend_graph_compute(cpu, reference.graph) == GGML_STATUS_SUCCESS);
 
-        const float expected[] = {12, 3, 0, 6};
-        check_pattern(out, expected, 513);
-        const float expected_root[] = {-2, -1, 0, 1};
-        check_pattern(root, expected_root, 513);
+            for (auto * tensor : {root, v, t, q, out}) {
+                const auto * expected_tensor = ggml_graph_get_tensor(reference.graph, tensor->name);
+                REQUIRE(expected_tensor);
+                const size_t count = size_t(ggml_nelements(tensor));
+                std::vector<float> actual(count), expected(count);
+                ggml_backend_tensor_get(tensor, actual.data(), 0, count * sizeof(float));
+                ggml_backend_tensor_get(expected_tensor, expected.data(), 0, count * sizeof(float));
+                for (size_t i = 0; i < count; ++i) {
+                    REQUIRE(std::fabs(actual[i] - expected[i]) <= 2e-6f * std::max(1.0f, std::fabs(expected[i])));
+                }
+            }
+        }
     }
 
-    observer_snapshot(after);
-    REQUIRE(after[HIPRTC_TEST_COMPILE] == before[HIPRTC_TEST_COMPILE]);
-    REQUIRE(after[HIPRTC_TEST_MODULE_LAUNCH] == before[HIPRTC_TEST_MODULE_LAUNCH]);
-
-    for (float & value : input) {
-        value = -value;
-    }
-    observer_snapshot(before);
-    ggml_backend_tensor_set(a, input.data(), 0, input.size() * sizeof(float));
-    REQUIRE(ggml_backend_sched_graph_compute(sched, g) == GGML_STATUS_SUCCESS);
-    observer_snapshot(after);
-    const float expected[] = {18, 6, 0, 3};
-    check_pattern(out, expected, 513);
-    const float expected_root[] = {2, 1, 0, -1};
-    check_pattern(root, expected_root, 513);
-    REQUIRE(after[HIPRTC_TEST_GRAPH_LAUNCH] == before[HIPRTC_TEST_GRAPH_LAUNCH] + 1);
-    REQUIRE(after[HIPRTC_TEST_CAPTURE_BEGIN] == before[HIPRTC_TEST_CAPTURE_BEGIN]);
-    REQUIRE(after[HIPRTC_TEST_EVENT_RECORD] == before[HIPRTC_TEST_EVENT_RECORD]);
-    REQUIRE(after[HIPRTC_TEST_STREAM_WAIT] == before[HIPRTC_TEST_STREAM_WAIT]);
-
+    ggml_backend_graph_copy_free(reference);
     ggml_backend_sched_free(sched);
     ggml_backend_free(cpu);
     ggml_backend_free(backend);
     ggml_free(ctx);
+}
 
-    std::puts("streams: three real side streams replay changed inputs without host fork/join calls");
+static void streams() {
+    streams_case(513, false);
+    streams_case(8193, true);
+    std::puts("streams: fork/join boundaries, three branches, reductions, changed inputs and stream remapping passed");
 }
 
 #include "hiprtc-fusion-bench.h"

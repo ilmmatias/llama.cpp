@@ -1667,6 +1667,9 @@ struct ggml_backend_cuda_context {
     }
 };
 
+int ggml_cuda_fusion_stream_end(
+        ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int first, int last);
+
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;

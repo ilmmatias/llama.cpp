@@ -754,6 +754,7 @@ struct rtc_node_reference {
 
 struct rtc_action {
     int start = 0;
+    int stream = 0;
     int members[GGML_FUSION_MAX_VALUES] = {};
     int outputs[GGML_FUSION_MAX_OUTPUTS] = {};
     rtc_node_reference inputs[GGML_FUSION_MAX_INPUTS];
@@ -769,7 +770,7 @@ struct ggml_cuda_rtc_plan {
     std::vector<rtc_action> actions;
     std::vector<std::shared_ptr<const rtc_artifact>> pending;
     bool retry = false;
-    const float * scratch = nullptr;
+    const float * scratch[GGML_CUDA_MAX_STREAMS] = {};
 
     size_t bytes() const {
         return sizeof(*this) + signature.capacity() * sizeof(uint64_t) + actions.capacity() * sizeof(rtc_action) + pending.capacity() * sizeof(pending[0]);
@@ -803,8 +804,8 @@ struct ggml_cuda_rtc_fusion {
 
     int max_threads = 0;
     size_t max_shared = 0;
-    float * partial = nullptr;
-    bool scratch_attempted = false;
+    float * partial[GGML_CUDA_MAX_STREAMS] = {};
+    bool scratch_attempted[GGML_CUDA_MAX_STREAMS] = {};
 
     bool recording = false;
     // signature_count is the active prefix; keep the workspace size between graphs.
@@ -827,8 +828,10 @@ struct ggml_cuda_rtc_fusion {
         actions.clear();
         cache.clear();
 
-        if (partial) {
-            CUDA_CHECK(hipFree(partial));
+        for (float * scratch : partial) {
+            if (scratch) {
+                CUDA_CHECK(hipFree(scratch));
+            }
         }
     }
 };
@@ -1111,10 +1114,15 @@ bool ggml_cuda_rtc_fusion_prepare(ggml_backend_cuda_context & ctx, const ggml_cg
 
     state.recording = true;
     const auto plan = capture_graph && capture_graph->rtc_plan ? capture_graph->rtc_plan : state.direct_plan;
-    if (!plan || !rtc_signature_matches(state, *plan) ||
-        (plan->scratch && plan->scratch != state.partial)) {
+    if (!plan || !rtc_signature_matches(state, *plan)) {
         state.direct_plan.reset();
         return false;
+    }
+    for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+        if (plan->scratch[stream] && plan->scratch[stream] != state.partial[stream]) {
+            state.direct_plan.reset();
+            return false;
+        }
     }
 
     if (plan->retry || std::any_of(plan->pending.begin(), plan->pending.end(), [](const std::shared_ptr<const rtc_artifact> & artifact) {
@@ -1199,8 +1207,7 @@ void ggml_cuda_rtc_fusion_record(ggml_backend_cuda_context & ctx, ggml_cuda_grap
         plan->retry = state.retry;
         for (const auto & action : plan->actions) {
             if (action.schedule.scratch) {
-                plan->scratch = state.partial;
-                break;
+                plan->scratch[action.stream] = state.partial[action.stream];
             }
         }
 
@@ -1232,6 +1239,7 @@ static void rtc_record_action(ggml_backend_cuda_context & ctx, const ggml_cgraph
     state.actions.emplace_back();
     auto & action = state.actions.back();
     action.start = region.members[0];
+    action.stream = ctx.curr_stream_no;
     action.program = program;
     action.schedule = schedule;
     action.key = key;
@@ -1663,6 +1671,7 @@ static bool rtc_select_schedule(const ggml_fusion_program & program, uint64_t n,
 static int rtc_launch(ggml_backend_cuda_context & ctx, const ggml_fusion_program & program,
                       const ggml_fusion_schedule & schedule, ggml_cuda_rtc_binding & binding, const rtc_module & module) {
     auto & state = *ctx.rtc_fusion;
+    float * & partial = state.partial[ctx.curr_stream_no];
 
     if (program.reduction.value >= 0) {
         unsigned long long columns = program.reduction.axes == 1 ? uint64_t(program.ne[0]) : binding.n;
@@ -1676,7 +1685,7 @@ static int rtc_launch(ggml_backend_cuda_context & ctx, const ggml_fusion_program
         for (int stage = first_stage; stage <= last_stage; ++stage) {
             int arg = 0;
             if (stage == 1) {
-                args[arg++] = &state.partial;
+                args[arg++] = &partial;
             } else {
                 for (int k = 0; k < program.outputs; ++k) {
                     args[arg++] = &binding.outputs[k];
@@ -1690,7 +1699,7 @@ static int rtc_launch(ggml_backend_cuda_context & ctx, const ggml_fusion_program
             }
 
             if (stage == 2) {
-                args[arg++] = &state.partial;
+                args[arg++] = &partial;
                 args[arg++] = &partials;
             } else if (stage == 1) {
                 args[arg++] = &binding.n;
@@ -1743,8 +1752,7 @@ static int rtc_launch(ggml_backend_cuda_context & ctx, const ggml_fusion_program
 }
 
 int ggml_cuda_rtc_fusion_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int node_idx, bool allow_compile, int min_count) {
-    if (!ggml_cuda_rtc_fusion_enabled() || ctx.curr_stream_no != 0 ||
-        !ctx.stream_context().concurrent_events.empty()) {
+    if (!ggml_cuda_rtc_fusion_enabled()) {
         return 0;
     }
 
@@ -1765,7 +1773,7 @@ int ggml_cuda_rtc_fusion_try(ggml_backend_cuda_context & ctx, const ggml_cgraph 
 
         const size_t index = state.capture_action;
         const auto & action = actions[index];
-        if (action.program.count < min_count) {
+        if (action.program.count < min_count || action.stream != ctx.curr_stream_no) {
             return 0;
         }
         ++state.capture_action;
@@ -1780,6 +1788,8 @@ int ggml_cuda_rtc_fusion_try(ggml_backend_cuda_context & ctx, const ggml_cgraph 
     ggml_fusion_program program;
     ggml_cuda_rtc_binding binding;
     ggml_cgraph slice = *graph;
+    slice.n_nodes = ggml_cuda_fusion_stream_end(ctx, graph, node_idx,
+        node_idx + std::min(graph->n_nodes - node_idx, GGML_FUSION_MAX_VALUES) - 1);
 
     for (;;) {
         if (!ggml_fusion_build(&slice, node_idx, region, program) || program.count < min_count) {
@@ -1872,16 +1882,17 @@ int ggml_cuda_rtc_fusion_try(ggml_backend_cuda_context & ctx, const ggml_cgraph 
         return 0;
     }
 
-    if (schedule.stages == 2 && !state.scratch_attempted) {
+    const int stream = ctx.curr_stream_no;
+    if (schedule.stages == 2 && !state.scratch_attempted[stream]) {
         ggml_cuda_rtc_setup_guard setup;
-        state.scratch_attempted = true;
-        const auto error = hipMalloc(&state.partial, size_t(schedule.scratch));
+        state.scratch_attempted[stream] = true;
+        const auto error = hipMalloc(&state.partial[stream], size_t(schedule.scratch));
         if (error != hipSuccess) {
             GGML_LOG_WARN("HIPRTC fusion: reduction scratch: %s\n", hipGetErrorString(error));
         }
     }
 
-    if (schedule.stages == 2 && !state.partial) {
+    if (schedule.stages == 2 && !state.partial[stream]) {
         return 0;
     }
 

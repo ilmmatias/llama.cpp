@@ -3941,21 +3941,32 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // A skipped span must not swallow a stream transition or a fork/join boundary.
-static bool ggml_cuda_fusion_same_stream(
+int ggml_cuda_fusion_stream_end(
         ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int first, int last) {
+    int end = last + 1;
     for (const auto & [fork, event] : ctx.stream_context().concurrent_events) {
         const auto start = event.stream_mapping.find(graph->nodes[first]);
         const int stream = start == event.stream_mapping.end() ? 0 : start->second;
-        for (int j = first; j <= last; ++j) {
+        for (int j = first; j < end; ++j) {
             const ggml_tensor * node = graph->nodes[j];
             const auto mapped = event.stream_mapping.find(node);
-            if ((j < last && node == fork) || (j > first && node == event.join_node) ||
+            if ((j > first && node == event.join_node) ||
                     (mapped == event.stream_mapping.end() ? 0 : mapped->second) != stream) {
-                return false;
+                end = j;
+                break;
+            }
+            if (node == fork) {
+                end = j + 1;
+                break;
             }
         }
     }
-    return true;
+    return end;
+}
+
+static bool ggml_cuda_fusion_same_stream(
+        ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int first, int last) {
+    return ggml_cuda_fusion_stream_end(ctx, graph, first, last) == last + 1;
 }
 
 // Include leaf inputs too: the general fusion range check exempts GGML_OP_NONE.

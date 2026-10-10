@@ -438,7 +438,7 @@ Page resolution marks the complete selection union and collects unique misses in
 
 Configure with `-DGGML_HIP_RTC=ON` to link the optional HIPRTC compiler, then set `GGML_HIP_RTC_FUSION=1` at runtime to enable fusion. Both switches default to off; ordinary HIP and CUDA builds do not require HIPRTC. CMake uses `hiprtc::hiprtc` when available, otherwise searches for `hip/hiprtc.h` and `libhiprtc` under the ROCm include/lib/lib64 paths.
 
-With `GGML_HIP_GRAPHS=ON`, RTC kernels and ordinary HIP kernels can share a captured graph. Plans are retained per backend subgraph, so interleaved CPU/GPU execution can reuse them. Tensor metadata and concurrent-stream topology are checked before replay; changing input values does not require recapture. Concurrent-stream graphs remain eligible for graph replay, but use ordinary kernels instead of RTC region fusion.
+With `GGML_HIP_GRAPHS=ON`, RTC kernels and ordinary HIP kernels can share a captured graph. Plans are retained per backend subgraph, so interleaved CPU/GPU execution can reuse them. Tensor metadata and concurrent-stream topology are checked before replay; changing input values does not require recapture. With `GGML_CUDA_GRAPH_OPT=1`, RTC fusion is allowed outside fork/join regions and within individual branches. Fusion preserves stream transitions and fork/join synchronization; two-stage reductions use separate scratch buffers for each stream.
 
 Matrix and attention operations retain their existing native or vendor-library implementations and specialized fusions. HIPRTC does not generate these computations or add generic runtime-interpreted epilogues to their kernels.
 

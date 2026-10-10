@@ -426,7 +426,7 @@ if (GGML_HIP AND GGML_HIP_RTC)
         if (GGML_HIP_GRAPHS)
             llama_test(test-hiprtc-fusion NAME test-hiprtc-fusion-streams ARGS streams)
             set_tests_properties(test-hiprtc-fusion-streams PROPERTIES SKIP_RETURN_CODE 77
-                ENVIRONMENT "GGML_HIP_RTC_FUSION=1;GGML_HIP_RTC_FUSION_ASYNC=0;GGML_CUDA_GRAPH_OPT=1;LD_PRELOAD=$<TARGET_FILE:hiprtc-test-interpose>")
+                ENVIRONMENT "GGML_HIP_RTC_FUSION=1;GGML_HIP_RTC_FUSION_ASYNC=0;GGML_HIP_RTC_FUSION_FORCE=1;GGML_CUDA_GRAPH_OPT=1;LD_PRELOAD=$<TARGET_FILE:hiprtc-test-interpose>")
             foreach(mode capture capture-limits concurrency-capture)
                 llama_test(test-hiprtc-fusion NAME test-hiprtc-fusion-${mode} ARGS ${mode})
                 set_tests_properties(test-hiprtc-fusion-${mode} PROPERTIES SKIP_RETURN_CODE 77
