@@ -11,6 +11,7 @@
 #include <hip/hiprtc.h>
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -1195,6 +1196,143 @@ struct cache_fixture {
     }
 };
 
+static void asynchronous(bool failure) {
+    auto pause = reinterpret_cast<void (*)(bool)>(dlsym(RTLD_DEFAULT, "hiprtc_test_pause_compiler"));
+    auto wait = reinterpret_cast<bool (*)(unsigned)>(dlsym(RTLD_DEFAULT, "hiprtc_test_wait_compiler"));
+    REQUIRE(pause && wait);
+    REQUIRE(getenv("GGML_HIP_RTC_FUSION_ASYNC") && std::atoi(getenv("GGML_HIP_RTC_FUSION_ASYNC")));
+
+    cache_fixture first(0), second(1);
+    uint64_t before[HIPRTC_TEST_COUNTER_COUNT], after[HIPRTC_TEST_COUNTER_COUNT];
+    observer_snapshot(before);
+    pause(true);
+    first.run(0, false, true);
+    REQUIRE(wait(0));
+
+    std::thread first_thread([&] {
+        for (int repeat = 0; repeat < 3; ++repeat) {
+            first.run(0, false, true);
+        }
+    });
+    std::thread second_thread([&] {
+        for (int repeat = 0; repeat < 3; ++repeat) {
+            second.run(0, false, true);
+        }
+    });
+    first_thread.join();
+    second_thread.join();
+    {
+        cache_fixture retiring(2);
+        retiring.run(1, false, true);
+    }
+    observer_snapshot(after);
+    REQUIRE(after[HIPRTC_TEST_COMPILE] == before[HIPRTC_TEST_COMPILE] + 1);
+    REQUIRE(after[HIPRTC_TEST_LOAD] == before[HIPRTC_TEST_LOAD]);
+#ifdef USE_CUDA_GRAPH
+    REQUIRE(after[HIPRTC_TEST_GRAPH_LAUNCH] >= before[HIPRTC_TEST_GRAPH_LAUNCH] + 4);
+#endif
+
+    pause(false);
+    REQUIRE(wait(2));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;) {
+        first.run(0, false, true);
+        second.run(0, false, true);
+        observer_snapshot(after);
+        if (failure || after[HIPRTC_TEST_LOAD] == before[HIPRTC_TEST_LOAD] + 2) {
+            break;
+        }
+        REQUIRE(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    cache_fixture replacement(3);
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        first.run(0, false, true);
+        second.run(0, false, true);
+        replacement.run(1, false, true);
+    }
+    observer_snapshot(after);
+    REQUIRE(after[HIPRTC_TEST_COMPILE] == before[HIPRTC_TEST_COMPILE] + 2);
+    REQUIRE(after[HIPRTC_TEST_LOAD] == before[HIPRTC_TEST_LOAD] + (failure ? 0 : 3));
+    REQUIRE(after[HIPRTC_TEST_SETUP_DURING_CAPTURE] == 0);
+    std::puts(failure ? "async: failed jobs stayed cached; native graph outputs passed" :
+        "async: native graphs ran while compilation was blocked; deduplicated jobs survived backend teardown and promoted to RTC; outputs passed");
+}
+
+static void asynchronous_limits() {
+    auto pause = reinterpret_cast<void (*)(bool)>(dlsym(RTLD_DEFAULT, "hiprtc_test_pause_compiler"));
+    auto wait = reinterpret_cast<bool (*)(unsigned)>(dlsym(RTLD_DEFAULT, "hiprtc_test_wait_compiler"));
+    REQUIRE(pause && wait);
+    auto backend = ggml_backend_cuda_init(0);
+    REQUIRE(backend);
+
+    struct fixture {
+        ggml_context * ctx;
+        ggml_backend_buffer_t buffer;
+        ggml_cgraph * graph;
+        ggml_tensor * out;
+    };
+    std::vector<fixture> fixtures;
+    uint64_t before[HIPRTC_TEST_COUNTER_COUNT], after[HIPRTC_TEST_COUNTER_COUNT];
+    observer_snapshot(before);
+    pause(true);
+    for (size_t stride = 2; stride < 38; ++stride) {
+        auto * ctx = ggml_init({1 << 20, nullptr, true});
+        REQUIRE(ctx);
+        auto * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 2);
+        auto * backing = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, stride + 2);
+        auto * b = ggml_view_2d(ctx, backing, 2, 2, stride * sizeof(float), 0);
+        auto * out = ggml_sqr(ctx, ggml_neg(ctx, ggml_mul(ctx, ggml_add(ctx, a, b), a)));
+        auto * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, out);
+        auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        REQUIRE(buffer);
+        const float av[] = {-4, -1, 2, 4};
+        std::vector<float> bv(stride + 2, 2.0f);
+        ggml_backend_tensor_set(a, av, 0, sizeof(av));
+        ggml_backend_tensor_set(backing, bv.data(), 0, bv.size() * sizeof(float));
+        fixtures.push_back({ctx, buffer, graph, out});
+    }
+
+    auto run = [&](const fixture & item) {
+        REQUIRE(ggml_backend_graph_compute(backend, item.graph) == GGML_STATUS_SUCCESS);
+        float values[4];
+        ggml_backend_tensor_get(item.out, values, 0, sizeof(values));
+        const float expected[] = {64, 1, 64, 576};
+        for (int i = 0; i < 4; ++i) {
+            REQUIRE(values[i] == expected[i]);
+        }
+    };
+    run(fixtures[0]);
+    REQUIRE(wait(0));
+    for (const auto & item : fixtures) {
+        run(item);
+    }
+    observer_snapshot(after);
+    REQUIRE(after[HIPRTC_TEST_COMPILE] == before[HIPRTC_TEST_COMPILE] + 1);
+    REQUIRE(after[HIPRTC_TEST_LOAD] == before[HIPRTC_TEST_LOAD]);
+
+    pause(false);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    do {
+        for (const auto & item : fixtures) {
+            run(item);
+        }
+        observer_snapshot(after);
+        REQUIRE(std::chrono::steady_clock::now() < deadline);
+    } while (after[HIPRTC_TEST_LOAD] != before[HIPRTC_TEST_LOAD] + fixtures.size());
+    REQUIRE(after[HIPRTC_TEST_COMPILE] == before[HIPRTC_TEST_COMPILE] + fixtures.size());
+    REQUIRE(after[HIPRTC_TEST_SETUP_DURING_CAPTURE] == 0);
+
+    ggml_backend_free(backend);
+    for (const auto & item : fixtures) {
+        ggml_backend_buffer_free(item.buffer);
+        ggml_free(item.ctx);
+    }
+    std::puts("async-limits: 36 distinct kernels exceeded the pending queue; all native outputs and eventual graph promotions passed");
+}
+
 struct capture_fixture {
     ggml_backend_t backend;
     ggml_context * ctx;
@@ -2193,6 +2331,86 @@ static void failure() {
     std::puts("failure: two real syntax failures cached across repeated requests and two contexts; ordinary outputs passed");
 }
 
+static void cache_shapes() {
+    auto backend = ggml_backend_cuda_init(0);
+    REQUIRE(backend);
+
+    for (bool normalize : {false, true}) {
+        uint64_t before[HIPRTC_TEST_COUNTER_COUNT], after[HIPRTC_TEST_COUNTER_COUNT];
+        observer_snapshot(before);
+
+        const int shapes[][6] = {
+            {8, 3, 1, 1, 4, 1},
+            {8, 5, 1, 1, 4, 1},
+            {8, 3, 2, 4, 4, 1},
+            {normalize ? 16 : 8, 5, 2, 2, 4, 1},
+            {8, 3, 2, 4, 2, 1},
+            {8, 3, 2, 4, 4, 2},
+        };
+        for (int variant = 0; variant < 6; ++variant) {
+            const auto & shape = shapes[variant];
+            auto * ctx = ggml_init({1 << 20, nullptr, true});
+            REQUIRE(ctx);
+
+            auto * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, shape[0], shape[1], shape[2], shape[3]);
+            auto * backing = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, shape[4] * shape[5]);
+            auto * b = ggml_view_1d(ctx, backing, shape[4], 0);
+            b->nb[0] = shape[5] * sizeof(float);
+            auto * out = normalize ?
+                ggml_sqr(ctx, ggml_add(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, a, 1e-5f), b), b)) :
+                ggml_neg(ctx, ggml_sqr(ctx, ggml_add(ctx, a, b)));
+            auto * graph = ggml_new_graph(ctx);
+            ggml_build_forward_expand(graph, b);
+            ggml_build_forward_expand(graph, out);
+
+            auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            REQUIRE(buffer);
+            std::vector<float> av(ggml_nelements(a)), bv(shape[4] * shape[5], -100.0f), values(av.size());
+            for (size_t i = 0; i < av.size(); ++i) {
+                av[i] = (int(i % 17) - 8) * 0.25f;
+            }
+            for (int i = 0; i < shape[4]; ++i) {
+                bv[i * shape[5]] = (i + 1) * 0.125f;
+            }
+            ggml_backend_tensor_set(a, av.data(), 0, av.size() * sizeof(float));
+            ggml_backend_tensor_set(backing, bv.data(), 0, bv.size() * sizeof(float));
+
+            int start = 0;
+            while (graph->nodes[start]->op == GGML_OP_VIEW) {
+                ++start;
+            }
+            auto & cuda_ctx = *static_cast<ggml_backend_cuda_context *>(backend->context);
+            REQUIRE(ggml_cuda_rtc_fusion_try(cuda_ctx, graph, start, true) == (normalize ? 3 : 2));
+            ggml_backend_synchronize(backend);
+            ggml_backend_tensor_get(out, values.data(), 0, values.size() * sizeof(float));
+
+            for (size_t row = 0; row < av.size() / shape[0]; ++row) {
+                float square_sum = 0.0f;
+                for (int col = 0; col < shape[0]; ++col) {
+                    const float value = av[row * shape[0] + col];
+                    square_sum += value * value;
+                }
+                const float scale = 1.0f / std::sqrt(square_sum / shape[0] + 1e-5f);
+                for (int col = 0; col < shape[0]; ++col) {
+                    const size_t i = row * shape[0] + col;
+                    const float bias = bv[(col % shape[4]) * shape[5]];
+                    const float value = normalize ? av[i] * scale * bias + bias : av[i] + bias;
+                    const float expected = (normalize ? 1.0f : -1.0f) * value * value;
+                    REQUIRE(std::fabs(values[i] - expected) < 1e-4f);
+                }
+            }
+
+            observer_snapshot(after);
+            REQUIRE(after[HIPRTC_TEST_COMPILE] - before[HIPRTC_TEST_COMPILE] == uint64_t(variant < 4 ? 1 : variant - 2));
+            ggml_backend_buffer_free(buffer);
+            ggml_free(ctx);
+        }
+    }
+
+    ggml_backend_free(backend);
+    std::puts("cache-shapes: changing batch sizes reused kernels; repeat factors and byte strides stayed distinct; all outputs passed");
+}
+
 static void limits() {
     auto backend = ggml_backend_cuda_init(0);
     REQUIRE(backend);
@@ -2473,6 +2691,12 @@ int main(int argc, char ** argv) {
         concurrency_capture();
     } else if (std::strcmp(argv[1], "failure") == 0) {
         failure();
+    } else if (std::strcmp(argv[1], "cache-shapes") == 0) {
+        cache_shapes();
+    } else if (std::strcmp(argv[1], "async") == 0 || std::strcmp(argv[1], "async-failure") == 0) {
+        asynchronous(std::strcmp(argv[1], "async-failure") == 0);
+    } else if (std::strcmp(argv[1], "async-limits") == 0) {
+        asynchronous_limits();
     } else if (std::strcmp(argv[1], "limits") == 0) {
         limits();
 #endif

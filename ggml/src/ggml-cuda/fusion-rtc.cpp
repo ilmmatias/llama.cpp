@@ -4,14 +4,18 @@
 #include "ggml-backend-impl.h"
 #include <hip/hiprtc.h>
 
+#include <algorithm>
 #include <climits>
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 struct ggml_cuda_rtc_binding {
@@ -640,13 +644,12 @@ enum rtc_compile_state {
 };
 
 struct rtc_artifact {
-    rtc_compile_state state = GGML_CUDA_RTC_COMPILE_COMPILING;
+    std::atomic<rtc_compile_state> state{GGML_CUDA_RTC_COMPILE_COMPILING};
     std::condition_variable changed;
     std::vector<char> code;
 };
 
 static std::mutex rtc_artifact_mutex;
-static std::mutex rtc_compiler_mutex;
 static size_t rtc_artifact_bytes = 0;
 static std::unordered_map<ggml_fusion_cache_key, std::shared_ptr<rtc_artifact>, rtc_key_hash, rtc_key_equal> rtc_artifacts;
 
@@ -668,6 +671,68 @@ static bool rtc_key_string(ggml_fusion_cache_key & key, const char * value) {
     std::memcpy(key.bytes + key.size, value, size);
     key.size += size;
     return true;
+}
+
+static bool rtc_make_key(ggml_fusion_program & program, const ggml_fusion_schedule & schedule, ggml_fusion_cache_key & key) {
+    if (!program.indexed) {
+        return ggml_fusion_make_key(program, schedule, key);
+    }
+
+    const bool narrow = rtc_index32(program);
+
+    // Normalize only the key. Binding and code generation need the original layouts.
+    int64_t original_ne[4];
+    unsigned char original_accesses[sizeof(program.accesses)];
+    const size_t access_bytes = program.inputs * sizeof(program.accesses[0]);
+    std::memcpy(original_ne, program.ne, sizeof(original_ne));
+    std::memcpy(original_accesses, program.accesses, access_bytes);
+
+    const bool row_coordinates = program.reduction.value >= 0 && program.reduction.axes == 1;
+    const int first = row_coordinates ? 1 : 0;
+    int required = first - 1;
+    for (int k = 0; k < program.inputs; ++k) {
+        auto & access = program.accesses[k];
+        const bool flat = rtc_flat_access(access);
+        for (int d = 0; d < 4; ++d) {
+            if (flat) {
+                access.ne[d] = 0;
+                access.nb[d] = 0;
+            } else if (access.ne[d] == 1) {
+                access.nb[d] = 0;
+                access.repeat &= ~(1 << d);
+            } else {
+                if (d >= first) {
+                    required = std::max(required, d);
+                }
+                if (!(access.repeat & (1 << d))) {
+                    access.ne[d] = 2;
+                }
+            }
+        }
+    }
+
+    if (program.reduction.value < 0 || row_coordinates) {
+        int last = 3;
+        while (last > first && original_ne[last] == 1) {
+            --last;
+        }
+
+        for (int d = 0; d < 4; ++d) {
+            if (d < first || d > required) {
+                program.ne[d] = 1;
+            } else if (d == required && d == last) {
+                program.ne[d] = 2;
+            }
+        }
+        if (required >= first && required < last) {
+            program.ne[required + 1] = 2;
+        }
+    }
+
+    const bool result = ggml_fusion_make_key(program, schedule, key);
+    std::memcpy(program.ne, original_ne, sizeof(original_ne));
+    std::memcpy(program.accesses, original_accesses, access_bytes);
+    return result && rtc_key_integer(key, narrow);
 }
 
 struct rtc_module {
@@ -702,10 +767,12 @@ struct rtc_action {
 struct ggml_cuda_rtc_plan {
     std::vector<uint64_t> signature;
     std::vector<rtc_action> actions;
+    std::vector<std::shared_ptr<const rtc_artifact>> pending;
+    bool retry = false;
     const float * scratch = nullptr;
 
     size_t bytes() const {
-        return sizeof(*this) + signature.capacity() * sizeof(uint64_t) + actions.capacity() * sizeof(rtc_action);
+        return sizeof(*this) + signature.capacity() * sizeof(uint64_t) + actions.capacity() * sizeof(rtc_action) + pending.capacity() * sizeof(pending[0]);
     }
 };
 
@@ -745,6 +812,9 @@ struct ggml_cuda_rtc_fusion {
     size_t signature_count = 0;
     std::vector<ggml_bitset_t> seen;
     std::vector<rtc_action> actions;
+    std::vector<std::shared_ptr<const rtc_artifact>> pending;
+    bool retry = false;
+    int pending_until = 0;
     std::vector<ggml_cuda_rtc_binding> bindings;
 
     std::shared_ptr<const ggml_cuda_rtc_plan> direct_plan;
@@ -771,7 +841,8 @@ static size_t rtc_metadata_bytes(const ggml_backend_cuda_context & ctx) {
     const auto & state = *ctx.rtc_fusion;
     size_t bytes = state.signature.capacity() * sizeof(uint64_t) +
         state.seen.capacity() * sizeof(ggml_bitset_t) +
-        state.actions.capacity() * sizeof(rtc_action) + state.bindings.capacity() * sizeof(ggml_cuda_rtc_binding);
+        state.actions.capacity() * sizeof(rtc_action) + state.bindings.capacity() * sizeof(ggml_cuda_rtc_binding) +
+        state.pending.capacity() * sizeof(state.pending[0]);
     bool direct_retained = false;
 
 #ifdef USE_CUDA_GRAPH
@@ -961,6 +1032,9 @@ bool ggml_cuda_rtc_fusion_prepare(ggml_backend_cuda_context & ctx, const ggml_cg
         ctx.rtc_fusion->capture_action = 0;
         ctx.rtc_fusion->actions.clear();
         ctx.rtc_fusion->bindings.clear();
+        ctx.rtc_fusion->pending.clear();
+        ctx.rtc_fusion->retry = false;
+        ctx.rtc_fusion->pending_until = 0;
     }
 
 #ifdef USE_CUDA_GRAPH
@@ -1043,6 +1117,13 @@ bool ggml_cuda_rtc_fusion_prepare(ggml_backend_cuda_context & ctx, const ggml_cg
         return false;
     }
 
+    if (plan->retry || std::any_of(plan->pending.begin(), plan->pending.end(), [](const std::shared_ptr<const rtc_artifact> & artifact) {
+            return artifact->state.load(std::memory_order_acquire) == GGML_CUDA_RTC_COMPILE_READY;
+        })) {
+        state.direct_plan.reset();
+        return false;
+    }
+
     if (!capture_graph || !capture_graph->instance) {
         if (!rtc_reserve(ctx, state.bindings, plan->actions.size())) {
             state.direct_plan.reset();
@@ -1089,7 +1170,8 @@ void ggml_cuda_rtc_fusion_record(ggml_backend_cuda_context & ctx, ggml_cuda_grap
 
     state.capture_plan.reset();
     const auto previous = capture_graph && capture_graph->rtc_plan ? capture_graph->rtc_plan : state.direct_plan;
-    bool unchanged = previous && rtc_signature_matches(state, *previous) && previous->actions.size() == state.actions.size();
+    bool unchanged = previous && rtc_signature_matches(state, *previous) && previous->actions.size() == state.actions.size() &&
+        previous->pending == state.pending && previous->retry == state.retry;
     for (size_t i = 0; unchanged && i < state.actions.size(); ++i) {
         const auto & before = previous->actions[i];
         const auto & after = state.actions[i];
@@ -1102,7 +1184,7 @@ void ggml_cuda_rtc_fusion_record(ggml_backend_cuda_context & ctx, ggml_cuda_grap
     } else {
         state.direct_plan.reset();
 
-        const size_t bytes = sizeof(ggml_cuda_rtc_plan) + state.signature_count * sizeof(uint64_t) + state.actions.size() * sizeof(rtc_action);
+        const size_t bytes = sizeof(ggml_cuda_rtc_plan) + state.signature_count * sizeof(uint64_t) + state.actions.size() * sizeof(rtc_action) + state.pending.size() * sizeof(state.pending[0]);
         const size_t retained = rtc_metadata_bytes(ctx);
         if (retained > RTC_PLAN_BYTES || bytes > RTC_PLAN_BYTES - retained) {
             state.recording = false;
@@ -1113,6 +1195,8 @@ void ggml_cuda_rtc_fusion_record(ggml_backend_cuda_context & ctx, ggml_cuda_grap
         auto plan = std::make_shared<ggml_cuda_rtc_plan>();
         plan->signature.assign(state.signature.begin(), state.signature.begin() + state.signature_count);
         plan->actions = state.actions;
+        plan->pending = state.pending;
+        plan->retry = state.retry;
         for (const auto & action : plan->actions) {
             if (action.schedule.scratch) {
                 plan->scratch = state.partial;
@@ -1193,7 +1277,6 @@ static bool rtc_initialize(ggml_backend_cuda_context & ctx) {
     auto & state = *ctx.rtc_fusion;
     state.initialization_attempted = true;
 
-    std::lock_guard<std::mutex> compiler_lock(rtc_compiler_mutex);
     ggml_cuda_rtc_setup_guard setup;
     ggml_cuda_set_device(ctx.device);
     state.physical_device = ggml_cuda_info().devices[ctx.device].physical_device;
@@ -1237,17 +1320,14 @@ static bool rtc_initialize(ggml_backend_cuda_context & ctx) {
     return true;
 }
 
-static std::vector<char> rtc_compile(const ggml_cuda_rtc_fusion & state, const ggml_fusion_program & program,
-                                     const ggml_fusion_schedule & schedule) {
+static std::vector<char> rtc_compile(const std::string & architecture, const std::string & source, int count, int64_t source_us) {
     const int64_t start = ggml_time_us();
-    const std::string source = program.reduction.value >= 0 ? rtc_emit_reduction(program, schedule) : rtc_emit_pointwise(program);
-    const int64_t emitted = ggml_time_us();
     if (source.size() > 64 * 1024) {
         GGML_LOG_WARN("HIPRTC fusion: source exceeds 64 KiB\n");
         return {};
     }
 
-    const std::string target = "--gpu-architecture=" + state.target;
+    const std::string target = "--gpu-architecture=" + architecture;
     const char * options[] = {target.c_str(), "-std=c++17", "-O3", "-ffp-contract=off"};
     rtc_compiler_program compiler;
     std::vector<char> log;
@@ -1256,7 +1336,7 @@ static std::vector<char> rtc_compile(const ggml_cuda_rtc_fusion & state, const g
             return true;
         }
 
-        GGML_LOG_WARN("HIPRTC fusion: %s %s: %s\n%s\n", state.target.c_str(), stage,
+        GGML_LOG_WARN("HIPRTC fusion: %s %s: %s\n%s\n", architecture.c_str(), stage,
                       hiprtcGetErrorString(error), log.empty() ? "" : log.data());
         return false;
     };
@@ -1300,59 +1380,124 @@ static std::vector<char> rtc_compile(const ggml_cuda_rtc_fusion & state, const g
     compiler.program = nullptr;
 
     GGML_LOG_DEBUG("HIPRTC fusion: compiled %d ops for %s source_us=%lld compile_us=%lld code_bytes=%zu\n",
-                   program.count, state.target.c_str(), (long long) (emitted - start),
-                   (long long) (ggml_time_us() - emitted), code.size());
+                   count, architecture.c_str(), (long long) source_us,
+                   (long long) (ggml_time_us() - start), code.size());
 
     return code;
+}
+
+struct rtc_compile_job {
+    std::shared_ptr<rtc_artifact> artifact;
+    std::string architecture;
+    std::string source;
+    int count;
+    int64_t source_us;
+};
+
+struct rtc_compiler {
+    static constexpr size_t max_pending = 32;
+    std::deque<rtc_compile_job> jobs;
+    std::condition_variable changed;
+    bool stopping = false;
+    std::thread worker;
+
+    rtc_compiler() : worker([this] { run(); }) {}
+
+    ~rtc_compiler() {
+        {
+            std::lock_guard<std::mutex> lock(rtc_artifact_mutex);
+            stopping = true;
+            for (auto & job : jobs) {
+                job.artifact->state.store(GGML_CUDA_RTC_COMPILE_FAILED, std::memory_order_release);
+                job.artifact->changed.notify_all();
+            }
+            jobs.clear();
+        }
+        changed.notify_one();
+        worker.join();
+    }
+
+    void run() {
+        for (;;) {
+            std::unique_lock<std::mutex> lock(rtc_artifact_mutex);
+            changed.wait(lock, [&] { return stopping || !jobs.empty(); });
+            if (stopping) {
+                return;
+            }
+
+            auto job = std::move(jobs.front());
+            jobs.pop_front();
+            lock.unlock();
+
+            std::vector<char> code;
+            try {
+                code = rtc_compile(job.architecture, job.source, job.count, job.source_us);
+            } catch (const std::exception & error) {
+                GGML_LOG_WARN("HIPRTC fusion: compiler setup: %s\n", error.what());
+            } catch (...) {
+                GGML_LOG_WARN("HIPRTC fusion: compiler setup: unknown exception\n");
+            }
+
+            lock.lock();
+            if (!code.empty() && code.size() <= RTC_CACHE_BYTES - rtc_artifact_bytes) {
+                rtc_artifact_bytes += code.size();
+                job.artifact->code = std::move(code);
+                job.artifact->state.store(GGML_CUDA_RTC_COMPILE_READY, std::memory_order_release);
+            } else {
+                job.artifact->state.store(GGML_CUDA_RTC_COMPILE_FAILED, std::memory_order_release);
+            }
+            lock.unlock();
+            job.artifact->changed.notify_all();
+        }
+    }
+};
+
+static bool rtc_async() {
+    static const bool enabled = !getenv("GGML_HIP_RTC_FUSION_ASYNC") || std::atoi(getenv("GGML_HIP_RTC_FUSION_ASYNC"));
+    return enabled;
 }
 
 static std::shared_ptr<const rtc_artifact> rtc_artifact_get(const ggml_cuda_rtc_fusion & state,
                                                           const ggml_fusion_cache_key & key,
                                                           const ggml_fusion_program & program,
-                                                          const ggml_fusion_schedule & schedule) {
+                                                          const ggml_fusion_schedule & schedule,
+                                                          bool & retry) {
+    std::unique_lock<std::mutex> lock(rtc_artifact_mutex);
+    auto found = rtc_artifacts.find(key);
     std::shared_ptr<rtc_artifact> artifact;
-
-    {
-        std::unique_lock<std::mutex> lock(rtc_artifact_mutex);
-        auto found = rtc_artifacts.find(key);
-        if (found != rtc_artifacts.end()) {
-            artifact = found->second;
-            artifact->changed.wait(lock, [&] { return artifact->state != GGML_CUDA_RTC_COMPILE_COMPILING; });
-            return artifact->state == GGML_CUDA_RTC_COMPILE_READY ? artifact : nullptr;
-        }
-
+    if (found != rtc_artifacts.end()) {
+        artifact = found->second;
+    } else {
         if (rtc_artifacts.size() >= 256 || rtc_artifact_bytes >= RTC_CACHE_BYTES) {
             return nullptr;
         }
 
+        static rtc_compiler compiler;
+        if (compiler.jobs.size() >= rtc_compiler::max_pending) {
+            retry = true;
+            return nullptr;
+        }
+
+        const int64_t start = ggml_time_us();
+        auto source = program.reduction.value >= 0 ? rtc_emit_reduction(program, schedule) : rtc_emit_pointwise(program);
+        const int64_t source_us = ggml_time_us() - start;
         artifact = std::make_shared<rtc_artifact>();
         rtc_artifacts.emplace(key, artifact);
-    }
-
-    std::vector<char> code;
-    try {
-        std::lock_guard<std::mutex> compiler_lock(rtc_compiler_mutex);
-        ggml_cuda_rtc_setup_guard setup;
-        code = rtc_compile(state, program, schedule);
-    } catch (const std::exception & error) {
-        GGML_LOG_WARN("HIPRTC fusion: compiler setup: %s\n", error.what());
-    } catch (...) {
-        GGML_LOG_WARN("HIPRTC fusion: compiler setup: unknown exception\n");
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(rtc_artifact_mutex);
-        if (!code.empty() && code.size() <= RTC_CACHE_BYTES - rtc_artifact_bytes) {
-            rtc_artifact_bytes += code.size();
-            artifact->code = std::move(code);
-            artifact->state = GGML_CUDA_RTC_COMPILE_READY;
-        } else {
-            artifact->state = GGML_CUDA_RTC_COMPILE_FAILED;
+        try {
+            compiler.jobs.push_back({artifact, state.target, std::move(source), program.count, source_us});
+        } catch (...) {
+            rtc_artifacts.erase(key);
+            throw;
         }
+        compiler.changed.notify_one();
     }
 
-    artifact->changed.notify_all();
-    return artifact->state == GGML_CUDA_RTC_COMPILE_READY ? artifact : nullptr;
+    if (!rtc_async()) {
+        artifact->changed.wait(lock, [&] {
+            return artifact->state.load(std::memory_order_acquire) != GGML_CUDA_RTC_COMPILE_COMPILING;
+        });
+    }
+    return artifact;
 }
 
 static bool rtc_force() {
@@ -1627,6 +1772,10 @@ int ggml_cuda_rtc_fusion_try(ggml_backend_cuda_context & ctx, const ggml_cgraph 
         return rtc_launch(ctx, action.program, action.schedule, state.bindings[index], *action.module);
     }
 
+    if (ctx.rtc_fusion && node_idx < ctx.rtc_fusion->pending_until) {
+        return 0;
+    }
+
     ggml_fusion_region region;
     ggml_fusion_program program;
     ggml_cuda_rtc_binding binding;
@@ -1654,7 +1803,7 @@ int ggml_cuda_rtc_fusion_try(ggml_backend_cuda_context & ctx, const ggml_cgraph 
     }
 
     ggml_fusion_cache_key key;
-    if (!ggml_fusion_make_key(program, schedule, key)) {
+    if (!rtc_make_key(program, schedule, key)) {
         return 0;
     }
 
@@ -1687,9 +1836,26 @@ int ggml_cuda_rtc_fusion_try(ggml_backend_cuda_context & ctx, const ggml_cgraph 
         }
 
         try {
+            auto artifact = rtc_artifact_get(state, key, program, schedule, state.retry);
+            if (!artifact) {
+                state.pending_until = region.members[region.count - 1] + 1;
+                return 0;
+            }
+            const auto status = artifact->state.load(std::memory_order_acquire);
+            if (status == GGML_CUDA_RTC_COMPILE_COMPILING) {
+                state.pending_until = region.members[region.count - 1] + 1;
+                if (state.recording && std::find(state.pending.begin(), state.pending.end(), artifact) == state.pending.end()) {
+                    if (!rtc_reserve(ctx, state.pending, state.pending.size() + 1)) {
+                        state.recording = false;
+                    } else {
+                        state.pending.push_back(artifact);
+                    }
+                }
+                return 0;
+            }
+
             entry = state.cache.emplace(key, nullptr).first;
-            auto artifact = rtc_artifact_get(state, key, program, schedule);
-            if (artifact && artifact->code.size() <= RTC_CACHE_BYTES - state.code_bytes) {
+            if (status == GGML_CUDA_RTC_COMPILE_READY && artifact->code.size() <= RTC_CACHE_BYTES - state.code_bytes) {
                 entry->second = rtc_load(state, *artifact, program, schedule);
                 if (entry->second) {
                     state.code_bytes += artifact->code.size();
@@ -1702,6 +1868,7 @@ int ggml_cuda_rtc_fusion_try(ggml_backend_cuda_context & ctx, const ggml_cgraph 
     }
 
     if (!entry->second) {
+        state.pending_until = region.members[region.count - 1] + 1;
         return 0;
     }
 

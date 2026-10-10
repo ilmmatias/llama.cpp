@@ -440,7 +440,11 @@ F32 `SUM_ROWS`, `MEAN`, `SUM`, and `RMS_NORM` can absorb pointwise producers and
 
 Normalization inputs stay live until the epilogue finishes, which can increase compute-buffer usage. A final multiply is left with a following row reduction when the normalization and weight pair already have a native fusion. Indexed kernels use 32-bit coordinates when the full domain fits, while byte offsets remain 64-bit; row-coordinate calculations are kept outside the per-column loops.
 
-Capture metadata is bounded to 32 MiB per backend context, without a fixed graph-size or graph-count limit. The metadata workspace is reused across evaluations without skipping the recorded metadata comparisons. Compilation is synchronous and cached within the process. Compare RTC on/off with the same model, offload placement, expert-cache size and batch settings; faster individual kernels do not guarantee faster end-to-end inference.
+Capture metadata is bounded to 32 MiB per backend context, without a fixed graph-size or graph-count limit. The metadata workspace is reused across evaluations without skipping the recorded metadata comparisons.
+
+Compilation is asynchronous by default, using one process-wide worker and up to 32 queued jobs. Native kernels and native captured graphs execute while compilation is pending. Ready code is loaded outside capture; only graphs with newly available kernels are rebuilt at the next evaluation boundary. Jobs own their compiler inputs and can finish after the requesting backend is freed. Pending jobs and failed compilations are shared across matching requests. Set `GGML_HIP_RTC_FUSION_ASYNC=0` to wait for compilation for diagnostics.
+
+Compiled kernels are reused across batch shapes when their address calculations are equivalent; repeat factors, used byte strides, coordinate divisors, and index widths remain part of the cache key. Compare RTC on/off with the same model, offload placement, expert-cache size and batch settings; faster individual kernels do not guarantee faster end-to-end inference.
 
 ### Unified Memory
 

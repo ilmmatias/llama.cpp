@@ -1,6 +1,7 @@
 #include "hiprtc-test-interpose.h"
 #include <chrono>
 #include <hip/hip_runtime_api.h>
+#include <condition_variable>
 #include <hip/hiprtc.h>
 #include <dlfcn.h>
 
@@ -12,6 +13,24 @@
 static std::mutex observer_mutex;
 static uint64_t counters[HIPRTC_TEST_COUNTER_COUNT] = {};
 static unsigned captures = 0;
+static std::mutex compiler_mutex;
+static std::condition_variable compiler_changed;
+static bool compiler_paused = false;
+static bool compiler_waiting = false;
+static unsigned compiler_finished = 0;
+
+extern "C" void hiprtc_test_pause_compiler(bool paused) {
+    std::lock_guard<std::mutex> lock(compiler_mutex);
+    compiler_paused = paused;
+    compiler_changed.notify_all();
+}
+
+extern "C" bool hiprtc_test_wait_compiler(unsigned finished) {
+    std::unique_lock<std::mutex> lock(compiler_mutex);
+    return compiler_changed.wait_for(lock, std::chrono::seconds(10), [&] {
+        return finished ? compiler_finished >= finished : compiler_waiting;
+    });
+}
 
 static void observe(hiprtc_test_counter counter, bool setup = false) {
     std::lock_guard<std::mutex> lock(observer_mutex);
@@ -40,7 +59,7 @@ extern "C" void hiprtc_test_snapshot(uint64_t * destination) {
 extern "C" hiprtcResult hiprtcCreateProgram(hiprtcProgram * program, const char * source, const char * name,
                                           int count, const char * const * headers, const char * const * names) {
     static auto call = real_api<decltype(&hiprtcCreateProgram)>("hiprtcCreateProgram");
-    observe(HIPRTC_TEST_CREATE, true);
+    observe(HIPRTC_TEST_CREATE);
 
     const char * fail = std::getenv("GGML_TEST_HIPRTC_FAIL_CREATE");
     if (fail && std::atoi(fail)) {
@@ -52,8 +71,22 @@ extern "C" hiprtcResult hiprtcCreateProgram(hiprtcProgram * program, const char 
 
 extern "C" hiprtcResult hiprtcCompileProgram(hiprtcProgram program, int count, const char * const * options) {
     static auto call = real_api<decltype(&hiprtcCompileProgram)>("hiprtcCompileProgram");
-    observe(HIPRTC_TEST_COMPILE, true);
-    return call(program, count, options);
+    observe(HIPRTC_TEST_COMPILE);
+    {
+        std::unique_lock<std::mutex> lock(compiler_mutex);
+        compiler_waiting = compiler_paused;
+        compiler_changed.notify_all();
+        // Let a failed test exit without waiting forever for this gate.
+        compiler_changed.wait_for(lock, std::chrono::seconds(30), [] { return !compiler_paused; });
+        compiler_waiting = false;
+    }
+    const auto status = call(program, count, options);
+    {
+        std::lock_guard<std::mutex> lock(compiler_mutex);
+        ++compiler_finished;
+        compiler_changed.notify_all();
+    }
+    return status;
 }
 
 extern "C" hiprtcResult hiprtcVersion(int * major, int * minor) {

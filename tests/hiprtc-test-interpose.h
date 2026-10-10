@@ -14,7 +14,7 @@ enum hiprtc_test_counter {
     HIPRTC_TEST_RESOURCE_QUERY,
     HIPRTC_TEST_ALLOCATE,
     HIPRTC_TEST_VERSION,
-    HIPRTC_TEST_SETUP_DURING_CAPTURE,
+    HIPRTC_TEST_SETUP_DURING_CAPTURE, // CPU compilation does not count as capture setup.
     HIPRTC_TEST_EVENT_RECORD,
     HIPRTC_TEST_STREAM_WAIT,
     HIPRTC_TEST_LOAD_NS,
@@ -22,3 +22,5 @@ enum hiprtc_test_counter {
 };
 
 extern "C" void hiprtc_test_snapshot(uint64_t * counters);
+extern "C" void hiprtc_test_pause_compiler(bool paused);
+extern "C" bool hiprtc_test_wait_compiler(unsigned finished);
