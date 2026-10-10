@@ -1,6 +1,7 @@
 #include "fusion-rtc.h"
 #include "common.cuh"
 #include "ggml-fusion.h"
+#include "ggml-backend-impl.h"
 #include <hip/hiprtc.h>
 
 #include <climits>
@@ -101,7 +102,9 @@ static bool rtc_bind(const ggml_cgraph * graph, int device, const ggml_fusion_re
             }
 
             const bool overlaps = output_address < input_address + span && input_address < output_address + output_bytes;
-            if (overlaps && (program.reduction.value >= 0 || output_address != input_address ||
+            const bool scalar_reduction = program.reduction.value >= 0 &&
+                program.values[program.reduction.value].op != GGML_OP_RMS_NORM;
+            if (overlaps && (scalar_reduction || output_address != input_address ||
                              !ggml_are_same_layout(output, input) || program.accesses[k].repeat)) {
                 return false;
             }
@@ -132,6 +135,90 @@ static std::string rtc_value(int reference) {
     return reference < 0 ? "x" + std::to_string(-1 - reference) : "v" + std::to_string(reference);
 }
 
+static bool rtc_normalizes(const ggml_fusion_program & program) {
+    return program.reduction.value >= 0 && program.values[program.reduction.value].op == GGML_OP_RMS_NORM;
+}
+
+static bool rtc_reduction_preferred(const ggml_cgraph * graph, const ggml_fusion_region & region, const ggml_fusion_program & program) {
+    if (!rtc_normalizes(program) || program.count != 3 || program.outputs != 1 || program.reduction.value != 0) {
+        return false;
+    }
+
+    const auto prefix = program.values[1].op;
+    const int last = region.members[region.count - 1];
+    const auto * output = graph->nodes[last];
+    if ((prefix != GGML_OP_MUL && prefix != GGML_OP_SCALE) || output->op != GGML_OP_MUL || last + 1 >= graph->n_nodes) {
+        return false;
+    }
+
+    // Keep the multiply available for the next row reduction.
+    const auto * next = graph->nodes[last + 1];
+    return (next->op == GGML_OP_SUM_ROWS || next->op == GGML_OP_MEAN) && next->src[0] == output && !(output->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(graph, last) == 1;
+}
+
+static bool rtc_index32(const ggml_fusion_program & program) {
+    uint64_t n = 1;
+
+    for (const int64_t extent : program.ne) {
+        if (extent <= 0 || uint64_t(extent) > UINT32_MAX / n) {
+            return false;
+        }
+        n *= uint64_t(extent);
+    }
+
+    return true;
+}
+
+static bool rtc_flat_access(const ggml_fusion_access & access) {
+    if (access.repeat) {
+        return false;
+    }
+
+    uint64_t stride = ggml_type_size(access.type);
+    for (int d = 0; d < 4; ++d) {
+        if (access.ne[d] > 1 && access.nb[d] != stride) {
+            return false;
+        }
+        stride *= uint64_t(access.ne[d]);
+    }
+
+    return true;
+}
+
+static void rtc_row_coordinates(std::string & source, const ggml_fusion_program & program) {
+    if (!program.indexed || program.reduction.axes != 1) {
+        return;
+    }
+
+    int last = 3;
+    while (last > 0 && program.ne[last] == 1) {
+        --last;
+    }
+
+    if (last == 0) {
+        return;
+    }
+
+    const bool narrow = rtc_index32(program);
+    const char * type = narrow ? "unsigned int" : "unsigned long long";
+    const char * suffix = narrow ? "U" : "ULL";
+    source += "    " + std::string(type) + " row_index = " + (narrow ? "(unsigned int)row" : "row") + ";\n";
+
+    for (int d = 1; d <= last; ++d) {
+        if (program.ne[d] > 1) {
+            source += "    " + std::string(type) + " r" + std::to_string(d) + " = row_index";
+            if (d < last) {
+                source += " % " + std::to_string(program.ne[d]) + suffix;
+            }
+            source += ";\n";
+
+            if (d < last) {
+                source += "    row_index /= " + std::to_string(program.ne[d]) + suffix + ";\n";
+            }
+        }
+    }
+}
+
 static const char * rtc_type(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
@@ -159,12 +246,31 @@ static void rtc_instructions(std::string & source, const ggml_fusion_program & p
             case GGML_OP_ADD:
                 expression = a + " + " + b;
                 break;
+            case GGML_OP_SUB:
+                expression = a + " - " + b;
+                break;
             case GGML_OP_MUL:
                 expression = a + " * " + b;
+                break;
+            case GGML_OP_DIV:
+                expression = a + " / " + b;
                 break;
             case GGML_OP_SQR:
                 expression = a + " * " + a;
                 break;
+            case GGML_OP_SQRT:
+                expression = "sqrtf(" + a + ")";
+                break;
+            case GGML_OP_LOG:
+                expression = "logf(" + a + ")";
+                break;
+            case GGML_OP_CLAMP: {
+                const std::string lower = "p" + std::to_string(instruction.param);
+                const std::string upper = "p" + std::to_string(instruction.param + 1);
+                const std::string cast = instruction.type == GGML_TYPE_F16 ? "(float)(_Float16)" : "";
+                expression = "fminf(fmaxf(" + a + ", " + cast + lower + "), " + cast + upper + ")";
+                break;
+            }
             case GGML_OP_SCALE:
                 expression = "fmaf(p" + std::to_string(instruction.param) + ", " + a + ", p" + std::to_string(instruction.param + 1) + ")";
                 break;
@@ -178,6 +284,24 @@ static void rtc_instructions(std::string & source, const ggml_fusion_program & p
                         break;
                     case GGML_UNARY_OP_SILU:
                         expression = a + " / (1.0f + expf(-" + a + "))";
+                        break;
+                    case GGML_UNARY_OP_SIGMOID:
+                        expression = "1.0f / (1.0f + expf(-" + a + "))";
+                        break;
+                    case GGML_UNARY_OP_SOFTPLUS:
+                        expression = "(" + a + " > 20.0f ? " + a + " : logf(1.0f + expf(" + a + ")))";
+                        break;
+                    case GGML_UNARY_OP_ABS:
+                        expression = "fabsf(" + a + ")";
+                        break;
+                    case GGML_UNARY_OP_SGN:
+                        expression = "(" + a + " > 0.0f ? 1.0f : (" + a + " < 0.0f ? -1.0f : 0.0f))";
+                        break;
+                    case GGML_UNARY_OP_EXP:
+                        expression = "expf(" + a + ")";
+                        break;
+                    case GGML_UNARY_OP_TANH:
+                        expression = "tanhf(" + a + ")";
                         break;
                     default:
                         GGML_ABORT("unsupported RTC unary");
@@ -198,7 +322,8 @@ static void rtc_instructions(std::string & source, const ggml_fusion_program & p
 static bool rtc_parameter_domain(const ggml_fusion_program & program, int slot, uint8_t domain) {
     for (int i = 0; i < program.count; ++i) {
         const auto & value = program.values[i];
-        if (value.domain == domain && value.param >= 0 && (slot == value.param || slot == value.param + 1)) {
+        const int params = value.op == GGML_OP_RMS_NORM ? 1 : 2;
+        if (value.domain == domain && value.param >= 0 && slot >= value.param && slot < value.param + params) {
             return true;
         }
     }
@@ -241,7 +366,9 @@ static std::string rtc_reduce_signature(const ggml_fusion_program & program, con
 }
 
 static void rtc_reduce_loads(std::string & source, const ggml_fusion_program & program, uint8_t domain) {
-    uint64_t divisor = 1;
+    const bool narrow = rtc_index32(program);
+    const char * suffix = narrow ? "U" : "ULL";
+    const char * index = narrow ? "(unsigned int)i" : "i";
 
     for (int k = 0; k < program.inputs; ++k) {
         const auto & access = program.accesses[k];
@@ -250,16 +377,26 @@ static void rtc_reduce_loads(std::string & source, const ggml_fusion_program & p
         }
 
         std::string offset = "i * 4ULL";
-        if (program.indexed) {
+        if (program.indexed && !rtc_flat_access(access)) {
             offset = "0ULL";
-            divisor = 1;
+            uint64_t divisor = 1;
             for (int d = 0; d < 4; ++d) {
-                const uint64_t extent = domain == 2 && (program.reduction.axes & (1 << d)) ? 1 : program.ne[d];
+                const uint64_t extent = domain == 2 && !rtc_normalizes(program) && (program.reduction.axes & (1 << d)) ? 1 : program.ne[d];
                 if (access.ne[d] > 1) {
-                    offset += " + ((i / " + std::to_string(divisor) + "ULL) % " +
-                        std::to_string(extent) + "ULL % " + std::to_string(access.ne[d]) + "ULL) * " +
-                        std::to_string(access.nb[d]) + "ULL";
+                    std::string coordinate;
+                    if (program.reduction.axes == 1) {
+                        coordinate = d == 0 ? "column" : "r" + std::to_string(d);
+                    } else {
+                        coordinate = "((" + std::string(index) + " / " + std::to_string(divisor) + suffix + ") % " + std::to_string(extent) + suffix + ")";
+                    }
+
+                    if (access.repeat & (1 << d)) {
+                        coordinate = "(" + coordinate + " % " + std::to_string(access.ne[d]) + suffix + ")";
+                    }
+
+                    offset += " + " + coordinate + " * " + std::to_string(access.nb[d]) + "ULL";
                 }
+
                 divisor *= extent;
             }
         }
@@ -295,7 +432,8 @@ static std::string rtc_emit_reduction(const ggml_fusion_program & program, const
         "    return value;\n"
         "}\n";
     const bool two_stage = schedule.stages == 2;
-    const char * kernel_name = two_stage ? "ggml_fused_reduce_partial" : "ggml_fused_reduce_rows";
+    const char * kernel_name = rtc_normalizes(program) ? "ggml_fused_normalize_rows" : two_stage ? "ggml_fused_reduce_partial" : "ggml_fused_reduce_rows";
+
     source += rtc_reduce_signature(program, kernel_name, two_stage ? 1 : 0);
     source += "    __shared__ float shared[8];\n";
     if (two_stage) {
@@ -304,15 +442,40 @@ static std::string rtc_emit_reduction(const ggml_fusion_program & program, const
     } else {
         source += "    for (unsigned long long row = blockIdx.x; row < rows; row += gridDim.x) {\n"
                   "    unsigned long long begin = row * columns;\n";
+        rtc_row_coordinates(source, program);
     }
+
     source += "    float sum = 0.0f;\n"
               "    for (unsigned long long column = threadIdx.x; column < columns; column += blockDim.x) {\n"
               "        unsigned long long i = begin + column;\n";
     rtc_reduce_loads(source, program, 1);
     rtc_instructions(source, program, 1);
-    source += "        sum += " + rtc_value(reduction.src[0]) + ";\n    }\n"
-              "    sum = rtc_block_sum(sum, shared);\n"
-              "    if (threadIdx.x == 0) {\n";
+
+    const std::string input = rtc_value(reduction.src[0]);
+    source += rtc_normalizes(program) ? "        sum = fmaf(" + input + ", " + input + ", sum);\n" : "        sum += " + input + ";\n";
+    source += "    }\n    sum = rtc_block_sum(sum, shared);\n";
+
+    if (rtc_normalizes(program)) {
+        source += "    if (threadIdx.x == 0) shared[0] = rsqrtf(sum / (float)columns + p" + std::to_string(reduction.param) + ");\n"
+                  "    __syncthreads();\n"
+                  "    float inv_rms = shared[0];\n"
+                  "    for (unsigned long long column = threadIdx.x; column < columns; column += blockDim.x) {\n"
+                  "        unsigned long long i = begin + column;\n";
+        rtc_reduce_loads(source, program, 1);
+        rtc_instructions(source, program, 1);
+
+        source += "        float v" + std::to_string(program.reduction.value) + " = " + input + " * inv_rms;\n";
+        rtc_reduce_loads(source, program, 2);
+        rtc_instructions(source, program, 2);
+
+        for (int k = 0; k < program.outputs; ++k) {
+            source += "        out" + std::to_string(k) + "[i] = v" + std::to_string(program.roots[k]) + ";\n";
+        }
+
+        return source + "    }\n    __syncthreads();\n    }\n}\n";
+    }
+
+    source += "    if (threadIdx.x == 0) {\n";
     if (two_stage) {
         source += "        partial[blockIdx.x] = sum;\n    }\n}\n";
         source += rtc_reduce_signature(program, "ggml_fused_reduce_finalize", 2);
@@ -360,13 +523,29 @@ static std::string rtc_emit_pointwise(const ggml_fusion_program & program) {
               "    unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;\n\n"
               "    while (i < n) {\n";
 
+    const bool narrow = rtc_index32(program);
+    const char * index_type = narrow ? "unsigned int" : "unsigned long long";
+    const char * suffix = narrow ? "U" : "ULL";
+
     if (program.indexed) {
-        source += "        unsigned long long remaining = i;\n";
+        int last = 3;
+        while (last > 0 && program.ne[last] == 1) {
+            --last;
+        }
+
+        source += "        " + std::string(index_type) + " remaining = " + (narrow ? "(unsigned int)i" : "i") + ";\n";
+
         for (int d = 0; d < 4; ++d) {
             if (program.ne[d] > 1) {
-                source += "        unsigned long long q" + std::to_string(d) + " = remaining % " +
-                    std::to_string(program.ne[d]) + "ULL;\n";
-                source += "        remaining /= " + std::to_string(program.ne[d]) + "ULL;\n";
+                source += "        " + std::string(index_type) + " q" + std::to_string(d) + " = remaining";
+                if (d < last) {
+                    source += " % " + std::to_string(program.ne[d]) + suffix;
+                }
+                source += ";\n";
+
+                if (d < last) {
+                    source += "        remaining /= " + std::to_string(program.ne[d]) + suffix + ";\n";
+                }
             }
         }
 
@@ -384,9 +563,7 @@ static std::string rtc_emit_pointwise(const ggml_fusion_program & program) {
                 }
 
                 if (!emitted) {
-                    source += "        unsigned long long r" + std::to_string(d) + "_" +
-                        std::to_string(access.ne[d]) + " = q" + std::to_string(d) + " % " +
-                        std::to_string(access.ne[d]) + "ULL;\n";
+                    source += "        " + std::string(index_type) + " r" + std::to_string(d) + "_" + std::to_string(access.ne[d]) + " = q" + std::to_string(d) + " % " + std::to_string(access.ne[d]) + suffix + ";\n";
                 }
             }
         }
@@ -395,7 +572,7 @@ static std::string rtc_emit_pointwise(const ggml_fusion_program & program) {
 
     for (int k = 0; k < program.inputs; ++k) {
         std::string offset = "i * " + std::to_string(ggml_type_size(program.accesses[k].type)) + "ULL";
-        if (program.indexed) {
+        if (program.indexed && !rtc_flat_access(program.accesses[k])) {
             const auto & access = program.accesses[k];
             offset = "0ULL";
             for (int d = 0; d < 4; ++d) {
@@ -505,17 +682,17 @@ struct rtc_module {
     }
 };
 
-struct rtc_tensor_reference {
+struct rtc_node_reference {
     int node = -1;
-    int source = -1;
+    int slot = -1;
 };
 
 struct rtc_action {
     int start = 0;
     int members[GGML_FUSION_MAX_VALUES] = {};
     int outputs[GGML_FUSION_MAX_OUTPUTS] = {};
-    rtc_tensor_reference inputs[GGML_FUSION_MAX_INPUTS];
-    int parameters[GGML_FUSION_MAX_PARAMS] = {};
+    rtc_node_reference inputs[GGML_FUSION_MAX_INPUTS];
+    rtc_node_reference parameters[GGML_FUSION_MAX_PARAMS];
     ggml_fusion_program program;
     ggml_fusion_schedule schedule;
     ggml_fusion_cache_key key;
@@ -563,7 +740,9 @@ struct ggml_cuda_rtc_fusion {
     bool scratch_attempted = false;
 
     bool recording = false;
+    // signature_count is the active prefix; keep the workspace size between graphs.
     std::vector<uint64_t> signature;
+    size_t signature_count = 0;
     std::vector<ggml_bitset_t> seen;
     std::vector<rtc_action> actions;
     std::vector<ggml_cuda_rtc_binding> bindings;
@@ -583,6 +762,10 @@ struct ggml_cuda_rtc_fusion {
         }
     }
 };
+
+static bool rtc_signature_matches(const ggml_cuda_rtc_fusion & state, const ggml_cuda_rtc_plan & plan) {
+    return plan.signature.size() == state.signature_count && std::memcmp(plan.signature.data(), state.signature.data(), state.signature_count * sizeof(uint64_t)) == 0;
+}
 
 static size_t rtc_metadata_bytes(const ggml_backend_cuda_context & ctx) {
     const auto & state = *ctx.rtc_fusion;
@@ -626,25 +809,39 @@ static bool rtc_reserve(ggml_backend_cuda_context & ctx, std::vector<T> & values
 }
 
 static bool rtc_signature_add(ggml_backend_cuda_context & ctx, uint64_t value) {
-    auto & signature = ctx.rtc_fusion->signature;
-    if (!rtc_reserve(ctx, signature, signature.size() + 1)) {
+    auto & state = *ctx.rtc_fusion;
+    auto & signature = state.signature;
+    if (!rtc_reserve(ctx, signature, state.signature_count + 1)) {
         return false;
     }
 
-    signature.push_back(value);
+    if (state.signature_count == signature.size()) {
+        signature.push_back(value);
+    } else {
+        signature[state.signature_count] = value;
+    }
+
+    ++state.signature_count;
     return true;
 }
 
 static bool rtc_signature_tensor(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, const ggml_tensor * tensor) {
-    auto & signature = ctx.rtc_fusion->signature;
+    auto & state = *ctx.rtc_fusion;
+    auto & signature = state.signature;
     int depth = 0;
+
     do {
         const size_t count = tensor ? 11 + 2 * GGML_MAX_DIMS + GGML_MAX_OP_PARAMS / sizeof(int32_t) + GGML_MAX_SRC : 1;
-        if (!rtc_reserve(ctx, signature, signature.size() + count)) {
+        const size_t start = state.signature_count;
+        if (!rtc_reserve(ctx, signature, start + count)) {
             return false;
         }
-        const size_t start = signature.size();
-        signature.resize(start + count);
+
+        if (signature.size() < start + count) {
+            signature.resize(start + count);
+        }
+
+        state.signature_count = start + count;
         uint64_t * value = signature.data() + start;
         *value++ = reinterpret_cast<uintptr_t>(tensor);
 
@@ -746,11 +943,11 @@ static bool rtc_action_bind(ggml_backend_cuda_context & ctx, const ggml_cgraph *
     }
 
     for (int i = 0; i < program.inputs; ++i) {
-        region.inputs[i] = graph->nodes[action.inputs[i].node]->src[action.inputs[i].source];
+        region.inputs[i] = graph->nodes[action.inputs[i].node]->src[action.inputs[i].slot];
     }
 
     for (int p = 0; p < program.params; ++p) {
-        region.params[p] = ggml_get_op_params_f32(graph->nodes[action.parameters[p]], p % 2);
+        region.params[p] = ggml_get_op_params_f32(graph->nodes[action.parameters[p].node], action.parameters[p].slot);
     }
 
     return rtc_bind(graph, ctx.device, region, program, binding);
@@ -793,7 +990,7 @@ bool ggml_cuda_rtc_fusion_prepare(ggml_backend_cuda_context & ctx, const ggml_cg
     }
 
     auto & state = *ctx.rtc_fusion;
-    state.signature.clear();
+    state.signature_count = 0;
     if (!rtc_signature_add(ctx, uint64_t(graph->n_nodes)) || !rtc_signature_streams(ctx)) {
         state.direct_plan.reset();
         return false;
@@ -840,7 +1037,7 @@ bool ggml_cuda_rtc_fusion_prepare(ggml_backend_cuda_context & ctx, const ggml_cg
 
     state.recording = true;
     const auto plan = capture_graph && capture_graph->rtc_plan ? capture_graph->rtc_plan : state.direct_plan;
-    if (!plan || plan->signature != state.signature ||
+    if (!plan || !rtc_signature_matches(state, *plan) ||
         (plan->scratch && plan->scratch != state.partial)) {
         state.direct_plan.reset();
         return false;
@@ -892,7 +1089,7 @@ void ggml_cuda_rtc_fusion_record(ggml_backend_cuda_context & ctx, ggml_cuda_grap
 
     state.capture_plan.reset();
     const auto previous = capture_graph && capture_graph->rtc_plan ? capture_graph->rtc_plan : state.direct_plan;
-    bool unchanged = previous && previous->signature == state.signature && previous->actions.size() == state.actions.size();
+    bool unchanged = previous && rtc_signature_matches(state, *previous) && previous->actions.size() == state.actions.size();
     for (size_t i = 0; unchanged && i < state.actions.size(); ++i) {
         const auto & before = previous->actions[i];
         const auto & after = state.actions[i];
@@ -905,8 +1102,7 @@ void ggml_cuda_rtc_fusion_record(ggml_backend_cuda_context & ctx, ggml_cuda_grap
     } else {
         state.direct_plan.reset();
 
-        const size_t bytes = sizeof(ggml_cuda_rtc_plan) + state.signature.size() * sizeof(uint64_t) +
-            state.actions.size() * sizeof(rtc_action);
+        const size_t bytes = sizeof(ggml_cuda_rtc_plan) + state.signature_count * sizeof(uint64_t) + state.actions.size() * sizeof(rtc_action);
         const size_t retained = rtc_metadata_bytes(ctx);
         if (retained > RTC_PLAN_BYTES || bytes > RTC_PLAN_BYTES - retained) {
             state.recording = false;
@@ -915,7 +1111,7 @@ void ggml_cuda_rtc_fusion_record(ggml_backend_cuda_context & ctx, ggml_cuda_grap
         }
 
         auto plan = std::make_shared<ggml_cuda_rtc_plan>();
-        plan->signature = state.signature;
+        plan->signature.assign(state.signature.begin(), state.signature.begin() + state.signature_count);
         plan->actions = state.actions;
         for (const auto & action : plan->actions) {
             if (action.schedule.scratch) {
@@ -982,7 +1178,7 @@ static void rtc_record_action(ggml_backend_cuda_context & ctx, const ggml_cgraph
     for (int parameter = 0; parameter < program.params; ++parameter) {
         for (int i = 0; i < region.count; ++i) {
             if (graph->nodes[region.members[i]] == region.parameters[parameter]) {
-                action.parameters[parameter] = region.members[i];
+                action.parameters[parameter] = {region.members[i], region.parameter_slots[parameter]};
                 break;
             }
         }
@@ -1177,6 +1373,8 @@ static std::shared_ptr<rtc_module> rtc_load(const ggml_cuda_rtc_fusion & state, 
         const char * name;
         if (program.reduction.value < 0) {
             name = "ggml_fused_elementwise";
+        } else if (rtc_normalizes(program)) {
+            name = "ggml_fused_normalize_rows";
         } else if (schedule.stages == 2) {
             name = "ggml_fused_reduce_partial";
         } else {
@@ -1242,6 +1440,9 @@ static bool rtc_profitable(const ggml_fusion_program & program, uint64_t n, uint
     }
 
     if (program.reduction.value >= 0) {
+        if (rtc_normalizes(program) && program.count < 3) {
+            return false;
+        }
         int producer = 0;
         bool silu = false;
 
@@ -1300,7 +1501,7 @@ static bool rtc_select_schedule(const ggml_fusion_program & program, uint64_t n,
             rows = n / columns;
         }
 
-        schedule.kind = GGML_FUSION_SCHEDULE_REDUCE_ROWS;
+        schedule.kind = rtc_normalizes(program) ? GGML_FUSION_SCHEDULE_NORMALIZE_ROWS : GGML_FUSION_SCHEDULE_REDUCE_ROWS;
         schedule.threads = columns <= 256 ? schedule.wave : 256;
 
         if (program.reduction.axes == 15 && n > 4096) {
@@ -1396,7 +1597,7 @@ static int rtc_launch(ggml_backend_cuda_context & ctx, const ggml_fusion_program
     return program.count - 1;
 }
 
-int ggml_cuda_rtc_fusion_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int node_idx, bool allow_compile) {
+int ggml_cuda_rtc_fusion_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int node_idx, bool allow_compile, int min_count) {
     if (!ggml_cuda_rtc_fusion_enabled() || ctx.curr_stream_no != 0 ||
         !ctx.stream_context().concurrent_events.empty()) {
         return 0;
@@ -1417,19 +1618,26 @@ int ggml_cuda_rtc_fusion_try(ggml_backend_cuda_context & ctx, const ggml_cgraph 
             return 0;
         }
 
-        const size_t index = state.capture_action++;
+        const size_t index = state.capture_action;
         const auto & action = actions[index];
+        if (action.program.count < min_count) {
+            return 0;
+        }
+        ++state.capture_action;
         return rtc_launch(ctx, action.program, action.schedule, state.bindings[index], *action.module);
     }
 
     ggml_fusion_region region;
     ggml_fusion_program program;
-    ggml_fusion_cache_key key;
     ggml_cuda_rtc_binding binding;
     ggml_cgraph slice = *graph;
 
     for (;;) {
-        if (!ggml_fusion_build(&slice, node_idx, region, program)) {
+        if (!ggml_fusion_build(&slice, node_idx, region, program) || program.count < min_count) {
+            return 0;
+        }
+
+        if (rtc_reduction_preferred(graph, region, program)) {
             return 0;
         }
 
@@ -1441,7 +1649,12 @@ int ggml_cuda_rtc_fusion_try(ggml_backend_cuda_context & ctx, const ggml_cgraph 
     }
 
     ggml_fusion_schedule schedule;
-    if (!rtc_select_schedule(program, binding.n, ctx.device, schedule) || !ggml_fusion_make_key(program, schedule, key)) {
+    if (!rtc_select_schedule(program, binding.n, ctx.device, schedule)) {
+        return 0;
+    }
+
+    ggml_fusion_cache_key key;
+    if (!ggml_fusion_make_key(program, schedule, key)) {
         return 0;
     }
 
@@ -1516,6 +1729,27 @@ int ggml_cuda_rtc_fusion_try(ggml_backend_cuda_context & ctx, const ggml_cgraph 
     }
 
     return skipped;
+}
+
+void ggml_cuda_rtc_fusion_alloc_deps(const ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
+    if (!ggml_cuda_rtc_fusion_enabled()) {
+        return;
+    }
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_fusion_region region;
+        ggml_fusion_program program;
+        if (!ggml_fusion_build(graph, i, region, program) || program.count < 3 || !rtc_normalizes(program) || rtc_reduction_preferred(graph, region, program)) {
+            continue;
+        }
+
+        auto * until = graph->nodes[region.members[region.count - 1]];
+        for (int k = 0; k < program.inputs; ++k) {
+            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(region.inputs[k]), until);
+        }
+
+        i += region.count - 1;
+    }
 }
 
 void ggml_cuda_rtc_fusion_free(ggml_backend_cuda_context & ctx) {

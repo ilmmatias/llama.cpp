@@ -44,7 +44,7 @@ struct fusion_bench_log {
 static ggml_cgraph * fusion_bench_build_graph(ggml_context * ctx, const std::string & name, ggml_type type,
                                             const std::array<int64_t, 4> & ne, std::vector<ggml_tensor *> & outputs) {
     auto * graph = ggml_new_graph(ctx);
-    auto * a = ggml_new_tensor(ctx, type, 4, ne.data());
+    auto * a = name == "rms_gate_strided" ? ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, ne[0], ne[2], ne[1], ne[3]), 0, 2, 1, 3) : ggml_new_tensor(ctx, type, 4, ne.data());
     ggml_tensor * b;
     if (name == "repeat") {
         b = ggml_new_tensor_4d(ctx, type, 5, 2, 2, 1);
@@ -81,6 +81,9 @@ static ggml_cgraph * fusion_bench_build_graph(ggml_context * ctx, const std::str
         for (int i = 1; i < 8; ++i) {
             out = ggml_add(ctx, out, branches[i]);
         }
+    } else if (name == "rms_gate" || name == "rms_gate_strided") {
+        auto * gamma = ggml_new_tensor_2d(ctx, type, ne[0], ne[1]);
+        out = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, a, 1e-6f), gamma), ggml_sigmoid(ctx, b));
     } else {
         auto * u = ggml_add(ctx, a, b);
         if (name == "tiny_indexed") {
@@ -357,4 +360,10 @@ static void bench() {
     for (int64_t n : {4096, 4097, 8193, 1048576}) {
         fusion_bench_case("full", GGML_TYPE_F32, {n, 1, 1, 1});
     }
+
+    for (auto shape : {std::array<int64_t, 4>{128, 48, 1, 1}, {128, 48, 1024, 1}, {2560, 4, 1024, 1}, {257, 3, 2, 2}}) {
+        fusion_bench_case("rms_gate", GGML_TYPE_F32, shape);
+    }
+
+    fusion_bench_case("rms_gate_strided", GGML_TYPE_F32, {128, 48, 1024, 1});
 }

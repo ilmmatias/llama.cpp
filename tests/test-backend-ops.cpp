@@ -4142,6 +4142,100 @@ struct test_elementwise_dag : public test_case {
     }
 };
 
+struct test_fusion_math : public test_elementwise_dag {
+    test_fusion_math(std::string variant, ggml_type type, std::array<int64_t, 4> ne)
+        : test_elementwise_dag(variant, type, ne) {}
+
+    std::string op_desc(ggml_tensor *) override {
+        return "FUSION_MATH";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        observed.clear();
+
+        auto * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        auto * b = ggml_new_tensor(ctx, type, 4, ne.data());
+
+        ggml_tensor * out;
+        if (variant == "signed_sqrt") {
+            auto * difference = ggml_sub(ctx, a, b);
+            auto * magnitude = ggml_sqrt(ctx, ggml_clamp(ctx, ggml_abs(ctx, difference), 1e-6f, INFINITY));
+            out = ggml_sigmoid(ctx, ggml_mul(ctx, ggml_sgn(ctx, difference), magnitude));
+        } else if (variant == "softplus") {
+            auto * plus = ggml_softplus(ctx, ggml_add(ctx, a, b));
+            ggml_set_output(plus);
+            observed.push_back(plus);
+            out = ggml_div(ctx, plus, ggml_exp(ctx, b));
+        } else {
+            auto * difference = ggml_sub(ctx, a, b);
+            out = ggml_tanh(ctx, ggml_log(ctx, ggml_exp(ctx, difference)));
+        }
+
+        observed.push_back(out);
+        return out;
+    }
+};
+
+struct test_fusion_norm : public test_elementwise_dag {
+    test_fusion_norm(std::string variant, std::array<int64_t, 4> ne)
+        : test_elementwise_dag(variant, GGML_TYPE_F32, ne) {}
+
+    std::string op_desc(ggml_tensor *) override {
+        return "FUSION_NORM";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        observed.clear();
+
+        auto * a = variant == "strided" ? ggml_new_tensor_4d(ctx, type, ne[0], ne[2], ne[1], ne[3]) : ggml_new_tensor(ctx, type, 4, ne.data());
+
+        if (variant == "parameters") {
+            auto * normalized = ggml_rms_norm(ctx, a, 1e-6f);
+            auto * out = ggml_sigmoid(ctx, ggml_clamp(ctx, ggml_scale_bias(ctx, normalized, 0.75f, -0.25f), -0.5f, 0.625f));
+            observed.push_back(out);
+            return out;
+        }
+
+        auto * gate = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * gamma;
+        if (variant == "padded") {
+            auto * backing = ggml_new_tensor_2d(ctx, type, ne[0] * 2, ne[1]);
+            gamma = ggml_view_2d(ctx, backing, ne[0], ne[1], backing->nb[1], 0);
+        } else {
+            gamma = ggml_new_tensor_2d(ctx, type, ne[0], ne[1]);
+        }
+
+        auto * input = variant == "strided" ? ggml_permute(ctx, a, 0, 2, 1, 3) : variant == "producer" ? ggml_add(ctx, a, gate) : a;
+        auto * normalized = variant == "inplace" ? ggml_rms_norm_inplace(ctx, input, 1e-6f) : ggml_rms_norm(ctx, input, 1e-6f);
+        auto * out = ggml_mul(ctx, ggml_mul(ctx, normalized, gamma), ggml_sigmoid(ctx, gate));
+
+        if (variant == "exposed") {
+            ggml_set_output(normalized);
+            observed.push_back(normalized);
+        }
+
+        observed.push_back(out);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        uint32_t state = 1;
+        for (auto * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+            if (tensor->view_src || tensor->op != GGML_OP_NONE) {
+                continue;
+            }
+
+            std::vector<float> values(ggml_nelements(tensor));
+            for (float & value : values) {
+                state = state * 1664525U + 1013904223U;
+                value = float(int(state >> 8) - 8388608) / 8388608.0f;
+            }
+
+            ggml_backend_tensor_set(tensor, values.data(), 0, values.size() * sizeof(float));
+        }
+    }
+};
+
 struct test_fusion_layout : public test_elementwise_dag {
     test_fusion_layout(std::string variant, ggml_type type, std::array<int64_t, 4> ne)
         : test_elementwise_dag(variant, type, ne) {}
@@ -11058,6 +11152,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_fusion_reduction("dense", {7, 65537, 1, 1}, GGML_OP_SUM_ROWS));
     test_cases.emplace_back(new test_fusion_reduction("dense", {16777217, 1, 1, 1}, GGML_OP_SUM));
+
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        test_cases.emplace_back(new test_fusion_math("softplus", type, {257, 3, 1, 1}));
+        test_cases.emplace_back(new test_fusion_math("log_exp", type, {257, 3, 1, 1}));
+    }
+    test_cases.emplace_back(new test_fusion_math("signed_sqrt", GGML_TYPE_F32, {257, 3, 1, 1}));
+
+    for (int64_t columns : {1, 32, 128, 257, 4096, 4097}) {
+        test_cases.emplace_back(new test_fusion_norm("gate", {columns, 3, 2, 2}));
+    }
+
+    for (const char * variant : {"producer", "padded", "strided", "exposed", "parameters", "inplace"}) {
+        test_cases.emplace_back(new test_fusion_norm(variant, {257, 3, 2, 2}));
+    }
+
+    test_cases.emplace_back(new test_fusion_norm("gate", {7, 65537, 1, 1}));
 
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

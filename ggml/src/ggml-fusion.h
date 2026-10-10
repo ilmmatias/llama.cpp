@@ -57,6 +57,7 @@ struct ggml_fusion_region {
     const ggml_tensor * inputs[GGML_FUSION_MAX_INPUTS] = {};
     const ggml_tensor * outputs[GGML_FUSION_MAX_OUTPUTS] = {};
     const ggml_tensor * parameters[GGML_FUSION_MAX_PARAMS] = {};
+    int parameter_slots[GGML_FUSION_MAX_PARAMS] = {};
     float params[GGML_FUSION_MAX_PARAMS] = {};
     uint64_t n = 0;
 };
@@ -66,6 +67,7 @@ enum ggml_fusion_schedule_kind {
     GGML_FUSION_SCHEDULE_POINTWISE_INDEXED,
     GGML_FUSION_SCHEDULE_REDUCE_ROWS,
     GGML_FUSION_SCHEDULE_REDUCE_ALL_TWO_STAGE,
+    GGML_FUSION_SCHEDULE_NORMALIZE_ROWS,
 };
 
 struct ggml_fusion_schedule {

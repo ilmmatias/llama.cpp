@@ -434,7 +434,13 @@ Configure with `-DGGML_HIP_RTC=ON` to link the optional HIPRTC compiler, then se
 
 With `GGML_HIP_GRAPHS=ON`, RTC kernels and ordinary HIP kernels can share a captured graph. Plans are retained per backend subgraph, so interleaved CPU/GPU execution can reuse them. Tensor metadata and concurrent-stream topology are checked before replay; changing input values does not require recapture. Concurrent-stream graphs remain eligible for graph replay, but use ordinary kernels instead of RTC region fusion.
 
-Capture metadata is bounded to 32 MiB per backend context, without a fixed graph-size or graph-count limit. Compilation is synchronous and cached within the process. Compare RTC on/off with the same model, offload placement, expert-cache size and batch settings; faster individual kernels do not guarantee faster end-to-end inference.
+The IR supports `ADD`, `SUB`, `MUL`, `DIV`, `SQR`, `SQRT`, `LOG`, `SCALE`, `CLAMP`, and the `NEG`, `RELU`, `SILU`, `SIGMOID`, `SOFTPLUS`, `ABS`, `SGN`, `EXP`, and `TANH` unary operations, subject to HIP type and layout support. Intermediate F16/BF16 rounding is retained.
+
+F32 `SUM_ROWS`, `MEAN`, `SUM`, and `RMS_NORM` can absorb pointwise producers and epilogues. RMS normalization accepts contiguous rows with strided or permuted outer dimensions, up to 4096 columns, and can combine normalization, weights, and gates in one kernel. Existing specialized native normalization fusions retain priority; RTC is used to extend epilogues that would otherwise require more kernels.
+
+Normalization inputs stay live until the epilogue finishes, which can increase compute-buffer usage. A final multiply is left with a following row reduction when the normalization and weight pair already have a native fusion. Indexed kernels use 32-bit coordinates when the full domain fits, while byte offsets remain 64-bit; row-coordinate calculations are kept outside the per-column loops.
+
+Capture metadata is bounded to 32 MiB per backend context, without a fixed graph-size or graph-count limit. The metadata workspace is reused across evaluations without skipping the recorded metadata comparisons. Compilation is synchronous and cached within the process. Compare RTC on/off with the same model, offload placement, expert-cache size and batch settings; faster individual kernels do not guarantee faster end-to-end inference.
 
 ### Unified Memory
 

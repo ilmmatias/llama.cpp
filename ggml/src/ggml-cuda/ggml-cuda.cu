@@ -4278,7 +4278,7 @@ static int ggml_cuda_try_qsa_mask_fusion(ggml_backend_cuda_context & ctx, ggml_c
 }
 
 // try and fuse nodes and return the number of nodes to skip
-static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, [[maybe_unused]] bool allow_compile) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
@@ -5148,6 +5148,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+#ifdef GGML_HIP_RTC
+    if (node->op == GGML_OP_RMS_NORM) {
+        const int skipped = ggml_cuda_rtc_fusion_try(*cuda_ctx, cgraph, i, allow_compile, 3);
+        if (skipped) {
+            return skipped;
+        }
+    }
+#endif
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
@@ -5346,7 +5355,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, !use_cuda_graph);
 #ifdef GGML_HIP_RTC
                 if (nodes_to_skip == 0) {
                     nodes_to_skip = ggml_cuda_rtc_fusion_try(*cuda_ctx, cgraph, i, !use_cuda_graph);
@@ -5665,6 +5674,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 break;
             }
         }
+#ifdef GGML_HIP_RTC
+        ggml_cuda_rtc_fusion_alloc_deps(cgraph, params);
+#endif
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             ggml_cuda_shared_mul_add_match shared;
             if (cgraph->nodes[i]->op == GGML_OP_MUL && ggml_cuda_match_shared_mul_add(cgraph, i, shared)) {
