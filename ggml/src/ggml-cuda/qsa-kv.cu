@@ -296,44 +296,19 @@ static __global__ void resolve_pages(
             if (slot >= 0) {
                 state.referenced[slot] = 1;
                 atomicAdd(&n_protected, 1);
+            } else {
+                const int miss = atomicAdd(&n_misses, 1);
+
+                if (miss < state.n_slots) {
+                    state.misses[miss] = page;
+                }
             }
         }
     }
 
     __syncthreads();
 
-    for (int i = threadIdx.x; i < n_indices; i += blockDim.x) {
-        const int row = indices ? indices[i] : i;
-
-        if (row < 0) {
-            continue;
-        }
-
-        const size_t byte = offset + size_t(row)*row_bytes;
-
-        if (byte >= state.bytes) {
-            continue;
-        }
-
-        const int page = cache_page_for_byte(state, byte);
-
-        if (state.pages[page] >= 0 || atomicCAS(state.pages + page, -1, -2) != -1) {
-            continue;
-        }
-
-        // Admit only as many misses as can fit without evicting selected hits.
-        // The sweep below assigns each admitted page a distinct cache slot.
-        const int miss = atomicAdd(&n_misses, 1);
-
-        if (miss < state.n_slots - n_protected) {
-            state.misses[miss] = page;
-        } else {
-            state.pages[page] = -1;
-        }
-    }
-
-    __syncthreads();
-
+    // Admit only as many misses as can fit without evicting selected hits.
     const int need       = min(n_misses, state.n_slots - n_protected);
     const int scan_width = min(resolve_threads, state.n_slots);
     const int lane       = threadIdx.x % WARP_SIZE;
@@ -404,10 +379,6 @@ static __global__ void resolve_pages(
         }
 
         __syncthreads();
-    }
-
-    for (int i = placed + threadIdx.x; i < need; i += blockDim.x) {
-        state.pages[state.misses[i]] = -1;
     }
 
     if (threadIdx.x == 0) {

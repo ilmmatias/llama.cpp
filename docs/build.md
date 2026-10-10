@@ -428,6 +428,12 @@ The environment variable [`HIP_VISIBLE_DEVICES`](https://rocm.docs.amd.com/en/la
 If your GPU is not officially supported you can use the environment variable [`HSA_OVERRIDE_GFX_VERSION`] set to a similar GPU, for example 10.3.0 on RDNA2 (e.g. gfx1030, gfx1031, or gfx1035) or 11.0.0 on RDNA3. Note that [`HSA_OVERRIDE_GFX_VERSION`] is [not supported on Windows](https://github.com/ROCm/ROCm/issues/2654)
 
 
+### Paged QSA KV cache
+
+For Qwen4Exp on CUDA/HIP, `LLAMA_QSA_KV_RESIDENT=16384` keeps a bounded KV page cache in GPU memory and authoritative KV data in mapped host memory. The resident token budget is rounded down to a multiple of four and must be smaller than the context size. This does not change the model's QSA selection threshold.
+
+Page resolution marks the complete selection union and collects unique misses in one pass before the CLOCK eviction sweep. Selected resident pages cannot be evicted by another query in the same attention launch; pages that do not fit remain readable from host memory. Large prefill batches use bounded staging when their KV views exceed the resident cache.
+
 ### Experimental HIPRTC fusion
 
 Configure with `-DGGML_HIP_RTC=ON` to link the optional HIPRTC compiler, then set `GGML_HIP_RTC_FUSION=1` at runtime to enable fusion. Both switches default to off; ordinary HIP and CUDA builds do not require HIPRTC. CMake uses `hiprtc::hiprtc` when available, otherwise searches for `hip/hiprtc.h` and `libhiprtc` under the ROCm include/lib/lib64 paths.
