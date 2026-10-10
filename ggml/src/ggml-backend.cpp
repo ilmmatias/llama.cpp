@@ -1861,16 +1861,111 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 }
 
+static void ggml_backend_sched_complete_upload(ggml_backend_t & pending_upload) {
+    if (pending_upload != NULL) {
+        ggml_backend_synchronize(pending_upload);
+        pending_upload = NULL;
+    }
+}
+
+static bool ggml_backend_sched_copy_inputs_batch(
+        ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, int prev_backend_id, ggml_backend_t & pending_upload) {
+    if (prev_backend_id < 0 || prev_backend_id == split->backend_id) {
+        return false;
+    }
+
+    ggml_backend_t src_backend = sched->backends[prev_backend_id];
+    ggml_backend_t dst_backend = sched->backends[split->backend_id];
+    const bool upload = src_backend->iface.synchronize == NULL && dst_backend->iface.set_tensor_async != NULL;
+    const bool readback = dst_backend->iface.synchronize == NULL && src_backend->iface.get_tensor_async != NULL;
+
+    if (!upload && !readback) {
+        return false;
+    }
+
+    const auto device_buft = ggml_backend_get_default_buffer_type(upload ? dst_backend : src_backend);
+    const auto compatible = [&](struct ggml_tensor * input) {
+        struct ggml_tensor * copy = tensor_copy(input, split->backend_id, sched->cur_copy);
+        return !(input->flags & GGML_TENSOR_FLAG_INPUT) &&
+            ggml_backend_sched_get_tensor_backend(sched, input) == src_backend &&
+            (upload ? ggml_backend_buffer_is_host(input->buffer) && copy->buffer->buft == device_buft :
+                      ggml_backend_buffer_is_host(copy->buffer) && input->buffer->buft == device_buft);
+    };
+
+    for (int begin = 0; begin < split->n_inputs; ) {
+        struct ggml_tensor * input = split->inputs[begin];
+        if (ggml_backend_sched_is_host_weight(input)) {
+            ++begin;
+            continue;
+        }
+        if (!compatible(input)) {
+            ggml_backend_sched_complete_upload(pending_upload);
+            ggml_backend_sched_copy_input(sched, split, input);
+            ++begin;
+            continue;
+        }
+
+        int end = begin;
+        int n_copies = 0;
+        for (; end < split->n_inputs; ++end) {
+            input = split->inputs[end];
+            if (ggml_backend_sched_is_host_weight(input)) {
+                continue;
+            }
+            if (!compatible(input)) {
+                break;
+            }
+            GGML_ASSERT(ggml_are_same_layout(input, tensor_copy(input, split->backend_id, sched->cur_copy)));
+            ++n_copies;
+        }
+
+        if (n_copies == 1 && !upload) {
+            ggml_backend_sched_complete_upload(pending_upload);
+            ggml_backend_sched_copy_input(sched, split, split->inputs[begin]);
+        } else {
+            // Keep input order; finish pending host reads before fallback copies or CPU buffer reuse.
+            for (int i = begin; i < end; ++i) {
+                input = split->inputs[i];
+                if (ggml_backend_sched_is_host_weight(input)) {
+                    continue;
+                }
+                struct ggml_tensor * copy = tensor_copy(input, split->backend_id, sched->cur_copy);
+                if (upload) {
+                    ggml_backend_tensor_set_async(dst_backend, copy, input->data, 0, ggml_nbytes(input));
+                } else {
+                    ggml_backend_tensor_get_async(src_backend, input, copy->data, 0, ggml_nbytes(input));
+                }
+            }
+            if (upload) {
+                pending_upload = dst_backend;
+            } else {
+                ggml_backend_synchronize(src_backend);
+                if (pending_upload == src_backend) {
+                    pending_upload = NULL;
+                }
+            }
+        }
+        begin = end;
+    }
+    return true;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
     int prev_backend_id = -1;
+    ggml_backend_t pending_upload = NULL;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        if (split_backend->iface.synchronize == NULL && pending_upload != NULL &&
+                (prev_backend_id < 0 || sched->backends[prev_backend_id] != pending_upload ||
+                 pending_upload->iface.get_tensor_async == NULL)) {
+            ggml_backend_sched_complete_upload(pending_upload);
+        }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1884,23 +1979,31 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
-        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
-            if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+        if (!ggml_backend_sched_copy_inputs_batch(sched, split, prev_backend_id, pending_upload)) {
+            for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+                if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+                    ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                }
             }
         }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+                ggml_backend_sched_complete_upload(pending_upload);
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
+        }
+        if (split_backend->iface.synchronize == NULL) {
+            ggml_backend_sched_complete_upload(pending_upload);
         }
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
+                ggml_backend_sched_complete_upload(pending_upload);
                 return ec;
             }
         } else {
+            ggml_backend_sched_complete_upload(pending_upload);
             // similar to ggml_backend_compare_graph_backend
             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
                 struct ggml_tensor * t = split->graph.nodes[j0];
@@ -1920,6 +2023,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
+                    ggml_backend_sched_complete_upload(pending_upload);
                     return ec;
                 }
 
@@ -1942,6 +2046,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
+    // Do not let a later evaluation or the caller overwrite sources of pending uploads.
+    ggml_backend_sched_complete_upload(pending_upload);
     return GGML_STATUS_SUCCESS;
 }
 

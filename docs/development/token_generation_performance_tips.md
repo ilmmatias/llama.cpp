@@ -19,6 +19,12 @@ If you see these lines, then the GPU is being used.
 ## Verifying that the CPU is not oversaturated
 llama accepts a `-t N` (or `--threads N`) parameter. It's extremely important that this parameter is not too large. If your token generation is extremely slow, try setting this number to 1. If this significantly improves your token generation speed, then your CPU is being oversaturated and you need to explicitly set this parameter to the number of the physical CPU cores on your machine (even if you utilize a GPU). If in doubt, start with 1 and double the amount until you hit a performance bottleneck, then scale the number down.
 
+## CPU/GPU handoffs
+
+Mixed CPU/GPU graphs can spend time waiting for transfers even when the GPU kernels are fast. The scheduler groups compatible intermediate-tensor transfers from the preceding split without reordering user-input or fallback copies. GPU-to-CPU groups wait once for their results. CPU-to-GPU uploads, including single tensors, can continue into GPU computation on the same stream; completion is enforced before CPU storage reuse, fallback copies, host-weight callbacks, or return to the caller. User-input copies and unsupported transfer paths keep their existing behavior.
+
+Profile the active execution path before changing synchronization. Expert-cache configurations can bypass the routing-ID readback callback, and a backend transition without split inputs can still require a wait because scratch allocations are reused. Compare unprofiled `llama-bench` runs with the same context depth, offload settings, and thread count; profiler overhead can change the apparent bottleneck.
+
 # Example of runtime flags effect on inference speed benchmark
 These runs were tested on the following machine:
 GPU: A6000 (48GB VRAM)
