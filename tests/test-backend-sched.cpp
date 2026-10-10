@@ -24,6 +24,7 @@ static void test_round_trip(ggml_backend_dev_t dev, bool parallel, bool mixed_so
     ggml_tensor * y = ggml_new_tensor_1d(inputs, GGML_TYPE_F32, n + 8);
     ggml_set_input(x);
     ggml_set_input(y);
+
     ggml_backend_buffer_t input_buffer = ggml_backend_alloc_ctx_tensors(inputs, cpu);
     GGML_ASSERT(input_buffer);
 
@@ -32,6 +33,7 @@ static void test_round_trip(ggml_backend_dev_t dev, bool parallel, bool mixed_so
     ggml_tensor * b = ggml_scale(ctx, y, -0.75f);
     ggml_backend_sched_set_tensor_backend(sched, a, gpu);
     ggml_backend_sched_set_tensor_backend(sched, b, mixed_sources ? other : gpu);
+
     a = ggml_view_1d(ctx, a, n, 3*sizeof(float));
     b = ggml_view_1d(ctx, b, n, 5*sizeof(float));
 
@@ -49,6 +51,7 @@ static void test_round_trip(ggml_backend_dev_t dev, bool parallel, bool mixed_so
     ggml_tensor * h = ggml_sub(ctx, e, f);
     ggml_backend_sched_set_tensor_backend(sched, g, cpu);
     ggml_backend_sched_set_tensor_backend(sched, h, cpu);
+
     ggml_tensor * out = ggml_add(ctx, g, h);
     ggml_backend_sched_set_tensor_backend(sched, out, gpu);
     ggml_set_output(out);
@@ -64,6 +67,7 @@ static void test_round_trip(ggml_backend_dev_t dev, bool parallel, bool mixed_so
             xv[i] = float((i + iteration*3) % 31 - 15)/16;
             yv[i] = float((i*7 + iteration) % 37 - 18)/32;
         }
+
         ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
         ggml_backend_tensor_set(y, yv.data(), 0, ggml_nbytes(y));
         GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_SUCCESS);
@@ -72,17 +76,22 @@ static void test_round_trip(ggml_backend_dev_t dev, bool parallel, bool mixed_so
         if (iteration % 6 != 5) {
             continue;
         }
+
         ggml_backend_sched_synchronize(sched);
         ggml_backend_tensor_get(out, actual.data(), 0, ggml_nbytes(out));
+
         for (int64_t i = 0; i < n; ++i) {
             const float av = 1.25f*xv[i + 3];
             const float bv = -0.75f*yv[i + 5];
             const float expected = 2*(av + bv)*(av - bv);
+
             GGML_ASSERT(std::isfinite(actual[i]));
             error = std::max(error, std::abs(actual[i] - expected));
         }
+
         GGML_ASSERT(error <= 3e-6f);
     }
+
     printf("%s: round trip n=%lld parallel=%d mixed_sources=%d PASS (max error %g)\n",
             ggml_backend_dev_name(dev), (long long) n, parallel, mixed_sources, error);
 
@@ -102,17 +111,21 @@ static bool copy_selected_experts(ggml_backend_t backend, const ggml_tensor * sr
     if (ggml_graph_n_nodes(graph) == 0) {
         return false;
     }
+
     const ggml_tensor * node = ggml_graph_node(graph, 0);
     if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
         return false;
     }
+
     int32_t ids[2];
     ggml_backend_tensor_get(node->src[2], ids, 0, sizeof(ids));
+
     for (int32_t id : ids) {
         GGML_ASSERT(id >= 0 && id < src->ne[2]);
         const size_t offset = id*src->nb[2];
         ggml_backend_tensor_set_async(backend, dst, static_cast<const char *>(src->data) + offset, offset, src->nb[2]);
     }
+
     return true;
 }
 
@@ -122,6 +135,7 @@ static void test_expert_callback(ggml_backend_dev_t dev, bool parallel) {
     ggml_backend_t cpu = ggml_backend_cpu_init();
     GGML_ASSERT(gpu && cpu);
     ggml_backend_cpu_set_n_threads(cpu, 4);
+
     ggml_backend_t backends[] = { gpu, cpu };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 2, 128, parallel, true);
     ggml_backend_sched_set_copy_callback(sched, copy_selected_experts, nullptr);
@@ -131,6 +145,7 @@ static void test_expert_callback(ggml_backend_dev_t dev, bool parallel) {
     ggml_backend_buffer_t weight_buffer = ggml_backend_alloc_ctx_tensors(weights, cpu);
     GGML_ASSERT(weight_buffer);
     ggml_backend_buffer_set_usage(weight_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
     std::vector<float> wv(k*m*n_experts);
     for (int expert = 0; expert < n_experts; ++expert) {
         for (int row = 0; row < m; ++row) {
@@ -139,6 +154,7 @@ static void test_expert_callback(ggml_backend_dev_t dev, bool parallel) {
             }
         }
     }
+
     ggml_backend_tensor_set(w, wv.data(), 0, ggml_nbytes(w));
 
     ggml_context * inputs = ggml_init({ 2*ggml_tensor_overhead(), nullptr, true });
@@ -146,6 +162,7 @@ static void test_expert_callback(ggml_backend_dev_t dev, bool parallel) {
     ggml_tensor * scores = ggml_new_tensor_2d(inputs, GGML_TYPE_F32, n_experts, 1);
     ggml_set_input(x);
     ggml_set_input(scores);
+
     ggml_backend_buffer_t input_buffer = ggml_backend_alloc_ctx_tensors(inputs, cpu);
     GGML_ASSERT(input_buffer);
 
@@ -155,9 +172,11 @@ static void test_expert_callback(ggml_backend_dev_t dev, bool parallel) {
     ggml_backend_sched_set_tensor_backend(sched, activation, cpu);
     ggml_backend_sched_set_tensor_backend(sched, ids->src[0], cpu);
     ggml_backend_sched_set_tensor_backend(sched, ids, cpu);
+
     ggml_tensor * out = ggml_mul_mat_id(ctx, w, activation, ids);
     ggml_backend_sched_set_tensor_backend(sched, out, gpu);
     ggml_set_output(out);
+
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 128, false);
     ggml_build_forward_expand(graph, out);
     GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
@@ -168,29 +187,36 @@ static void test_expert_callback(ggml_backend_dev_t dev, bool parallel) {
         for (int col = 0; col < k; ++col) {
             xv[col] = float((col + iteration*3) % 23 - 11)/16;
         }
+
         for (int expert = 0; expert < n_experts; ++expert) {
             sv[expert] = float((expert + iteration) % n_experts);
         }
+
         ggml_backend_tensor_set(x, xv, 0, sizeof(xv));
         ggml_backend_tensor_set(scores, sv, 0, sizeof(sv));
         GGML_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
         ggml_backend_tensor_get(out, actual, 0, sizeof(actual));
+
         int32_t expected_ids[2];
         ggml_backend_tensor_get(ids, expected_ids, 0, sizeof(expected_ids));
+
         for (int slot = 0; slot < 2; ++slot) {
             const int expert = expected_ids[slot];
             GGML_ASSERT(expert >= 0 && expert < n_experts && sv[expert] >= 2);
+
             for (int row = 0; row < m; ++row) {
                 float expected = 0;
                 for (int col = 0; col < k; ++col) {
                     expected += wv[(expert*m + row)*k + col]*xv[col]*0.5f;
                 }
+
                 GGML_ASSERT(std::isfinite(actual[slot*m + row]));
                 error = std::max(error, std::abs(actual[slot*m + row] - expected));
             }
         }
         GGML_ASSERT(error <= 3e-6f);
     }
+
     printf("%s: selected expert callback parallel=%d PASS (max error %g)\n", ggml_backend_dev_name(dev), parallel, error);
 
     ggml_backend_sched_free(sched);
@@ -209,6 +235,7 @@ static void test_upload_lifetime(ggml_backend_dev_t dev, bool parallel, bool use
     ggml_backend_t cpu = ggml_backend_cpu_init();
     GGML_ASSERT(gpu && cpu);
     ggml_backend_cpu_set_n_threads(cpu, 4);
+
     ggml_backend_t backends[] = { gpu, cpu };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 2, 128, parallel, true);
     GGML_ASSERT(sched);
@@ -218,6 +245,7 @@ static void test_upload_lifetime(ggml_backend_dev_t dev, bool parallel, bool use
     ggml_tensor * y = ggml_new_tensor_1d(inputs, GGML_TYPE_F32, n);
     ggml_set_input(x);
     ggml_set_input(y);
+
     ggml_backend_buffer_t input_buffer = ggml_backend_alloc_ctx_tensors(inputs, cpu);
     GGML_ASSERT(input_buffer);
 
@@ -226,16 +254,19 @@ static void test_upload_lifetime(ggml_backend_dev_t dev, bool parallel, bool use
     ggml_tensor * b = ggml_scale(ctx, y, 3);
     ggml_backend_sched_set_tensor_backend(sched, a, cpu);
     ggml_backend_sched_set_tensor_backend(sched, b, cpu);
+
     ggml_tensor * out = ggml_add(ctx, a, b);
     ggml_backend_sched_set_tensor_backend(sched, out, gpu);
     if (user_input) {
         out = ggml_add(ctx, out, y);
         ggml_backend_sched_set_tensor_backend(sched, out, gpu);
+
         ggml_tensor * c = ggml_scale(ctx, x, 4);
         ggml_backend_sched_set_tensor_backend(sched, c, cpu);
         out = ggml_add(ctx, out, c);
         ggml_backend_sched_set_tensor_backend(sched, out, gpu);
     }
+
     ggml_set_output(out);
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 128, false);
     ggml_build_forward_expand(graph, out);
@@ -248,16 +279,20 @@ static void test_upload_lifetime(ggml_backend_dev_t dev, bool parallel, bool use
         std::fill(values.begin(), values.end(), float(iteration + 2));
         ggml_backend_tensor_set(y, values.data(), 0, ggml_nbytes(y));
         GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_SUCCESS);
+
         // Preserve each result before the next CPU split overwrites its intermediate sources.
         ggml_backend_tensor_get_async(gpu, out, actual.data() + iteration*n, 0, ggml_nbytes(out));
     }
+
     ggml_backend_sched_synchronize(sched);
+
     for (int iteration = 0; iteration < iterations; ++iteration) {
         const float expected = user_input ? 10*iteration + 14 : 5*iteration + 8;
         for (int i = 0; i < n; ++i) {
             GGML_ASSERT(actual[iteration*n + i] == expected);
         }
     }
+
     printf("%s: queued CPU-first uploads parallel=%d user_input=%d PASS\n", ggml_backend_dev_name(dev), parallel, user_input);
 
     ggml_backend_sched_free(sched);
@@ -270,11 +305,13 @@ static void test_upload_lifetime(ggml_backend_dev_t dev, bool parallel, bool use
 
 int main() {
     ggml_backend_load_all();
+
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
             continue;
         }
+
         for (bool parallel : { false, true }) {
             test_round_trip(dev, parallel, false, 2048);
             test_round_trip(dev, parallel, false, 65536);
@@ -284,5 +321,6 @@ int main() {
             test_upload_lifetime(dev, parallel, true);
         }
     }
+
     return 0;
 }

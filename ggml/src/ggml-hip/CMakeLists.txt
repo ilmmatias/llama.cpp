@@ -84,6 +84,7 @@ if (GGML_HIP_RTC)
             message(FATAL_ERROR "GGML_HIP_RTC requires HIPRTC headers and library")
         endif()
     endif()
+
     list(APPEND GGML_SOURCES_ROCM ../ggml-cuda/fusion-rtc.cpp)
 endif()
 

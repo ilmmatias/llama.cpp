@@ -387,12 +387,14 @@ if (GGML_HIP AND GGML_HIP_RTC)
     if (fusion_hip_architectures)
         set_property(TARGET test-hiprtc-fusion PROPERTY HIP_ARCHITECTURES ${fusion_hip_architectures})
     endif()
+
     if (CMAKE_HIP_COMPILER)
         set_source_files_properties(test-hiprtc-fusion.cpp PROPERTIES LANGUAGE HIP)
     else()
         set_source_files_properties(test-hiprtc-fusion.cpp PROPERTIES LANGUAGE CXX)
         target_link_libraries(test-hiprtc-fusion PRIVATE hip::device)
     endif()
+
     target_link_libraries(test-hiprtc-fusion PRIVATE ggml-base ggml ggml-hip ggml-cpu hip::host ${CMAKE_DL_LIBS})
     if (TARGET hiprtc::hiprtc)
         target_link_libraries(test-hiprtc-fusion PRIVATE hiprtc::hiprtc)
@@ -406,27 +408,34 @@ if (GGML_HIP AND GGML_HIP_RTC)
         set_tests_properties(test-hiprtc-fusion-${mode} PROPERTIES
             SKIP_RETURN_CODE 77 ENVIRONMENT "GGML_HIP_RTC_FUSION=1;GGML_HIP_RTC_FUSION_ASYNC=0;GGML_HIP_RTC_FUSION_FORCE=1;GGML_CUDA_DISABLE_GRAPHS=1")
     endforeach()
+
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_library(hiprtc-test-interpose SHARED hiprtc-test-interpose.cpp)
         target_link_libraries(hiprtc-test-interpose PRIVATE hip::host ${CMAKE_DL_LIBS})
         target_include_directories(hiprtc-test-interpose PRIVATE ${GGML_HIP_RTC_INCLUDE_DIR})
         set_target_properties(hiprtc-test-interpose PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+
         foreach(mode concurrency failure limits cache-shapes)
             llama_test(test-hiprtc-fusion NAME test-hiprtc-fusion-${mode} ARGS ${mode})
             set_tests_properties(test-hiprtc-fusion-${mode} PROPERTIES SKIP_RETURN_CODE 77
                 ENVIRONMENT "GGML_HIP_RTC_FUSION=1;GGML_HIP_RTC_FUSION_ASYNC=0;GGML_HIP_RTC_FUSION_FORCE=1;GGML_CUDA_DISABLE_GRAPHS=1;AMD_COMGR_CACHE=0;LD_PRELOAD=$<TARGET_FILE:hiprtc-test-interpose>")
         endforeach()
         set_property(TEST test-hiprtc-fusion-failure APPEND PROPERTY ENVIRONMENT "GGML_TEST_HIPRTC_FAIL_CREATE=1")
+
         foreach(mode async async-failure async-limits)
             llama_test(test-hiprtc-fusion NAME test-hiprtc-fusion-${mode} ARGS ${mode})
             set_tests_properties(test-hiprtc-fusion-${mode} PROPERTIES SKIP_RETURN_CODE 77
                 ENVIRONMENT "GGML_HIP_RTC_FUSION=1;GGML_HIP_RTC_FUSION_ASYNC=1;GGML_HIP_RTC_FUSION_FORCE=1;AMD_COMGR_CACHE=0;LD_PRELOAD=$<TARGET_FILE:hiprtc-test-interpose>")
         endforeach()
         set_property(TEST test-hiprtc-fusion-async-failure APPEND PROPERTY ENVIRONMENT "GGML_TEST_HIPRTC_FAIL_CREATE=1")
+
         if (GGML_HIP_GRAPHS)
-            llama_test(test-hiprtc-fusion NAME test-hiprtc-fusion-streams ARGS streams)
-            set_tests_properties(test-hiprtc-fusion-streams PROPERTIES SKIP_RETURN_CODE 77
-                ENVIRONMENT "GGML_HIP_RTC_FUSION=1;GGML_HIP_RTC_FUSION_ASYNC=0;GGML_HIP_RTC_FUSION_FORCE=1;GGML_CUDA_GRAPH_OPT=1;LD_PRELOAD=$<TARGET_FILE:hiprtc-test-interpose>")
+            foreach(mode streams split-streams)
+                llama_test(test-hiprtc-fusion NAME test-hiprtc-fusion-${mode} ARGS ${mode})
+                set_tests_properties(test-hiprtc-fusion-${mode} PROPERTIES SKIP_RETURN_CODE 77
+                    ENVIRONMENT "GGML_HIP_RTC_FUSION=1;GGML_HIP_RTC_FUSION_ASYNC=0;GGML_HIP_RTC_FUSION_FORCE=1;GGML_CUDA_GRAPH_OPT=1;LD_PRELOAD=$<TARGET_FILE:hiprtc-test-interpose>")
+            endforeach()
+
             foreach(mode capture capture-limits concurrency-capture)
                 llama_test(test-hiprtc-fusion NAME test-hiprtc-fusion-${mode} ARGS ${mode})
                 set_tests_properties(test-hiprtc-fusion-${mode} PROPERTIES SKIP_RETURN_CODE 77

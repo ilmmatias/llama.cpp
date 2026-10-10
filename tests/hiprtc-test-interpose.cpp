@@ -35,6 +35,7 @@ extern "C" bool hiprtc_test_wait_compiler(unsigned finished) {
 static void observe(hiprtc_test_counter counter, bool setup = false) {
     std::lock_guard<std::mutex> lock(observer_mutex);
     ++counters[counter];
+
     if (setup && captures) {
         ++counters[HIPRTC_TEST_SETUP_DURING_CAPTURE];
     }
@@ -72,26 +73,31 @@ extern "C" hiprtcResult hiprtcCreateProgram(hiprtcProgram * program, const char 
 extern "C" hiprtcResult hiprtcCompileProgram(hiprtcProgram program, int count, const char * const * options) {
     static auto call = real_api<decltype(&hiprtcCompileProgram)>("hiprtcCompileProgram");
     observe(HIPRTC_TEST_COMPILE);
+
     {
         std::unique_lock<std::mutex> lock(compiler_mutex);
         compiler_waiting = compiler_paused;
         compiler_changed.notify_all();
+
         // Let a failed test exit without waiting forever for this gate.
         compiler_changed.wait_for(lock, std::chrono::seconds(30), [] { return !compiler_paused; });
         compiler_waiting = false;
     }
+
     const auto status = call(program, count, options);
     {
         std::lock_guard<std::mutex> lock(compiler_mutex);
         ++compiler_finished;
         compiler_changed.notify_all();
     }
+
     return status;
 }
 
 extern "C" hiprtcResult hiprtcVersion(int * major, int * minor) {
     static auto call = real_api<decltype(&hiprtcVersion)>("hiprtcVersion");
     observe(HIPRTC_TEST_VERSION, true);
+
     return call(major, minor);
 }
 
@@ -114,6 +120,7 @@ extern "C" hipError_t hipModuleLoadData(hipModule_t * module, const void * image
 extern "C" hipError_t hipModuleUnload(hipModule_t module) {
     static auto call = real_api<decltype(&hipModuleUnload)>("hipModuleUnload");
     observe(HIPRTC_TEST_UNLOAD, true);
+
     return call(module);
 }
 
@@ -122,12 +129,14 @@ extern "C" hipError_t hipModuleLaunchKernel(hipFunction_t function, unsigned gx,
                                           hipStream_t stream, void ** arguments, void ** extra) {
     static auto call = real_api<decltype(&hipModuleLaunchKernel)>("hipModuleLaunchKernel");
     observe(HIPRTC_TEST_MODULE_LAUNCH);
+
     return call(function, gx, gy, gz, bx, by, bz, shared, stream, arguments, extra);
 }
 
 extern "C" hipError_t hipFuncGetAttribute(int * value, hipFunction_attribute attribute, hipFunction_t function) {
     static auto call = real_api<decltype(&hipFuncGetAttribute)>("hipFuncGetAttribute");
     observe(HIPRTC_TEST_RESOURCE_QUERY, true);
+
     return call(value, attribute, function);
 }
 
@@ -135,12 +144,14 @@ extern "C" hipError_t hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(int * b
                                                                      int threads, size_t shared) {
     static auto call = real_api<decltype(&hipModuleOccupancyMaxActiveBlocksPerMultiprocessor)>("hipModuleOccupancyMaxActiveBlocksPerMultiprocessor");
     observe(HIPRTC_TEST_RESOURCE_QUERY, true);
+
     return call(blocks, function, threads, shared);
 }
 
 extern "C" hipError_t hipMalloc(void ** pointer, size_t size) {
     static auto call = real_api<hipError_t (*)(void **, size_t)>("hipMalloc");
     observe(HIPRTC_TEST_ALLOCATE, true);
+
     return call(pointer, size);
 }
 
@@ -168,6 +179,7 @@ extern "C" hipError_t hipStreamEndCapture(hipStream_t stream, hipGraph_t * graph
     {
         std::lock_guard<std::mutex> lock(observer_mutex);
         ++counters[HIPRTC_TEST_CAPTURE_END];
+
         if (!captures) {
             std::abort();
         }
@@ -181,17 +193,20 @@ extern "C" hipError_t hipStreamEndCapture(hipStream_t stream, hipGraph_t * graph
 extern "C" hipError_t hipGraphLaunch(hipGraphExec_t graph, hipStream_t stream) {
     static auto call = real_api<decltype(&hipGraphLaunch)>("hipGraphLaunch");
     observe(HIPRTC_TEST_GRAPH_LAUNCH);
+
     return call(graph, stream);
 }
 
 extern "C" hipError_t hipEventRecord(hipEvent_t event, hipStream_t stream) {
     static auto call = real_api<decltype(&hipEventRecord)>("hipEventRecord");
     observe(HIPRTC_TEST_EVENT_RECORD);
+
     return call(event, stream);
 }
 
 extern "C" hipError_t hipStreamWaitEvent(hipStream_t stream, hipEvent_t event, unsigned flags) {
     static auto call = real_api<decltype(&hipStreamWaitEvent)>("hipStreamWaitEvent");
     observe(HIPRTC_TEST_STREAM_WAIT);
+
     return call(stream, event, flags);
 }

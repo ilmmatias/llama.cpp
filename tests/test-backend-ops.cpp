@@ -4002,10 +4002,12 @@ struct test_elementwise_chain : public test_case {
             } else if (type != GGML_TYPE_F16) {
                 v = ggml_scale_bias(ctx, v, 0.5f, -1.0f);
             }
+
             output = ggml_sqr(ctx, ggml_relu(ctx, v));
         }
 
         ggml_set_name(output, "out");
+
         return output;
     }
 };
@@ -4110,6 +4112,7 @@ struct test_elementwise_dag : public test_case {
         }
 
         observed.push_back(out);
+
         return out;
     }
 
@@ -4172,6 +4175,7 @@ struct test_fusion_math : public test_elementwise_dag {
         }
 
         observed.push_back(out);
+
         return out;
     }
 };
@@ -4215,6 +4219,7 @@ struct test_fusion_norm : public test_elementwise_dag {
         }
 
         observed.push_back(out);
+
         return out;
     }
 
@@ -4294,6 +4299,7 @@ struct test_fusion_layout : public test_elementwise_dag {
 
         auto * out = ggml_sqr(ctx, ggml_neg(ctx, v));
         observed.push_back(out);
+
         return out;
     }
 };
@@ -4382,6 +4388,7 @@ struct test_fusion_reduction : public test_elementwise_dag {
         }
 
         observed.push_back(out);
+
         return out;
     }
 };
@@ -11095,6 +11102,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_elementwise_chain("basic", {n, 1, 1, 1}));
     }
     test_cases.emplace_back(new test_elementwise_chain("basic", {5, 7, 3, 2}));
+
     for (const char * variant : {"swapped", "reuse", "exposed", "outside_consumer", "strided", "broadcast", "inplace"}) {
         test_cases.emplace_back(new test_elementwise_chain(variant, {64, 5, 4, 3}));
     }
@@ -11105,6 +11113,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_elementwise_dag("diamond", type, {n, 1, 1, 1}));
             }
         }
+
         if (type == GGML_TYPE_F32) {
             test_cases.emplace_back(new test_elementwise_dag("diamond", type, {5, 7, 3, 2}));
             test_cases.emplace_back(new test_elementwise_dag("outside_consumer", type, {257, 1, 1, 1}));
@@ -11114,15 +11123,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_elementwise_chain("basic", {257, 1, 1, 1}, type));
             test_cases.emplace_back(new test_elementwise_dag("mixed_binary", type, {257, 1, 1, 1}));
         }
+
         for (const char * variant : {"independent", "exposed", "multi_output", "disconnected"}) {
             test_cases.emplace_back(new test_elementwise_dag(variant, type, {257, 1, 1, 1}));
         }
+
         for (const char * variant : {"repeat", "padded", "rhs_permute", "offset_view", "view_boundary", "inplace"}) {
             const std::array<int64_t, 4> shape = std::string(variant) == "repeat" ?
                 std::array<int64_t, 4>{10, 6, 4, 3} : std::array<int64_t, 4>{13, 3, 2, 2};
             test_cases.emplace_back(new test_fusion_layout(variant, type, shape));
         }
     }
+
     test_cases.emplace_back(new test_fusion_layout("large_stride", GGML_TYPE_F32, {257, 1, 1, 1}));
     test_cases.emplace_back(new test_fusion_layout("tiny_indexed", GGML_TYPE_F32, {257, 1, 1, 1}));
     test_cases.emplace_back(new test_fusion_reduction("silu_producer", {32, 3, 1, 1}, GGML_OP_SUM_ROWS));
@@ -11131,10 +11143,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t columns : {1, 31, 32, 33, 255, 256, 257, 4095, 4096, 4097, 8193}) {
             test_cases.emplace_back(new test_fusion_reduction("dense", {columns, 3, 2, 2}, reduction));
         }
+
         for (const char * variant : {"repeat", "padded", "multi_output", "exposed_producer", "outside_consumer", "two_reductions"}) {
             test_cases.emplace_back(new test_fusion_reduction(variant, {257, 3, 2, 2}, reduction));
         }
     }
+
     for (ggml_op reduction : {GGML_OP_SUM_ROWS, GGML_OP_MEAN}) {
         for (int64_t columns : {1, 31, 32, 33, 63, 64, 65, 255, 256, 257, 1023, 1024, 1025, 4095, 4096, 4097}) {
             for (int64_t rows : {1, 3, 64}) {
@@ -11143,13 +11157,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
     for (int64_t n : {1, 255, 256, 257, 4095, 4096, 4097, 8193, 1048577}) {
         test_cases.emplace_back(new test_fusion_reduction("sum", {n, 1, 1, 1}, GGML_OP_SUM));
     }
+
     for (ggml_op reduction : {GGML_OP_SUM_ROWS, GGML_OP_MEAN, GGML_OP_SUM}) {
         test_cases.emplace_back(new test_fusion_reduction("epilogue", {257, 3, 2, 2}, reduction));
         test_cases.emplace_back(new test_fusion_reduction("broadcast_producer", {256, 3, 2, 2}, reduction));
     }
+
     test_cases.emplace_back(new test_fusion_reduction("dense", {7, 65537, 1, 1}, GGML_OP_SUM_ROWS));
     test_cases.emplace_back(new test_fusion_reduction("dense", {16777217, 1, 1, 1}, GGML_OP_SUM));
 
@@ -13760,11 +13777,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_elementwise_dag("diamond", type, {n, 1, 1, 1}));
         }
     }
+
     for (int64_t n : {4096, 1048576}) {
         for (const char * variant : {"wide", "many_output"}) {
             test_cases.emplace_back(new test_elementwise_dag(variant, GGML_TYPE_F32, {n, 1, 1, 1}));
         }
     }
+
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
         test_cases.emplace_back(new test_fusion_layout("repeat", type, {10, 2, 4, 3}));
         test_cases.emplace_back(new test_fusion_layout("repeat", type, {1280, 6, 4, 32}));
@@ -13773,11 +13792,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_fusion_layout(variant, type, {256, 256, 4, 4}));
         }
     }
+
     test_cases.emplace_back(new test_fusion_layout("tiny_indexed", GGML_TYPE_F32, {257, 1, 1, 1}));
+
     for (const auto & shape : {std::array<int64_t, 4>{32, 64, 1, 1}, {257, 64, 1, 1}, {4096, 1, 1, 1}, {4096, 64, 1, 1}}) {
         test_cases.emplace_back(new test_fusion_reduction("epilogue", shape, GGML_OP_SUM_ROWS));
     }
+
     test_cases.emplace_back(new test_fusion_reduction("silu_producer", {4096, 1, 1, 1}, GGML_OP_SUM_ROWS));
+
     for (int64_t n : {4096, 4097, 8193, 1048576}) {
         test_cases.emplace_back(new test_fusion_reduction("epilogue", {n, 1, 1, 1}, GGML_OP_SUM));
     }

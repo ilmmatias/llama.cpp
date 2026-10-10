@@ -61,6 +61,7 @@ extern "C" __global__ void probe(float * out, const float * in, unsigned long lo
     if (i < n) out[i] = in[i] * 2.0f + bias;
 }
 )";
+
     if (capture) {
         source += R"(
 extern "C" __global__ void partial(float * out, const float * in, unsigned long long n, float bias) {
@@ -158,6 +159,7 @@ extern "C" __global__ void finalize(float * out, const float * in, unsigned long
                 for (size_t i = 0; i < input.size(); ++i) {
                     input[i] = step ? float(step) : float(int(i % 17) - 8);
                 }
+
                 CUDA_CHECK(hipMemcpyAsync(current_input, input.data(), capacity * sizeof(float), hipMemcpyHostToDevice, stream));
 
                 if (!capture || step != 1) {
@@ -234,6 +236,7 @@ static float decode_scalar(const unsigned char * data, ggml_type type) {
 
     uint16_t value;
     std::memcpy(&value, data, sizeof(value));
+
     return type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(value) : ggml_bf16_to_fp32({value});
 }
 
@@ -376,10 +379,12 @@ static void test_scale_contraction(ggml_backend_t backend) {
         for (size_t i = 0; i < ggml_type_size(type); ++i) {
             std::printf("%02x", ordinary[i]);
         }
+
         std::printf(" RTC=");
         for (size_t i = 0; i < ggml_type_size(type); ++i) {
             std::printf("%02x", fused[i]);
         }
+
         std::puts("");
         REQUIRE(ordinary == fused);
 
@@ -663,6 +668,7 @@ static void schedule() {
     auto backend = ggml_backend_cuda_init(0);
     auto cpu = ggml_backend_cpu_init();
     REQUIRE(backend && cpu);
+
     ggml_backend_t backends[] = {backend, cpu};
 
     for (int mode = 0; mode < 5; ++mode) {
@@ -695,6 +701,7 @@ static void schedule() {
         for (auto * input : {a, b, c}) {
             ggml_backend_sched_set_tensor_backend(sched, input, backend);
         }
+
         for (int i = 0; i < g->n_nodes; ++i) {
             ggml_backend_sched_set_tensor_backend(sched, g->nodes[i], mode == 4 && g->nodes[i] == u ? cpu : backend);
         }
@@ -983,6 +990,7 @@ static void reductions() {
                         values[i] = 2.0f;
                     }
                 }
+
                 ggml_backend_tensor_set(input, values.data(), 0, values.size() * sizeof(float));
             }
 
@@ -1108,6 +1116,7 @@ static void reductions() {
                 ggml_free(ctx);
             }
         }
+
         ggml_backend_free(backend);
     }
 
@@ -1219,12 +1228,15 @@ static void asynchronous(bool failure) {
             second.run(0, false, true);
         }
     });
+
     first_thread.join();
     second_thread.join();
+
     {
         cache_fixture retiring(2);
         retiring.run(1, false, true);
     }
+
     observer_snapshot(after);
     REQUIRE(after[HIPRTC_TEST_COMPILE] == before[HIPRTC_TEST_COMPILE] + 1);
     REQUIRE(after[HIPRTC_TEST_LOAD] == before[HIPRTC_TEST_LOAD]);
@@ -1252,6 +1264,7 @@ static void asynchronous(bool failure) {
         second.run(0, false, true);
         replacement.run(1, false, true);
     }
+
     observer_snapshot(after);
     REQUIRE(after[HIPRTC_TEST_COMPILE] == before[HIPRTC_TEST_COMPILE] + 2);
     REQUIRE(after[HIPRTC_TEST_LOAD] == before[HIPRTC_TEST_LOAD] + (failure ? 0 : 3));
@@ -1264,6 +1277,7 @@ static void asynchronous_limits() {
     auto pause = reinterpret_cast<void (*)(bool)>(dlsym(RTLD_DEFAULT, "hiprtc_test_pause_compiler"));
     auto wait = reinterpret_cast<bool (*)(unsigned)>(dlsym(RTLD_DEFAULT, "hiprtc_test_wait_compiler"));
     REQUIRE(pause && wait);
+
     auto backend = ggml_backend_cuda_init(0);
     REQUIRE(backend);
 
@@ -1273,6 +1287,7 @@ static void asynchronous_limits() {
         ggml_cgraph * graph;
         ggml_tensor * out;
     };
+
     std::vector<fixture> fixtures;
     uint64_t before[HIPRTC_TEST_COUNTER_COUNT], after[HIPRTC_TEST_COUNTER_COUNT];
     observer_snapshot(before);
@@ -1280,18 +1295,23 @@ static void asynchronous_limits() {
     for (size_t stride = 2; stride < 38; ++stride) {
         auto * ctx = ggml_init({1 << 20, nullptr, true});
         REQUIRE(ctx);
+
         auto * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 2);
         auto * backing = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, stride + 2);
         auto * b = ggml_view_2d(ctx, backing, 2, 2, stride * sizeof(float), 0);
         auto * out = ggml_sqr(ctx, ggml_neg(ctx, ggml_mul(ctx, ggml_add(ctx, a, b), a)));
+
         auto * graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, out);
+
         auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
         REQUIRE(buffer);
+
         const float av[] = {-4, -1, 2, 4};
         std::vector<float> bv(stride + 2, 2.0f);
         ggml_backend_tensor_set(a, av, 0, sizeof(av));
         ggml_backend_tensor_set(backing, bv.data(), 0, bv.size() * sizeof(float));
+
         fixtures.push_back({ctx, buffer, graph, out});
     }
 
@@ -1304,11 +1324,14 @@ static void asynchronous_limits() {
             REQUIRE(values[i] == expected[i]);
         }
     };
+
     run(fixtures[0]);
     REQUIRE(wait(0));
+
     for (const auto & item : fixtures) {
         run(item);
     }
+
     observer_snapshot(after);
     REQUIRE(after[HIPRTC_TEST_COMPILE] == before[HIPRTC_TEST_COMPILE] + 1);
     REQUIRE(after[HIPRTC_TEST_LOAD] == before[HIPRTC_TEST_LOAD]);
@@ -1319,9 +1342,11 @@ static void asynchronous_limits() {
         for (const auto & item : fixtures) {
             run(item);
         }
+
         observer_snapshot(after);
         REQUIRE(std::chrono::steady_clock::now() < deadline);
     } while (after[HIPRTC_TEST_LOAD] != before[HIPRTC_TEST_LOAD] + fixtures.size());
+
     REQUIRE(after[HIPRTC_TEST_COMPILE] == before[HIPRTC_TEST_COMPILE] + fixtures.size());
     REQUIRE(after[HIPRTC_TEST_SETUP_DURING_CAPTURE] == 0);
 
@@ -1330,6 +1355,7 @@ static void asynchronous_limits() {
         ggml_backend_buffer_free(item.buffer);
         ggml_free(item.ctx);
     }
+
     std::puts("async-limits: 36 distinct kernels exceeded the pending queue; all native outputs and eventual graph promotions passed");
 }
 
@@ -1398,15 +1424,15 @@ struct capture_fixture {
     float a_value(int i) const {
         static const float original[] = {-4, -1, 2, 4};
         static const float replacement[] = {-2, 1, 4, 6};
-        return (changed_address ? replacement : original)[i % 4];
 
+        return (changed_address ? replacement : original)[i % 4];
     }
 
     float b_value(int i) const {
         static const float original[] = {2, 3, -2, 0};
         static const float replacement[] = {4, 3, 0, 0};
-        return (changed_inputs ? replacement : original)[i % 4];
 
+        return (changed_inputs ? replacement : original)[i % 4];
     }
 
     void upload() {
@@ -1414,11 +1440,13 @@ struct capture_fixture {
         for (int i = 0; i < 2 * 513; ++i) {
             values[i] = b_value(i);
         }
+
         ggml_backend_tensor_set(backing, values.data(), 0, values.size() * sizeof(float));
 
         for (int i = 0; i < n; ++i) {
             values[i] = a_value(i);
         }
+
         ggml_backend_tensor_set(a, values.data(), 0, n * sizeof(float));
 
         std::fill(values.begin(), values.end(), 2.0f);
@@ -1553,6 +1581,7 @@ static void capture_reductions() {
             for (int i = 0; i < columns * rows; ++i) {
                 values[i] = probes[(i + shift) % 4];
             }
+
             ggml_backend_tensor_set(input, values.data(), 0, values.size() * sizeof(float));
         };
 
@@ -1573,6 +1602,7 @@ static void capture_reductions() {
         auto run = [&] {
             REQUIRE(graph->uid == 1);
             REQUIRE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+
             check();
         };
 
@@ -1784,6 +1814,7 @@ static void capture_normalization_reduction() {
     auto * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, out);
     graph->uid = 1;
+
     auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     REQUIRE(buffer);
 
@@ -1792,6 +1823,7 @@ static void capture_normalization_reduction() {
         values[i] = float(int(i % 11) - 5) * 0.25f;
         keys[i] = float(int(i % 7) - 3) * 0.25f;
     }
+
     for (int column = 0; column < columns; ++column) {
         weights[column] = 0.75f + 0.125f * (column % 3);
     }
@@ -1799,6 +1831,7 @@ static void capture_normalization_reduction() {
     ggml_backend_tensor_set(input, values.data(), 0, values.size() * sizeof(float));
     ggml_backend_tensor_set(key, keys.data(), 0, keys.size() * sizeof(float));
     ggml_backend_tensor_set(gamma, weights.data(), 0, weights.size() * sizeof(float));
+
     auto & cuda_ctx = *static_cast<ggml_backend_cuda_context *>(backend->context);
     REQUIRE(ggml_cuda_rtc_fusion_try(cuda_ctx, graph, 0, true, 3) == 0);
 
@@ -1822,6 +1855,7 @@ static void capture_normalization_reduction() {
             REQUIRE(std::fabs(result[row] - expected) < 3e-6f);
         }
     }
+
     observer_snapshot(after);
     REQUIRE(after[HIPRTC_TEST_MODULE_LAUNCH] == before[HIPRTC_TEST_MODULE_LAUNCH] + 2);
     REQUIRE(after[HIPRTC_TEST_GRAPH_LAUNCH] == before[HIPRTC_TEST_GRAPH_LAUNCH] + 2);
@@ -1837,6 +1871,7 @@ static void capture_normalization_schedule() {
     auto backend = ggml_backend_cuda_init(0);
     auto cpu = ggml_backend_cpu_init();
     REQUIRE(backend && cpu);
+
     ggml_backend_t backends[] = {backend, cpu};
 
     auto * ctx = ggml_init({2 << 20, nullptr, true});
@@ -1861,14 +1896,17 @@ static void capture_normalization_schedule() {
 
     auto * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, out);
+
     auto sched = ggml_backend_sched_new(backends, nullptr, 2, 2048, false, true);
     REQUIRE(sched);
     for (auto * tensor : {seed, gamma, gate}) {
         ggml_backend_sched_set_tensor_backend(sched, tensor, backend);
     }
+
     for (int i = 0; i < graph->n_nodes; ++i) {
         ggml_backend_sched_set_tensor_backend(sched, graph->nodes[i], backend);
     }
+
     REQUIRE(ggml_backend_sched_alloc_graph(sched, graph));
 
     std::vector<float> values(columns * heads * tokens), gates(values.size()), weights(columns);
@@ -1913,6 +1951,7 @@ static void capture_normalization_schedule() {
             }
         }
     }
+
     observer_snapshot(after);
     REQUIRE(after[HIPRTC_TEST_MODULE_LAUNCH] == before[HIPRTC_TEST_MODULE_LAUNCH] + 2);
     REQUIRE(after[HIPRTC_TEST_GRAPH_LAUNCH] == before[HIPRTC_TEST_GRAPH_LAUNCH] + 2);
@@ -1954,6 +1993,7 @@ static void capture_normalization() {
 
         auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
         REQUIRE(buffer);
+
         std::vector<float> values(columns * rows);
 
         auto check = [&] {
@@ -2038,6 +2078,7 @@ static void capture_normalization() {
 static void capture_mixed() {
     auto backend = ggml_backend_cuda_init(0);
     REQUIRE(backend);
+
     auto * ctx = ggml_init({2 << 20, nullptr, true});
     REQUIRE(ctx);
 
@@ -2046,18 +2087,23 @@ static void capture_mixed() {
     auto * alternate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 8);
     ggml_set_input(input);
     ggml_set_input(weight);
+
     auto * producer = ggml_neg(ctx, ggml_scale_bias(ctx, input, 2.0f, 1.0f));
     auto * mm = ggml_mul_mat(ctx, weight, producer);
     auto * out = ggml_neg(ctx, ggml_scale_bias(ctx, mm, 0.5f, 2.0f));
     ggml_set_output(out);
+
     auto * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, out);
     graph->uid = 1;
+
     auto * other_out = ggml_sqr(ctx, alternate);
     ggml_set_output(other_out);
+
     auto * other_graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(other_graph, other_out);
     other_graph->uid = 1;
+
     auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     REQUIRE(buffer);
 
@@ -2075,6 +2121,7 @@ static void capture_mixed() {
         for (float value : other_result) {
             REQUIRE(value == 0.25f);
         }
+
         REQUIRE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
         float result[32];
         ggml_backend_tensor_get(out, result, 0, sizeof(result));
@@ -2090,6 +2137,7 @@ static void capture_mixed() {
         } else if (phase == 2) {
             weight->data = alternate->data;
         }
+
         const float expected = phase == 0 ? 10.0f : phase == 1 ? 18.0f : 38.0f;
         uint64_t before[HIPRTC_TEST_COUNTER_COUNT], after[HIPRTC_TEST_COUNTER_COUNT];
         observer_snapshot(before);
@@ -2123,7 +2171,6 @@ static void capture() {
     capture_normalization();
 
     for (bool diamond : {false, true}) {
-
         capture_fixture fixture(diamond);
         fixture.recapture(false);
 
@@ -2359,19 +2406,23 @@ static void cache_shapes() {
             auto * out = normalize ?
                 ggml_sqr(ctx, ggml_add(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, a, 1e-5f), b), b)) :
                 ggml_neg(ctx, ggml_sqr(ctx, ggml_add(ctx, a, b)));
+
             auto * graph = ggml_new_graph(ctx);
             ggml_build_forward_expand(graph, b);
             ggml_build_forward_expand(graph, out);
 
             auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
             REQUIRE(buffer);
+
             std::vector<float> av(ggml_nelements(a)), bv(shape[4] * shape[5], -100.0f), values(av.size());
             for (size_t i = 0; i < av.size(); ++i) {
                 av[i] = (int(i % 17) - 8) * 0.25f;
             }
+
             for (int i = 0; i < shape[4]; ++i) {
                 bv[i * shape[5]] = (i + 1) * 0.125f;
             }
+
             ggml_backend_tensor_set(a, av.data(), 0, av.size() * sizeof(float));
             ggml_backend_tensor_set(backing, bv.data(), 0, bv.size() * sizeof(float));
 
@@ -2379,6 +2430,7 @@ static void cache_shapes() {
             while (graph->nodes[start]->op == GGML_OP_VIEW) {
                 ++start;
             }
+
             auto & cuda_ctx = *static_cast<ggml_backend_cuda_context *>(backend->context);
             REQUIRE(ggml_cuda_rtc_fusion_try(cuda_ctx, graph, start, true) == (normalize ? 3 : 2));
             ggml_backend_synchronize(backend);
@@ -2390,6 +2442,7 @@ static void cache_shapes() {
                     const float value = av[row * shape[0] + col];
                     square_sum += value * value;
                 }
+
                 const float scale = 1.0f / std::sqrt(square_sum / shape[0] + 1e-5f);
                 for (int col = 0; col < shape[0]; ++col) {
                     const size_t i = row * shape[0] + col;
@@ -2402,6 +2455,7 @@ static void cache_shapes() {
 
             observer_snapshot(after);
             REQUIRE(after[HIPRTC_TEST_COMPILE] - before[HIPRTC_TEST_COMPILE] == uint64_t(variant < 4 ? 1 : variant - 2));
+
             ggml_backend_buffer_free(buffer);
             ggml_free(ctx);
         }
@@ -2517,6 +2571,7 @@ static void limits() {
                         expected = expected * 0.5f + 1.0f;
                     }
                 }
+
                 REQUIRE(values[j] == expected);
             }
         }
@@ -2539,6 +2594,7 @@ static void streams_case(int n, bool reduce) {
     auto backend = ggml_backend_cuda_init(0);
     auto cpu = ggml_backend_cpu_init();
     REQUIRE(backend && cpu);
+
     ggml_backend_t backends[] = {backend, cpu};
 
     auto * ctx = ggml_init({4 << 20, nullptr, true});
@@ -2547,6 +2603,7 @@ static void streams_case(int n, bool reduce) {
     auto * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
     ggml_set_input(a);
     ggml_set_name(a, "streams_input");
+
     auto * root = ggml_scale(ctx, ggml_neg(ctx, a), 0.5f);
     ggml_set_name(root, "attn_norm");
     ggml_set_output(root); // keep the shared fork input out of branch storage
@@ -2559,6 +2616,7 @@ static void streams_case(int n, bool reduce) {
         t = ggml_sum(ctx, t);
         q = ggml_sum(ctx, q);
     }
+
     for (auto * branch : {v, t, q}) {
         ggml_set_output(branch);
     }
@@ -2567,6 +2625,7 @@ static void streams_case(int n, bool reduce) {
     ggml_build_forward_expand(g, v);
     ggml_build_forward_expand(g, t);
     ggml_build_forward_expand(g, q);
+
     auto * joined = ggml_add(ctx, ggml_add(ctx, v, t), q);
     auto * out = ggml_scale(ctx, ggml_sqr(ctx, ggml_neg(ctx, joined)), 0.25f);
     ggml_set_name(out, "streams_output");
@@ -2579,6 +2638,7 @@ static void streams_case(int n, bool reduce) {
     for (int i = 0; i < g->n_nodes; ++i) {
         ggml_backend_sched_set_tensor_backend(sched, g->nodes[i], backend);
     }
+
     REQUIRE(ggml_backend_sched_alloc_graph(sched, g));
 
     auto & cuda_ctx = *static_cast<ggml_backend_cuda_context *>(backend->context);
@@ -2609,6 +2669,7 @@ static void streams_case(int n, bool reduce) {
                 }
             }
         }
+
         for (int repeat = 0; repeat < 4; ++repeat) {
             ggml_backend_tensor_set(a, input.data(), 0, input.size() * sizeof(float));
             ggml_backend_tensor_set(reference_input, input.data(), 0, input.size() * sizeof(float));
@@ -2622,6 +2683,7 @@ static void streams_case(int n, bool reduce) {
                 std::vector<float> actual(count), expected(count);
                 ggml_backend_tensor_get(tensor, actual.data(), 0, count * sizeof(float));
                 ggml_backend_tensor_get(expected_tensor, expected.data(), 0, count * sizeof(float));
+
                 for (size_t i = 0; i < count; ++i) {
                     REQUIRE(std::fabs(actual[i] - expected[i]) <= 2e-6f * std::max(1.0f, std::fabs(expected[i])));
                 }
@@ -2642,6 +2704,140 @@ static void streams() {
     std::puts("streams: fork/join boundaries, three branches, reductions, changed inputs and stream remapping passed");
 }
 
+static void split_streams_case(bool tail) {
+    auto backend = ggml_backend_cuda_init(0);
+    auto cpu = ggml_backend_cpu_init();
+    REQUIRE(backend && cpu);
+
+    ggml_backend_t backends[] = {backend, cpu};
+    auto * ctx = ggml_init({4 << 20, nullptr, true});
+    REQUIRE(ctx);
+
+    auto * g = ggml_new_graph(ctx);
+    auto * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 513);
+    ggml_set_input(a);
+
+    const auto fork = [&](ggml_tensor * input, const char * name) {
+        auto * root = ggml_scale(ctx, ggml_neg(ctx, input), 0.5f);
+        ggml_set_name(root, name);
+        ggml_set_output(root);
+
+        auto * v = ggml_sqr(ctx, ggml_neg(ctx, root));
+        auto * t = ggml_scale(ctx, ggml_sqr(ctx, root), 2.0f);
+        auto * q = ggml_scale(ctx, ggml_relu(ctx, root), 3.0f);
+
+        for (auto * branch : {v, t, q}) {
+            ggml_set_output(branch);
+            ggml_build_forward_expand(g, branch);
+        }
+
+        auto * out = ggml_scale(ctx, ggml_add(ctx, ggml_add(ctx, v, t), q), 0.125f);
+        ggml_set_output(out);
+        ggml_build_forward_expand(g, out);
+
+        return out;
+    };
+
+    auto * out_a = fork(a, "attn_norm_A");
+    auto * bridge_sqr = ggml_sqr(ctx, out_a);
+    auto * bridge = ggml_scale(ctx, bridge_sqr, 0.0625f);
+    ggml_set_output(bridge);
+    ggml_build_forward_expand(g, bridge);
+
+    auto * out_b = fork(bridge, "attn_norm_B");
+
+    ggml_tensor * tail_neg = nullptr;
+    ggml_tensor * tail_sqr = nullptr;
+    auto * out = out_b;
+    if (tail) {
+        tail_neg = ggml_neg(ctx, out_b);
+        tail_sqr = ggml_sqr(ctx, tail_neg);
+        out = ggml_scale(ctx, tail_sqr, 0.25f);
+        ggml_set_output(out);
+        ggml_build_forward_expand(g, out);
+    }
+
+    auto sched = ggml_backend_sched_new(backends, nullptr, 2, 2048, false, true);
+    REQUIRE(sched);
+    ggml_backend_sched_set_tensor_backend(sched, a, backend);
+    for (int i = 0; i < g->n_nodes; ++i) {
+        ggml_backend_sched_set_tensor_backend(sched, g->nodes[i], backend);
+    }
+
+    for (auto * node : {bridge_sqr, bridge, tail_neg, tail_sqr}) {
+        if (node) {
+            ggml_backend_sched_set_tensor_backend(sched, node, cpu);
+        }
+    }
+
+    REQUIRE(ggml_backend_sched_alloc_graph(sched, g));
+
+    const auto reference_fork = [](float input) {
+        const float root = -input * 0.5f;
+        const float v = root * root;
+        const float t = v * 2.0f;
+        const float q = std::max(root, 0.0f) * 3.0f;
+
+        return ((v + t) + q) * 0.125f;
+    };
+
+    ggml_tensor * outputs[] = {out_a, bridge, out_b, out};
+    std::vector<float> expected[4];
+    for (auto & values : expected) {
+        values.resize(513);
+    }
+
+    for (int repeat = 0; repeat < 8; ++repeat) {
+#ifdef USE_CUDA_GRAPH
+        if (repeat == 4) {
+            auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+            cuda_ctx->evict_cuda_graphs(ggml_time_us() + 11'000'000);
+        }
+#endif
+
+        std::vector<float> input(513);
+        for (int i = 0; i < 513; ++i) {
+            input[i] = float(i % 4 - 2) * (1.0f + 0.125f * repeat);
+            expected[0][i] = reference_fork(input[i]);
+            expected[1][i] = expected[0][i] * expected[0][i] * 0.0625f;
+            expected[2][i] = reference_fork(expected[1][i]);
+            expected[3][i] = expected[2][i] * expected[2][i] * 0.25f;
+        }
+
+        ggml_backend_tensor_set(a, input.data(), 0, input.size() * sizeof(float));
+
+        uint64_t before[HIPRTC_TEST_COUNTER_COUNT], after[HIPRTC_TEST_COUNTER_COUNT];
+        observer_snapshot(before);
+        REQUIRE(ggml_backend_sched_graph_compute(sched, g) == GGML_STATUS_SUCCESS);
+        observer_snapshot(after);
+
+        for (int output = 0; output < (tail ? 4 : 3); ++output) {
+            std::vector<float> actual(513);
+            ggml_backend_tensor_get(outputs[output], actual.data(), 0, actual.size() * sizeof(float));
+
+            for (int i = 0; i < 513; ++i) {
+                REQUIRE(std::fabs(actual[i] - expected[output][i]) <= 2e-6f * std::max(1.0f, std::fabs(expected[output][i])));
+            }
+        }
+
+        if (repeat == 0 || repeat == 4) {
+            // Each region needs three fork waits and three join waits.
+            REQUIRE(after[HIPRTC_TEST_STREAM_WAIT] - before[HIPRTC_TEST_STREAM_WAIT] >= 12);
+        }
+    }
+
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(cpu);
+    ggml_backend_free(backend);
+    ggml_free(ctx);
+}
+
+static void split_streams() {
+    split_streams_case(false);
+    split_streams_case(true);
+    std::puts("split streams: both GPU regions survive CPU work and a non-concurrent GPU tail");
+}
+
 #include "hiprtc-fusion-bench.h"
 #endif
 
@@ -2657,7 +2853,8 @@ int main(int argc, char ** argv) {
 
 #ifndef USE_CUDA_GRAPH
     if (std::strcmp(argv[1], "capture") == 0 || std::strcmp(argv[1], "capture-limits") == 0 ||
-        std::strcmp(argv[1], "concurrency-capture") == 0 || std::strcmp(argv[1], "streams") == 0) {
+        std::strcmp(argv[1], "concurrency-capture") == 0 || std::strcmp(argv[1], "streams") == 0 ||
+        std::strcmp(argv[1], "split-streams") == 0) {
         std::fputs("This mode requires GGML_HIP_GRAPHS=ON\n", stderr);
         return 77;
     }
@@ -2701,6 +2898,8 @@ int main(int argc, char ** argv) {
 #ifdef __linux__
     } else if (std::strcmp(argv[1], "streams") == 0) {
         streams();
+    } else if (std::strcmp(argv[1], "split-streams") == 0) {
+        split_streams();
     } else if (std::strcmp(argv[1], "bench") == 0) {
         bench();
     } else if (std::strcmp(argv[1], "capture") == 0) {

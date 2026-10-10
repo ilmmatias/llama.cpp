@@ -427,7 +427,6 @@ You can download it from your Linux distro's package manager or from here: [ROCm
 The environment variable [`HIP_VISIBLE_DEVICES`](https://rocm.docs.amd.com/en/latest/understand/gpu_isolation.html#hip-visible-devices) can be used to specify which GPU(s) will be used.
 If your GPU is not officially supported you can use the environment variable [`HSA_OVERRIDE_GFX_VERSION`] set to a similar GPU, for example 10.3.0 on RDNA2 (e.g. gfx1030, gfx1031, or gfx1035) or 11.0.0 on RDNA3. Note that [`HSA_OVERRIDE_GFX_VERSION`] is [not supported on Windows](https://github.com/ROCm/ROCm/issues/2654)
 
-
 ### Paged QSA KV cache
 
 For Qwen4Exp on CUDA/HIP, `LLAMA_QSA_KV_RESIDENT=16384` keeps a bounded KV page cache in GPU memory and authoritative KV data in mapped host memory. The resident token budget is rounded down to a multiple of four and must be smaller than the context size. This does not change the model's QSA selection threshold.
@@ -438,7 +437,7 @@ Page resolution marks the complete selection union and collects unique misses in
 
 Configure with `-DGGML_HIP_RTC=ON` to link the optional HIPRTC compiler, then set `GGML_HIP_RTC_FUSION=1` at runtime to enable fusion. Both switches default to off; ordinary HIP and CUDA builds do not require HIPRTC. CMake uses `hiprtc::hiprtc` when available, otherwise searches for `hip/hiprtc.h` and `libhiprtc` under the ROCm include/lib/lib64 paths.
 
-With `GGML_HIP_GRAPHS=ON`, RTC kernels and ordinary HIP kernels can share a captured graph. Plans are retained per backend subgraph, so interleaved CPU/GPU execution can reuse them. Tensor metadata and concurrent-stream topology are checked before replay; changing input values does not require recapture. With `GGML_CUDA_GRAPH_OPT=1`, RTC fusion is allowed outside fork/join regions and within individual branches. Fusion preserves stream transitions and fork/join synchronization; two-stage reductions use separate scratch buffers for each stream.
+With `GGML_HIP_GRAPHS=ON`, RTC kernels and ordinary HIP kernels can share a captured graph. Plans are retained per backend subgraph, so interleaved CPU/GPU execution can reuse them. Concurrent-stream metadata follows the same per-subgraph graph-cache lifetime and is rebuilt after cache eviction. Tensor metadata and concurrent-stream topology are checked before replay; changing input values does not require recapture. With `GGML_CUDA_GRAPH_OPT=1`, RTC fusion is allowed outside fork/join regions and within individual branches. Fusion preserves stream transitions and fork/join synchronization; two-stage reductions use separate scratch buffers for each stream.
 
 Matrix and attention operations retain their existing native or vendor-library implementations and specialized fusions. HIPRTC does not generate these computations or add generic runtime-interpreted epilogues to their kernels.
 

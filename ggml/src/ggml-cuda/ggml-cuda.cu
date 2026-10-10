@@ -718,15 +718,16 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    ggml_cuda_set_device(device);
+    if (streams[device][0]) {
+        CUDA_CHECK(cudaStreamSynchronize(streams[device][0]));
+    }
+#ifdef USE_CUDA_GRAPH
+    active_stream_context = nullptr;
+    cuda_graphs.clear();
+#endif
 #ifdef GGML_HIP_RTC
     if (rtc_fusion) {
-        ggml_cuda_set_device(device);
-        if (streams[device][0]) {
-            CUDA_CHECK(cudaStreamSynchronize(streams[device][0]));
-        }
-#ifdef USE_CUDA_GRAPH
-        cuda_graphs.clear();
-#endif
         ggml_cuda_rtc_fusion_free(*this);
     }
 #endif
@@ -3947,6 +3948,7 @@ int ggml_cuda_fusion_stream_end(
     for (const auto & [fork, event] : ctx.stream_context().concurrent_events) {
         const auto start = event.stream_mapping.find(graph->nodes[first]);
         const int stream = start == event.stream_mapping.end() ? 0 : start->second;
+
         for (int j = first; j < end; ++j) {
             const ggml_tensor * node = graph->nodes[j];
             const auto mapped = event.stream_mapping.find(node);
@@ -3955,12 +3957,14 @@ int ggml_cuda_fusion_stream_end(
                 end = j;
                 break;
             }
+
             if (node == fork) {
                 end = j + 1;
                 break;
             }
         }
     }
+
     return end;
 }
 
@@ -5235,7 +5239,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     ggml_cuda_stream_context & stream_ctx = cuda_ctx->stream_context();
     bool                         is_concurrent_event_active = false;
     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
-    bool                         should_launch_concurrent_events = false;
 
     const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
         if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
@@ -5262,67 +5265,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
 
-            if (stream_ctx.concurrent_events.size() > 0) {
-                should_launch_concurrent_events = true;
-                for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
-                    should_launch_concurrent_events = should_launch_concurrent_events && event.is_valid();
-                }
-            }
-
-            if (should_launch_concurrent_events) {
-                // Restore original node order within each concurrent region to enable fusion within streams
-
-                std::unordered_map<const ggml_tensor *, int> node_to_idx;
-                node_to_idx.reserve(cgraph->n_nodes);
-                for (int i = 0; i < cgraph->n_nodes; ++i) {
-                    node_to_idx[cgraph->nodes[i]] = i;
-                }
-
-                for (auto & [fork_node, event] : stream_ctx.concurrent_events) {
-                    // Find positions of all nodes from this event in the current graph
-                    std::vector<int> positions;
-                    positions.reserve(event.original_order.size());
-
-                    bool all_found = true;
-                    for (const ggml_tensor * orig_node : event.original_order) {
-                        auto it = node_to_idx.find(orig_node);
-                        if (it != node_to_idx.end()) {
-                            positions.push_back(it->second);
-                        } else {
-                            all_found = false;
-                            break;
-                        }
-                    }
-
-                    if (!all_found || positions.size() != event.original_order.size()) {
-                        continue;
-                    }
-
-                    // Sort positions to get contiguous range
-                    std::vector<int> sorted_positions = positions;
-                    std::sort(sorted_positions.begin(), sorted_positions.end());
-
-                    bool is_contiguous = true;
-                    for (size_t i = 1; i < sorted_positions.size(); ++i) {
-                        if (sorted_positions[i] != sorted_positions[i-1] + 1) {
-                            is_contiguous = false;
-                            break;
-                        }
-                    }
-
-                    if (!is_contiguous) {
-                        continue;
-                    }
-
-                    // Restore original order at the sorted positions
-                    int start_pos = sorted_positions[0];
-                    for (size_t i = 0; i < event.original_order.size(); ++i) {
-                        cgraph->nodes[start_pos + i] = const_cast<ggml_tensor *>(event.original_order[i]);
-                    }
-                }
-            } else {
-                stream_ctx.concurrent_events.clear();
-            }
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -5469,10 +5411,52 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+static bool ggml_cuda_graph_optimization_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_GRAPH_OPT");
+        return env != nullptr && atoi(env) == 1;
+    }();
+
+    return enabled;
+}
+
+#ifdef USE_CUDA_GRAPH
+static void ggml_cuda_graph_optimize_concurrency(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, bool interleave);
+#endif
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    cuda_ctx->active_stream_context = nullptr;
+#ifdef USE_CUDA_GRAPH
+    if (ggml_cuda_graph_optimization_enabled() && cgraph->n_nodes > 0) {
+        const void * key = ggml_cuda_graph_get_key(cgraph);
+        if (ggml_cuda_graph_set_enabled(cuda_ctx, key)) {
+            auto * owner = cuda_ctx->cuda_graph(key);
+            if (owner->stream_context.n_nodes != cgraph->n_nodes) {
+                ggml_cuda_graph_optimize_concurrency(cuda_ctx, cgraph, false);
+            }
+
+            cuda_ctx->active_stream_context = &owner->stream_context;
+
+            for (const auto & entry : owner->stream_context.concurrent_events) {
+                const auto & event = entry.second;
+                const int start = event.fork_index + 1;
+                GGML_ASSERT(start > 0 && start < cgraph->n_nodes &&
+                            event.original_order.size() < size_t(cgraph->n_nodes - start));
+                GGML_ASSERT(cgraph->nodes[event.fork_index] == entry.first &&
+                            cgraph->nodes[start + event.original_order.size()] == event.join_node);
+
+                if (!std::equal(event.original_order.begin(), event.original_order.end(), cgraph->nodes + start)) {
+                    for (size_t i = 0; i < event.original_order.size(); ++i) {
+                        cgraph->nodes[start + i] = const_cast<ggml_tensor *>(event.original_order[i]);
+                    }
+                }
+            }
+        }
+    }
+#endif
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -5569,6 +5553,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #endif
 #endif
 
+    if (!use_cuda_graph || cuda_graph_update_required) {
+        auto & events = cuda_ctx->stream_context().concurrent_events;
+        const bool valid = std::all_of(events.begin(), events.end(),
+                                      [](const auto & entry) { return entry.second.is_valid(); });
+        if (!valid) {
+            CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream(cuda_ctx->device, 0)));
+#ifdef USE_CUDA_GRAPH
+            cuda_ctx->cuda_graph(graph_key)->reset();
+#endif
+            events.clear();
+            use_cuda_graph = false;
+            cuda_graph_update_required = false;
+        }
+    }
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -5584,7 +5583,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (!use_cuda_graph) {
         ggml_cuda_rtc_fusion_record(*cuda_ctx, rtc_graph);
 #ifdef USE_CUDA_GRAPH
-        if (rtc_graph && !rtc_graph->rtc_plan) {
+        if (rtc_graph && !rtc_graph->rtc_plan && rtc_graph->stream_context.n_nodes < 0) {
+            cuda_ctx->active_stream_context = nullptr;
             cuda_ctx->cuda_graphs.erase(graph_key);
         }
 #endif
@@ -5762,21 +5762,42 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     GGML_UNUSED(cgraph);
 #endif
 
-    static bool enable_graph_optimization = [] {
-        const char * env     = getenv("GGML_CUDA_GRAPH_OPT");
-        return env != nullptr && atoi(env) == 1;
-    }();
-
-    if (!enable_graph_optimization) {
+    if (!ggml_cuda_graph_optimization_enabled()) {
         return;
     }
 
-    ggml_cuda_stream_context & stream_context = cuda_ctx->stream_context();
-    stream_context.reset();
-
-    if (!use_cuda_graph) {
-        return;
+#ifdef USE_CUDA_GRAPH
+    if (use_cuda_graph && cgraph->n_nodes > 0) {
+        ggml_cuda_graph_optimize_concurrency(cuda_ctx, cgraph, true);
     }
+#else
+    GGML_UNUSED(use_cuda_graph);
+#endif
+}
+
+#ifdef USE_CUDA_GRAPH
+static void ggml_cuda_graph_optimize_concurrency(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, bool interleave) {
+    auto * graph = cuda_ctx->cuda_graph(ggml_cuda_graph_get_key(cgraph));
+    auto & stream_context = graph->stream_context;
+    auto & concurrent_events = stream_context.concurrent_events;
+    cuda_ctx->active_stream_context = &stream_context;
+    stream_context.n_nodes = cgraph->n_nodes;
+
+    for (auto & entry : concurrent_events) {
+        entry.second.retained = false;
+    }
+
+    bool changed = false;
+    const auto invalidate = [&] {
+        if (!changed) {
+            if (cuda_ctx->streams[cuda_ctx->device][0]) {
+                CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->streams[cuda_ctx->device][0]));
+            }
+
+            graph->reset();
+            changed = true;
+        }
+    };
 
     ggml_cuda_set_device(cuda_ctx->device);
 
@@ -5838,7 +5859,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     for (const auto & [root_node, count] : fan_out) {
         if (count >= min_fan_out && count <= max_fan_out) {
-            const int root_node_idx = node_indices[root_node];
+            const auto root = node_indices.find(root_node);
+            if (root == node_indices.end()) {
+                continue;
+            }
+            const int root_node_idx = root->second;
 
             // only optimize for attn_norm
             // TODO: make this more generic
@@ -5914,15 +5939,6 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
 
             if (join_node) {
-                //Create ggml_cuda_concurrent_event
-                ggml_cuda_concurrent_event concurrent_event(nodes_per_branch.size());
-                concurrent_event.join_node = join_node;
-
-                for (size_t branch_idx = 0; branch_idx < nodes_per_branch.size(); branch_idx++) {
-                    for (const ggml_tensor * n : nodes_per_branch[branch_idx]) {
-                        concurrent_event.stream_mapping[n] = branch_idx + 1;
-                    }
-                }
 
                 int fork_node_idx = node_indices[root_node];
                 int join_node_idx = node_indices[join_node];
@@ -5932,7 +5948,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 const int n_branches         = nodes_per_branch.size();
 
                 int total_branch_nodes = 0;
-                for (std::vector<const ggml_tensor *> branch_nodes : nodes_per_branch) {
+                for (const auto & branch_nodes : nodes_per_branch) {
                     total_branch_nodes += branch_nodes.size();
                 }
 
@@ -5946,18 +5962,53 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     continue;
                 }
 
-                // Save the original order of nodes in this region before interleaving
-                // This is used later to restore grouping for fusion within streams
-                concurrent_event.original_order.reserve(total_branch_nodes);
-                for (int i = fork_node_idx + 1; i < join_node_idx; ++i) {
-                    concurrent_event.original_order.push_back(cgraph->nodes[i]);
+                auto previous = concurrent_events.find(root_node);
+                bool reuse = previous != concurrent_events.end() &&
+                    previous->second.n_streams == n_branches &&
+                    previous->second.join_node == join_node &&
+                    previous->second.fork_index == fork_node_idx &&
+                    previous->second.stream_mapping.size() == size_t(total_branch_nodes) &&
+                    previous->second.original_order.size() == size_t(total_branch_nodes) &&
+                    std::equal(previous->second.original_order.begin(), previous->second.original_order.end(),
+                               cgraph->nodes + fork_node_idx + 1);
+
+                if (reuse) {
+                    for (size_t branch = 0; branch < nodes_per_branch.size(); ++branch) {
+                        for (const auto * node : nodes_per_branch[branch]) {
+                            const auto mapped = previous->second.stream_mapping.find(node);
+                            reuse = reuse && mapped != previous->second.stream_mapping.end() &&
+                                    mapped->second == int(branch + 1);
+                        }
+                    }
                 }
 
-                std::unordered_map<const ggml_tensor *, ggml_cuda_concurrent_event> & concurrent_events = cuda_ctx->stream_context().concurrent_events;
-                GGML_ASSERT(concurrent_events.find(root_node) == concurrent_events.end());
-                concurrent_events.emplace(root_node, std::move(concurrent_event));
+                if (!reuse) {
+                    invalidate();
+                    if (previous != concurrent_events.end()) {
+                        concurrent_events.erase(previous);
+                    }
+
+                    ggml_cuda_concurrent_event event(n_branches);
+                    event.join_node = join_node;
+                    event.fork_index = fork_node_idx;
+                    event.original_order.assign(cgraph->nodes + fork_node_idx + 1, cgraph->nodes + join_node_idx);
+
+                    for (size_t branch = 0; branch < nodes_per_branch.size(); ++branch) {
+                        for (const auto * node : nodes_per_branch[branch]) {
+                            event.stream_mapping.emplace(node, branch + 1);
+                        }
+                    }
+
+                    previous = concurrent_events.emplace(root_node, std::move(event)).first;
+                }
+
+                previous->second.retained = true;
+
                 GGML_LOG_DEBUG("Adding stream at node %s %p\n", root_node->name, root_node);
                 concurrent_node_ranges.emplace_back(fork_node_idx, join_node_idx);
+                if (!interleave) {
+                    continue;
+                }
 
                 // interleave tensors to extend lifetimes so that ggml graph doesn't recycle them
                 // example transformation:
@@ -5967,7 +6018,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     std::vector<const ggml_tensor *> & branch_nodes = nodes_per_branch[current_branch_idx];
 
                     bool has_node = false;
-                    for (std::vector<const ggml_tensor *> branch_node : nodes_per_branch) {
+                    for (const auto & branch_node : nodes_per_branch) {
                         has_node |= branch_node.size() > 0;
                     }
 
@@ -5994,7 +6045,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
     }
+    for (auto it = concurrent_events.begin(); it != concurrent_events.end();) {
+        if (!it->second.retained) {
+            invalidate();
+            it = concurrent_events.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
+#endif
 
 static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .get_name                = */ ggml_backend_cuda_get_name,

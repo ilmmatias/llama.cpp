@@ -48,6 +48,7 @@ static bool fusion_layout(const ggml_tensor * tensor, uint64_t & n) {
     if (!tensor || (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16 && tensor->type != GGML_TYPE_BF16)) {
         return false;
     }
+
     const size_t element = ggml_type_size(tensor->type);
 
     n = 1;
@@ -59,9 +60,11 @@ static bool fusion_layout(const ggml_tensor * tensor, uint64_t & n) {
             uint64_t(tensor->ne[d] - 1) > (SIZE_MAX - span) / (tensor->nb[d] ? tensor->nb[d] : 1)) {
             return false;
         }
+
         n *= uint64_t(tensor->ne[d]);
         span += size_t(tensor->ne[d] - 1) * tensor->nb[d];
     }
+
     if (n > SIZE_MAX / element) {
         return false;
     }
@@ -73,15 +76,18 @@ static bool fusion_layout(const ggml_tensor * tensor, uint64_t & n) {
             order[j] = previous;
         }
     }
+
     span = element;
     for (int d : order) {
         if (tensor->ne[d] > 1) {
             if (tensor->nb[d] < span) {
                 return false;
             }
+
             span += size_t(tensor->ne[d] - 1) * tensor->nb[d];
         }
     }
+
     return true;
 }
 
@@ -102,10 +108,12 @@ static bool fusion_reduction_input(const ggml_tensor * node, const ggml_tensor *
 static ggml_fusion_access fusion_access(const ggml_tensor * tensor) {
     ggml_fusion_access access;
     access.type = tensor->type;
+
     for (int d = 0; d < 4; ++d) {
         access.ne[d] = tensor->ne[d];
         access.nb[d] = tensor->nb[d];
     }
+
     return access;
 }
 
@@ -113,20 +121,22 @@ static bool fusion_source(const ggml_tensor * source, const ggml_tensor * node, 
     if (!fusion_layout(source, n)) {
         return false;
     }
+
     if (fusion_binary(node->op) && slot == 1) {
         for (int d = 0; d < 4; ++d) {
             if (node->ne[d] % source->ne[d]) {
                 return false;
             }
         }
+
         return true;
     }
-    return ggml_are_same_shape(source, node) &&
-        (fusion_binary(node->op) || ggml_is_contiguous(source));
+    return ggml_are_same_shape(source, node) && (fusion_binary(node->op) || ggml_is_contiguous(source));
 }
 
 static bool fusion_types(const ggml_tensor * node) {
     const auto a = node->src[0]->type;
+
     if (fusion_binary(node->op)) {
         const auto b = node->src[1]->type;
         return (a == GGML_TYPE_F32 && b != GGML_TYPE_BF16 && node->type == GGML_TYPE_F32) ||
@@ -134,6 +144,7 @@ static bool fusion_types(const ggml_tensor * node) {
                 (node->type == GGML_TYPE_F16 || (b == GGML_TYPE_F32 && node->type == GGML_TYPE_F32))) ||
             (a == GGML_TYPE_BF16 && (b == GGML_TYPE_BF16 || b == GGML_TYPE_F32) && node->type == GGML_TYPE_BF16);
     }
+
     return node->type == a && (node->op != GGML_OP_SCALE || a != GGML_TYPE_F16) &&
         (node->op != GGML_OP_CLAMP || a != GGML_TYPE_BF16);
 }
@@ -144,6 +155,7 @@ static int fusion_member(const ggml_cgraph * graph, int start, int count, const 
             return i;
         }
     }
+
     return -1;
 }
 
@@ -161,9 +173,11 @@ struct fusion_builder {
         if (references[member] >= 0) {
             return references[member];
         }
+
         if (visiting[member]) {
             return -1;
         }
+
         visiting[member] = true;
 
         const auto * node = graph->nodes[start + member];
@@ -182,10 +196,12 @@ struct fusion_builder {
                 if (internal >= member) {
                     return -1;
                 }
+
                 value.src[s] = visit(internal);
                 if (value.src[s] < 0) {
                     return -1;
                 }
+
                 continue;
             }
 
@@ -211,15 +227,18 @@ struct fusion_builder {
                     program.accesses[slot].domain != access.domain)) {
                 ++slot;
             }
+
             if (slot == program.inputs) {
                 if (slot == GGML_FUSION_MAX_INPUTS) {
                     return -1;
                 }
+
                 region.inputs[slot] = source;
                 program.accesses[slot] = access;
                 program.indexed |= access.repeat || !ggml_is_contiguous(source);
                 ++program.inputs;
             }
+
             value.src[s] = -1 - slot;
         }
 
@@ -241,6 +260,7 @@ struct fusion_builder {
         program.values[reference] = value;
         references[member] = reference;
         visiting[member] = false;
+
         return reference;
     }
 };
@@ -248,11 +268,13 @@ struct fusion_builder {
 static bool fusion_connected(const ggml_cgraph * graph, int start, int count) {
     bool reached[GGML_FUSION_MAX_VALUES] = {};
     reached[0] = true;
+
     for (int pass = 0; pass < count; ++pass) {
         for (int i = 0; i < count; ++i) {
             if (!reached[i]) {
                 continue;
             }
+
             const auto * a = graph->nodes[start + i];
             for (int j = 0; j < count; ++j) {
                 const auto * b = graph->nodes[start + j];
@@ -260,6 +282,7 @@ static bool fusion_connected(const ggml_cgraph * graph, int start, int count) {
                     if (a->src[s] == b) {
                         reached[j] = true;
                     }
+
                     for (int t = 0; t < fusion_sources(b); ++t) {
                         if (b->src[t] == a || b->src[t] == a->src[s]) {
                             reached[j] = true;
@@ -269,17 +292,20 @@ static bool fusion_connected(const ggml_cgraph * graph, int start, int count) {
             }
         }
     }
+
     for (int i = 0; i < count; ++i) {
         if (!reached[i]) {
             return false;
         }
     }
+
     return true;
 }
 
 static bool fusion_liveness(const ggml_fusion_program & program) {
     int input_last[GGML_FUSION_MAX_INPUTS] = {};
     int value_last[GGML_FUSION_MAX_VALUES] = {};
+
     for (int i = 0; i < program.count; ++i) {
         const auto & value = program.values[i];
         const int sources = fusion_binary(value.op) ? 2 : 1;
@@ -293,6 +319,7 @@ static bool fusion_liveness(const ggml_fusion_program & program) {
             }
         }
     }
+
     for (int i = 0; i < program.outputs; ++i) {
         value_last[program.roots[i]] = program.count;
     }
@@ -300,18 +327,22 @@ static bool fusion_liveness(const ggml_fusion_program & program) {
     if (program.inputs > 24) {
         return false;
     }
+
     for (int i = 0; i < program.count; ++i) {
         int live = 1;
         for (int k = 0; k < program.inputs; ++k) {
             live += input_last[k] >= i;
         }
+
         for (int j = 0; j < i; ++j) {
             live += value_last[j] >= i;
         }
+
         if (live > 24) {
             return false;
         }
     }
+
     return true;
 }
 
@@ -321,9 +352,11 @@ static bool fusion_mark_domain(const ggml_cgraph * graph, int start, int count, 
         domains[member] = 2;
         return true;
     }
+
     if (domains[member]) {
         return domains[member] == domain;
     }
+
     domains[member] = domain;
     const auto * node = graph->nodes[start + member];
     for (int s = 0; s < fusion_sources(node); ++s) {
@@ -332,6 +365,7 @@ static bool fusion_mark_domain(const ggml_cgraph * graph, int start, int count, 
             return false;
         }
     }
+
     return true;
 }
 
@@ -357,13 +391,16 @@ bool ggml_fusion_build(const ggml_cgraph * graph, int start, ggml_fusion_region 
                 (node->op == GGML_OP_SUM ? elements > 16777216 : node->src[0]->ne[0] > 4096)) {
                 break;
             }
+
             if (node->op != GGML_OP_RMS_NORM && fusion_sources(node->src[0]) &&
                 fusion_member(graph, start, count, node->src[0]) < 0) {
                 break;
             }
+
             reduction = count;
             shape = node;
         }
+
         if (!sources || !(node->flags & GGML_TENSOR_FLAG_COMPUTE) ||
             (node->view_src && node->op != GGML_OP_RMS_NORM) ||
             !fusion_dense(node, shape, n)) {
@@ -378,9 +415,11 @@ bool ggml_fusion_build(const ggml_cgraph * graph, int start, ggml_fusion_region 
                 valid = valid && node->src[s] == nullptr;
             }
         }
+
         if (!valid || !fusion_types(node)) {
             break;
         }
+
         ops[count++] = node->op;
     }
 
@@ -406,18 +445,21 @@ bool ggml_fusion_build(const ggml_cgraph * graph, int start, ggml_fusion_region 
                     region.uses[i] += consumer->src[s] == node;
                 }
             }
+
             if ((node->flags & GGML_TENSOR_FLAG_OUTPUT) || (node->view_src && node->op == GGML_OP_RMS_NORM) ||
                 ggml_node_get_use_count(graph, start + i) > region.uses[i] || region.uses[i] == 0) {
                 if (program.outputs == GGML_FUSION_MAX_OUTPUTS) {
                     valid = false;
                     break;
                 }
+
                 const int slot = program.outputs++;
                 region.outputs[slot] = node;
                 region.output_indices[slot] = start + i;
                 program.stores[slot] = fusion_access(node);
             }
         }
+
         uint8_t domains[GGML_FUSION_MAX_VALUES] = {};
         const int reduced = reduction < count ? reduction : -1;
         if (valid && reduced >= 0) {
@@ -428,6 +470,7 @@ bool ggml_fusion_build(const ggml_cgraph * graph, int start, ggml_fusion_region 
                 valid = fusion_mark_domain(graph, start, count, region.output_indices[k] - start, reduced, 2, domains);
                 program.stores[k].domain = 2;
             }
+
             int producers = 0;
             for (int i = 0; valid && i < count; ++i) {
                 const auto * node = graph->nodes[start + i];
@@ -438,16 +481,19 @@ bool ggml_fusion_build(const ggml_cgraph * graph, int start, ggml_fusion_region 
                         ggml_node_get_use_count(graph, start + i) == region.uses[i] && region.uses[i] > 0;
                 }
             }
+
             uint64_t elements;
             valid = valid && fusion_reduction_input(reduce, reduce->src[0], elements);
             if (valid && reduce->op == GGML_OP_SUM && elements > 4096 && producers < 2) {
                 valid = false;
             }
         }
+
         if (!valid || !ggml_can_fuse_subgraph_ext(graph, region.members, count, ops,
                                                 region.output_indices, program.outputs)) {
             continue;
         }
+
         const auto * domain_shape = reduced >= 0 ? graph->nodes[start + reduced]->src[0] : graph->nodes[last];
         fusion_layout(domain_shape, region.n);
         for (int d = 0; d < 4; ++d) {
@@ -458,14 +504,17 @@ bool ggml_fusion_build(const ggml_cgraph * graph, int start, ggml_fusion_region 
         for (int & reference : builder.references) {
             reference = -1;
         }
+
         for (int k = 0; k < program.outputs; ++k) {
             const int root = builder.visit(region.output_indices[k] - start);
             if (root < 0) {
                 valid = false;
                 break;
             }
+
             program.roots[k] = root;
         }
+
         if (valid && reduced >= 0) {
             program.reduction.value = builder.references[reduced];
             program.reduction.axes = graph->nodes[start + reduced]->op == GGML_OP_SUM ? 15 : 1;
@@ -477,10 +526,12 @@ bool ggml_fusion_build(const ggml_cgraph * graph, int start, ggml_fusion_region 
                 }
             }
         }
+
         if (valid && program.count == count && fusion_liveness(program)) {
             return true;
         }
     }
+
     return false;
 }
 
@@ -492,6 +543,7 @@ bool ggml_fusion_make_key(const ggml_fusion_program & program, const ggml_fusion
             valid = false;
             return;
         }
+
         for (size_t i = 0; i < bytes; ++i) {
             key.bytes[key.size++] = uint8_t(value >> (8 * i));
         }
@@ -515,6 +567,7 @@ bool ggml_fusion_make_key(const ggml_fusion_program & program, const ggml_fusion
             put(program.ne[d], 8);
         }
     }
+
     for (int i = 0; i < program.count; ++i) {
         const auto & value = program.values[i];
         put(value.op, 4);
@@ -526,11 +579,14 @@ bool ggml_fusion_make_key(const ggml_fusion_program & program, const ggml_fusion
         if (fusion_binary(value.op)) {
             put(value.src[1], 4);
         }
+
         if (value.param >= 0) {
             put(value.param, 4);
         }
+
         put(value.domain, 1);
     }
+
     for (int i = 0; i < program.inputs; ++i) {
         const auto & access = program.accesses[i];
         put(access.type, 4);
@@ -543,6 +599,7 @@ bool ggml_fusion_make_key(const ggml_fusion_program & program, const ggml_fusion
             }
         }
     }
+
     for (int i = 0; i < program.outputs; ++i) {
         put(program.roots[i], 4);
         put(program.stores[i].type, 4);
@@ -558,5 +615,6 @@ bool ggml_fusion_make_key(const ggml_fusion_program & program, const ggml_fusion
     put(schedule.tile, 4);
     put(schedule.stages, 4);
     put(schedule.scratch, 8);
+
     return valid;
 }

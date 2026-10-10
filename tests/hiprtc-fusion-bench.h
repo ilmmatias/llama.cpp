@@ -69,6 +69,7 @@ static ggml_cgraph * fusion_bench_build_graph(ggml_context * ctx, const std::str
         for (int i = 0; i < 8; ++i) {
             auto * input = i == 0 ? b : ggml_new_tensor(ctx, type, 4, ne.data());
             branches[i] = ggml_add(ctx, a, input);
+
             if (name == "many_output") {
                 ggml_set_output(branches[i]);
                 outputs.push_back(branches[i]);
@@ -155,6 +156,7 @@ static std::vector<std::vector<unsigned char>> fusion_bench_reference(ggml_backe
         auto node = ggml_graph_view(graph, i, i + 1);
         REQUIRE(ggml_backend_graph_compute(backend, &node) == GGML_STATUS_SUCCESS);
     }
+
     ggml_backend_synchronize(backend);
 
     std::vector<std::vector<unsigned char>> reference;
@@ -240,6 +242,7 @@ static void fusion_bench_case(const std::string & name, ggml_type type, std::arr
     for (int i = 0; i < 20; ++i) {
         REQUIRE(ggml_backend_graph_compute_async(backend, graph) == GGML_STATUS_SUCCESS);
     }
+
     ggml_backend_synchronize(backend);
 
     auto & cuda_ctx = *static_cast<ggml_backend_cuda_context *>(backend->context);
@@ -275,6 +278,7 @@ static void fusion_bench_case(const std::string & name, ggml_type type, std::arr
                 REQUIRE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
                 ggml_backend_synchronize(backend);
             }
+
             us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - begin).count() / 100.0;
         }
     }
@@ -337,26 +341,33 @@ static void bench() {
                 fusion_bench_case(name, type, {n, 1, 1, 1});
             }
         }
+
         for (int64_t n : {240, 983040}) {
             fusion_bench_case("repeat", type, {n / 24, 6, 2, 2});
         }
+
         for (const char * name : {"padded", "permuted", "gather"}) {
             for (int64_t n : {257, 1048576}) {
                 fusion_bench_case(name, type, {n, 1, 1, 1});
             }
         }
     }
+
     for (const char * name : {"wide", "many_output"}) {
         for (int64_t n : {4096, 1048576}) {
             fusion_bench_case(name, GGML_TYPE_F32, {n, 1, 1, 1});
         }
     }
+
     fusion_bench_case("tiny_indexed", GGML_TYPE_F32, {257, 1, 1, 1});
     fusion_bench_case("large_stride", GGML_TYPE_F32, {4096, 1, 1, 1});
+
     for (auto shape : {std::array<int64_t, 4>{32, 64, 1, 1}, {257, 64, 1, 1}, {4096, 1, 1, 1}, {4096, 64, 1, 1}}) {
         fusion_bench_case("row", GGML_TYPE_F32, shape);
     }
+
     fusion_bench_case("silu_row", GGML_TYPE_F32, {4096, 1, 1, 1});
+
     for (int64_t n : {4096, 4097, 8193, 1048576}) {
         fusion_bench_case("full", GGML_TYPE_F32, {n, 1, 1, 1});
     }

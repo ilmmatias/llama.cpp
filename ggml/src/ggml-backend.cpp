@@ -1886,6 +1886,7 @@ static bool ggml_backend_sched_copy_inputs_batch(
     const auto device_buft = ggml_backend_get_default_buffer_type(upload ? dst_backend : src_backend);
     const auto compatible = [&](struct ggml_tensor * input) {
         struct ggml_tensor * copy = tensor_copy(input, split->backend_id, sched->cur_copy);
+
         return !(input->flags & GGML_TENSOR_FLAG_INPUT) &&
             ggml_backend_sched_get_tensor_backend(sched, input) == src_backend &&
             (upload ? ggml_backend_buffer_is_host(input->buffer) && copy->buffer->buft == device_buft :
@@ -1898,6 +1899,7 @@ static bool ggml_backend_sched_copy_inputs_batch(
             ++begin;
             continue;
         }
+
         if (!compatible(input)) {
             ggml_backend_sched_complete_upload(pending_upload);
             ggml_backend_sched_copy_input(sched, split, input);
@@ -1912,9 +1914,11 @@ static bool ggml_backend_sched_copy_inputs_batch(
             if (ggml_backend_sched_is_host_weight(input)) {
                 continue;
             }
+
             if (!compatible(input)) {
                 break;
             }
+
             GGML_ASSERT(ggml_are_same_layout(input, tensor_copy(input, split->backend_id, sched->cur_copy)));
             ++n_copies;
         }
@@ -1929,6 +1933,7 @@ static bool ggml_backend_sched_copy_inputs_batch(
                 if (ggml_backend_sched_is_host_weight(input)) {
                     continue;
                 }
+
                 struct ggml_tensor * copy = tensor_copy(input, split->backend_id, sched->cur_copy);
                 if (upload) {
                     ggml_backend_tensor_set_async(dst_backend, copy, input->data, 0, ggml_nbytes(input));
@@ -1936,6 +1941,7 @@ static bool ggml_backend_sched_copy_inputs_batch(
                     ggml_backend_tensor_get_async(src_backend, input, copy->data, 0, ggml_nbytes(input));
                 }
             }
+
             if (upload) {
                 pending_upload = dst_backend;
             } else {
@@ -1945,8 +1951,10 @@ static bool ggml_backend_sched_copy_inputs_batch(
                 }
             }
         }
+
         begin = end;
     }
+
     return true;
 }
 
@@ -1961,6 +1969,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
         if (split_backend->iface.synchronize == NULL && pending_upload != NULL &&
                 (prev_backend_id < 0 || sched->backends[prev_backend_id] != pending_upload ||
                  pending_upload->iface.get_tensor_async == NULL)) {

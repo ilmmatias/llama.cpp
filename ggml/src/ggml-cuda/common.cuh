@@ -1341,50 +1341,14 @@ struct ggml_tensor_extra_gpu {
 struct ggml_cuda_rtc_plan;
 #endif
 
-struct ggml_cuda_graph {
-#ifdef GGML_HIP_RTC
-    std::shared_ptr<const ggml_cuda_rtc_plan> rtc_plan;
-#endif
-#ifdef USE_CUDA_GRAPH
-    ~ggml_cuda_graph() {
-        if (instance != nullptr) {
-            CUDA_CHECK(cudaGraphExecDestroy(instance));
-        }
-        if (graph != nullptr) {
-            CUDA_CHECK(cudaGraphDestroy(graph));
-        }
-    }
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t instance = nullptr;
-    size_t num_nodes = 0;
-    std::vector<cudaGraphNode_t> nodes;
-    bool disable_due_to_gpu_arch = false;
-    bool warmup_complete = false;
-    uint64_t uid = 0;
-    int64_t last_used_time = 0;
-    uint64_t pool_flush_count = UINT64_MAX;
-    struct node_properties {
-        ggml_tensor node;
-        void *    node_src_data_ptrs[GGML_MAX_SRC];
-        ggml_type node_src_types[GGML_MAX_SRC];
-        int64_t   node_src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
-        size_t    node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
-    };
-    std::vector<node_properties> node_props;
-
-    bool is_enabled() const {
-        static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
-        return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
-    }
-#endif
-};
-
 struct ggml_cuda_concurrent_event {
     std::vector<cudaEvent_t> join_events;
     cudaEvent_t              fork_event = nullptr;
 
     int                                          n_streams = 0;
     std::unordered_map<const ggml_tensor *, int> stream_mapping;
+    int fork_index = 0;
+    bool retained = false;
 
     // Original order of nodes in this concurrent region (before interleaving)
     // Used to restore grouping for fusion within streams
@@ -1413,7 +1377,9 @@ struct ggml_cuda_concurrent_event {
     , n_streams(other.n_streams)
     , stream_mapping(std::move(other.stream_mapping))
     , original_order(std::move(other.original_order))
-    , join_node(other.join_node) {
+    , join_node(other.join_node)
+    , fork_index(other.fork_index)
+    , retained(other.retained) {
         other.fork_event = nullptr;
     }
 
@@ -1525,9 +1491,59 @@ struct ggml_cuda_concurrent_event {
 struct ggml_cuda_stream_context {
     std::unordered_map<const ggml_tensor *, ggml_cuda_concurrent_event> concurrent_events;
 
+    int n_nodes = -1;
+};
+
+struct ggml_cuda_graph {
+    ggml_cuda_stream_context stream_context;
+#ifdef GGML_HIP_RTC
+    std::shared_ptr<const ggml_cuda_rtc_plan> rtc_plan;
+#endif
+#ifdef USE_CUDA_GRAPH
     void reset() {
-        concurrent_events.clear();
+        if (instance != nullptr) {
+            CUDA_CHECK(cudaGraphExecDestroy(instance));
+            instance = nullptr;
+        }
+
+        if (graph != nullptr) {
+            CUDA_CHECK(cudaGraphDestroy(graph));
+            graph = nullptr;
+        }
+
+        warmup_complete = false;
+#ifdef GGML_HIP_RTC
+        rtc_plan.reset();
+#endif
     }
+
+    ~ggml_cuda_graph() {
+        reset();
+    }
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t instance = nullptr;
+    size_t num_nodes = 0;
+    std::vector<cudaGraphNode_t> nodes;
+    bool disable_due_to_gpu_arch = false;
+    bool warmup_complete = false;
+    uint64_t uid = 0;
+    int64_t last_used_time = 0;
+    uint64_t pool_flush_count = UINT64_MAX;
+    struct node_properties {
+        ggml_tensor node;
+        void *    node_src_data_ptrs[GGML_MAX_SRC];
+        ggml_type node_src_types[GGML_MAX_SRC];
+        int64_t   node_src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
+        size_t    node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
+    };
+    std::vector<node_properties> node_props;
+
+    bool is_enabled() const {
+        static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
+        return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
+    }
+#endif
 };
 
 #ifdef GGML_HIP_RTC
@@ -1567,8 +1583,20 @@ struct ggml_backend_cuda_context {
         // sweep every 5s, evicting cuda graphs unused for >=10s
         if (time_now - last_graph_eviction_sweep >= 5'000'000) {
             last_graph_eviction_sweep = time_now;
+            bool synchronized = false;
+
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
                 if (time_now - it->second->last_used_time >= 10'000'000) {
+                    if (active_stream_context == &it->second->stream_context) {
+                        active_stream_context = nullptr;
+                    }
+
+                    if (!synchronized && streams[device][0]) {
+                        ggml_cuda_set_device(device);
+                        CUDA_CHECK(cudaStreamSynchronize(streams[device][0]));
+                        synchronized = true;
+                    }
+
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;
@@ -1617,6 +1645,7 @@ struct ggml_backend_cuda_context {
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
+    ggml_cuda_stream_context * active_stream_context = nullptr;
 
     ~ggml_backend_cuda_context();
 
@@ -1630,7 +1659,9 @@ struct ggml_backend_cuda_context {
 
     cudaStream_t stream() { return stream(device, curr_stream_no); }
 
-    ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
+    ggml_cuda_stream_context & stream_context() {
+        return active_stream_context ? *active_stream_context : concurrent_stream_context;
+    }
 
     cublasHandle_t cublas_handle() {
         if (cublas_handles[device][curr_stream_no] == nullptr) {

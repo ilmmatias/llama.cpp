@@ -46,9 +46,11 @@ static bool rtc_tensor_valid(const ggml_tensor * tensor, int device) {
                 uint64_t(tensor->ne[d] - 1) > (SIZE_MAX - span) / (tensor->nb[d] ? tensor->nb[d] : 1)) {
                 return false;
             }
+
             n *= uint64_t(tensor->ne[d]);
             span += size_t(tensor->ne[d] - 1) * tensor->nb[d];
         }
+
         if (n > SIZE_MAX / element) {
             return false;
         }
@@ -60,12 +62,14 @@ static bool rtc_tensor_valid(const ggml_tensor * tensor, int device) {
             data > UINTPTR_MAX - span || data + span > base + size) {
             return false;
         }
+
         if (tensor == original) {
             original_span = span;
         } else if (address < data || address > data + span || original_span > data + span - address) {
             return false;
         }
     }
+
     return depth != 0;
 }
 
@@ -167,6 +171,7 @@ static bool rtc_index32(const ggml_fusion_program & program) {
         if (extent <= 0 || uint64_t(extent) > UINT32_MAX / n) {
             return false;
         }
+
         n *= uint64_t(extent);
     }
 
@@ -183,6 +188,7 @@ static bool rtc_flat_access(const ggml_fusion_access & access) {
         if (access.ne[d] > 1 && access.nb[d] != stride) {
             return false;
         }
+
         stride *= uint64_t(access.ne[d]);
     }
 
@@ -405,8 +411,7 @@ static void rtc_reduce_loads(std::string & source, const ggml_fusion_program & p
             }
         }
 
-        source += "        float x" + std::to_string(k) + " = *(const float *)(in" + std::to_string(k) +
-            " + " + offset + ");\n";
+        source += "        float x" + std::to_string(k) + " = *(const float *)(in" + std::to_string(k) + " + " + offset + ");\n";
     }
 }
 
@@ -435,6 +440,7 @@ static std::string rtc_emit_reduction(const ggml_fusion_program & program, const
         "    if (wave == 0) value = rtc_wave_sum(value);\n"
         "    return value;\n"
         "}\n";
+
     const bool two_stage = schedule.stages == 2;
     const char * kernel_name = rtc_normalizes(program) ? "ggml_fused_normalize_rows" : two_stage ? "ggml_fused_reduce_partial" : "ggml_fused_reduce_rows";
 
@@ -492,17 +498,21 @@ static std::string rtc_emit_reduction(const ggml_fusion_program & program, const
     } else {
         source += "        unsigned long long i = row;\n";
     }
+
     source += "        float v" + std::to_string(program.reduction.value) +
         (reduction.op == GGML_OP_MEAN ? " = sum / (float)columns;\n" : " = sum;\n");
     rtc_reduce_loads(source, program, 2);
     rtc_instructions(source, program, 2);
+
     for (int k = 0; k < program.outputs; ++k) {
         source += "        out" + std::to_string(k) + "[i] = v" + std::to_string(program.roots[k]) + ";\n";
     }
+
     source += "    }\n";
     if (!two_stage) {
         source += "    __syncthreads();\n    }\n";
     }
+
     return source + "}\n";
 }
 
@@ -616,6 +626,7 @@ static std::string rtc_emit_pointwise(const ggml_fusion_program & program) {
 bool ggml_cuda_rtc_fusion_enabled() {
     static const bool enabled = getenv("GGML_HIP_RTC_FUSION") && std::atoi(getenv("GGML_HIP_RTC_FUSION")) &&
         !(getenv("GGML_CUDA_DISABLE_FUSION") && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION")));
+
     return enabled;
 }
 
@@ -625,6 +636,7 @@ struct rtc_key_hash {
         for (size_t i = 0; i < key.size; ++i) {
             hash = (hash ^ key.bytes[i]) * 1099511628211ULL;
         }
+
         return size_t(hash);
     }
 };
@@ -657,9 +669,11 @@ static bool rtc_key_integer(ggml_fusion_cache_key & key, uint32_t value) {
     if (sizeof(key.bytes) - key.size < 4) {
         return false;
     }
+
     for (int i = 0; i < 4; ++i) {
         key.bytes[key.size++] = uint8_t(value >> (8 * i));
     }
+
     return true;
 }
 
@@ -668,8 +682,10 @@ static bool rtc_key_string(ggml_fusion_cache_key & key, const char * value) {
     if (size > UINT32_MAX || !rtc_key_integer(key, uint32_t(size)) || size > sizeof(key.bytes) - key.size) {
         return false;
     }
+
     std::memcpy(key.bytes + key.size, value, size);
     key.size += size;
+
     return true;
 }
 
@@ -704,6 +720,7 @@ static bool rtc_make_key(ggml_fusion_program & program, const ggml_fusion_schedu
                 if (d >= first) {
                     required = std::max(required, d);
                 }
+
                 if (!(access.repeat & (1 << d))) {
                     access.ne[d] = 2;
                 }
@@ -724,6 +741,7 @@ static bool rtc_make_key(ggml_fusion_program & program, const ggml_fusion_schedu
                 program.ne[d] = 2;
             }
         }
+
         if (required >= first && required < last) {
             program.ne[required + 1] = 2;
         }
@@ -879,6 +897,7 @@ static bool rtc_reserve(ggml_backend_cuda_context & ctx, std::vector<T> & values
     }
 
     values.reserve(capacity);
+
     return true;
 }
 
@@ -896,6 +915,7 @@ static bool rtc_signature_add(ggml_backend_cuda_context & ctx, uint64_t value) {
     }
 
     ++state.signature_count;
+
     return true;
 }
 
@@ -922,6 +942,7 @@ static bool rtc_signature_tensor(ggml_backend_cuda_context & ctx, const ggml_cgr
         if (!tensor) {
             return true;
         }
+
         if (++depth > 64) {
             return false;
         }
@@ -942,9 +963,11 @@ static bool rtc_signature_tensor(ggml_backend_cuda_context & ctx, const ggml_cgr
             *value++ = uint64_t(tensor->ne[d]);
             *value++ = tensor->nb[d];
         }
+
         for (int p = 0; p < GGML_MAX_OP_PARAMS / int(sizeof(int32_t)); ++p) {
             *value++ = uint32_t(tensor->op_params[p]);
         }
+
         for (const auto * source : tensor->src) {
             *value++ = reinterpret_cast<uintptr_t>(source);
         }
@@ -954,7 +977,7 @@ static bool rtc_signature_tensor(ggml_backend_cuda_context & ctx, const ggml_cgr
 }
 
 static bool rtc_signature_streams(ggml_backend_cuda_context & ctx) {
-    const auto & events = ctx.concurrent_stream_context.concurrent_events;
+    const auto & events = ctx.stream_context().concurrent_events;
     if (!rtc_signature_add(ctx, events.size())) {
         return false;
     }
@@ -978,6 +1001,7 @@ static bool rtc_signature_streams(ggml_backend_cuda_context & ctx) {
         if (!rtc_signature_add(ctx, event.stream_mapping.size())) {
             return false;
         }
+
         for (const auto & mapping : event.stream_mapping) {
             if (!rtc_signature_add(ctx, reinterpret_cast<uintptr_t>(mapping.first)) ||
                 !rtc_signature_add(ctx, mapping.second)) {
@@ -988,6 +1012,7 @@ static bool rtc_signature_streams(ggml_backend_cuda_context & ctx) {
         if (!rtc_signature_add(ctx, event.original_order.size())) {
             return false;
         }
+
         for (const auto * node : event.original_order) {
             if (!rtc_signature_add(ctx, reinterpret_cast<uintptr_t>(node))) {
                 return false;
@@ -1078,6 +1103,7 @@ bool ggml_cuda_rtc_fusion_prepare(ggml_backend_cuda_context & ctx, const ggml_cg
         state.direct_plan.reset();
         return false;
     }
+
     state.seen.assign(words, 0);
     for (int i = 0; i < graph->n_nodes; ++i) {
         const size_t hash = ggml_hash_find(&graph->visited_hash_set, graph->nodes[i]);
@@ -1097,15 +1123,18 @@ bool ggml_cuda_rtc_fusion_prepare(ggml_backend_cuda_context & ctx, const ggml_cg
             if (!source) {
                 continue;
             }
+
             const size_t hash = ggml_hash_find(&graph->visited_hash_set, source);
             const bool visited = ggml_bitset_get(graph->visited_hash_set.used, hash);
             if (visited && ggml_bitset_get(state.seen.data(), hash)) {
                 continue;
             }
+
             if (!rtc_signature_tensor(ctx, graph, source)) {
                 state.direct_plan.reset();
                 return false;
             }
+
             if (visited) {
                 ggml_bitset_set(state.seen.data(), hash);
             }
@@ -1118,6 +1147,7 @@ bool ggml_cuda_rtc_fusion_prepare(ggml_backend_cuda_context & ctx, const ggml_cg
         state.direct_plan.reset();
         return false;
     }
+
     for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
         if (plan->scratch[stream] && plan->scratch[stream] != state.partial[stream]) {
             state.direct_plan.reset();
@@ -1137,6 +1167,7 @@ bool ggml_cuda_rtc_fusion_prepare(ggml_backend_cuda_context & ctx, const ggml_cg
             state.direct_plan.reset();
             return false;
         }
+
         state.bindings.resize(plan->actions.size());
         for (size_t i = 0; i < plan->actions.size(); ++i) {
             const auto & action = plan->actions[i];
@@ -1180,6 +1211,7 @@ void ggml_cuda_rtc_fusion_record(ggml_backend_cuda_context & ctx, ggml_cuda_grap
     const auto previous = capture_graph && capture_graph->rtc_plan ? capture_graph->rtc_plan : state.direct_plan;
     bool unchanged = previous && rtc_signature_matches(state, *previous) && previous->actions.size() == state.actions.size() &&
         previous->pending == state.pending && previous->retry == state.retry;
+
     for (size_t i = 0; unchanged && i < state.actions.size(); ++i) {
         const auto & before = previous->actions[i];
         const auto & after = state.actions[i];
@@ -1205,6 +1237,7 @@ void ggml_cuda_rtc_fusion_record(ggml_backend_cuda_context & ctx, ggml_cuda_grap
         plan->actions = state.actions;
         plan->pending = state.pending;
         plan->retry = state.retry;
+
         for (const auto & action : plan->actions) {
             if (action.schedule.scratch) {
                 plan->scratch[action.stream] = state.partial[action.stream];
@@ -1325,6 +1358,7 @@ static bool rtc_initialize(ggml_backend_cuda_context & ctx) {
     GGML_LOG_DEBUG("HIPRTC fusion: target=%s wave=%d hiprtc=%d.%d header=%d runtime=%d driver=%d\n",
                    state.target.c_str(), properties.warpSize, major, minor, HIP_VERSION, runtime, driver);
     state.ready = true;
+
     return true;
 }
 
@@ -1366,6 +1400,7 @@ static std::vector<char> rtc_compile(const std::string & architecture, const std
         if (!check(hiprtcGetProgramLog(compiler.program, log.data()), "log")) {
             return {};
         }
+
         log.back() = '\0';
     }
 
@@ -1419,8 +1454,10 @@ struct rtc_compiler {
                 job.artifact->state.store(GGML_CUDA_RTC_COMPILE_FAILED, std::memory_order_release);
                 job.artifact->changed.notify_all();
             }
+
             jobs.clear();
         }
+
         changed.notify_one();
         worker.join();
     }
@@ -1462,6 +1499,7 @@ struct rtc_compiler {
 
 static bool rtc_async() {
     static const bool enabled = !getenv("GGML_HIP_RTC_FUSION_ASYNC") || std::atoi(getenv("GGML_HIP_RTC_FUSION_ASYNC"));
+
     return enabled;
 }
 
@@ -1491,12 +1529,14 @@ static std::shared_ptr<const rtc_artifact> rtc_artifact_get(const ggml_cuda_rtc_
         const int64_t source_us = ggml_time_us() - start;
         artifact = std::make_shared<rtc_artifact>();
         rtc_artifacts.emplace(key, artifact);
+
         try {
             compiler.jobs.push_back({artifact, state.target, std::move(source), program.count, source_us});
         } catch (...) {
             rtc_artifacts.erase(key);
             throw;
         }
+
         compiler.changed.notify_one();
     }
 
@@ -1505,11 +1545,13 @@ static std::shared_ptr<const rtc_artifact> rtc_artifact_get(const ggml_cuda_rtc_
             return artifact->state.load(std::memory_order_acquire) != GGML_CUDA_RTC_COMPILE_COMPILING;
         });
     }
+
     return artifact;
 }
 
 static bool rtc_force() {
     static const bool force = getenv("GGML_HIP_RTC_FUSION_FORCE") && std::atoi(getenv("GGML_HIP_RTC_FUSION_FORCE"));
+
     return force;
 }
 
@@ -1586,7 +1628,6 @@ static std::shared_ptr<rtc_module> rtc_load(const ggml_cuda_rtc_fusion & state, 
     return module;
 }
 
-
 static bool rtc_profitable(const ggml_fusion_program & program, uint64_t n, uint64_t rows, int device) {
     if (rtc_force()) {
         return true;
@@ -1596,6 +1637,7 @@ static bool rtc_profitable(const ggml_fusion_program & program, uint64_t n, uint
         if (rtc_normalizes(program) && program.count < 3) {
             return false;
         }
+
         int producer = 0;
         bool silu = false;
 
@@ -1776,6 +1818,7 @@ int ggml_cuda_rtc_fusion_try(ggml_backend_cuda_context & ctx, const ggml_cgraph 
         if (action.program.count < min_count || action.stream != ctx.curr_stream_no) {
             return 0;
         }
+
         ++state.capture_action;
         return rtc_launch(ctx, action.program, action.schedule, state.bindings[index], *action.module);
     }
@@ -1851,6 +1894,7 @@ int ggml_cuda_rtc_fusion_try(ggml_backend_cuda_context & ctx, const ggml_cgraph 
                 state.pending_until = region.members[region.count - 1] + 1;
                 return 0;
             }
+
             const auto status = artifact->state.load(std::memory_order_acquire);
             if (status == GGML_CUDA_RTC_COMPILE_COMPILING) {
                 state.pending_until = region.members[region.count - 1] + 1;
@@ -1861,6 +1905,7 @@ int ggml_cuda_rtc_fusion_try(ggml_backend_cuda_context & ctx, const ggml_cgraph 
                         state.pending.push_back(artifact);
                     }
                 }
+
                 return 0;
             }
 
