@@ -434,6 +434,8 @@ Configure with `-DGGML_HIP_RTC=ON` to link the optional HIPRTC compiler, then se
 
 With `GGML_HIP_GRAPHS=ON`, RTC kernels and ordinary HIP kernels can share a captured graph. Plans are retained per backend subgraph, so interleaved CPU/GPU execution can reuse them. Tensor metadata and concurrent-stream topology are checked before replay; changing input values does not require recapture. Concurrent-stream graphs remain eligible for graph replay, but use ordinary kernels instead of RTC region fusion.
 
+Matrix and attention operations retain their existing native or vendor-library implementations and specialized fusions. HIPRTC does not generate these computations or add generic runtime-interpreted epilogues to their kernels.
+
 The IR supports `ADD`, `SUB`, `MUL`, `DIV`, `SQR`, `SQRT`, `LOG`, `SCALE`, `CLAMP`, and the `NEG`, `RELU`, `SILU`, `SIGMOID`, `SOFTPLUS`, `ABS`, `SGN`, `EXP`, and `TANH` unary operations, subject to HIP type and layout support. Intermediate F16/BF16 rounding is retained.
 
 F32 `SUM_ROWS`, `MEAN`, `SUM`, and `RMS_NORM` can absorb pointwise producers and epilogues. RMS normalization accepts contiguous rows with strided or permuted outer dimensions, up to 4096 columns, and can combine normalization, weights, and gates in one kernel. Existing specialized native normalization fusions retain priority; RTC is used to extend epilogues that would otherwise require more kernels.
