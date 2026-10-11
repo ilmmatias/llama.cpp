@@ -519,7 +519,7 @@ static std::string rtc_emit_reduction(const ggml_fusion_program & program, const
     return source + "}\n";
 }
 
-static std::string rtc_emit_pointwise(const ggml_fusion_program & program) {
+static std::string rtc_emit_pointwise(const ggml_fusion_program & program, const ggml_fusion_schedule & schedule) {
     std::string source = "extern \"C\" __global__ void ggml_fused_elementwise(";
 
     for (int k = 0; k < program.outputs; ++k) {
@@ -535,10 +535,42 @@ static std::string rtc_emit_pointwise(const ggml_fusion_program & program) {
         source += ", float p" + std::to_string(k);
     }
 
-    source += ") {\n"
-              "    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n"
-              "    unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;\n\n"
-              "    while (i < n) {\n";
+    const bool paired = schedule.tile == 2;
+    source += ") {\n";
+    if (paired) {
+        source += "    typedef float pair __attribute__((ext_vector_type(2), aligned(4), may_alias));\n";
+    }
+    source += "    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n"
+              "    unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;\n\n";
+
+    if (paired) {
+        source += "    i *= 2;\n"
+                  "    stride *= 2;\n"
+                  "    while (i < n && n - i >= 2) {\n";
+        for (int k = 0; k < program.inputs; ++k) {
+            source += "        pair a" + std::to_string(k) + " = *(const pair *)(in" + std::to_string(k) + " + i * 4ULL);\n";
+        }
+        for (int k = 0; k < program.outputs; ++k) {
+            source += "        pair b" + std::to_string(k) + ";\n";
+        }
+        source += "        #pragma unroll\n"
+                  "        for (int lane = 0; lane < 2; ++lane) {\n";
+        for (int k = 0; k < program.inputs; ++k) {
+            source += "        float x" + std::to_string(k) + " = a" + std::to_string(k) + "[lane];\n";
+        }
+        rtc_instructions(source, program, 0);
+        for (int k = 0; k < program.outputs; ++k) {
+            source += "        b" + std::to_string(k) + "[lane] = v" + std::to_string(program.roots[k]) + ";\n";
+        }
+        source += "        }\n";
+        for (int k = 0; k < program.outputs; ++k) {
+            source += "        *(pair *)(out" + std::to_string(k) + " + i * 4ULL) = b" + std::to_string(k) + ";\n";
+        }
+        source += "        if (n - i <= stride) return;\n"
+                  "        i += stride;\n"
+                  "    }\n";
+    }
+    source += "    while (i < n) {\n";
 
     const bool narrow = rtc_index32(program);
     const char * index_type = narrow ? "unsigned int" : "unsigned long long";
@@ -1527,7 +1559,7 @@ static std::shared_ptr<const rtc_artifact> rtc_artifact_get(const ggml_cuda_rtc_
         }
 
         const int64_t start = ggml_time_us();
-        auto source = program.reduction.value >= 0 ? rtc_emit_reduction(program, schedule) : rtc_emit_pointwise(program);
+        auto source = program.reduction.value >= 0 ? rtc_emit_reduction(program, schedule) : rtc_emit_pointwise(program, schedule);
         const int64_t source_us = ggml_time_us() - start;
         artifact = std::make_shared<rtc_artifact>();
         rtc_artifacts.emplace(key, artifact);
@@ -1716,6 +1748,17 @@ static bool rtc_select_schedule(const ggml_fusion_program & program, uint64_t n,
         }
     }
 
+    if (program.reduction.value < 0 && !program.indexed) {
+        bool f32 = true;
+        for (int k = 0; k < program.inputs; ++k) {
+            f32 &= program.accesses[k].type == GGML_TYPE_F32;
+        }
+        for (int k = 0; k < program.outputs; ++k) {
+            f32 &= program.stores[k].type == GGML_TYPE_F32;
+        }
+        schedule.tile = f32 ? 2 : 1;
+    }
+
     return rtc_profitable(program, n, rows, device);
 }
 
@@ -1796,8 +1839,9 @@ static int rtc_launch(ggml_backend_cuda_context & ctx, const ggml_fusion_program
         args[arg++] = &binding.params[k];
     }
 
-    const unsigned int blocks = unsigned(std::min((binding.n - 1) / 256 + 1, 65535ULL));
-    CUDA_CHECK(hipModuleLaunchKernel(module.function, blocks, 1, 1, 256, 1, 1, 0, ctx.stream(), args, nullptr));
+    const uint64_t elements_per_block = uint64_t(schedule.threads) * std::max(schedule.tile, 1U);
+    const unsigned int blocks = unsigned(std::min((binding.n - 1) / elements_per_block + 1, 65535ULL));
+    CUDA_CHECK(hipModuleLaunchKernel(module.function, blocks, 1, 1, schedule.threads, 1, 1, 0, ctx.stream(), args, nullptr));
 
     return program.count - 1;
 }

@@ -5237,11 +5237,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_SQR }, { GGML_UNARY_OP_RELU })) {
+#ifdef GGML_HIP_RTC
+        if (node->type == GGML_TYPE_F32 && ggml_nelements(node) >= (1 << 20)) {
+            const int skipped = ggml_cuda_rtc_fusion_try(*cuda_ctx, cgraph, i, allow_compile, 2, 2);
+            if (skipped) {
+                return skipped;
+            }
+        }
+#endif
         ggml_cuda_op_relu_sqr(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
+#ifdef GGML_HIP_RTC
+        if (ggml_nelements(node) >= (1 << 20)) {
+            const int skipped = ggml_cuda_rtc_fusion_try(*cuda_ctx, cgraph, i, allow_compile, 3, 3);
+            if (skipped) {
+                return skipped;
+            }
+        }
+#endif
         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
         return 2;
     }

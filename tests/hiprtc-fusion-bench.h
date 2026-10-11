@@ -352,7 +352,7 @@ static void bench(bool manual = false) {
 
     if (manual) {
         for (const char * name : {"silu_mul", "sigmoid_mul", "softplus_mul", "relu_sqr", "softcap", "cont_gate"}) {
-            for (auto shape : {std::array<int64_t, 4>{257, 1, 1, 1}, {128, 48, 1, 1}, {257, 3, 2, 2}, {1024, 1024, 1, 1}, {128, 48, 1024, 1}}) {
+            for (auto shape : {std::array<int64_t, 4>{257, 1, 1, 1}, {128, 48, 1, 1}, {257, 3, 2, 2}, {1024, 1024, 1, 1}, {1048577, 1, 1, 1}, {128, 48, 1024, 1}}) {
                 fusion_bench_case(name, GGML_TYPE_F32, shape);
             }
         }

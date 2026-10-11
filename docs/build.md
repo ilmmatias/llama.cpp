@@ -441,38 +441,14 @@ Contiguous CPU-to-GPU scheduler input uploads share a completion wait. User inpu
 
 ### Experimental HIPRTC fusion
 
-Configure with `-DGGML_HIP_RTC=ON` to link the optional HIPRTC compiler and enable RTC fusion at compile time. No runtime activation variable is required. The CMake option defaults to off; ordinary HIP and CUDA builds do not require HIPRTC. CMake uses `hiprtc::hiprtc` when available, otherwise searches for `hip/hiprtc.h` and `libhiprtc` under the ROCm include/lib/lib64 paths. `GGML_CUDA_DISABLE_FUSION=1` still disables all fusion for diagnostics.
+Add `-DGGML_HIP_RTC=ON` to your HIP build to enable runtime kernel fusion. This requires the HIPRTC headers and library from ROCm and is disabled by default.
 
-With `GGML_HIP_GRAPHS=ON`, RTC kernels and ordinary HIP kernels can share a captured graph. Plans are retained per backend subgraph, so interleaved CPU/GPU execution can reuse them. Concurrent-stream metadata follows the same per-subgraph graph-cache lifetime and is rebuilt after cache eviction. Tensor metadata and concurrent-stream topology are checked before replay; changing input values does not require recapture. With `GGML_CUDA_GRAPH_OPT=1`, RTC fusion is allowed outside fork/join regions and within individual branches. Fusion preserves stream transitions and fork/join synchronization; two-stage reductions use separate scratch buffers for each stream.
+```bash
+cmake -B build -DGGML_HIP=ON -DGGML_HIP_RTC=ON
+cmake --build build --config Release
+```
 
-Matrix and attention operations retain their existing native or vendor-library implementations and specialized fusions. HIPRTC does not generate these computations or add generic runtime-interpreted epilogues to their kernels.
-
-The IR supports `ADD`, `SUB`, `MUL`, `DIV`, `CONT`, `SQR`, `SQRT`, `LOG`, `SCALE`, `CLAMP`, and the `NEG`, `RELU`, `SILU`, `SIGMOID`, `SOFTPLUS`, `ABS`, `SGN`, `EXP`, and `TANH` unary operations, subject to HIP type and layout support. `CONT` can absorb a strided copy into a pointwise region. Unary inputs can have strided outer dimensions when their rows are contiguous. Intermediate F16/BF16 rounding is retained.
-
-For at least 1048576 elements, RTC takes priority over native F32 contiguous `SILU`/`SIGMOID`/`SOFTPLUS` plus `MUL`, and interleaved-row F32 `CONT` plus `SIGMOID` plus `MUL`. These replacements are limited to the original two- or three-operation span. Native fusions execute while compilation is pending or if RTC rejects the region or kernel. Small tensors, F16/BF16 unary/multiply, ReLU/square, and softcap keep native priority: removing their manual paths is not yet justified by performance parity.
-
-`test-hiprtc-fusion bench-manual` compares these pointwise families against ordinary per-node HIP execution for correctness and reports cold setup, warm GPU time, and synchronized host time. Use separate RTC-enabled and RTC-disabled builds for end-to-end comparisons. On gfx1031, at 1024 x 1024 F32 elements with graphs disabled, measured warm synchronized time was:
-
-| Fusion | Native (us) | RTC (us) |
-| --- | ---: | ---: |
-| SiLU/multiply | 33.405 | 26.993 |
-| Sigmoid/multiply | 33.424 | 26.670 |
-| Softplus/multiply | 35.162 | 27.367 |
-| CONT/sigmoid/multiply | 35.324 | 27.707 |
-
-These measurements exclude compilation and do not establish parity on other devices. The benchmark also covers small and four-dimensional shapes; no timing threshold is enforced by correctness tests.
-
-F32 `SUM_ROWS`, `MEAN`, `SUM`, and `RMS_NORM` can absorb pointwise producers and epilogues. RMS normalization accepts contiguous rows with strided or permuted outer dimensions, up to 4096 columns, and can combine normalization, weights, and gates in one kernel. Existing specialized native normalization fusions retain priority; RTC is used to extend epilogues that would otherwise require more kernels.
-
-Normalization inputs stay live until the epilogue finishes, which can increase compute-buffer usage. A final multiply is left with a following row reduction when the normalization and weight pair already have a native fusion. Indexed kernels use 32-bit coordinates when the full domain fits, while byte offsets remain 64-bit; row-coordinate calculations are kept outside the per-column loops.
-
-Capture metadata is bounded to 32 MiB per backend context, without a fixed graph-size or graph-count limit. The metadata workspace is reused across evaluations without skipping the recorded metadata comparisons.
-
-Compilation is asynchronous by default, using one process-wide worker and up to 32 queued jobs. Native kernels and native captured graphs execute while compilation is pending. Ready code is loaded outside capture; only graphs with newly available kernels are rebuilt at the next evaluation boundary. Jobs own their compiler inputs and can finish after the requesting backend is freed. Pending jobs and failed compilations are shared across matching requests. Set `GGML_HIP_RTC_FUSION_ASYNC=0` to wait for compilation for diagnostics.
-
-Compiled kernels are reused across batch shapes when their address calculations are equivalent; repeat factors, used byte strides, coordinate divisors, and index widths remain part of the cache key. Compare RTC-enabled and RTC-disabled builds with the same model, offload placement, expert-cache size and batch settings; faster individual kernels do not guarantee faster end-to-end inference.
-
-Stream-cache identity and topology are checked before cached node order is restored, even when the graph key, node count and UID are unchanged. Changes invalidate the native executable and rebuild stream metadata before recapture. Graph eviction runs before evaluation, not from graph lookups during capture.
+Kernels compile in the background, with native kernels used until compilation finishes or if compilation fails. No runtime activation variable is needed. Matrix multiplication and attention still use native kernels. Performance gains depend on the model and GPU.
 
 ### Unified Memory
 

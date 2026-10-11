@@ -827,12 +827,14 @@ static void schedule() {
 }
 
 static void test_output_input_aliases(ggml_backend_t backend) {
-    for (int offset : {0, 1}) {
+    for (const auto mapping : {std::array<int, 2>{0, 0}, {0, 1}, {1, 0}}) {
         auto * ctx = ggml_init({1 << 20, nullptr, true});
         REQUIRE(ctx);
 
+        const int base = mapping[0];
+        const int shift = mapping[1];
         auto * backing = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 515);
-        auto * a = ggml_view_1d(ctx, backing, 513, 0);
+        auto * a = ggml_view_1d(ctx, backing, 513, base * sizeof(float));
         auto * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 513);
         auto * c = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 513);
         auto * u = ggml_add(ctx, a, b);
@@ -853,12 +855,12 @@ static void test_output_input_aliases(ggml_backend_t backend) {
         ggml_backend_tensor_set(c, values.data(), 0, 513 * sizeof(float));
 
         out->buffer = backing->buffer;
-        out->data = static_cast<float *>(backing->data) + offset;
+        out->data = static_cast<float *>(backing->data) + base + shift;
         REQUIRE(out->view_src == nullptr);
 
         auto & cuda_ctx = *static_cast<ggml_backend_cuda_context *>(backend->context);
         const int skipped = ggml_cuda_rtc_fusion_try(cuda_ctx, g, 1, true);
-        REQUIRE(skipped == (offset == 0 ? 1 : 0));
+        REQUIRE(skipped == (shift == 0 ? 1 : 0));
         if (!skipped) {
             REQUIRE(ggml_backend_graph_compute(backend, g) == GGML_STATUS_SUCCESS);
         }
@@ -868,7 +870,7 @@ static void test_output_input_aliases(ggml_backend_t backend) {
         std::vector<float> result(515);
         ggml_backend_tensor_get(backing, result.data(), 0, 515 * sizeof(float));
         for (int i = 0; i < 515; ++i) {
-            const float expected = i >= offset && i < 513 + offset ? (original[i - offset] + 2.0f) * 2.0f : original[i];
+            const float expected = i >= base + shift && i < 513 + base + shift ? (original[i - shift] + 2.0f) * 2.0f : original[i];
             REQUIRE(result[i] == expected);
         }
 
