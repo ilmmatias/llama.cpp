@@ -453,6 +453,8 @@ Compilation is asynchronous by default, using one process-wide worker and up to 
 
 Compiled kernels are reused across batch shapes when their address calculations are equivalent; repeat factors, used byte strides, coordinate divisors, and index widths remain part of the cache key. Compare RTC on/off with the same model, offload placement, expert-cache size and batch settings; faster individual kernels do not guarantee faster end-to-end inference.
 
+Stream-cache identity and topology are checked before cached node order is restored, even when the graph key, node count and UID are unchanged. Changes invalidate the native executable and rebuild stream metadata before recapture. Graph eviction runs before evaluation, not from graph lookups during capture.
+
 ### Unified Memory
 
 On Linux it is possible to use unified memory architecture (UMA) to share main memory between the CPU and integrated GPU by setting environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`. However, this hurts performance for non-integrated GPUs (but enables working with integrated GPUs).

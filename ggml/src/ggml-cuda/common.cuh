@@ -27,6 +27,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -1488,10 +1489,60 @@ struct ggml_cuda_concurrent_event {
     }
 };
 
+struct ggml_cuda_stream_node {
+    const ggml_tensor * node;
+    ggml_op op;
+    ggml_type type;
+    const ggml_tensor * view_src;
+    const ggml_tensor * src[GGML_MAX_SRC];
+    int64_t ne[GGML_MAX_DIMS];
+    char name[GGML_MAX_NAME];
+
+    explicit ggml_cuda_stream_node(const ggml_tensor * tensor) :
+        node(tensor), op(tensor->op), type(tensor->type), view_src(tensor->view_src) {
+        std::memcpy(src, tensor->src, sizeof(src));
+        std::memcpy(ne, tensor->ne, sizeof(ne));
+        std::memcpy(name, tensor->name, sizeof(name));
+    }
+
+    bool matches() const {
+        return op == node->op && type == node->type && view_src == node->view_src &&
+            std::memcmp(src, node->src, sizeof(src)) == 0 &&
+            std::memcmp(ne, node->ne, sizeof(ne)) == 0 &&
+            std::memcmp(name, node->name, sizeof(name)) == 0;
+    }
+};
+
 struct ggml_cuda_stream_context {
     std::unordered_map<const ggml_tensor *, ggml_cuda_concurrent_event> concurrent_events;
 
-    int n_nodes = -1;
+    std::vector<ggml_cuda_stream_node> topology;
+    std::vector<const ggml_tensor *> allocation_order;
+
+    bool matches(const ggml_cgraph * graph) const {
+        if (topology.size() != size_t(graph->n_nodes) || allocation_order.size() != topology.size()) {
+            return false;
+        }
+
+        bool canonical = true;
+        bool allocated = true;
+        for (size_t i = 0; i < topology.size(); ++i) {
+            canonical &= topology[i].node == graph->nodes[i];
+            allocated &= allocation_order[i] == graph->nodes[i];
+            if (!canonical && !allocated) {
+                return false;
+            }
+        }
+
+        // Check all identities before reading cached tensors.
+        for (const auto & node : topology) {
+            if (!node.matches()) {
+                return false;
+            }
+        }
+
+        return true;
+    }
 };
 
 struct ggml_cuda_graph {
@@ -1607,7 +1658,6 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();
-        evict_cuda_graphs(time_now);
 
         auto it = cuda_graphs.find(first_node_ptr);
         if (it == cuda_graphs.end()) {

@@ -722,6 +722,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (streams[device][0]) {
         CUDA_CHECK(cudaStreamSynchronize(streams[device][0]));
     }
+
 #ifdef USE_CUDA_GRAPH
     active_stream_context = nullptr;
     cuda_graphs.clear();
@@ -5430,11 +5431,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_set_device(cuda_ctx->device);
     cuda_ctx->active_stream_context = nullptr;
 #ifdef USE_CUDA_GRAPH
+    cuda_ctx->evict_cuda_graphs(ggml_time_us());
     if (ggml_cuda_graph_optimization_enabled() && cgraph->n_nodes > 0) {
         const void * key = ggml_cuda_graph_get_key(cgraph);
         if (ggml_cuda_graph_set_enabled(cuda_ctx, key)) {
             auto * owner = cuda_ctx->cuda_graph(key);
-            if (owner->stream_context.n_nodes != cgraph->n_nodes) {
+            if (!owner->stream_context.matches(cgraph)) {
                 ggml_cuda_graph_optimize_concurrency(cuda_ctx, cgraph, false);
             }
 
@@ -5469,7 +5471,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #ifdef GGML_HIP_RTC
     const bool rtc_enabled = ggml_cuda_rtc_fusion_enabled();
     if (rtc_enabled) {
-        cuda_ctx->evict_cuda_graphs(ggml_time_us());
         if (cgraph->n_nodes > 0) {
             graph_key = ggml_cuda_graph_get_key(cgraph);
             const auto entry = cuda_ctx->cuda_graphs.find(graph_key);
@@ -5518,8 +5519,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph) ||
-                                            ggml_cuda_graph_pool_flushed(graph);
+            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph) || ggml_cuda_graph_pool_flushed(graph);
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -5583,7 +5583,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (!use_cuda_graph) {
         ggml_cuda_rtc_fusion_record(*cuda_ctx, rtc_graph);
 #ifdef USE_CUDA_GRAPH
-        if (rtc_graph && !rtc_graph->rtc_plan && rtc_graph->stream_context.n_nodes < 0) {
+        if (rtc_graph && !rtc_graph->rtc_plan && rtc_graph->stream_context.topology.empty()) {
             cuda_ctx->active_stream_context = nullptr;
             cuda_ctx->cuda_graphs.erase(graph_key);
         }
@@ -5781,7 +5781,6 @@ static void ggml_cuda_graph_optimize_concurrency(ggml_backend_cuda_context * cud
     auto & stream_context = graph->stream_context;
     auto & concurrent_events = stream_context.concurrent_events;
     cuda_ctx->active_stream_context = &stream_context;
-    stream_context.n_nodes = cgraph->n_nodes;
 
     for (auto & entry : concurrent_events) {
         entry.second.retained = false;
@@ -5800,6 +5799,16 @@ static void ggml_cuda_graph_optimize_concurrency(ggml_backend_cuda_context * cud
     };
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    if (!stream_context.topology.empty() && !stream_context.matches(cgraph)) {
+        invalidate();
+    }
+
+    stream_context.topology.clear();
+    stream_context.topology.reserve(cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        stream_context.topology.emplace_back(cgraph->nodes[i]);
+    }
 
     // number of out-degrees for a particular node
     std::unordered_map<const ggml_tensor *, int> fan_out;
@@ -6053,6 +6062,8 @@ static void ggml_cuda_graph_optimize_concurrency(ggml_backend_cuda_context * cud
             ++it;
         }
     }
+
+    stream_context.allocation_order.assign(cgraph->nodes, cgraph->nodes + cgraph->n_nodes);
 }
 #endif
 

@@ -2838,6 +2838,90 @@ static void split_streams() {
     std::puts("split streams: both GPU regions survive CPU work and a non-concurrent GPU tail");
 }
 
+static void stream_mutations() {
+    auto backend = ggml_backend_cuda_init(0);
+    REQUIRE(backend);
+
+    auto * ctx = ggml_init({4 << 20, nullptr, true});
+    REQUIRE(ctx);
+
+    constexpr int n = 513;
+    auto * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+    auto * root = ggml_scale(ctx, ggml_neg(ctx, input), 0.5f);
+    ggml_set_name(root, "attn_norm");
+
+    auto * v_input = ggml_neg(ctx, root);
+    auto * v = ggml_sqr(ctx, v_input);
+    auto * t_input = ggml_sqr(ctx, root);
+    auto * t = ggml_scale(ctx, t_input, 2.0f);
+    auto * q_input = ggml_relu(ctx, root);
+    auto * q = ggml_scale(ctx, q_input, 3.0f);
+    auto * out = ggml_add(ctx, ggml_add(ctx, v, t), q);
+    auto * replacement = ggml_scale(ctx, root, -2.0f);
+    for (auto * tensor : {root, v, t, q, out}) {
+        ggml_set_output(tensor);
+    }
+
+    auto * graph = ggml_new_graph(ctx);
+    const auto rebuild = [&] {
+        ggml_graph_clear(graph);
+        ggml_build_forward_expand(graph, v);
+        ggml_build_forward_expand(graph, t);
+        ggml_build_forward_expand(graph, q);
+        ggml_build_forward_expand(graph, out);
+        graph->uid = 1;
+    };
+    rebuild();
+
+    const auto * key = graph->nodes[0];
+    const int nodes = graph->n_nodes;
+    auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    REQUIRE(buffer);
+
+    std::vector<float> values(n), actual(n), sentinel(n, 100.0f);
+    for (int i = 0; i < n; ++i) {
+        values[i] = float(i % 7 - 3);
+    }
+    ggml_backend_tensor_set(input, values.data(), 0, ggml_nbytes(input));
+    ggml_backend_tensor_set(replacement, sentinel.data(), 0, ggml_nbytes(replacement));
+
+    for (int phase = 0; phase < 4; ++phase) {
+        if (phase == 1) {
+            v->src[0] = replacement;
+        } else if (phase == 2) {
+            q_input->src[0] = t_input;
+        } else if (phase == 3) {
+            v->src[0] = v_input;
+            q_input->src[0] = root;
+        }
+        rebuild();
+        REQUIRE(graph->nodes[0] == key && graph->n_nodes == nodes);
+
+        uint64_t before[HIPRTC_TEST_COUNTER_COUNT], after[HIPRTC_TEST_COUNTER_COUNT];
+        observer_snapshot(before);
+        for (int repeat = 0; repeat < 3; ++repeat) {
+            REQUIRE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get(out, actual.data(), 0, ggml_nbytes(out));
+
+            for (int i = 0; i < n; ++i) {
+                const float r = -values[i] * 0.5f;
+                const float square = r * r;
+                const float expected_v = (phase == 1 || phase == 2) ? 4.0f * square : square;
+                const float expected_q = phase == 2 ? 3.0f * square : 3.0f * std::max(r, 0.0f);
+                REQUIRE(actual[i] == (expected_v + 2.0f * square) + expected_q);
+            }
+        }
+        observer_snapshot(after);
+        REQUIRE(after[HIPRTC_TEST_CAPTURE_BEGIN] > before[HIPRTC_TEST_CAPTURE_BEGIN]);
+        REQUIRE(after[HIPRTC_TEST_GRAPH_LAUNCH] >= before[HIPRTC_TEST_GRAPH_LAUNCH] + 2);
+    }
+
+    ggml_backend_free(backend);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    std::puts("stream mutations: same key, node count and UID; changed tensor identities and cross-branch edges recaptured safely");
+}
+
 #include "hiprtc-fusion-bench.h"
 #endif
 
@@ -2854,7 +2938,7 @@ int main(int argc, char ** argv) {
 #ifndef USE_CUDA_GRAPH
     if (std::strcmp(argv[1], "capture") == 0 || std::strcmp(argv[1], "capture-limits") == 0 ||
         std::strcmp(argv[1], "concurrency-capture") == 0 || std::strcmp(argv[1], "streams") == 0 ||
-        std::strcmp(argv[1], "split-streams") == 0) {
+        std::strcmp(argv[1], "split-streams") == 0 || std::strcmp(argv[1], "stream-mutations") == 0) {
         std::fputs("This mode requires GGML_HIP_GRAPHS=ON\n", stderr);
         return 77;
     }
@@ -2900,6 +2984,8 @@ int main(int argc, char ** argv) {
         streams();
     } else if (std::strcmp(argv[1], "split-streams") == 0) {
         split_streams();
+    } else if (std::strcmp(argv[1], "stream-mutations") == 0) {
+        stream_mutations();
     } else if (std::strcmp(argv[1], "bench") == 0) {
         bench();
     } else if (std::strcmp(argv[1], "capture") == 0) {
