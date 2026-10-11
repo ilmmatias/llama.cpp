@@ -1,6 +1,8 @@
 #include "expert-cache.h"
 
 #include "ggml-alloc.h"
+#include "ggml-cpu.h"
+#include "ggml-quants.h"
 #include "quants.h"
 #include "repack.h"
 
@@ -21,7 +23,39 @@
 #include <vector>
 
 namespace {
+static bool supports_input(const ggml_tensor * op) {
+    const ggml_type type = op->src[1]->type;
+    return type == GGML_TYPE_F32 ||
+           ((type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q8_K) &&
+            type == ggml_get_type_traits_cpu(op->src[0]->type)->vec_dot_type);
+}
 
+static void pack_input_q8_1(const void * input, ggml_type type, void * output, int64_t n) {
+    if (type == GGML_TYPE_F32) {
+        quantize_row_q8_1(static_cast<const float *>(input), output, n);
+    } else if (type == GGML_TYPE_Q8_0) {
+        const auto * in = static_cast<const block_q8_0 *>(input);
+        auto * out = static_cast<block_q8_1 *>(output);
+        for (int64_t b = 0; b < n / QK8_0; ++b) {
+            out[b].d = in[b].d;
+            memcpy(out[b].qs, in[b].qs, QK8_0);
+            int sum = 0;
+            for (int j = 0; j < QK8_0; ++j) {
+                sum += in[b].qs[j];
+            }
+            out[b].s = GGML_FP32_TO_FP16(GGML_FP16_TO_FP32(in[b].d) * sum);
+        }
+    } else {
+        GGML_ASSERT(type == GGML_TYPE_Q8_K);
+        const auto * in = static_cast<const block_q8_K *>(input);
+        auto * out = static_cast<block_q8_1 *>(output);
+        float values[QK_K];
+        for (int64_t b = 0; b < n / QK_K; ++b) {
+            dequantize_row_q8_K(in + b, values, QK_K);
+            quantize_row_q8_1(values, out + b * (QK_K / QK8_1), QK_K);
+        }
+    }
+}
 
 enum class expert_cache_part {
     none,
@@ -701,7 +735,7 @@ private:
                 gate_up_op->src[0] != layer.gate_up ||
                 gate_up_op->src[1] == nullptr ||
                 gate_up_op->src[2] != down_op->src[2] ||
-                gate_up_op->src[1]->type != GGML_TYPE_F32 ||
+                !supports_input(gate_up_op) ||
                 !ggml_is_contiguous(gate_up_op->src[1])) {
                 return;
             }
@@ -734,7 +768,7 @@ private:
                 gate_op->src[0] != layer.gate || up_op->src[0] != layer.up ||
                 gate_op->src[1] == nullptr || gate_op->src[1] != up_op->src[1] ||
                 gate_op->src[2] != down_op->src[2] || up_op->src[2] != down_op->src[2] ||
-                gate_op->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(gate_op->src[1])) {
+                !supports_input(gate_op) || !supports_input(up_op) || !ggml_is_contiguous(gate_op->src[1])) {
                 return;
             }
 
@@ -959,7 +993,7 @@ private:
         layer.active_hits = (int) layer.active_slots.size();
 
         if (!allow_gpu || layer.active_hits == 0 || op == nullptr || op->src[1] == nullptr ||
-            op->src[1]->type != GGML_TYPE_F32 || op->src[1]->ne[1] != 1 ||
+            !supports_input(op) || op->src[1]->ne[1] != 1 ||
             op->src[1]->ne[2] != ids->ne[1] || op->src[1]->ne[3] != 1) {
             return;
         }
@@ -1023,7 +1057,7 @@ private:
                 const auto * input_data = (const uint8_t *) op->src[1]->data + token * op->src[1]->nb[2];
                 auto * packed = (uint8_t *) input_ptr + input_offset + i * t->input->nb[2];
                 if (t->input_q8) {
-                    quantize_row_q8_1((const float *) input_data, packed, layer.input_dim);
+                    pack_input_q8_1(input_data, op->src[1]->type, packed, layer.input_dim);
                 } else {
                     memcpy(packed, input_data, input_row_bytes);
                 }

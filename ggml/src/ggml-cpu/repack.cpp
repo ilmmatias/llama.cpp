@@ -19,6 +19,7 @@
 #include <cstdio>  // for GGML_ASSERT
 #include <cstdlib>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "repack.h"
@@ -4932,6 +4933,29 @@ class tensor_traits_base : public ggml::cpu::tensor_traits {
     virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
 };
 
+template <int64_t INTER_SIZE, ggml_type TYPE>
+static void repack_activation_rows(const void * const rows[4], void * dst, int64_t n) {
+    using block_type = std::conditional_t<TYPE == GGML_TYPE_Q8_0, block_q8_0, block_q8_K>;
+    using packed_type = std::conditional_t<TYPE == GGML_TYPE_Q8_0, block_q8_0x4, block_q8_Kx4>;
+    constexpr int block_size = TYPE == GGML_TYPE_Q8_0 ? QK8_0 : QK_K;
+    auto * out = static_cast<packed_type *>(dst);
+    for (int64_t b = 0; b < n / block_size; ++b) {
+        for (int r = 0; r < 4; ++r) {
+            const auto & in = static_cast<const block_type *>(rows[r])[b];
+            out[b].d[r] = in.d;
+            for (int j = 0; j < block_size; j += INTER_SIZE) {
+                memcpy(out[b].qs + j*4 + r*INTER_SIZE, in.qs + j, INTER_SIZE);
+            }
+            if constexpr (TYPE == GGML_TYPE_Q8_K) {
+                for (int j = 0; j < QK_K / 16; ++j) {
+                    const int index = INTER_SIZE == 1 ? j*4 + r : (j/4)*16 + r*4 + j%4;
+                    out[b].bsums[index] = in.bsums[j];
+                }
+            }
+        }
+    }
+}
+
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
 
     bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
@@ -4939,7 +4963,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         switch (op->op) {
             case GGML_OP_MUL_MAT:
                 {
-                    size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
+                    const auto * input = op->src[1];
+                    const int64_t rows = input->type == PARAM_TYPE ? input->ne[1] - input->ne[1] % 4 : input->ne[1];
+                    size = ggml_row_size(PARAM_TYPE, input->ne[0]) * rows * input->ne[2];
                     return true;
                 }
             case GGML_OP_MUL_MAT_ID:
@@ -4948,7 +4974,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     const int64_t ne12 = op->src[1]->ne[2]; // n_tokens
 
                     // ZNQ MoE stores routed activation rows in expert order.
-                    size_t activation_size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
+                    size_t activation_size = op->src[1]->type == PARAM_TYPE ? 0 :
+                        ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
                     if constexpr (PARAM_TYPE == GGML_TYPE_Q8_0 && INTER_SIZE == 8 && NB_COLS == 8) {
@@ -4960,7 +4987,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                             const size_t row_size = ggml_row_size(PARAM_TYPE, op->src[1]->ne[0]);
                             const size_t routed_size = row_size * (size_t) n_ids * (size_t) ne12;
                             activation_size = MAX(activation_size, routed_size);
-                            if (src0_type == GGML_TYPE_ZNQ3 && op->src[1]->ne[1] == 1 && n_ids >= 4) {
+                            if (src0_type == GGML_TYPE_ZNQ3 && op->src[1]->type == GGML_TYPE_F32 && op->src[1]->ne[1] == 1 && n_ids >= 4) {
                                 activation_size += row_size * (size_t) ne12;
                             }
                         }
@@ -5026,24 +5053,27 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int64_t i2 = i12;
 
         const char * src0_ptr = (const char *) src0->data + i02 * nb02;
-        const char * src1_ptr = (const char *) params->wdata + (i11 + i12 * ne11) * src1_col_stride;
+        const int64_t packed_rows = src1->type == PARAM_TYPE ? ne11 - ne11 % 4 : ne11;
+        const char * src1_ptr = packed_rows ? (const char *) params->wdata + (i11 + i12 * packed_rows) * src1_col_stride : nullptr;
         char *       dst_ptr  = ((char *) dst->data + (i1 * nb1 + i2 * nb2));
 
         const int64_t nrows = src1_end - src1_start;
         const int64_t ncols = src0_end - src0_start;
 
-        GGML_ASSERT(src1_ptr + src1_col_stride * nrows <= (const char *) params->wdata + params->wsize);
-
         // If there are more than three rows in src1, use gemm; otherwise, use gemv.
         if (nrows > 3) {
+            GGML_ASSERT(src1_ptr + src1_col_stride * (nrows - nrows % 4) <= (const char *) params->wdata + params->wsize);
             gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst_ptr) + src0_start, nb1 / nb0,
                                                              src0_ptr + src0_start * nb01, src1_ptr,
                                                              nrows - (nrows % 4), ncols);
         }
         for (int iter = nrows - (nrows % 4); iter < nrows; iter++) {
+            const void * row = src1->type == PARAM_TYPE
+                ? (const char *) src1->data + (i11 + iter)*nb11 + i12*nb12
+                : src1_ptr + src1_col_stride*iter;
             gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst_ptr + (iter * nb1)) + src0_start,
                                                              ne01, src0_ptr + src0_start * nb01,
-                                                             src1_ptr + (src1_col_stride * iter), 1 /* nrows */, ncols);
+                                                             row, 1 /* nrows */, ncols);
         }
     }
 
@@ -5074,14 +5104,15 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         GGML_ASSERT(ne13 == 1);
         GGML_ASSERT(ne3 == 1);
 
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == PARAM_TYPE);
 
         GGML_ASSERT(ggml_n_dims(op->src[0]) == 2);
         // GGML_ASSERT(ggml_n_dims(op->src[1]) == 2);
 
         char *       wdata = static_cast<char *>(params->wdata);
         const size_t nbw1  = ggml_row_size(PARAM_TYPE, ne10);
-        const size_t nbw2  = nbw1 * ne11;
+        const int64_t packed_rows = src1->type == PARAM_TYPE ? ne11 - ne11 % 4 : ne11;
+        const size_t nbw2  = nbw1 * packed_rows;
 
         assert(params->wsize >= nbw2 * ne12);
 
@@ -5092,16 +5123,26 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // the planes are broadcast.
         for (int64_t i12 = 0; i12 < ne12; i12++) {
             char * data_ptr  = (char *) src1->data + i12 * nb12;
-            char * wdata_ptr = wdata + i12 * nbw2;
+            char * wdata_ptr = nbw2 ? wdata + i12 * nbw2 : nullptr;
 
             for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
-                ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>((float *) (data_ptr + i11 * nb11),
-                                                            (void *) (wdata_ptr + i11 * nbw1), 4, ne10);
+                if (src1->type == PARAM_TYPE) {
+                    const void * rows[4];
+                    for (int r = 0; r < 4; ++r) {
+                        rows[r] = data_ptr + (i11 + r)*nb11;
+                    }
+                    repack_activation_rows<INTER_SIZE, PARAM_TYPE>(rows, wdata_ptr + i11*nbw1, ne10);
+                } else {
+                    ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>((float *) (data_ptr + i11 * nb11),
+                                                              (void *) (wdata_ptr + i11 * nbw1), 4, ne10);
+                }
             }
 
             const int64_t i11_processed = ne11 - ne11 % 4;
             for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
-                from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
+                if (src1->type == GGML_TYPE_F32) {
+                    from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
+                }
             }
         }
 
@@ -5207,7 +5248,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         GGML_ASSERT(ne13 == 1);
         GGML_ASSERT(ne3  == 1);
 
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == PARAM_TYPE);
 
         // row groups
         const int n_ids = ids->ne[0]; // n_expert_used
@@ -5249,9 +5290,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         // Reserve the expert-grouped activation stream separately from the row map.
         const size_t routed_q8_size = nbw1 * (size_t) n_ids * (size_t) ne12;
-        const bool reuse_znq3_input = use_znq_moe && src0->type == GGML_TYPE_ZNQ3 && ne11 == 1 && n_ids >= 4;
-        const size_t activation_size = (use_znq_moe ? MAX(nbw3, routed_q8_size) : nbw3) +
-                                       (reuse_znq3_input ? nbw3 : 0);
+        const bool reuse_znq3_input = use_znq_moe && src1->type == GGML_TYPE_F32 &&
+                                     src0->type == GGML_TYPE_ZNQ3 && ne11 == 1 && n_ids >= 4;
+        const size_t activation_size = (use_znq_moe ? MAX(nbw3, routed_q8_size) :
+                                       src1->type == PARAM_TYPE ? 0 : nbw3) +
+                                      (reuse_znq3_input ? nbw3 : 0);
 
         GGML_ASSERT(params->wsize >=
                 (GGML_PAD(activation_size, sizeof(int64_t)) +
@@ -5277,8 +5320,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         }
 
         // ZNQ MoE routes activations before packing them into expert-grouped Q8_0 rows.
-        // src1: float32 => param type
-        if (!use_znq_moe) {
+        if (!use_znq_moe && src1->type == GGML_TYPE_F32) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
                     from_float((float *)((char *) src1->data + i12 * nb12 + i11 * nb11),
@@ -5362,6 +5404,16 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                         continue;
                     }
 
+                    if (src1->type == PARAM_TYPE) {
+                        const void * rows[4];
+                        for (int r = 0; r < 4; ++r) {
+                            const mmid_row_mapping row = MMID_MATRIX_ROW(cur_a, ir1 + r);
+                            rows[r] = (const char *) src1->data + row.i2*nb12 + (row.i1 % ne11)*nb11;
+                        }
+                        repack_activation_rows<INTER_SIZE, PARAM_TYPE>(rows, wdata + (expert_row_base + ir1)*nbw1, ne10);
+                        continue;
+                    }
+
                     const float * xr[4];
                     for (int r = 0; r < 4; ++r) {
                         const mmid_row_mapping row = MMID_MATRIX_ROW(cur_a, ir1 + r);
@@ -5382,9 +5434,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     const mmid_row_mapping row = MMID_MATRIX_ROW(cur_a, ir1);
                     const int64_t i11 = row.i1 % ne11;
                     const int64_t i12 = row.i2;
-                    from_float(
-                        (float *) ((char *) src1->data + i12*nb12 + i11*nb11),
-                        wdata + (expert_row_base + ir1)*nbw1, ne10);
+                    const auto * row_data = (const char *) src1->data + i12*nb12 + i11*nb11;
+                    if (src1->type == PARAM_TYPE) {
+                        memcpy(wdata + (expert_row_base + ir1)*nbw1, row_data, nbw1);
+                    } else {
+                        from_float((const float *) row_data, wdata + (expert_row_base + ir1)*nbw1, ne10);
+                    }
                 }
                 expert_row_base += cne1;
             }
@@ -5590,7 +5645,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
                 const auto * src1_col = use_znq_moe
                     ? expert_q8 + ir1*nbw1
-                    : (const char *) wdata + (i11*nbw1 + i12*nbw2);
+                    : src1->type == PARAM_TYPE
+                        ? (const char *) src1->data + i11*nb11 + i12*nb12
+                        : (const char *) wdata + (i11*nbw1 + i12*nbw2);
 
                 gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
                     ne00, (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, ne01,
@@ -5918,13 +5975,8 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
                 return false;
             }
-            if (op->src[1]->type == GGML_TYPE_F32) {
-                return true;
-            }
-            //if (op->src[1]->type == GGML_TYPE_Q8_0) {
-            //    return true;
-            //}
-            // may be possible if Q8_0 packed...
+            return op->src[1]->type == GGML_TYPE_F32 ||
+                   op->src[1]->type == ggml_get_type_traits_cpu(op->src[0]->type)->vec_dot_type;
         } else if (op->op == GGML_OP_MUL_MAT_ID
                 && op->src[0]->buffer
                 && (ggml_n_dims(op->src[0]) == 3)
@@ -5934,12 +5986,8 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
                 return false;
             }
-            if (op->src[1]->type == GGML_TYPE_F32) {
-                return true;
-            }
-            //if (op->src[1]->type == GGML_TYPE_Q8_0) {
-            //    return true;
-            //}
+            return op->src[1]->type == GGML_TYPE_F32 ||
+                   op->src[1]->type == ggml_get_type_traits_cpu(op->src[0]->type)->vec_dot_type;
         }
         return false;
     }

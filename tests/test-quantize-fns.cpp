@@ -249,7 +249,7 @@ static int test_vec_dot_q(bool verbose) {
     return num_failed;
 }
 
-static int test_znq3_repack(bool verbose) {
+static int test_repack(bool verbose, ggml_type weight_type, ggml_type input_type, bool dense = false) {
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     assert(backend);
     auto * dev = ggml_backend_get_device(backend.get());
@@ -277,28 +277,52 @@ static int test_znq3_repack(bool verbose) {
     };
     for (const auto & shape : shapes) {
         const int k = shape[0], m = shape[1], n = shape[2];
-        const int n_used = shape[3], n_expert = 2*n_used;
+        if (dense && std::any_of(shapes, &shape, [&](const auto & previous) {
+                return previous[0] == k && previous[1] == m && previous[2] == n;
+            })) {
+            continue;
+        }
+        if (k % ggml_blck_size(weight_type) != 0 || k % ggml_blck_size(input_type) != 0) {
+            continue;
+        }
+        const int n_used = shape[3], n_expert = dense ? 1 : 2*n_used;
         ggml_init_params params = { 1024*1024, nullptr, true };
         ggml_context_ptr weight_ctx[2] = { ggml_context_ptr(ggml_init(params)), ggml_context_ptr(ggml_init(params)) };
         ggml_tensor * weights[2];
         ggml_backend_buffer_ptr weight_buf[2];
         for (int i = 0; i < 2; ++i) {
-            weights[i] = ggml_new_tensor_3d(weight_ctx[i].get(), GGML_TYPE_ZNQ3, k, m, n_expert);
+            weights[i] = dense ? ggml_new_tensor_2d(weight_ctx[i].get(), weight_type, k, m)
+                               : ggml_new_tensor_3d(weight_ctx[i].get(), weight_type, k, m, n_expert);
             weight_buf[i].reset(ggml_backend_alloc_ctx_tensors_from_buft(weight_ctx[i].get(), i == 0 ? ggml_backend_cpu_buffer_type() : repack_buft));
             assert(weight_buf[i]);
             ggml_backend_buffer_set_usage(weight_buf[i].get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         }
 
         for (bool broadcast : { false, true }) {
+            if (dense && broadcast) {
+                continue;
+            }
             ggml_context_ptr ctx(ggml_init(params));
-            auto * input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, k, broadcast ? 1 : n_used, n);
+            const int slots = dense ? n : (broadcast ? 1 : n_used);
+            const int planes = dense ? 1 : n;
+            const size_t row_size = ggml_row_size(input_type, k);
+            const int stride = input_type == GGML_TYPE_F32 ? 1 : 2;
+            auto * storage = ggml_new_tensor_3d(ctx.get(), input_type, k, stride*slots, planes);
+            auto * input = ggml_view_3d(ctx.get(), storage, k, slots, planes, stride*row_size, stride*slots*row_size, 0);
             auto * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_used, n);
             ggml_tensor * out[2] = {
-                ggml_mul_mat_id(ctx.get(), weights[0], input, ids),
-                ggml_mul_mat_id(ctx.get(), weights[1], input, ids),
+                dense ? ggml_mul_mat(ctx.get(), weights[0], input) : ggml_mul_mat_id(ctx.get(), weights[0], input, ids),
+                dense ? ggml_mul_mat(ctx.get(), weights[1], input) : ggml_mul_mat_id(ctx.get(), weights[1], input, ids),
             };
+            auto * float_input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, k, slots, planes);
+            auto * float_out = dense ? ggml_mul_mat(ctx.get(), weights[1], float_input)
+                                    : ggml_mul_mat_id(ctx.get(), weights[1], float_input, ids);
+            if (!ggml_backend_supports_op(backend.get(), float_out)) {
+                continue;
+            }
             if (!ggml_backend_supports_op(backend.get(), out[1])) {
-                return num_failed;
+                fprintf(stderr, "%s repack does not support %s input\n", ggml_type_name(weight_type), ggml_type_name(input_type));
+                return num_failed + 1;
             }
 
             auto * graph = ggml_new_graph(ctx.get());
@@ -310,13 +334,22 @@ static int test_znq3_repack(bool verbose) {
             std::vector<float> data(ggml_nelements(weights[0]));
             generate_data(0.0f, data.size(), data.data());
             std::vector<uint8_t> quantized(ggml_nbytes(weights[0]));
-            ggml_quantize_chunk(GGML_TYPE_ZNQ3, data.data(), quantized.data(), 0, m*n_expert, k, nullptr);
+            ggml_quantize_chunk(weight_type, data.data(), quantized.data(), 0, m*n_expert, k, nullptr);
             for (auto * weight : weights) {
                 ggml_backend_tensor_set(weight, quantized.data(), 0, quantized.size());
             }
-            data.resize(ggml_nelements(input));
+            data.resize(ggml_nelements(storage));
             generate_data(1.0f, data.size(), data.data());
-            ggml_backend_tensor_set(input, data.data(), 0, ggml_nbytes(input));
+            if (input_type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(storage, data.data(), 0, ggml_nbytes(storage));
+            } else {
+                quantized.resize(ggml_nbytes(storage));
+                const auto from_float = ggml_get_type_traits_cpu(input_type)->from_float;
+                for (int row = 0; row < stride*slots*planes; ++row) {
+                    from_float(data.data() + row*k, quantized.data() + row*row_size, k);
+                }
+                ggml_backend_tensor_set(storage, quantized.data(), 0, quantized.size());
+            }
             std::vector<int32_t> routes(n*n_used);
             for (int t = 0; t < n; ++t) {
                 for (int r = 0; r < n_used; ++r) {
@@ -347,7 +380,7 @@ static int test_znq3_repack(bool verbose) {
                 const bool failed = !(error <= 1e-6 * std::max(norm, 1e-20));
                 num_failed += failed;
                 if (failed || verbose) {
-                    printf("znq3 repack k=%d m=%d n=%d used=%d broadcast=%d threads=%d: %s\n", k, m, n, n_used, broadcast, threads, RESULT_STR[failed]);
+                    printf("%s repack input=%s dense=%d k=%d m=%d n=%d used=%d broadcast=%d threads=%d: %s\n", ggml_type_name(weight_type), ggml_type_name(input_type), dense, k, m, n, n_used, broadcast, threads, RESULT_STR[failed]);
                 }
             }
         }
@@ -412,7 +445,13 @@ int main(int argc, char * argv[]) {
 
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_vec_dot_q(verbose);
-    num_failed += test_znq3_repack(verbose);
+    num_failed += test_repack(verbose, GGML_TYPE_ZNQ3, GGML_TYPE_F32);
+    for (ggml_type type : {GGML_TYPE_ZNQ2, GGML_TYPE_ZNQ3, GGML_TYPE_ZNQ4, GGML_TYPE_Q4_0,
+                           GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        const ggml_type input_type = ggml_get_type_traits_cpu(type)->vec_dot_type;
+        num_failed += test_repack(verbose, type, input_type);
+        num_failed += test_repack(verbose, type, input_type, true);
+    }
     num_failed += test_quantize_imatrix_degenerate(verbose);
 
     if (num_failed || verbose) {

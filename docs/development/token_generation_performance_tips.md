@@ -23,6 +23,10 @@ llama accepts a `-t N` (or `--threads N`) parameter. It's extremely important th
 
 Mixed CPU/GPU graphs can spend time waiting for transfers even when the GPU kernels are fast. The scheduler groups compatible intermediate-tensor transfers from the preceding split without reordering user-input or fallback copies. GPU-to-CPU groups wait once for their results. CPU-to-GPU uploads, including single tensors, can continue into GPU computation on the same stream; completion is enforced before CPU storage reuse, fallback copies, host-weight callbacks, or return to the caller. User-input copies and unsupported transfer paths keep their existing behavior.
 
+CPU_REPACK `MUL_MAT` and `MUL_MAT_ID` accept F32 or the weight type's native vector-dot input type (Q8_0 or Q8_K). Prequantized inputs keep their tensor type and row strides; the CPU packs full GEMM groups without dequantizing them and reads GEMV tails directly. ZNQ expert-cache hits also accept native Q8_0 inputs, including combined gate/up weights, and pack them into the GPU's Q8_1 layout. Existing F32 graphs remain unchanged.
+
+This is an operator capability, not automatic graph quantization. Callers must explicitly produce a supported quantized tensor before a GPU-to-CPU handoff. Measure transfer and packing costs against the F32 path before using it in a model graph.
+
 Profile the active execution path before changing synchronization. Expert-cache configurations can bypass the routing-ID readback callback, and a backend transition without split inputs can still require a wait because scratch allocations are reused. Compare unprofiled `llama-bench` runs with the same context depth, offload settings, and thread count; profiler overhead can change the apparent bottleneck.
 
 # Example of runtime flags effect on inference speed benchmark
