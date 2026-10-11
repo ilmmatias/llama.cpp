@@ -371,9 +371,9 @@ static std::string rtc_reduce_signature(const ggml_fusion_program & program, con
     }
 
     if (stage == 2) {
-        source += ", const float * partial, unsigned long long columns";
+        source += ", const float * partial, unsigned long long parts, unsigned long long columns";
     } else if (stage == 1) {
-        source += ", unsigned long long n";
+        source += program.reduction.axes == 1 ? ", unsigned long long columns" : ", unsigned long long n";
     } else {
         source += ", unsigned long long rows, unsigned long long columns";
     }
@@ -487,6 +487,7 @@ static std::string rtc_emit_reduction(const ggml_fusion_program & program, const
         "}\n";
 
     const bool two_stage = schedule.stages == 2;
+    const bool split_rows = two_stage && program.reduction.axes == 1;
     const char * kernel_name = rtc_normalizes(program) ? "ggml_fused_normalize_rows" : two_stage ? "ggml_fused_reduce_partial" : "ggml_fused_reduce_rows";
 
     source += rtc_reduce_signature(program, kernel_name, two_stage ? 1 : 0);
@@ -500,8 +501,17 @@ static std::string rtc_emit_reduction(const ggml_fusion_program & program, const
                   "    float * shared = row_shared + threadIdx.y * 8;\n";
     }
     if (two_stage) {
-        source += "    unsigned long long begin = (unsigned long long)blockIdx.x * 4096ULL;\n"
-                  "    unsigned long long columns = n - begin < 4096ULL ? n - begin : 4096ULL;\n";
+        if (split_rows) {
+            source += "    unsigned long long parts = (columns - 1) / " + std::to_string(schedule.tile) + "ULL + 1;\n"
+                      "    unsigned long long row = blockIdx.y;\n"
+                      "    unsigned long long begin = row * columns;\n"
+                      "    unsigned long long first_column = (unsigned long long)blockIdx.x * " + std::to_string(schedule.tile) + "ULL;\n"
+                      "    unsigned long long end_column = columns - first_column < " + std::to_string(schedule.tile) + "ULL ? columns : first_column + " + std::to_string(schedule.tile) + "ULL;\n";
+            rtc_row_coordinates(source, program);
+        } else {
+            source += "    unsigned long long begin = (unsigned long long)blockIdx.x * " + std::to_string(schedule.tile) + "ULL;\n"
+                      "    unsigned long long columns = n - begin < " + std::to_string(schedule.tile) + "ULL ? n - begin : " + std::to_string(schedule.tile) + "ULL;\n";
+        }
     } else {
         source += "    for (unsigned long long base_row = (unsigned long long)blockIdx.x * " + tile + "; base_row < rows; base_row += (unsigned long long)gridDim.x * " + tile + ") {\n"
                   "    unsigned long long row = base_row + threadIdx.y;\n"
@@ -509,9 +519,11 @@ static std::string rtc_emit_reduction(const ggml_fusion_program & program, const
         rtc_row_coordinates(source, program);
     }
 
-    source += "    float sum = 0.0f;\n"
-              "    for (unsigned long long column = threadIdx.x; " + row_guard + "column < columns; column += blockDim.x) {\n"
-              "        unsigned long long i = begin + column;\n";
+    source += "    float sum = 0.0f;\n";
+    source += split_rows ?
+        "    for (unsigned long long column = first_column + threadIdx.x; column < end_column; column += blockDim.x) {\n" :
+        "    for (unsigned long long column = threadIdx.x; " + row_guard + "column < columns; column += blockDim.x) {\n";
+    source += "        unsigned long long i = begin + column;\n";
     rtc_reduce_loads(source, program, 1);
     rtc_instructions(source, program, 1);
 
@@ -596,14 +608,16 @@ static std::string rtc_emit_reduction(const ggml_fusion_program & program, const
 
     source += "    if (" + row_guard + "threadIdx.x == 0) {\n";
     if (two_stage) {
-        source += "        partial[blockIdx.x] = sum;\n    }\n}\n";
+        source += "        partial[" + std::string(split_rows ? "row * parts + blockIdx.x" : "blockIdx.x") + "] = sum;\n    }\n}\n";
         source += rtc_reduce_signature(program, "ggml_fused_reduce_finalize", 2);
         source += "    __shared__ float shared[8];\n"
-                  "    float sum = 0.0f;\n"
-                  "    for (unsigned long long i = threadIdx.x; i < columns; i += blockDim.x) sum += partial[i];\n"
+                  "    unsigned long long row = blockIdx.x;\n";
+        rtc_row_coordinates(source, program);
+        source += "    float sum = 0.0f;\n"
+                  "    for (unsigned long long part = threadIdx.x; part < parts; part += blockDim.x) sum += partial[row * parts + part];\n"
                   "    sum = rtc_block_sum(sum, shared);\n"
                   "    if (threadIdx.x == 0) {\n"
-                  "        unsigned long long i = 0;\n";
+                  "        unsigned long long i = row;\n";
     } else {
         source += "        unsigned long long i = row;\n";
     }
@@ -1791,7 +1805,20 @@ static std::shared_ptr<rtc_module> rtc_load(const ggml_cuda_rtc_fusion & state, 
     return module;
 }
 
-static bool rtc_profitable(const ggml_fusion_program & program, uint64_t n, uint64_t rows, int device) {
+static bool rtc_costly_producer(const ggml_fusion_program & program) {
+    int count = 0;
+    bool silu = false;
+    for (int i = 0; i < program.count; ++i) {
+        if (program.values[i].domain == 1) {
+            ++count;
+            silu |= program.values[i].op == GGML_OP_UNARY && program.values[i].unary == GGML_UNARY_OP_SILU;
+        }
+    }
+
+    return silu || count > 4;
+}
+
+static bool rtc_profitable(const ggml_fusion_program & program, uint64_t n, bool costly, const ggml_fusion_schedule & schedule) {
     if (rtc_force()) {
         return true;
     }
@@ -1801,18 +1828,7 @@ static bool rtc_profitable(const ggml_fusion_program & program, uint64_t n, uint
             return false;
         }
 
-        int producer = 0;
-        bool silu = false;
-
-        for (int i = 0; i < program.count; ++i) {
-            if (program.values[i].domain == 1) {
-                ++producer;
-                silu |= program.values[i].op == GGML_OP_UNARY && program.values[i].unary == GGML_UNARY_OP_SILU;
-            }
-        }
-
-        return program.reduction.axes != 1 || rows >= uint64_t(ggml_cuda_info().devices[device].nsm) ||
-            (!silu && producer <= 4);
+        return !costly || (!rtc_normalizes(program) && (schedule.stages == 2 || program.ne[0] <= 256));
     }
 
     if (program.count < 2) {
@@ -1854,6 +1870,7 @@ static bool rtc_select_schedule(const ggml_fusion_program & program, uint64_t n,
     schedule.kind = program.indexed ? GGML_FUSION_SCHEDULE_POINTWISE_INDEXED : GGML_FUSION_SCHEDULE_POINTWISE_FLAT;
     uint64_t columns = n;
     uint64_t rows = 1;
+    bool costly = false;
 
     if (program.reduction.value >= 0) {
         schedule.wave = ggml_cuda_info().devices[device].warp_size;
@@ -1866,6 +1883,9 @@ static bool rtc_select_schedule(const ggml_fusion_program & program, uint64_t n,
             rows = n / columns;
         }
 
+        costly = program.reduction.axes == 1 && rows < uint64_t(ggml_cuda_info().devices[device].nsm) &&
+            rtc_costly_producer(program);
+
         schedule.kind = rtc_normalizes(program) ? GGML_FUSION_SCHEDULE_NORMALIZE_ROWS : GGML_FUSION_SCHEDULE_REDUCE_ROWS;
         schedule.threads = columns <= 256 ? schedule.wave : 256;
         if (program.reduction.axes == 1 && schedule.threads == schedule.wave) {
@@ -1875,8 +1895,23 @@ static bool rtc_select_schedule(const ggml_fusion_program & program, uint64_t n,
             }
         }
 
+        if (!rtc_normalizes(program) && costly) {
+            if (columns <= 256) {
+                while (schedule.threads < columns) {
+                    schedule.threads *= 2;
+                }
+                schedule.tile = 1;
+            } else if (rows <= 4096 / ((columns - 1) / 128 + 1)) {
+                schedule.kind = GGML_FUSION_SCHEDULE_REDUCE_TWO_STAGE;
+                schedule.threads = 128;
+                schedule.tile = 128;
+                schedule.stages = 2;
+                schedule.scratch = 16384;
+            }
+        }
+
         if (program.reduction.axes == 15 && n > 4096) {
-            schedule.kind = GGML_FUSION_SCHEDULE_REDUCE_ALL_TWO_STAGE;
+            schedule.kind = GGML_FUSION_SCHEDULE_REDUCE_TWO_STAGE;
             schedule.tile = 4096;
             schedule.stages = 2;
             schedule.scratch = 16384;
@@ -1916,7 +1951,7 @@ static bool rtc_select_schedule(const ggml_fusion_program & program, uint64_t n,
         }
     }
 
-    return rtc_profitable(program, n, rows, device);
+    return rtc_profitable(program, n, costly, schedule);
 }
 
 static int rtc_launch(ggml_backend_cuda_context & ctx, const ggml_fusion_program & program,
@@ -1927,7 +1962,7 @@ static int rtc_launch(ggml_backend_cuda_context & ctx, const ggml_fusion_program
     if (program.reduction.value >= 0) {
         unsigned long long columns = program.reduction.axes == 1 ? uint64_t(program.ne[0]) : binding.n;
         unsigned long long rows = binding.n / columns;
-        unsigned long long partials = (binding.n - 1) / 4096 + 1;
+        unsigned long long partials = schedule.stages == 2 ? (columns - 1) / schedule.tile + 1 : 0;
 
         void * args[3 + GGML_FUSION_MAX_OUTPUTS + GGML_FUSION_MAX_INPUTS + GGML_FUSION_MAX_PARAMS];
         const int first_stage = schedule.stages == 2 ? 1 : 0;
@@ -1952,8 +1987,9 @@ static int rtc_launch(ggml_backend_cuda_context & ctx, const ggml_fusion_program
             if (stage == 2) {
                 args[arg++] = &partial;
                 args[arg++] = &partials;
+                args[arg++] = &columns;
             } else if (stage == 1) {
-                args[arg++] = &binding.n;
+                args[arg++] = program.reduction.axes == 1 ? &columns : &binding.n;
             } else {
                 args[arg++] = &rows;
                 args[arg++] = &columns;
@@ -1966,17 +2002,19 @@ static int rtc_launch(ggml_backend_cuda_context & ctx, const ggml_fusion_program
             }
 
             unsigned int blocks;
+            unsigned int grid_rows = 1;
             if (stage == 1) {
                 blocks = unsigned(partials);
+                grid_rows = unsigned(rows);
             } else if (stage == 2) {
-                blocks = 1;
+                blocks = unsigned(rows);
             } else {
                 blocks = unsigned(std::min((rows - 1) / rtc_rows_per_block(schedule) + 1, 65535ULL));
             }
 
             const hipFunction_t function = stage == 2 ? module.finalize : module.function;
             const uint32_t row_tile = stage ? 1 : rtc_rows_per_block(schedule);
-            CUDA_CHECK(hipModuleLaunchKernel(function, blocks, 1, 1, schedule.threads, row_tile, 1, 0, ctx.stream(), args, nullptr));
+            CUDA_CHECK(hipModuleLaunchKernel(function, blocks, grid_rows, 1, schedule.threads, row_tile, 1, 0, ctx.stream(), args, nullptr));
         }
 
         return program.count - 1;

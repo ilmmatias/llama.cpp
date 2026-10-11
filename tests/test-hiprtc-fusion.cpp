@@ -1701,6 +1701,125 @@ struct capture_fixture {
     }
 };
 
+static void capture_split_rows() {
+    auto backend = ggml_backend_cuda_init(0);
+    REQUIRE(backend);
+
+    for (ggml_op op : {GGML_OP_SUM_ROWS, GGML_OP_MEAN}) {
+        for (int columns : {128, 257, 1025, 4096}) {
+            auto * ctx = ggml_init({2 << 20, nullptr, true});
+            REQUIRE(ctx);
+
+            constexpr int rows = 12;
+            const int period = columns % 5 == 0 ? 5 : 1;
+            auto * storage = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2 * columns + 1, 3, 2, 2);
+            auto * input = ggml_view_4d(ctx, storage, columns, 3, 2, 2, storage->nb[1], storage->nb[2], storage->nb[3], sizeof(float));
+            auto * addend = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, period);
+            auto * weights = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 3, 1, 2);
+            ggml_set_input(storage);
+            ggml_set_input(addend);
+            ggml_set_input(weights);
+
+            auto * added = ggml_add(ctx, input, addend);
+            auto * affine = ggml_scale_bias(ctx, added, 1.25f, -0.25f);
+            auto * producer = affine;
+            for (int i = 0; i < 4; ++i) {
+                producer = ggml_silu(ctx, producer);
+            }
+            auto * reduced = op == GGML_OP_MEAN ? ggml_mean(ctx, producer) : ggml_sum_rows(ctx, producer);
+            ggml_set_output(reduced);
+            auto * out = ggml_scale_bias(ctx, ggml_mul(ctx, reduced, weights), 0.5f, -0.25f);
+            ggml_set_output(out);
+            auto * graph = ggml_new_graph(ctx);
+            ggml_build_forward_expand(graph, out);
+            graph->uid = 1;
+
+            int start = 0;
+            while (graph->nodes[start] != added) {
+                ++start;
+            }
+            auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            REQUIRE(buffer);
+
+            std::vector<float> input_values(ggml_nelements(storage)), addends(period), produced(columns * rows);
+            std::array<float, 6> coefficients;
+            std::vector<float> actual_reduced(rows), actual_out(rows);
+            float epilogue[] = {0.5f, -0.25f};
+
+            for (int phase = 0; phase < 2; ++phase) {
+                for (size_t i = 0; i < input_values.size(); ++i) {
+                    input_values[i] = float(int((i + phase) % 29) - 14) * 0.125f;
+                }
+                for (int i = 0; i < period; ++i) {
+                    addends[i] = float(i + 1) * (phase ? -0.15f : 0.15f);
+                }
+                for (size_t i = 0; i < coefficients.size(); ++i) {
+                    coefficients[i] = float(i + 1) * 0.25f;
+                }
+                if (phase) {
+                    const float parameters[] = {0.75f, 0.125f};
+                    ggml_set_op_params(affine, parameters, sizeof(parameters));
+                    epilogue[0] = -1.0f;
+                    epilogue[1] = 0.5f;
+                    ggml_set_op_params(out, epilogue, sizeof(epilogue));
+                }
+
+                ggml_backend_tensor_set(storage, input_values.data(), 0, input_values.size() * sizeof(float));
+                ggml_backend_tensor_set(addend, addends.data(), 0, addends.size() * sizeof(float));
+                ggml_backend_tensor_set(weights, coefficients.data(), 0, coefficients.size() * sizeof(float));
+                for (int i = 0; graph->nodes[i] != reduced; ++i) {
+                    auto node = ggml_graph_view(graph, i, i + 1);
+                    REQUIRE(ggml_backend_graph_compute(backend, &node) == GGML_STATUS_SUCCESS);
+                }
+                ggml_backend_tensor_get(producer, produced.data(), 0, produced.size() * sizeof(float));
+
+                auto check = [&] {
+                    ggml_backend_tensor_get(reduced, actual_reduced.data(), 0, actual_reduced.size() * sizeof(float));
+                    ggml_backend_tensor_get(out, actual_out.data(), 0, actual_out.size() * sizeof(float));
+                    for (int row = 0; row < rows; ++row) {
+                        double sum = 0;
+                        for (int column = 0; column < columns; ++column) {
+                            sum += produced[row * columns + column];
+                        }
+                        const float expected = float(op == GGML_OP_MEAN ? sum / columns : sum);
+                        const float weight = coefficients[row % 3 + 3 * (row / 6)];
+                        const float transformed = std::fma(epilogue[0], expected * weight, epilogue[1]);
+                        REQUIRE(std::fabs(actual_reduced[row] - expected) <= 2e-6f * std::max(1.0f, std::fabs(expected)));
+                        REQUIRE(std::fabs(actual_out[row] - transformed) <= 2e-6f * std::max(1.0f, std::fabs(transformed)));
+                    }
+                };
+
+                if (!phase) {
+                    auto & cuda_ctx = *static_cast<ggml_backend_cuda_context *>(backend->context);
+                    REQUIRE(ggml_cuda_rtc_fusion_try(cuda_ctx, graph, start, true) == graph->n_nodes - start - 1);
+                    ggml_backend_synchronize(backend);
+                    check();
+                }
+                for (int repeat = 0; repeat < 3; ++repeat) {
+                    REQUIRE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+                    check();
+                }
+                uint64_t before[HIPRTC_TEST_COUNTER_COUNT], after[HIPRTC_TEST_COUNTER_COUNT];
+                observer_snapshot(before);
+                REQUIRE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+                check();
+                observer_snapshot(after);
+                REQUIRE(after[HIPRTC_TEST_GRAPH_LAUNCH] == before[HIPRTC_TEST_GRAPH_LAUNCH] + 1);
+                REQUIRE(after[HIPRTC_TEST_COMPILE] == before[HIPRTC_TEST_COMPILE]);
+                REQUIRE(after[HIPRTC_TEST_LOAD] == before[HIPRTC_TEST_LOAD]);
+                REQUIRE(after[HIPRTC_TEST_ALLOCATE] == before[HIPRTC_TEST_ALLOCATE]);
+                REQUIRE(after[HIPRTC_TEST_SETUP_DURING_CAPTURE] == 0);
+            }
+
+            ggml_backend_buffer_free(buffer);
+            ggml_free(ctx);
+        }
+    }
+
+    ggml_backend_free(backend);
+    std::puts("capture: split row sums, means, repeat phases and epilogues replay safely");
+}
+
 static void capture_reductions() {
     for (int iteration = 0; iteration < 100; ++iteration) {
         const bool full = iteration % 2 != 0;
@@ -2394,6 +2513,7 @@ static void capture() {
     }
 
     capture_reductions();
+    capture_split_rows();
     std::puts("capture: same-UID contents, address, tail, scalar, stride, output and source mutations passed");
 }
 

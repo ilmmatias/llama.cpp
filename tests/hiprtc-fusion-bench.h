@@ -45,7 +45,10 @@ static ggml_cgraph * fusion_bench_build_graph(ggml_context * ctx, const std::str
                                             const std::array<int64_t, 4> & ne, std::vector<ggml_tensor *> & outputs) {
     auto * graph = ggml_new_graph(ctx);
     ggml_tensor * a;
-    if (name == "cont_gate") {
+    if (name == "silu_padded") {
+        auto * storage = ggml_new_tensor_4d(ctx, type, 2 * ne[0] + 1, ne[1], ne[2], ne[3]);
+        a = ggml_view_4d(ctx, storage, ne[0], ne[1], ne[2], ne[3], storage->nb[1], storage->nb[2], storage->nb[3], ggml_type_size(type));
+    } else if (name == "cont_gate") {
         auto * storage = ggml_new_tensor_4d(ctx, type, 2 * ne[0], ne[1], ne[2], ne[3]);
         a = ggml_view_4d(ctx, storage, ne[0], ne[1], ne[2], ne[3], storage->nb[1], storage->nb[2], storage->nb[3], ne[0] * ggml_type_size(type));
     } else {
@@ -114,18 +117,18 @@ static ggml_cgraph * fusion_bench_build_graph(ggml_context * ctx, const std::str
             } else {
                 out = ggml_neg(ctx, type == GGML_TYPE_F16 ? v : ggml_scale_bias(ctx, v, 0.5f, -1.0f));
             }
-        } else if (name == "row" || name == "full" || name == "silu_row") {
+        } else if (name == "row" || name == "full" || name == "silu_row" || name == "silu_mean" || name == "silu_padded" || name == "silu_light") {
             ggml_tensor * producer;
-            if (name == "silu_row") {
+            if (name == "silu_row" || name == "silu_mean" || name == "silu_padded" || name == "silu_light") {
                 producer = u;
-                for (int i = 0; i < 8; ++i) {
+                for (int i = 0; i < (name == "silu_light" ? 1 : 8); ++i) {
                     producer = ggml_silu(ctx, producer);
                 }
             } else {
                 producer = ggml_add(ctx, ggml_mul(ctx, u, a), ggml_neg(ctx, u));
             }
 
-            out = name == "full" ? ggml_sum(ctx, producer) : ggml_sum_rows(ctx, producer);
+            out = name == "full" ? ggml_sum(ctx, producer) : name == "silu_mean" ? ggml_mean(ctx, producer) : ggml_sum_rows(ctx, producer);
         } else {
             out = ggml_sqr(ctx, ggml_neg(ctx, ggml_mul(ctx, u, b)));
         }
@@ -396,7 +399,11 @@ static void bench(bool manual = false) {
         fusion_bench_case("row", GGML_TYPE_F32, shape);
     }
 
-    fusion_bench_case("silu_row", GGML_TYPE_F32, {4096, 1, 1, 1});
+    for (const char * name : {"silu_row", "silu_mean", "silu_padded", "silu_light"}) {
+        for (auto shape : {std::array<int64_t, 4>{128, 1, 1, 1}, {257, 3, 1, 1}, {1027, 1, 1, 1}, {1027, 3, 2, 2}, {4096, 1, 1, 1}, {4096, 3, 1, 1}, {4096, 64, 1, 1}}) {
+            fusion_bench_case(name, GGML_TYPE_F32, shape);
+        }
+    }
 
     for (int64_t n : {4096, 4097, 8193, 1048576}) {
         fusion_bench_case("full", GGML_TYPE_F32, {n, 1, 1, 1});
