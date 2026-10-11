@@ -433,6 +433,8 @@ For Qwen4Exp on CUDA/HIP, `LLAMA_QSA_KV_RESIDENT=16384` keeps a bounded KV page 
 
 Page resolution marks the complete selection union and collects unique misses in one pass before the CLOCK eviction sweep. Selected resident pages cannot be evicted by another query in the same attention launch; pages that do not fit remain readable from host memory. Large prefill batches use bounded staging when their KV views exceed the resident cache.
 
+`test-qsa-kv` compares paged attention with fully resident KV data, including eviction, oversized selections, row overwrites and host-state restoration. It tests F16 and, on backends with quantized paging support, Q8_0 caches. Run it with `ctest --test-dir build -R qsa-kv --output-on-failure`.
+
 QSA decode scores use separate block, query and stream launch coordinates. Selected KV rows are sorted over the bits needed for the physical cache size; visibility checks, duplicate removal and host fallback are unchanged. Host metadata grouping uses shifts for power-of-two compression ratios and division for other ratios.
 
 Contiguous CPU-to-GPU scheduler input uploads share a completion wait. User input uploads finish before computation proceeds, so callers can still overwrite their host input buffers after asynchronous graph submission returns.

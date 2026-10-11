@@ -20,10 +20,10 @@ struct cache {
     ggml_tensor *         k;
     ggml_tensor *         v;
 
-    explicit cache(ggml_backend_buffer_type_t buft, int n_rows = rows) {
+    explicit cache(ggml_backend_buffer_type_t buft, int n_rows = rows, ggml_type type = GGML_TYPE_F16) {
         ctx    = ggml_init({ 16 * ggml_tensor_overhead(), nullptr, true });
-        k      = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, width, n_rows, 1);
-        v      = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, width, n_rows, 1);
+        k      = ggml_new_tensor_3d(ctx, type, width, n_rows, 1);
+        v      = ggml_new_tensor_3d(ctx, type, width, n_rows, 1);
         buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
         GGML_ASSERT(buffer);
     }
@@ -35,15 +35,18 @@ struct cache {
 
     void restore(int version) {
         const int64_t n_values = ggml_nelements(k);
-        std::vector<ggml_fp16_t> values(n_values);
+        std::vector<float> values(n_values);
+        std::vector<uint8_t> data(ggml_nbytes(k));
 
         for (int64_t i = 0; i < n_values; ++i) {
-            values[i] = ggml_fp32_to_fp16(std::sin(float(i % 997 + version * 17) * 0.03125f));
+            values[i] = std::sin(float(i % 997 + version * 17) * 0.03125f);
         }
 
-        ggml_backend_tensor_set(k, values.data(), 0, ggml_nbytes(k));
+        ggml_quantize_chunk(k->type, values.data(), data.data(), 0, k->ne[1], width, nullptr);
+        ggml_backend_tensor_set(k, data.data(), 0, data.size());
         std::reverse(values.begin(), values.end());
-        ggml_backend_tensor_set(v, values.data(), 0, ggml_nbytes(v));
+        ggml_quantize_chunk(v->type, values.data(), data.data(), 0, v->ne[1], width, nullptr);
+        ggml_backend_tensor_set(v, data.data(), 0, data.size());
     }
 };
 
@@ -68,8 +71,8 @@ static std::vector<float> attention(
     ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_rows, n_queries, 1, n_seqs);
     const auto    view = [&](ggml_tensor * tensor, int extra_offset = 0) {
         return ggml_view_4d(ctx, tensor, dim, n_rows, heads, n_seqs,
-                width*sizeof(ggml_fp16_t), dim*sizeof(ggml_fp16_t),
-                size_t(n_rows)*width*sizeof(ggml_fp16_t), size_t(row_offset + extra_offset)*width*sizeof(ggml_fp16_t));
+                tensor->nb[1], ggml_row_size(tensor->type, dim),
+                size_t(n_rows)*tensor->nb[1], size_t(row_offset + extra_offset)*tensor->nb[1]);
     };
     ggml_tensor * k = view(kv.k);
     ggml_tensor * v = alias_v ? view(kv.k, 4) : view(kv.v);
@@ -123,15 +126,18 @@ static std::vector<float> attention(
     GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
 
     if (update) {
-        std::vector<ggml_fp16_t> saved(width);
-        for (ggml_tensor * tensor : {kv.k, kv.v}) {
-            ggml_backend_tensor_get(tensor, saved.data(), size_t(write_row)*width*sizeof(ggml_fp16_t),
-                saved.size()*sizeof(ggml_fp16_t));
+        std::vector<float> values(width);
+        for (int i = 0; i < width; ++i) {
+            values[i] = float((i + write_row) % 19 - 9)*0.125f;
+        }
 
-            for (int i = 0; i < width; ++i) {
-                const float expected = float((i + write_row) % 19 - 9)*0.125f;
-                GGML_ASSERT(saved[i] == ggml_fp32_to_fp16(expected));
-            }
+        std::vector<uint8_t> expected(ggml_row_size(kv.k->type, width));
+        std::vector<uint8_t> saved(expected.size());
+        ggml_quantize_chunk(kv.k->type, values.data(), expected.data(), 0, 1, width, nullptr);
+
+        for (ggml_tensor * tensor : {kv.k, kv.v}) {
+            ggml_backend_tensor_get(tensor, saved.data(), size_t(write_row)*tensor->nb[1], saved.size());
+            GGML_ASSERT(saved == expected);
         }
     }
 
@@ -238,13 +244,13 @@ static void mutate(ggml_backend_t backend, cache & kv, mutation kind) {
     ggml_free(ctx);
 }
 
-static void test(ggml_backend_dev_t dev, ggml_backend_buffer_type_t paged_type) {
+static void test(ggml_backend_dev_t dev, ggml_backend_buffer_type_t paged_type, ggml_type type = GGML_TYPE_F16) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     GGML_ASSERT(backend);
 
     {
-        cache resident(ggml_backend_dev_buffer_type(dev));
-        cache paged(paged_type);
+        cache resident(ggml_backend_dev_buffer_type(dev), rows, type);
+        cache paged(paged_type, rows, type);
         resident.restore(0);
         paged.restore(0);
 
@@ -287,6 +293,10 @@ static void test(ggml_backend_dev_t dev, ggml_backend_buffer_type_t paged_type) 
         };
 
         for (const auto & test_case : mutations) {
+            if (type == GGML_TYPE_Q8_0 && test_case.kind == mutation::shift) {
+                continue;
+            }
+
             mutate(backend, resident, test_case.kind);
             mutate(backend, paged, test_case.kind);
             run(test_case.label, 1, 0, 8);
@@ -503,6 +513,12 @@ int main() {
         if (fn) {
             printf("Testing %s\n", ggml_backend_dev_name(dev));
             test(dev, fn(dev, 64));
+            using q8_supported_fn = bool (*)();
+            auto q8_supported = reinterpret_cast<q8_supported_fn>(
+                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_qsa_kv_q8_supported"));
+            if (q8_supported && q8_supported()) {
+                test(dev, fn(dev, 64), GGML_TYPE_Q8_0);
+            }
             test_clock_wrap(dev, fn(dev, 4100));
             test_bounded_staging(dev, fn(dev, 64));
             test_compact_visibility(dev, ggml_backend_dev_buffer_type(dev), 5);
