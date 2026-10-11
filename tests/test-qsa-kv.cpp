@@ -383,6 +383,7 @@ static void test_compact_visibility(
             metadata[4*i + 1] = i % 2;
             metadata[4*i + 2] = i/2 % 2;
         }
+        metadata[4*(n_rows - 1)] = 0;
 
         std::vector<int32_t> indices(n_selected*n_queries);
         std::vector<ggml_fp16_t> masks(n_rows*n_queries, ggml_fp32_to_fp16(-INFINITY));
@@ -417,7 +418,7 @@ static void test_compact_visibility(
             }
 
             for (int i = 0; i < n_selected; ++i) {
-                const int cell = i == 0 ? -1 : i == 1 ? n_rows : ((i/2)*17 + query*13) % n_rows;
+                const int cell = i == 0 ? -1 : i == 1 ? n_rows : i < 4 ? n_rows - 1 : ((i/2)*17 + query*13) % n_rows;
                 const size_t offset = query*n_selected + i;
                 indices[offset] = cell;
 

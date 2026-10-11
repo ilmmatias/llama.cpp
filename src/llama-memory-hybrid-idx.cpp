@@ -895,6 +895,12 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     const int64_t r         = ratio;
     const int64_t n_blocks  = (n_kv + r - 1)/r;
 
+    const bool ratio_power_of_two = (ratio & (ratio - 1)) == 0;
+    uint32_t ratio_shift = 0;
+    for (uint32_t value = ratio; value > 1; value >>= 1) {
+        ++ratio_shift;
+    }
+
     GGML_ASSERT(n_tokens % n_ns == 0);
     GGML_ASSERT(n_updates > 0);
     GGML_ASSERT(block_key_cells->type == GGML_TYPE_I32);
@@ -984,14 +990,14 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 }
 
                 const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
-                const int64_t b   = idx/r;
+                const int64_t b = ratio_power_of_two && idx >= 0 ? idx >> ratio_shift : idx/r;
 
                 if (b >= n_blocks) {
                     oor = true;
                     continue;
                 }
 
-                const int64_t slot = b*r + (idx%r);
+                const int64_t slot = idx;
 
                 const bool slot_filled = cur_blk_cells[slot] >= 0;
                 dup |= slot_filled;

@@ -140,7 +140,9 @@ static __global__ void flash_attn_prepare_selected_indices(
         rows[j] = int32_t(row);
     }
 
-    sort_t(temp.sort).Sort(rows);
+    // Keep INT_MAX above every valid row in the sorted bit range.
+    const int end_bit = 32 - __clz(uint32_t(n_kv));
+    sort_t(temp.sort).Sort(rows, 0, end_bit);
     last[tid] = rows[items_per_thread - 1];
     __syncthreads();
 

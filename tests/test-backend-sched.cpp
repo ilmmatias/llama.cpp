@@ -260,6 +260,8 @@ static void test_upload_lifetime(ggml_backend_dev_t dev, bool parallel, bool use
     if (user_input) {
         out = ggml_add(ctx, out, y);
         ggml_backend_sched_set_tensor_backend(sched, out, gpu);
+        out = ggml_add(ctx, out, x);
+        ggml_backend_sched_set_tensor_backend(sched, out, gpu);
 
         ggml_tensor * c = ggml_scale(ctx, x, 4);
         ggml_backend_sched_set_tensor_backend(sched, c, cpu);
@@ -287,7 +289,7 @@ static void test_upload_lifetime(ggml_backend_dev_t dev, bool parallel, bool use
     ggml_backend_sched_synchronize(sched);
 
     for (int iteration = 0; iteration < iterations; ++iteration) {
-        const float expected = user_input ? 10*iteration + 14 : 5*iteration + 8;
+        const float expected = user_input ? 11*iteration + 15 : 5*iteration + 8;
         for (int i = 0; i < n; ++i) {
             GGML_ASSERT(actual[iteration*n + i] == expected);
         }

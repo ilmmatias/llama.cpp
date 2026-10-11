@@ -60,8 +60,6 @@ static __global__ void qsa_block_score_f32_128x4_wave32(
         const float * mask,
         float * dst,
         int64_t n_blocks,
-        int64_t n_query,
-        int64_t n_stream,
         int64_t sq1,
         int64_t sq2,
         int64_t sq3,
@@ -88,18 +86,13 @@ static __global__ void qsa_block_score_f32_128x4_wave32(
     const int tid = threadIdx.x;
     const int wave = tid / wave_size;
     const int lane = tid & (wave_size - 1);
-    const int64_t ir = (int64_t) blockIdx.x * waves_per_block + wave;
-    const int64_t nr = n_blocks*n_query*n_stream;
-    const bool valid = ir < nr;
+    const int64_t ib = (int64_t) blockIdx.x * waves_per_block + wave;
+    const int64_t iq = blockIdx.y;
+    const int64_t is = blockIdx.z;
+    const bool valid = ib < n_blocks;
 
-    int64_t ib = 0;
-    int64_t iq = 0;
-    int64_t is = 0;
     int32_t cell = 0;
     if (valid) {
-        ib = ir % n_blocks;
-        iq = (ir/n_blocks) % n_query;
-        is = ir/(n_blocks*n_query);
         cell = cells[ib*sc0 + is*sc1];
     }
 
@@ -348,7 +341,7 @@ void ggml_cuda_op_qsa_block_score(ggml_backend_cuda_context & ctx, ggml_tensor *
     GGML_ASSERT(dst->ne[2] == n_stream);
 
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
-    if (warp_size == 32 && n_embd == 128 && n_head == 4) {
+    if (warp_size == 32 && n_embd == 128 && n_head == 4 && n_stream <= 65535) {
         constexpr int block_size = 256;
         const dim3 block_dims(block_size, 1, 1);
 
@@ -379,8 +372,7 @@ void ggml_cuda_op_qsa_block_score(ggml_backend_cuda_context & ctx, ggml_tensor *
         }
 
         constexpr int waves_per_block = block_size / 32;
-        const int64_t nr = n_blocks*n_query*n_stream;
-        const dim3 grid_dims((nr + waves_per_block - 1) / waves_per_block, 1, 1);
+        const dim3 grid_dims((n_blocks + waves_per_block - 1) / waves_per_block, n_query, n_stream);
         const ggml_cuda_kernel_launch_params launch_params =
             ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
@@ -390,7 +382,7 @@ void ggml_cuda_op_qsa_block_score(ggml_backend_cuda_context & ctx, ggml_tensor *
                 (const int32_t *) cells->data,
                 (const float *) mask->data,
                 (float *) dst->data,
-                n_blocks, n_query, n_stream,
+                n_blocks,
                 nbq1 / sizeof(float), nbq2 / sizeof(float), nbq3 / sizeof(float),
                 nbk1 / sizeof(float),
                 nbc0 / sizeof(int32_t), nbc1 / sizeof(int32_t),

@@ -176,6 +176,26 @@ static void test_deferred() {
     GGML_ASSERT(resumed.refreshed_positions().size() == 32);
 }
 
+static void test_grouping_ratios() {
+    for (uint32_t ratio : {3u, 4u, 16u}) {
+        fixture f;
+        auto batch = make_batch(64, 0);
+        auto ctx = f.append(batch);
+        inputs grouped(*ctx, batch, ratio);
+
+        const auto * cells = (const int32_t *) grouped.cells->data;
+        for (uint32_t cell = 0; cell < batch.n_tokens; ++cell) {
+            GGML_ASSERT(cells[cell] == int32_t(cell/ratio));
+        }
+
+        std::vector<int32_t> expected;
+        for (uint32_t position = 0; position + ratio <= batch.n_tokens; position += ratio) {
+            expected.push_back(position);
+        }
+        GGML_ASSERT(grouped.refreshed_positions() == expected);
+    }
+}
+
 static void test_rewrite() {
     fixture f;
     auto batch = make_batch(64, 0);
@@ -217,6 +237,7 @@ int main() {
     test_tail(true, GGML_TYPE_Q8_0);
     test_tail(false, GGML_TYPE_Q8_0);
     test_deferred();
+    test_grouping_ratios();
     test_rewrite();
     test_shared_tail();
     llama_backend_free();

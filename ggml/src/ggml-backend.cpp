@@ -1887,7 +1887,7 @@ static bool ggml_backend_sched_copy_inputs_batch(
     const auto compatible = [&](struct ggml_tensor * input) {
         struct ggml_tensor * copy = tensor_copy(input, split->backend_id, sched->cur_copy);
 
-        return !(input->flags & GGML_TENSOR_FLAG_INPUT) &&
+        return (upload || !(input->flags & GGML_TENSOR_FLAG_INPUT)) &&
             ggml_backend_sched_get_tensor_backend(sched, input) == src_backend &&
             (upload ? ggml_backend_buffer_is_host(input->buffer) && copy->buffer->buft == device_buft :
                       ggml_backend_buffer_is_host(copy->buffer) && input->buffer->buft == device_buft);
@@ -1909,6 +1909,7 @@ static bool ggml_backend_sched_copy_inputs_batch(
 
         int end = begin;
         int n_copies = 0;
+        bool user_inputs = false;
         for (; end < split->n_inputs; ++end) {
             input = split->inputs[end];
             if (ggml_backend_sched_is_host_weight(input)) {
@@ -1920,6 +1921,7 @@ static bool ggml_backend_sched_copy_inputs_batch(
             }
 
             GGML_ASSERT(ggml_are_same_layout(input, tensor_copy(input, split->backend_id, sched->cur_copy)));
+            user_inputs |= (input->flags & GGML_TENSOR_FLAG_INPUT) != 0;
             ++n_copies;
         }
 
@@ -1927,6 +1929,14 @@ static bool ggml_backend_sched_copy_inputs_batch(
             ggml_backend_sched_complete_upload(pending_upload);
             ggml_backend_sched_copy_input(sched, split, split->inputs[begin]);
         } else {
+            if (user_inputs) {
+                if (sched->events[split->backend_id][sched->cur_copy] != NULL) {
+                    ggml_backend_event_synchronize(sched->events[split->backend_id][sched->cur_copy]);
+                } else {
+                    ggml_backend_synchronize(dst_backend);
+                }
+            }
+
             // Keep input order; finish pending host reads before fallback copies or CPU buffer reuse.
             for (int i = begin; i < end; ++i) {
                 input = split->inputs[i];
@@ -1944,6 +1954,10 @@ static bool ggml_backend_sched_copy_inputs_batch(
 
             if (upload) {
                 pending_upload = dst_backend;
+                // Finish user input reads before the caller can overwrite their host storage.
+                if (user_inputs) {
+                    ggml_backend_sched_complete_upload(pending_upload);
+                }
             } else {
                 ggml_backend_synchronize(src_backend);
                 if (pending_upload == src_backend) {
