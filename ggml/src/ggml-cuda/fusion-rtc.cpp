@@ -143,8 +143,17 @@ static std::string rtc_value(int reference) {
     return reference < 0 ? "x" + std::to_string(-1 - reference) : "v" + std::to_string(reference);
 }
 
+static std::string rtc_vector_type(ggml_type type) {
+    return "vec" + std::to_string(type);
+}
+
 static bool rtc_normalizes(const ggml_fusion_program & program) {
     return program.reduction.value >= 0 && program.values[program.reduction.value].op == GGML_OP_RMS_NORM;
+}
+
+static uint32_t rtc_rows_per_block(const ggml_fusion_schedule & schedule) {
+    return schedule.kind == GGML_FUSION_SCHEDULE_REDUCE_ROWS || schedule.kind == GGML_FUSION_SCHEDULE_NORMALIZE_ROWS ?
+        std::max(schedule.tile, 1U) : 1;
 }
 
 static bool rtc_reduction_preferred(const ggml_cgraph * graph, const ggml_fusion_region & region, const ggml_fusion_program & program) {
@@ -421,6 +430,10 @@ static void rtc_reduce_loads(std::string & source, const ggml_fusion_program & p
 static std::string rtc_emit_reduction(const ggml_fusion_program & program, const ggml_fusion_schedule & schedule) {
     const auto & reduction = program.values[program.reduction.value];
     const std::string wave = std::to_string(schedule.wave);
+    const bool wave_only = schedule.threads == schedule.wave;
+    const uint32_t row_tile = rtc_rows_per_block(schedule);
+    const std::string tile = std::to_string(row_tile);
+    const std::string row_guard = row_tile > 1 ? "row < rows && " : "";
     std::string source =
         "__device__ float rtc_wave_sum(float value) {\n"
         "    union { float f; unsigned int u; } bits;\n"
@@ -448,31 +461,42 @@ static std::string rtc_emit_reduction(const ggml_fusion_program & program, const
     const char * kernel_name = rtc_normalizes(program) ? "ggml_fused_normalize_rows" : two_stage ? "ggml_fused_reduce_partial" : "ggml_fused_reduce_rows";
 
     source += rtc_reduce_signature(program, kernel_name, two_stage ? 1 : 0);
-    source += "    __shared__ float shared[8];\n";
+    if (!wave_only) {
+        source += "    __shared__ float row_shared[8 * " + tile + "];\n"
+                  "    float * shared = row_shared + threadIdx.y * 8;\n";
+    }
     if (two_stage) {
         source += "    unsigned long long begin = (unsigned long long)blockIdx.x * 4096ULL;\n"
                   "    unsigned long long columns = n - begin < 4096ULL ? n - begin : 4096ULL;\n";
     } else {
-        source += "    for (unsigned long long row = blockIdx.x; row < rows; row += gridDim.x) {\n"
+        source += "    for (unsigned long long base_row = (unsigned long long)blockIdx.x * " + tile + "; base_row < rows; base_row += (unsigned long long)gridDim.x * " + tile + ") {\n"
+                  "    unsigned long long row = base_row + threadIdx.y;\n"
                   "    unsigned long long begin = row * columns;\n";
         rtc_row_coordinates(source, program);
     }
 
     source += "    float sum = 0.0f;\n"
-              "    for (unsigned long long column = threadIdx.x; column < columns; column += blockDim.x) {\n"
+              "    for (unsigned long long column = threadIdx.x; " + row_guard + "column < columns; column += blockDim.x) {\n"
               "        unsigned long long i = begin + column;\n";
     rtc_reduce_loads(source, program, 1);
     rtc_instructions(source, program, 1);
 
     const std::string input = rtc_value(reduction.src[0]);
     source += rtc_normalizes(program) ? "        sum = fmaf(" + input + ", " + input + ", sum);\n" : "        sum += " + input + ";\n";
-    source += "    }\n    sum = rtc_block_sum(sum, shared);\n";
+    source += wave_only ? "    }\n    sum = rtc_wave_sum(sum);\n" : "    }\n    sum = rtc_block_sum(sum, shared);\n";
 
     if (rtc_normalizes(program)) {
-        source += "    if (threadIdx.x == 0) shared[0] = rsqrtf(sum / (float)columns + p" + std::to_string(reduction.param) + ");\n"
-                  "    __syncthreads();\n"
-                  "    float inv_rms = shared[0];\n"
-                  "    for (unsigned long long column = threadIdx.x; column < columns; column += blockDim.x) {\n"
+        if (wave_only) {
+            source += "    union { float f; unsigned int u; } inv;\n"
+                      "    inv.f = threadIdx.x == 0 ? rsqrtf(sum / (float)columns + p" + std::to_string(reduction.param) + ") : 0.0f;\n"
+                      "    inv.u = __builtin_amdgcn_ds_bpermute(0, inv.u);\n"
+                      "    float inv_rms = inv.f;\n";
+        } else {
+            source += "    if (threadIdx.x == 0) shared[0] = rsqrtf(sum / (float)columns + p" + std::to_string(reduction.param) + ");\n"
+                      "    __syncthreads();\n"
+                      "    float inv_rms = shared[0];\n";
+        }
+        source += "    for (unsigned long long column = threadIdx.x; " + row_guard + "column < columns; column += blockDim.x) {\n"
                   "        unsigned long long i = begin + column;\n";
         rtc_reduce_loads(source, program, 1);
         rtc_instructions(source, program, 1);
@@ -485,10 +509,14 @@ static std::string rtc_emit_reduction(const ggml_fusion_program & program, const
             source += "        out" + std::to_string(k) + "[i] = v" + std::to_string(program.roots[k]) + ";\n";
         }
 
-        return source + "    }\n    __syncthreads();\n    }\n}\n";
+        source += "    }\n";
+        if (!wave_only) {
+            source += "    __syncthreads();\n";
+        }
+        return source + "    }\n}\n";
     }
 
-    source += "    if (threadIdx.x == 0) {\n";
+    source += "    if (" + row_guard + "threadIdx.x == 0) {\n";
     if (two_stage) {
         source += "        partial[blockIdx.x] = sum;\n    }\n}\n";
         source += rtc_reduce_signature(program, "ggml_fused_reduce_finalize", 2);
@@ -513,10 +541,79 @@ static std::string rtc_emit_reduction(const ggml_fusion_program & program, const
 
     source += "    }\n";
     if (!two_stage) {
-        source += "    __syncthreads();\n    }\n";
+        if (!wave_only) {
+            source += "    __syncthreads();\n";
+        }
+        source += "    }\n";
     }
 
     return source + "}\n";
+}
+
+static void rtc_pointwise_coordinates(std::string & source, const ggml_fusion_program & program) {
+    if (!program.indexed) {
+        return;
+    }
+
+    const bool narrow = rtc_index32(program);
+    const char * type = narrow ? "unsigned int" : "unsigned long long";
+    const char * suffix = narrow ? "U" : "ULL";
+    int last = 3;
+    while (last > 0 && program.ne[last] == 1) {
+        --last;
+    }
+
+    source += "        " + std::string(type) + " remaining = " + (narrow ? "(unsigned int)i" : "i") + ";\n";
+    for (int d = 0; d < 4; ++d) {
+        if (program.ne[d] > 1) {
+            source += "        " + std::string(type) + " q" + std::to_string(d) + " = remaining";
+            if (d < last) {
+                source += " % " + std::to_string(program.ne[d]) + suffix;
+            }
+            source += ";\n";
+            if (d < last) {
+                source += "        remaining /= " + std::to_string(program.ne[d]) + suffix + ";\n";
+            }
+        }
+    }
+
+    for (int k = 0; k < program.inputs; ++k) {
+        const auto & access = program.accesses[k];
+        for (int d = 0; d < 4; ++d) {
+            if (!(access.repeat & (1 << d)) || access.ne[d] == 1) {
+                continue;
+            }
+
+            bool emitted = false;
+            for (int j = 0; j < k; ++j) {
+                emitted |= (program.accesses[j].repeat & (1 << d)) && program.accesses[j].ne[d] == access.ne[d];
+            }
+
+            if (!emitted) {
+                source += "        " + std::string(type) + " r" + std::to_string(d) + "_" + std::to_string(access.ne[d]) + " = q" + std::to_string(d) + " % " + std::to_string(access.ne[d]) + suffix + ";\n";
+            }
+        }
+    }
+}
+
+static std::string rtc_pointwise_offset(const ggml_fusion_program & program, int input) {
+    const auto & access = program.accesses[input];
+    if (!program.indexed || rtc_flat_access(access)) {
+        return "i * " + std::to_string(ggml_type_size(access.type)) + "ULL";
+    }
+
+    std::string offset = "0ULL";
+    for (int d = 0; d < 4; ++d) {
+        if (access.ne[d] == 1) {
+            continue;
+        }
+
+        const std::string coordinate = access.repeat & (1 << d) ?
+            "r" + std::to_string(d) + "_" + std::to_string(access.ne[d]) : "q" + std::to_string(d);
+        offset += " + " + coordinate + " * " + std::to_string(access.nb[d]) + "ULL";
+    }
+
+    return offset;
 }
 
 static std::string rtc_emit_pointwise(const ggml_fusion_program & program, const ggml_fusion_schedule & schedule) {
@@ -535,125 +632,76 @@ static std::string rtc_emit_pointwise(const ggml_fusion_program & program, const
         source += ", float p" + std::to_string(k);
     }
 
-    const bool paired = schedule.tile == 2;
+    const bool vectorized = schedule.tile > 1;
+    const std::string width = std::to_string(schedule.tile);
     source += ") {\n";
-    if (paired) {
-        source += "    typedef float pair __attribute__((ext_vector_type(2), aligned(4), may_alias));\n";
+    if (vectorized) {
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+            source += "    typedef " + std::string(rtc_type(type)) + " " + rtc_vector_type(type) +
+                " __attribute__((ext_vector_type(" + width + "), aligned(" + std::to_string(ggml_type_size(type)) + "), may_alias));\n";
+        }
     }
     source += "    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n"
               "    unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;\n\n";
 
-    if (paired) {
-        source += "    i *= 2;\n"
-                  "    stride *= 2;\n"
-                  "    while (i < n && n - i >= 2) {\n";
+    if (vectorized) {
+        source += "    i *= " + width + ";\n"
+                  "    stride *= " + width + ";\n"
+                  "    while (i < n && n - i >= " + width + ") {\n";
+        rtc_pointwise_coordinates(source, program);
         for (int k = 0; k < program.inputs; ++k) {
-            source += "        pair a" + std::to_string(k) + " = *(const pair *)(in" + std::to_string(k) + " + i * 4ULL);\n";
+            const auto & access = program.accesses[k];
+            const std::string type = rtc_type(access.type);
+            const bool broadcast = program.indexed && access.ne[0] == 1;
+            const std::string storage = broadcast ? type : rtc_vector_type(access.type);
+            source += "        " + storage + " a" + std::to_string(k) + " = *(const " + storage + " *)(in" +
+                std::to_string(k) + " + " + rtc_pointwise_offset(program, k) + ");\n";
         }
         for (int k = 0; k < program.outputs; ++k) {
-            source += "        pair b" + std::to_string(k) + ";\n";
+            source += "        " + rtc_vector_type(program.stores[k].type) + " b" + std::to_string(k) + ";\n";
         }
         source += "        #pragma unroll\n"
-                  "        for (int lane = 0; lane < 2; ++lane) {\n";
+                  "        for (int lane = 0; lane < " + width + "; ++lane) {\n";
         for (int k = 0; k < program.inputs; ++k) {
-            source += "        float x" + std::to_string(k) + " = a" + std::to_string(k) + "[lane];\n";
+            const bool broadcast = program.indexed && program.accesses[k].ne[0] == 1;
+            source += "        float x" + std::to_string(k) + " = (float)a" + std::to_string(k) + (broadcast ? "" : "[lane]") + ";\n";
         }
         rtc_instructions(source, program, 0);
         for (int k = 0; k < program.outputs; ++k) {
-            source += "        b" + std::to_string(k) + "[lane] = v" + std::to_string(program.roots[k]) + ";\n";
+            source += "        b" + std::to_string(k) + "[lane] = (" + rtc_type(program.stores[k].type) + ")v" +
+                std::to_string(program.roots[k]) + ";\n";
         }
         source += "        }\n";
         for (int k = 0; k < program.outputs; ++k) {
-            source += "        *(pair *)(out" + std::to_string(k) + " + i * 4ULL) = b" + std::to_string(k) + ";\n";
+            source += "        *(" + rtc_vector_type(program.stores[k].type) + " *)(out" + std::to_string(k) + " + i * " +
+                std::to_string(ggml_type_size(program.stores[k].type)) + "ULL) = b" + std::to_string(k) + ";\n";
         }
         source += "        if (n - i <= stride) return;\n"
                   "        i += stride;\n"
                   "    }\n";
     }
-    source += "    while (i < n) {\n";
 
-    const bool narrow = rtc_index32(program);
-    const char * index_type = narrow ? "unsigned int" : "unsigned long long";
-    const char * suffix = narrow ? "U" : "ULL";
-
-    if (program.indexed) {
-        int last = 3;
-        while (last > 0 && program.ne[last] == 1) {
-            --last;
-        }
-
-        source += "        " + std::string(index_type) + " remaining = " + (narrow ? "(unsigned int)i" : "i") + ";\n";
-
-        for (int d = 0; d < 4; ++d) {
-            if (program.ne[d] > 1) {
-                source += "        " + std::string(index_type) + " q" + std::to_string(d) + " = remaining";
-                if (d < last) {
-                    source += " % " + std::to_string(program.ne[d]) + suffix;
-                }
-                source += ";\n";
-
-                if (d < last) {
-                    source += "        remaining /= " + std::to_string(program.ne[d]) + suffix + ";\n";
-                }
-            }
-        }
-
-        for (int k = 0; k < program.inputs; ++k) {
-            for (int d = 0; d < 4; ++d) {
-                const auto & access = program.accesses[k];
-                if (!(access.repeat & (1 << d)) || access.ne[d] == 1) {
-                    continue;
-                }
-
-                bool emitted = false;
-                for (int j = 0; j < k; ++j) {
-                    emitted |= (program.accesses[j].repeat & (1 << d)) &&
-                        program.accesses[j].ne[d] == access.ne[d];
-                }
-
-                if (!emitted) {
-                    source += "        " + std::string(index_type) + " r" + std::to_string(d) + "_" + std::to_string(access.ne[d]) + " = q" + std::to_string(d) + " % " + std::to_string(access.ne[d]) + suffix + ";\n";
-                }
-            }
-        }
-        source += "\n";
-    }
-
+    source += vectorized ? "    for (unsigned int tail = 0; tail < " + width + " && i < n; ++tail, ++i) {\n" : "    while (i < n) {\n";
+    rtc_pointwise_coordinates(source, program);
     for (int k = 0; k < program.inputs; ++k) {
-        std::string offset = "i * " + std::to_string(ggml_type_size(program.accesses[k].type)) + "ULL";
-        if (program.indexed && !rtc_flat_access(program.accesses[k])) {
-            const auto & access = program.accesses[k];
-            offset = "0ULL";
-            for (int d = 0; d < 4; ++d) {
-                if (access.ne[d] == 1) {
-                    continue;
-                }
-
-                const std::string coordinate = access.repeat & (1 << d) ?
-                    "r" + std::to_string(d) + "_" + std::to_string(access.ne[d]) : "q" + std::to_string(d);
-                offset += " + " + coordinate + " * " + std::to_string(access.nb[d]) + "ULL";
-            }
-        }
-
         source += "        float x" + std::to_string(k) + " = (float)*(const " + rtc_type(program.accesses[k].type) +
-            " *)(in" + std::to_string(k) + " + " + offset + ");\n";
+            " *)(in" + std::to_string(k) + " + " + rtc_pointwise_offset(program, k) + ");\n";
     }
 
     source += "\n";
-
     rtc_instructions(source, program, 0);
     source += "\n";
-
     for (int k = 0; k < program.outputs; ++k) {
         const std::string type = rtc_type(program.stores[k].type);
         source += "        ((" + type + " *)out" + std::to_string(k) + ")[i] = (" + type + ")v" +
             std::to_string(program.roots[k]) + ";\n";
     }
 
-    source += "\n        if (n - i <= stride) break;\n"
-              "        i += stride;\n"
-              "    }\n"
-              "}\n";
+    if (!vectorized) {
+        source += "\n        if (n - i <= stride) break;\n"
+                  "        i += stride;\n";
+    }
+    source += "    }\n}\n";
 
     return source;
 }
@@ -1621,6 +1669,7 @@ static std::shared_ptr<rtc_module> rtc_load(const ggml_cuda_rtc_fusion & state, 
         return nullptr;
     }
 
+    const uint32_t block_threads = schedule.threads * rtc_rows_per_block(schedule);
     for (auto function : {module->function, module->finalize}) {
         if (!function) {
             continue;
@@ -1636,14 +1685,14 @@ static std::shared_ptr<rtc_module> rtc_load(const ggml_cuda_rtc_fusion & state, 
         const auto local_error = hipFuncGetAttribute(&local, HIP_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, function);
         const auto shared_error = hipFuncGetAttribute(&shared, HIP_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, function);
         const auto thread_error = hipFuncGetAttribute(&threads, HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, function);
-        const auto occupancy_error = hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, function, schedule.threads, 0);
+        const auto occupancy_error = hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, function, block_threads, 0);
         if (reg_error != hipSuccess || local_error != hipSuccess || shared_error != hipSuccess ||
             thread_error != hipSuccess || occupancy_error != hipSuccess) {
             GGML_LOG_WARN("HIPRTC fusion: resource query unavailable; using static limits\n");
         }
 
-        if (schedule.threads > uint32_t(state.max_threads) ||
-            (thread_error == hipSuccess && threads < int(schedule.threads)) ||
+        if (block_threads > uint32_t(state.max_threads) ||
+            (thread_error == hipSuccess && threads < int(block_threads)) ||
             (shared_error == hipSuccess && (shared < 0 || size_t(shared) > state.max_shared)) ||
             (occupancy_error == hipSuccess && blocks <= 0)) {
             GGML_LOG_WARN("HIPRTC fusion: unsafe kernel resources\n");
@@ -1739,6 +1788,12 @@ static bool rtc_select_schedule(const ggml_fusion_program & program, uint64_t n,
 
         schedule.kind = rtc_normalizes(program) ? GGML_FUSION_SCHEDULE_NORMALIZE_ROWS : GGML_FUSION_SCHEDULE_REDUCE_ROWS;
         schedule.threads = columns <= 256 ? schedule.wave : 256;
+        if (program.reduction.axes == 1 && schedule.threads == schedule.wave) {
+            schedule.tile = 128 / schedule.wave;
+            while (schedule.tile > rows) {
+                schedule.tile /= 2;
+            }
+        }
 
         if (program.reduction.axes == 15 && n > 4096) {
             schedule.kind = GGML_FUSION_SCHEDULE_REDUCE_ALL_TWO_STAGE;
@@ -1748,15 +1803,37 @@ static bool rtc_select_schedule(const ggml_fusion_program & program, uint64_t n,
         }
     }
 
-    if (program.reduction.value < 0 && !program.indexed) {
-        bool f32 = true;
-        for (int k = 0; k < program.inputs; ++k) {
-            f32 &= program.accesses[k].type == GGML_TYPE_F32;
+    if (program.reduction.value < 0) {
+        schedule.tile = 4;
+        if (!program.indexed) {
+            bool f32 = true;
+            for (int k = 0; k < program.inputs; ++k) {
+                f32 &= program.accesses[k].type == GGML_TYPE_F32;
+            }
+            for (int k = 0; k < program.outputs; ++k) {
+                f32 &= program.stores[k].type == GGML_TYPE_F32;
+            }
+            if (f32 && (program.inputs > 2 || (program.inputs == 2 && n < (1 << 21)))) {
+                schedule.tile = 2;
+            }
+        } else {
+            while (program.ne[0] % schedule.tile) {
+                schedule.tile /= 2;
+            }
+            for (int k = 0; k < program.inputs; ++k) {
+                const auto & access = program.accesses[k];
+                if (access.ne[0] == 1) {
+                    continue;
+                }
+                if (access.nb[0] != ggml_type_size(access.type)) {
+                    schedule.tile = 1;
+                    break;
+                }
+                while (access.ne[0] % schedule.tile) {
+                    schedule.tile /= 2;
+                }
+            }
         }
-        for (int k = 0; k < program.outputs; ++k) {
-            f32 &= program.stores[k].type == GGML_TYPE_F32;
-        }
-        schedule.tile = f32 ? 2 : 1;
     }
 
     return rtc_profitable(program, n, rows, device);
@@ -1814,11 +1891,12 @@ static int rtc_launch(ggml_backend_cuda_context & ctx, const ggml_fusion_program
             } else if (stage == 2) {
                 blocks = 1;
             } else {
-                blocks = unsigned(std::min(rows, 65535ULL));
+                blocks = unsigned(std::min((rows - 1) / rtc_rows_per_block(schedule) + 1, 65535ULL));
             }
 
             const hipFunction_t function = stage == 2 ? module.finalize : module.function;
-            CUDA_CHECK(hipModuleLaunchKernel(function, blocks, 1, 1, schedule.threads, 1, 1, 0, ctx.stream(), args, nullptr));
+            const uint32_t row_tile = stage ? 1 : rtc_rows_per_block(schedule);
+            CUDA_CHECK(hipModuleLaunchKernel(function, blocks, 1, 1, schedule.threads, row_tile, 1, 0, ctx.stream(), args, nullptr));
         }
 
         return program.count - 1;

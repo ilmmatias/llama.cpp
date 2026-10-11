@@ -52,7 +52,9 @@ static ggml_cgraph * fusion_bench_build_graph(ggml_context * ctx, const std::str
         a = name == "rms_gate_strided" ? ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, ne[0], ne[2], ne[1], ne[3]), 0, 2, 1, 3) : ggml_new_tensor(ctx, type, 4, ne.data());
     }
     ggml_tensor * b;
-    if (name == "repeat") {
+    if (name == "row_broadcast") {
+        b = ggml_new_tensor_2d(ctx, type, 1, ne[1]);
+    } else if (name == "repeat") {
         b = ggml_new_tensor_4d(ctx, type, 5, 2, 2, 1);
     } else if (name == "padded") {
         b = ggml_new_tensor_4d(ctx, type, ne[0] * 3, ne[1] * 2, ne[2], ne[3]);
@@ -366,13 +368,17 @@ static void bench(bool manual = false) {
             }
         }
 
+        for (auto shape : {std::array<int64_t, 4>{128, 48, 1, 1}, {128, 48, 1024, 1}, {130, 48, 128, 1}, {131, 3, 128, 1}}) {
+            fusion_bench_case("row_broadcast", type, shape);
+        }
+
         for (int64_t n : {240, 983040}) {
             fusion_bench_case("repeat", type, {n / 24, 6, 2, 2});
         }
 
         for (const char * name : {"padded", "permuted", "gather"}) {
-            for (int64_t n : {257, 1048576}) {
-                fusion_bench_case(name, type, {n, 1, 1, 1});
+            for (auto shape : {std::array<int64_t, 4>{257, 1, 1, 1}, {1048576, 1, 1, 1}, {128, 48, 1024, 1}}) {
+                fusion_bench_case(name, type, shape);
             }
         }
     }
@@ -396,7 +402,7 @@ static void bench(bool manual = false) {
         fusion_bench_case("full", GGML_TYPE_F32, {n, 1, 1, 1});
     }
 
-    for (auto shape : {std::array<int64_t, 4>{128, 48, 1, 1}, {128, 48, 1024, 1}, {2560, 4, 1024, 1}, {257, 3, 2, 2}}) {
+    for (auto shape : {std::array<int64_t, 4>{128, 48, 1, 1}, {128, 13, 1, 1}, {32, 3, 1, 1}, {32, 262143, 1, 1}, {128, 48, 1024, 1}, {2560, 4, 1024, 1}, {257, 3, 2, 2}}) {
         fusion_bench_case("rms_gate", GGML_TYPE_F32, shape);
     }
 
