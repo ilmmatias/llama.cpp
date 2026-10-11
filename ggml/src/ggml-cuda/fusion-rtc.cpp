@@ -387,7 +387,33 @@ static std::string rtc_reduce_signature(const ggml_fusion_program & program, con
     return source + ") {\n";
 }
 
-static void rtc_reduce_loads(std::string & source, const ggml_fusion_program & program, uint8_t domain) {
+static uint32_t rtc_normalization_width(const ggml_fusion_program & program, const ggml_fusion_schedule & schedule) {
+    uint32_t width = 4;
+    while (width > 1 && uint64_t(width) * schedule.threads > uint64_t(program.ne[0])) {
+        width /= 2;
+    }
+
+    for (int k = 0; k < program.inputs; ++k) {
+        const auto & access = program.accesses[k];
+        if (rtc_flat_access(access) || access.ne[0] == 1) {
+            continue;
+        }
+
+        if (access.nb[0] != sizeof(float)) {
+            return 1;
+        }
+
+        if (access.repeat & 1) {
+            while (access.ne[0] % width) {
+                width /= 2;
+            }
+        }
+    }
+
+    return width;
+}
+
+static void rtc_reduce_loads(std::string & source, const ggml_fusion_program & program, uint8_t domain, uint32_t width = 1) {
     const bool narrow = rtc_index32(program);
     const char * suffix = narrow ? "U" : "ULL";
     const char * index = narrow ? "(unsigned int)i" : "i";
@@ -423,7 +449,10 @@ static void rtc_reduce_loads(std::string & source, const ggml_fusion_program & p
             }
         }
 
-        source += "        float x" + std::to_string(k) + " = *(const float *)(in" + std::to_string(k) + " + " + offset + ");\n";
+        const bool broadcast = width > 1 && !rtc_flat_access(access) && access.ne[0] == 1;
+        const std::string type = width == 1 || broadcast ? "float" : rtc_vector_type(GGML_TYPE_F32);
+        const std::string name = width == 1 ? "x" : "a";
+        source += "        " + type + " " + name + std::to_string(k) + " = *(const " + type + " *)(in" + std::to_string(k) + " + " + offset + ");\n";
     }
 }
 
@@ -461,6 +490,11 @@ static std::string rtc_emit_reduction(const ggml_fusion_program & program, const
     const char * kernel_name = rtc_normalizes(program) ? "ggml_fused_normalize_rows" : two_stage ? "ggml_fused_reduce_partial" : "ggml_fused_reduce_rows";
 
     source += rtc_reduce_signature(program, kernel_name, two_stage ? 1 : 0);
+    const uint32_t vector_width = rtc_normalizes(program) ? rtc_normalization_width(program, schedule) : 1;
+    if (vector_width > 1) {
+        source += "    typedef float " + rtc_vector_type(GGML_TYPE_F32) + " __attribute__((ext_vector_type(" +
+            std::to_string(vector_width) + "), aligned(4), may_alias));\n";
+    }
     if (!wave_only) {
         source += "    __shared__ float row_shared[8 * " + tile + "];\n"
                   "    float * shared = row_shared + threadIdx.y * 8;\n";
@@ -496,20 +530,64 @@ static std::string rtc_emit_reduction(const ggml_fusion_program & program, const
                       "    __syncthreads();\n"
                       "    float inv_rms = shared[0];\n";
         }
-        source += "    for (unsigned long long column = threadIdx.x; " + row_guard + "column < columns; column += blockDim.x) {\n"
-                  "        unsigned long long i = begin + column;\n";
-        rtc_reduce_loads(source, program, 1);
-        rtc_instructions(source, program, 1);
 
-        source += "        float v" + std::to_string(program.reduction.value) + " = " + input + " * inv_rms;\n";
-        rtc_reduce_loads(source, program, 2);
-        rtc_instructions(source, program, 2);
+        auto emit_body = [&](bool vectorized) {
+            source += "        unsigned long long i = begin + column;\n";
+            rtc_reduce_loads(source, program, 1, vectorized ? vector_width : 1);
+            if (vectorized) {
+                rtc_reduce_loads(source, program, 2, vector_width);
+                for (int k = 0; k < program.outputs; ++k) {
+                    source += "        " + rtc_vector_type(GGML_TYPE_F32) + " b" + std::to_string(k) + ";\n";
+                }
+                source += "        #pragma unroll\n"
+                          "        for (unsigned int lane = 0; lane < " + std::to_string(vector_width) + "; ++lane) {\n";
+                for (int k = 0; k < program.inputs; ++k) {
+                    if (program.accesses[k].domain == 1) {
+                        source += "        float x" + std::to_string(k) + " = a" + std::to_string(k) +
+                            (!rtc_flat_access(program.accesses[k]) && program.accesses[k].ne[0] == 1 ? "" : "[lane]") + ";\n";
+                    }
+                }
+            }
+            rtc_instructions(source, program, 1);
+            source += "        float v" + std::to_string(program.reduction.value) + " = " + input + " * inv_rms;\n";
+            if (vectorized) {
+                for (int k = 0; k < program.inputs; ++k) {
+                    if (program.accesses[k].domain == 2) {
+                        source += "        float x" + std::to_string(k) + " = a" + std::to_string(k) +
+                            (!rtc_flat_access(program.accesses[k]) && program.accesses[k].ne[0] == 1 ? "" : "[lane]") + ";\n";
+                    }
+                }
+            } else {
+                rtc_reduce_loads(source, program, 2);
+            }
+            rtc_instructions(source, program, 2);
+            for (int k = 0; k < program.outputs; ++k) {
+                source += vectorized ?
+                    "        b" + std::to_string(k) + "[lane] = v" + std::to_string(program.roots[k]) + ";\n" :
+                    "        out" + std::to_string(k) + "[i] = v" + std::to_string(program.roots[k]) + ";\n";
+            }
+            if (vectorized) {
+                source += "        }\n";
+                for (int k = 0; k < program.outputs; ++k) {
+                    source += "        *(" + rtc_vector_type(GGML_TYPE_F32) + " *)(out" + std::to_string(k) + " + i) = b" + std::to_string(k) + ";\n";
+                }
+            }
+        };
 
-        for (int k = 0; k < program.outputs; ++k) {
-            source += "        out" + std::to_string(k) + "[i] = v" + std::to_string(program.roots[k]) + ";\n";
+        if (vector_width > 1) {
+            const std::string width = std::to_string(vector_width);
+            source += "    unsigned long long column = (unsigned long long)threadIdx.x * " + width + ";\n"
+                      "    for (; " + row_guard + "column < columns && columns - column >= " + width + "; column += (unsigned long long)blockDim.x * " + width + ") {\n";
+            emit_body(true);
+            source += "    }\n"
+                      "    for (unsigned int tail = 0; " + row_guard + "column < columns && tail < " + width + "; ++tail, ++column) {\n";
+            emit_body(false);
+            source += "    }\n";
+        } else {
+            source += "    for (unsigned long long column = threadIdx.x; " + row_guard + "column < columns; column += blockDim.x) {\n";
+            emit_body(false);
+            source += "    }\n";
         }
-
-        source += "    }\n";
         if (!wave_only) {
             source += "    __syncthreads();\n";
         }
@@ -772,8 +850,10 @@ static bool rtc_key_string(ggml_fusion_cache_key & key, const char * value) {
 }
 
 static bool rtc_make_key(ggml_fusion_program & program, const ggml_fusion_schedule & schedule, ggml_fusion_cache_key & key) {
+    const bool normalize = rtc_normalizes(program);
+    const uint32_t width = normalize ? rtc_normalization_width(program, schedule) : 1;
     if (!program.indexed) {
-        return ggml_fusion_make_key(program, schedule, key);
+        return ggml_fusion_make_key(program, schedule, key) && (!normalize || rtc_key_integer(key, width));
     }
 
     const bool narrow = rtc_index32(program);
@@ -832,7 +912,7 @@ static bool rtc_make_key(ggml_fusion_program & program, const ggml_fusion_schedu
     const bool result = ggml_fusion_make_key(program, schedule, key);
     std::memcpy(program.ne, original_ne, sizeof(original_ne));
     std::memcpy(program.accesses, original_accesses, access_bytes);
-    return result && rtc_key_integer(key, narrow);
+    return result && rtc_key_integer(key, narrow) && (!normalize || rtc_key_integer(key, width));
 }
 
 struct rtc_module {

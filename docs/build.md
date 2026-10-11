@@ -448,7 +448,7 @@ cmake -B build -DGGML_HIP=ON -DGGML_HIP_RTC=ON
 cmake --build build --config Release
 ```
 
-Kernels compile in the background, with native kernels used until compilation finishes or if compilation fails. Vectorization and row tiling are selected automatically; no runtime activation variable is needed. Matrix multiplication and attention still use native kernels. Performance gains depend on the model and GPU.
+Kernels compile in the background, with native kernels used until compilation finishes or if compilation fails. Pointwise and RMS fusion use automatic vectorization and row tiling; no runtime activation variable is needed. Matrix multiplication and attention still use native kernels. Performance gains depend on the model and GPU.
 
 ### Unified Memory
 

@@ -2123,7 +2123,11 @@ static void capture_normalization_schedule() {
 }
 
 static void capture_normalization() {
-    for (const auto shape : {std::array<int, 3>{257, 3, 0}, {257, 3, 1}, {128, 13, 0}, {128, 13, 1}, {32, 3, 0}, {32, 3, 1}}) {
+    for (const auto shape : {
+            std::array<int, 3>{1, 13, 0}, {1, 13, 1},
+            {32, 3, 0}, {32, 3, 1}, {64, 13, 0}, {64, 13, 1},
+            {128, 13, 0}, {128, 13, 1}, {257, 3, 0}, {257, 3, 1},
+            {1025, 13, 0}, {1025, 13, 1}, {1027, 13, 0}, {1027, 13, 1}}) {
         const bool inplace = shape[2] != 0;
         auto backend = ggml_backend_cuda_init(0);
         REQUIRE(backend);
@@ -2133,8 +2137,9 @@ static void capture_normalization() {
 
         const int columns = shape[0];
         const int rows = shape[1];
-        auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, columns, rows);
-        ggml_set_input(input);
+        auto * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, columns * rows + 2);
+        auto * input = ggml_view_2d(ctx, storage, columns, rows, columns * sizeof(float), sizeof(float));
+        ggml_set_input(storage);
 
         float eps = 0.125f;
         float affine_params[] = {0.75f, -0.25f};
@@ -2149,10 +2154,18 @@ static void capture_normalization() {
         ggml_build_forward_expand(graph, out);
         graph->uid = 1;
 
+        int start = 0;
+        while (graph->nodes[start] != norm) {
+            ++start;
+        }
+
         auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
         REQUIRE(buffer);
 
         std::vector<float> values(columns * rows);
+        const float canary = 123.25f;
+        ggml_backend_tensor_set(storage, &canary, 0, sizeof(canary));
+        ggml_backend_tensor_set(storage, &canary, (values.size() + 1) * sizeof(float), sizeof(canary));
 
         auto check = [&] {
             std::vector<float> result(values.size()), normalized(values.size());
@@ -2160,6 +2173,11 @@ static void capture_normalization() {
             if (inplace) {
                 ggml_backend_tensor_get(input, normalized.data(), 0, normalized.size() * sizeof(float));
             }
+
+            float head, tail;
+            ggml_backend_tensor_get(storage, &head, 0, sizeof(head));
+            ggml_backend_tensor_get(storage, &tail, (values.size() + 1) * sizeof(float), sizeof(tail));
+            REQUIRE(head == canary && tail == canary);
 
             for (int row = 0; row < rows; ++row) {
                 double sum = 0;
@@ -2205,7 +2223,7 @@ static void capture_normalization() {
             if (phase == 0) {
                 ggml_backend_tensor_set(input, values.data(), 0, values.size() * sizeof(float));
                 auto & cuda_ctx = *static_cast<ggml_backend_cuda_context *>(backend->context);
-                REQUIRE(ggml_cuda_rtc_fusion_try(cuda_ctx, graph, 0, true) == graph->n_nodes - 1);
+                REQUIRE(ggml_cuda_rtc_fusion_try(cuda_ctx, graph, start, true) == graph->n_nodes - start - 1);
                 ggml_backend_synchronize(backend);
                 check();
             }

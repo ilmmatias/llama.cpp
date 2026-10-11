@@ -402,7 +402,7 @@ static void bench(bool manual = false) {
         fusion_bench_case("full", GGML_TYPE_F32, {n, 1, 1, 1});
     }
 
-    for (auto shape : {std::array<int64_t, 4>{128, 48, 1, 1}, {128, 13, 1, 1}, {32, 3, 1, 1}, {32, 262143, 1, 1}, {128, 48, 1024, 1}, {2560, 4, 1024, 1}, {257, 3, 2, 2}}) {
+    for (auto shape : {std::array<int64_t, 4>{128, 48, 1, 1}, {128, 13, 1, 1}, {32, 3, 1, 1}, {32, 262143, 1, 1}, {64, 131071, 1, 1}, {128, 48, 1024, 1}, {2560, 4, 1024, 1}, {1027, 13, 1, 1}, {257, 3, 2, 2}}) {
         fusion_bench_case("rms_gate", GGML_TYPE_F32, shape);
     }
 
