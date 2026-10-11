@@ -19,6 +19,7 @@ static int fusion_sources(const ggml_tensor * node) {
         case GGML_OP_MUL:
         case GGML_OP_DIV: return 2;
         case GGML_OP_SCALE:
+        case GGML_OP_CONT:
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
         case GGML_OP_LOG:
@@ -131,7 +132,8 @@ static bool fusion_source(const ggml_tensor * source, const ggml_tensor * node, 
 
         return true;
     }
-    return ggml_are_same_shape(source, node) && (fusion_binary(node->op) || ggml_is_contiguous(source));
+    return ggml_are_same_shape(source, node) && (fusion_binary(node->op) || node->op == GGML_OP_CONT ||
+        (node->op == GGML_OP_UNARY && ggml_is_contiguous_1(source)) || ggml_is_contiguous(source));
 }
 
 static bool fusion_types(const ggml_tensor * node) {

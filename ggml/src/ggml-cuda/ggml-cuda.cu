@@ -5206,6 +5206,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_is_contiguous(other) && ggml_are_same_shape(gate, other) &&
                 ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL }, { i + 2 }) &&
                 ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1)) {
+#ifdef GGML_HIP_RTC
+            if (ggml_nelements(mul) >= (1 << 20)) {
+                const int skipped = ggml_cuda_rtc_fusion_try(*cuda_ctx, cgraph, i, allow_compile, 3, 3);
+                if (skipped) {
+                    return skipped;
+                }
+            }
+#endif
             ggml_cuda_op_cont_sigmoid_mul(*cuda_ctx, node, unary, mul);
             return 2;
         }
@@ -5214,6 +5222,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
+#ifdef GGML_HIP_RTC
+        if (node->type == GGML_TYPE_F32 && ggml_nelements(node) >= (1 << 20) &&
+                ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(cgraph->nodes[i + 1]->src[0]) &&
+                ggml_is_contiguous(cgraph->nodes[i + 1]->src[1])) {
+            const int skipped = ggml_cuda_rtc_fusion_try(*cuda_ctx, cgraph, i, allow_compile, 2, 2);
+            if (skipped) {
+                return skipped;
+            }
+        }
+#endif
         ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }

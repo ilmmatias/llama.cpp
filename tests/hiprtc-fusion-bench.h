@@ -44,7 +44,13 @@ struct fusion_bench_log {
 static ggml_cgraph * fusion_bench_build_graph(ggml_context * ctx, const std::string & name, ggml_type type,
                                             const std::array<int64_t, 4> & ne, std::vector<ggml_tensor *> & outputs) {
     auto * graph = ggml_new_graph(ctx);
-    auto * a = name == "rms_gate_strided" ? ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, ne[0], ne[2], ne[1], ne[3]), 0, 2, 1, 3) : ggml_new_tensor(ctx, type, 4, ne.data());
+    ggml_tensor * a;
+    if (name == "cont_gate") {
+        auto * storage = ggml_new_tensor_4d(ctx, type, 2 * ne[0], ne[1], ne[2], ne[3]);
+        a = ggml_view_4d(ctx, storage, ne[0], ne[1], ne[2], ne[3], storage->nb[1], storage->nb[2], storage->nb[3], ne[0] * ggml_type_size(type));
+    } else {
+        a = name == "rms_gate_strided" ? ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, ne[0], ne[2], ne[1], ne[3]), 0, 2, 1, 3) : ggml_new_tensor(ctx, type, 4, ne.data());
+    }
     ggml_tensor * b;
     if (name == "repeat") {
         b = ggml_new_tensor_4d(ctx, type, 5, 2, 2, 1);
@@ -85,6 +91,15 @@ static ggml_cgraph * fusion_bench_build_graph(ggml_context * ctx, const std::str
     } else if (name == "rms_gate" || name == "rms_gate_strided") {
         auto * gamma = ggml_new_tensor_2d(ctx, type, ne[0], ne[1]);
         out = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, a, 1e-6f), gamma), ggml_sigmoid(ctx, b));
+    } else if (name == "cont_gate") {
+        out = ggml_mul(ctx, ggml_sigmoid(ctx, ggml_cont(ctx, a)), b);
+    } else if (name == "silu_mul" || name == "sigmoid_mul" || name == "softplus_mul") {
+        auto * unary = name == "silu_mul" ? ggml_silu(ctx, a) : name == "sigmoid_mul" ? ggml_sigmoid(ctx, a) : ggml_softplus(ctx, a);
+        out = ggml_mul(ctx, unary, b);
+    } else if (name == "relu_sqr") {
+        out = ggml_sqr(ctx, ggml_relu(ctx, a));
+    } else if (name == "softcap") {
+        out = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, a, 0.125f)), 8.0f);
     } else {
         auto * u = ggml_add(ctx, a, b);
         if (name == "tiny_indexed") {
@@ -326,7 +341,7 @@ static void fusion_bench_case(const std::string & name, ggml_type type, std::arr
     ggml_free(ctx);
 }
 
-static void bench() {
+static void bench(bool manual = false) {
     std::puts(
         "case,type,shape,admission,"
         "source_us,compile_us,load_us,first_us,"
@@ -334,6 +349,15 @@ static void bench() {
         "cold_compile,cold_load,cold_launch,cold_capture,cold_graph,"
         "warm_compile,warm_load,warm_launch,warm_graph,total_capture,warm_capture,capture_setup,"
         "registers,local_bytes,shared_bytes,blocks,max_abs_error,nmse");
+
+    if (manual) {
+        for (const char * name : {"silu_mul", "sigmoid_mul", "softplus_mul", "relu_sqr", "softcap", "cont_gate"}) {
+            for (auto shape : {std::array<int64_t, 4>{257, 1, 1, 1}, {128, 48, 1, 1}, {257, 3, 2, 2}, {1024, 1024, 1, 1}, {128, 48, 1024, 1}}) {
+                fusion_bench_case(name, GGML_TYPE_F32, shape);
+            }
+        }
+        return;
+    }
 
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
         for (const char * name : {"basic", "diamond"}) {

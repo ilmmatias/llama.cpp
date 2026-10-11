@@ -339,6 +339,75 @@ static void mixed_silu(ggml_backend_t backend) {
     }
 }
 
+static void cont() {
+    auto backend = ggml_backend_cuda_init(0);
+    REQUIRE(backend);
+
+    for (bool reverse : {false, true}) {
+        for (bool retain : {false, true}) {
+            auto * ctx = ggml_init({1 << 20, nullptr, true});
+            REQUIRE(ctx);
+
+            auto * storage = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 514, 3, 2, 2);
+            auto * gate = ggml_view_4d(ctx, storage, 257, 3, 2, 2, storage->nb[1], storage->nb[2], storage->nb[3], 257 * sizeof(float));
+            auto * other = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 257, 3, 2, 2);
+            auto * dense = ggml_cont(ctx, gate);
+            auto * unary = ggml_sigmoid(ctx, dense);
+            auto * out = reverse ? ggml_mul(ctx, other, unary) : ggml_mul(ctx, unary, other);
+            if (retain) {
+                ggml_set_output(dense);
+            }
+
+            auto * graph = ggml_new_graph(ctx);
+            ggml_build_forward_expand(graph, out);
+            auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            REQUIRE(buffer);
+
+            for (auto * tensor : {storage, other}) {
+                std::vector<float> values(ggml_nelements(tensor));
+                for (size_t i = 0; i < values.size(); ++i) {
+                    values[i] = float(int(i % 97) - 48) / 16.0f;
+                }
+                ggml_backend_tensor_set(tensor, values.data(), 0, values.size() * sizeof(float));
+            }
+
+            int start = -1;
+            for (int i = 0; i < graph->n_nodes; ++i) {
+                if (graph->nodes[i] == dense) {
+                    start = i;
+                }
+                auto view = ggml_graph_view(graph, i, i + 1);
+                REQUIRE(ggml_backend_graph_compute(backend, &view) == GGML_STATUS_SUCCESS);
+            }
+            REQUIRE(start >= 0);
+
+            std::vector<float> expected(ggml_nelements(out)), actual(expected.size()), copied(expected.size());
+            ggml_backend_tensor_get(out, expected.data(), 0, ggml_nbytes(out));
+            ggml_backend_tensor_get(dense, copied.data(), 0, ggml_nbytes(dense));
+            ggml_backend_tensor_memset(out, 0, 0, ggml_nbytes(out));
+            ggml_backend_tensor_memset(dense, 0, 0, ggml_nbytes(dense));
+
+            auto & cuda_ctx = *static_cast<ggml_backend_cuda_context *>(backend->context);
+            REQUIRE(ggml_cuda_rtc_fusion_try(cuda_ctx, graph, start, true, 3, 3) == 2);
+            ggml_backend_synchronize(backend);
+            ggml_backend_tensor_get(out, actual.data(), 0, ggml_nbytes(out));
+            for (size_t i = 0; i < actual.size(); ++i) {
+                REQUIRE(std::abs(actual[i] - expected[i]) <= 1e-6f);
+            }
+            if (retain) {
+                ggml_backend_tensor_get(dense, actual.data(), 0, ggml_nbytes(dense));
+                REQUIRE(actual == copied);
+            }
+
+            ggml_backend_buffer_free(buffer);
+            ggml_free(ctx);
+        }
+    }
+
+    ggml_backend_free(backend);
+    std::puts("CONT: strided gate, reversed multiply, and retained intermediate match ordinary execution");
+}
+
 static void test_scale_contraction(ggml_backend_t backend) {
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
         auto * ctx = ggml_init({1 << 20, nullptr, true});
@@ -2979,6 +3048,8 @@ int main(int argc, char ** argv) {
         types();
     } else if (std::strcmp(argv[1], "reductions") == 0) {
         reductions();
+    } else if (std::strcmp(argv[1], "cont") == 0) {
+        cont();
 #ifdef __linux__
     } else if (std::strcmp(argv[1], "streams") == 0) {
         streams();
@@ -2988,6 +3059,8 @@ int main(int argc, char ** argv) {
         stream_mutations();
     } else if (std::strcmp(argv[1], "bench") == 0) {
         bench();
+    } else if (std::strcmp(argv[1], "bench-manual") == 0) {
+        bench(true);
     } else if (std::strcmp(argv[1], "capture") == 0) {
         capture();
     } else if (std::strcmp(argv[1], "capture-limits") == 0) {

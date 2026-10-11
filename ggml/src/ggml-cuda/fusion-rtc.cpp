@@ -253,6 +253,9 @@ static void rtc_instructions(std::string & source, const ggml_fusion_program & p
         const auto b = rtc_value(instruction.src[1]);
         std::string expression;
         switch (instruction.op) {
+            case GGML_OP_CONT:
+                expression = a;
+                break;
             case GGML_OP_ADD:
                 expression = a + " + " + b;
                 break;
@@ -624,8 +627,7 @@ static std::string rtc_emit_pointwise(const ggml_fusion_program & program) {
 }
 
 bool ggml_cuda_rtc_fusion_enabled() {
-    static const bool enabled = getenv("GGML_HIP_RTC_FUSION") && std::atoi(getenv("GGML_HIP_RTC_FUSION")) &&
-        !(getenv("GGML_CUDA_DISABLE_FUSION") && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION")));
+    static const bool enabled = !(getenv("GGML_CUDA_DISABLE_FUSION") && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION")));
 
     return enabled;
 }
@@ -1656,6 +1658,13 @@ static bool rtc_profitable(const ggml_fusion_program & program, uint64_t n, uint
         return false;
     }
 
+    if (program.count == 2 && program.values[0].op == GGML_OP_UNARY && program.values[1].op == GGML_OP_MUL) {
+        const auto unary = program.values[0].unary;
+        if (unary == GGML_UNARY_OP_SILU || unary == GGML_UNARY_OP_SIGMOID || unary == GGML_UNARY_OP_SOFTPLUS) {
+            return true;
+        }
+    }
+
     if (!program.indexed || program.count >= 3) {
         return true;
     }
@@ -1793,7 +1802,7 @@ static int rtc_launch(ggml_backend_cuda_context & ctx, const ggml_fusion_program
     return program.count - 1;
 }
 
-int ggml_cuda_rtc_fusion_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int node_idx, bool allow_compile, int min_count) {
+int ggml_cuda_rtc_fusion_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int node_idx, bool allow_compile, int min_count, int max_count) {
     if (!ggml_cuda_rtc_fusion_enabled()) {
         return 0;
     }
@@ -1831,8 +1840,11 @@ int ggml_cuda_rtc_fusion_try(ggml_backend_cuda_context & ctx, const ggml_cgraph 
     ggml_fusion_program program;
     ggml_cuda_rtc_binding binding;
     ggml_cgraph slice = *graph;
-    slice.n_nodes = ggml_cuda_fusion_stream_end(ctx, graph, node_idx,
-        node_idx + std::min(graph->n_nodes - node_idx, GGML_FUSION_MAX_VALUES) - 1);
+    int available = std::min(graph->n_nodes - node_idx, GGML_FUSION_MAX_VALUES);
+    if (max_count > 0) {
+        available = std::min(available, max_count);
+    }
+    slice.n_nodes = ggml_cuda_fusion_stream_end(ctx, graph, node_idx, node_idx + available - 1);
 
     for (;;) {
         if (!ggml_fusion_build(&slice, node_idx, region, program) || program.count < min_count) {
