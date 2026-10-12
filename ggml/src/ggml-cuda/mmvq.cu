@@ -1814,6 +1814,19 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
+    if (!ids && dst->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(dst, 1) == GGML_HINT_EXACT_BATCH && ncols_dst > 1) {
+        // Keep the single-column reduction order and quantize the input only once.
+        for (int64_t col = 0; col < ncols_dst; ++col) {
+            mul_mat_vec_q_switch_type(
+                src0->data, src0->type, (const block_q8_1 *) src1_q8_1_d + col*stride_col_y, nullptr,
+                fusion_local, dst_d + col*stride_col_dst, ne00,
+                ne01,              1,             s01, stride_col_y,     stride_col_dst,
+                ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+                ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+        }
+        return;
+    }
+
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,

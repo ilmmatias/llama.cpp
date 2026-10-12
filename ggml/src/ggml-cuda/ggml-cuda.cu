@@ -1957,6 +1957,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, bool
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    if (tensor->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(tensor, 1) == GGML_HINT_EXACT_BATCH) {
+        return false;
+    }
+
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
@@ -2107,7 +2111,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+    const int64_t mmvq_ncols = hint == GGML_HINT_EXACT_BATCH ? 1 : ne11;
+    if (ggml_cuda_should_use_mmvq(src0->type, cc, mmvq_ncols)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -4018,6 +4023,10 @@ static bool ggml_cuda_can_fuse_swiglu_mmq(const ggml_cgraph * graph, int i) {
 }
 
 static bool ggml_cuda_should_fuse_swiglu_mmq(const ggml_tensor * glu, const ggml_tensor * dst, int cc) {
+    if (dst->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(dst, 1) == GGML_HINT_EXACT_BATCH) {
+        return false;
+    }
+
     const bool has_ids = dst->op == GGML_OP_MUL_MAT_ID;
     const ggml_tensor * weights = dst->src[0];
     const int64_t mmq_cols  = has_ids ? glu->ne[2] : glu->ne[1];

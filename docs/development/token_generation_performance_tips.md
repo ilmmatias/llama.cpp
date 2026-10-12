@@ -43,6 +43,8 @@ RDNA2 Q8_0 single-column grouped matrix-vector kernels use two warps for project
 
 A separate optimized/baseline/optimized/baseline comparison with the same model, hardware, and runtime settings measured 36.39 tokens/s for the rebuilt baseline and 36.80 tokens/s with this Q8_0 launch policy (1.12%, 20 repetitions per variant). Isolated 2560-input projections improved from 6.24 to 5.53 microseconds for 512 output rows and from 6.18 to 5.40 microseconds for 320 output rows; the wider controls retained their existing launch geometry.
 
+CUDA/HIP quantized `MUL_MAT` honors `GGML_HINT_EXACT_BATCH` by quantizing the activations once and using the single-column matrix-vector kernel for each output column. This keeps the single-token reduction order, including for batches larger than the normal matrix-vector limit. Fusions that would discard this hint are disabled. The hint trades batched throughput for batch-invariant results; unhinted dispatch keeps its existing policy.
+
 ## CPU sampling
 
 With large vocabularies, CPU repetition, frequency and presence penalties can add noticeable sampling latency. Candidates indexed by token ID use direct updates for the tokens in the penalty window; other layouts retain the full scan when direct indexing is not valid. This follows the [sparse penalty update in strix-llama.cpp](https://github.com/asf0/strix-llama.cpp/commit/4202e1b56c401ef052b17c5c7bbd3e1dbdc855c6) and does not change penalty arithmetic or token-window eviction.

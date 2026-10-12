@@ -6037,11 +6037,12 @@ struct test_mul_mat_exact_batch : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const bool with_bias;
 
-    test_mul_mat_exact_batch(ggml_type type_a, int64_t m, int64_t n, int64_t k) : type_a(type_a), m(m), n(n), k(k) {}
+    test_mul_mat_exact_batch(ggml_type type_a, int64_t m, int64_t n, int64_t k, bool with_bias = false) : type_a(type_a), m(m), n(n), k(k), with_bias(with_bias) {}
 
     std::string vars() override {
-        return VARS_TO_STR4(type_a, m, n, k);
+        return VARS_TO_STR5(type_a, m, n, k, with_bias);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -6049,11 +6050,19 @@ struct test_mul_mat_exact_batch : public test_case {
         ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
         ggml_tensor * batch = ggml_mul_mat(ctx, a, b);
         ggml_mul_mat_set_hint(batch, GGML_HINT_EXACT_BATCH);
+        ggml_tensor * bias = with_bias ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n) : nullptr;
+        if (bias) {
+            batch = ggml_add(ctx, batch, bias);
+        }
 
         ggml_tensor * diff = nullptr;
         for (int64_t col = 0; col < n; ++col) {
             ggml_tensor * b_col = ggml_view_2d(ctx, b, k, 1, b->nb[1], col*b->nb[1]);
             ggml_tensor * single = ggml_mul_mat(ctx, a, b_col);
+            if (bias) {
+                ggml_tensor * bias_col = ggml_view_2d(ctx, bias, m, 1, bias->nb[1], col*bias->nb[1]);
+                single = ggml_add(ctx, single, bias_col);
+            }
             ggml_tensor * batch_col = ggml_view_2d(ctx, batch, m, 1, batch->nb[1], col*batch->nb[1]);
             ggml_tensor * col_diff = ggml_sub(ctx, batch_col, single);
             diff = diff == nullptr ? col_diff : ggml_concat(ctx, diff, col_diff, 1);
@@ -12291,8 +12300,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (int64_t n : {2, 3, 4, 5, 8, 9, 16}) {
         test_cases.emplace_back(new test_mul_mat_exact_batch(GGML_TYPE_BF16, 128, n, 5120));
+        test_cases.emplace_back(new test_mul_mat_exact_batch(GGML_TYPE_Q8_0, 128, n, 5120));
     }
-    test_cases.emplace_back(new test_mul_mat_exact_batch(GGML_TYPE_Q8_0, 128, 4, 5120));
+    test_cases.emplace_back(new test_mul_mat_exact_batch(GGML_TYPE_Q8_0, 512, 3, 2560));
+    test_cases.emplace_back(new test_mul_mat_exact_batch(GGML_TYPE_Q8_0, 1024, 3, 2560));
+    test_cases.emplace_back(new test_mul_mat_exact_batch(GGML_TYPE_Q8_0, 512, 3, 2560, true));
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 127, 128, 511, 512}) {
