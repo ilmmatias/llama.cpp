@@ -495,7 +495,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     if (table_id == MMVQ_PARAMETERS_RDNA2 && ncols_dst == 1) {
         switch (type) {
             case GGML_TYPE_Q8_0:
-                return small_k ? 1 : (halve_iters ? 8 : 4);
+                return small_k ? (halve_iters ? 2 : 1) : (halve_iters ? 8 : 4);
             default:
                 return 1;
         }
@@ -1259,7 +1259,12 @@ static void mul_mat_vec_q_switch_ncols_dst(
             };
 
             if (should_use_small_k(c_ncols_dst)) {
-                launch(std::true_type{},  std::false_type{});
+                if (table_id == MMVQ_PARAMETERS_RDNA2 && type == GGML_TYPE_Q8_0 && nrows_x < 1024 &&
+                        blocks_per_row_x >= 2 * blocks_per_iter_1warp) {
+                    launch(std::true_type{}, std::true_type{});
+                } else {
+                    launch(std::true_type{}, std::false_type{});
+                }
             } else if (should_halve_iters()) {
                 launch(std::false_type{}, std::true_type{});
             } else {

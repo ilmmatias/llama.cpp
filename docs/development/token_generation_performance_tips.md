@@ -39,6 +39,10 @@ HIP ZNQ4 matrix-vector kernels expand four packed codes with a byte permutation 
 
 On a Ryzen 9 9950X and RX 6750 XT, the ZNQ3 admission conversion and HIP ZNQ4 byte permutation together increased Tinfield-1-ZNQ4-v2 generation throughput from 36.65 to 36.86 tokens/s (0.57%). This is a small end-to-end improvement, not the larger speedup seen in isolated conversion or matrix-vector measurements. The comparison used baseline/optimized/optimized/baseline runs with 10 repetitions each, 2048 prompt tokens, 256 generated tokens, 16 CPU threads, 32 expert-cache slots, an admission window of 1, and 2 cache workers; GPU offload, flash attention, and mlock loading were unchanged.
 
+RDNA2 Q8_0 single-column grouped matrix-vector kernels use two warps for projections with fewer than 1024 output rows when the reduction can occupy both warps. Larger and very short projections keep their existing launch geometry. Other architectures, weight formats, and multi-column kernels keep their existing policies.
+
+A separate optimized/baseline/optimized/baseline comparison with the same model, hardware, and runtime settings measured 36.39 tokens/s for the rebuilt baseline and 36.80 tokens/s with this Q8_0 launch policy (1.12%, 20 repetitions per variant). Isolated 2560-input projections improved from 6.24 to 5.53 microseconds for 512 output rows and from 6.18 to 5.40 microseconds for 320 output rows; the wider controls retained their existing launch geometry.
+
 ## CPU sampling
 
 With large vocabularies, CPU repetition, frequency and presence penalties can add noticeable sampling latency. Candidates indexed by token ID use direct updates for the tokens in the penalty window; other layouts retain the full scan when direct indexing is not valid. This follows the [sparse penalty update in strix-llama.cpp](https://github.com/asf0/strix-llama.cpp/commit/4202e1b56c401ef052b17c5c7bbd3e1dbdc855c6) and does not change penalty arithmetic or token-window eviction.
