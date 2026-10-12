@@ -72,4 +72,6 @@ common_device_memory_data_vec common_get_device_memory_data(
                            uint32_t & hp_n_ctx_train,
                            uint32_t & hp_n_expert,
                       uint32_t & hp_n_expert_used_max,
-                     ggml_log_level   log_level);
+                     ggml_log_level   log_level,
+                             size_t * cache_workspace_size,
+                 ggml_backend_dev_t   cache_dev);

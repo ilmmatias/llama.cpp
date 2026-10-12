@@ -25,6 +25,8 @@ Mixed CPU/GPU graphs can spend time waiting for transfers even when the GPU kern
 
 Supported ZNQ expert-cache outputs stay on-device when their next consumers run on the cache GPU. A row-gather graph combines cached outputs with uploaded CPU misses before GPU weighting and reduction; fully cached batches need no CPU-output upload. This avoids the cached-output GPU-to-CPU round trip. CPU consumers and evaluation callbacks keep the host-side join, and batches larger than 128 tokens keep the CPU bulk-prefill path.
 
+The merge workspace is shared across layers and grows with supported batch sizes rather than retaining a separate allocation for every layer. Fitting reserves its maximum size and the expert-compute workspace alongside cached weights, including loaded MTP layers. GPU events order workspace reuse without a host wait in steady-state merges.
+
 CPU_REPACK `MUL_MAT` and `MUL_MAT_ID` accept F32 or the weight type's native vector-dot input type (Q8_0 or Q8_K). Prequantized inputs keep their tensor type and row strides; the CPU packs full GEMM groups without dequantizing them and reads GEMV tails directly. ZNQ expert-cache hits also accept native Q8_0 inputs, including combined gate/up weights, and pack them into the GPU's Q8_1 layout. Existing F32 graphs remain unchanged.
 
 This is an operator capability, not automatic graph quantization. Callers must explicitly produce a supported quantized tensor before a GPU-to-CPU handoff. Measure transfer and packing costs against the F32 path before using it in a model graph.

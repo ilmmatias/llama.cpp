@@ -13,6 +13,8 @@ extern "C" {
     typedef ggml_backend_dev_t (*ggml_backend_cpu_expert_cache_device_t)(const struct ggml_tensor * op);
     typedef void (*ggml_backend_cpu_expert_cache_prepare_t)(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     typedef bool (*ggml_backend_cpu_expert_cache_copy_t)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst);
+    typedef size_t (*ggml_backend_cpu_expert_cache_get_buffer_size_t)(
+        ggml_backend_dev_t device, int64_t input_dim, int64_t ffn_dim, int64_t output_dim, int64_t n_expert_used);
 
     // the compute plan that needs to be prepared for ggml_graph_compute()
     // since https://github.com/ggml-org/ggml/issues/287

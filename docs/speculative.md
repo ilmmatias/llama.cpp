@@ -9,6 +9,8 @@ With `--expert-cache-slots`, supported CPU-resident MoE experts can use the GPU 
 
 When the expert outputs feed the cache GPU directly, cached rows stay on-device and CPU miss rows are uploaded for a device-side merge and weighted reduction. Fully cached batches do not upload CPU expert outputs. Device events protect cache slots and CPU staging storage until their readers finish. CPU consumers, observed expert outputs, and evaluation callbacks retain the host-side join.
 
+The device-side merge uses one workspace shared across layers and MTP evaluations. It grows only when a larger supported batch or expert shape is needed, and device events protect it until the previous copy finishes. Parameter fitting includes the maximum merge and expert-compute workspace sizes when GPU expert caching is enabled; `--fit-target` remains the margin for other runtime allocations.
+
 On HIP, changed graph executables are rebuilt rather than updated in place. This releases the old kernel-argument storage and avoids [ROCm's accumulating graph-update allocations](https://github.com/ROCm/rocm-systems/issues/10021), which speculative batch-size changes can exhaust.
 
 Qwen4Exp MTP supports both combined and detached draft-head GGUF files. Draft attention remains dense by default; set `LLAMA_QWEN4EXP_MTP_QSA=1` to use the branch's compact QSA block cache. The converter preserves the draft head's compression ratio in either mode.

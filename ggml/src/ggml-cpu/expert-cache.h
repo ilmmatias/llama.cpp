@@ -24,6 +24,8 @@ void             ggml_backend_cpu_expert_cache_end  (struct ggml_tensor * op);
 ggml_backend_dev_t ggml_backend_cpu_expert_cache_device(const struct ggml_tensor * op);
 void ggml_backend_cpu_expert_cache_prepare(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 bool ggml_backend_cpu_expert_cache_copy(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst);
+size_t ggml_backend_cpu_expert_cache_get_buffer_size(
+        ggml_backend_dev_t device, int64_t input_dim, int64_t ffn_dim, int64_t output_dim, int64_t n_expert_used);
 
 #ifdef __cplusplus
 }

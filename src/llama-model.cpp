@@ -24,6 +24,7 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <cassert>
@@ -3393,6 +3394,31 @@ int32_t llama_model_n_expert(const struct llama_model * model) {
 
 int32_t llama_model_n_expert_used_max(const struct llama_model * model) {
     return (int32_t)model->hparams.n_expert_used_max();
+}
+
+size_t llama_model_expert_cache_get_buffer_size(const struct llama_model * model, ggml_backend_dev_t device) {
+    int64_t input_dim = 0, ffn_dim = 0, output_dim = 0, n_expert_used = 0;
+    for (size_t il = 0; il < model->layers.size(); ++il) {
+        const auto & layer = model->layers[il];
+        const auto * down = layer.ffn_down_exps;
+        const auto * gate = layer.ffn_gate_up_exps != nullptr ? layer.ffn_gate_up_exps : layer.ffn_gate_exps;
+        const int64_t used = model->hparams.n_expert_used(il);
+        if (gate == nullptr || down == nullptr || used <= 0 || used > 64 ||
+            (down->type != GGML_TYPE_ZNQ2 && down->type != GGML_TYPE_ZNQ3 && down->type != GGML_TYPE_ZNQ4)) {
+            continue;
+        }
+
+        input_dim = std::max(input_dim, gate->ne[0]);
+        ffn_dim = std::max(ffn_dim, down->ne[0]);
+        output_dim = std::max(output_dim, down->ne[1]);
+        n_expert_used = std::max(n_expert_used, used);
+    }
+
+    const auto cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    const auto fn = reinterpret_cast<ggml_backend_cpu_expert_cache_get_buffer_size_t>(
+            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(cpu), "ggml_backend_cpu_expert_cache_get_buffer_size"));
+    GGML_ASSERT(fn != nullptr);
+    return fn(device, input_dim, ffn_dim, output_dim, n_expert_used);
 }
 
 int32_t llama_model_n_devices(const struct llama_model * model) {

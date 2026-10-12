@@ -100,23 +100,39 @@ struct expert_cache_template {
 
 struct expert_cache_merge {
     ggml_context * ctx = nullptr;
-    ggml_backend_buffer_t buffer = nullptr;
+    ggml_gallocr_t allocator = nullptr;
+    ggml_backend_event_t copied = nullptr;
+    int64_t output_capacity = 0;
+    int64_t expert_capacity = 0;
+    int64_t token_capacity = 1;
     ggml_cgraph * graph = nullptr;
     ggml_tensor * packed = nullptr;
     ggml_tensor * ids = nullptr;
     ggml_tensor * misses = nullptr;
     ggml_tensor * output = nullptr;
-    std::vector<int32_t> routes;
     bool all_cached = false;
-    bool computed = false;
+
+    void build(int64_t output_dim, int64_t n_expert_used, int64_t n_tokens) {
+        ggml_reset(ctx);
+        const int64_t rows = n_expert_used * n_tokens;
+        packed = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, output_dim, 2 * rows);
+        ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rows);
+        misses = ggml_view_3d(ctx, packed, output_dim, n_expert_used, n_tokens,
+                packed->nb[1], packed->nb[1] * n_expert_used, rows * packed->nb[1]);
+        output = ggml_reshape_3d(ctx, ggml_get_rows(ctx, packed, ids), output_dim, n_expert_used, n_tokens);
+        graph = ggml_new_graph_custom(ctx, 8, false);
+        ggml_build_forward_expand(graph, output);
+    }
 
     ~expert_cache_merge() {
-        ggml_backend_buffer_free(buffer);
+        ggml_backend_event_free(copied);
+        ggml_gallocr_free(allocator);
         ggml_free(ctx);
     }
 };
 
 static constexpr int EXPERT_CACHE_BATCH_SIZES = 4;
+static constexpr int EXPERT_CACHE_MAX_TOKENS = 128;
 
 struct expert_cache_batch {
     expert_cache_template * t;
@@ -186,8 +202,7 @@ struct expert_cache_layer {
     int active_hits = 0;
     bool active_gpu_launched = false;
     bool active_deferred = false;
-    const ggml_tensor * pending_output = nullptr;
-    std::unique_ptr<expert_cache_merge> merge;
+    std::vector<int32_t> merge_routes;
     ggml_backend_event_t reads_done = nullptr;
     bool reads_recorded = false;
 };
@@ -424,6 +439,7 @@ public:
             ggml_gallocr_free(workspace);
             workspace = nullptr;
         }
+        merge.reset();
         if (compute_backend != nullptr) {
             ggml_backend_free(compute_backend);
         }
@@ -461,7 +477,7 @@ public:
         ggml_backend_synchronize(compute_backend);
         std::lock_guard<std::mutex> lock(state_mutex);
         deferred_starts.clear();
-        pending_outputs.clear();
+        pending_output = nullptr;
 
         if (graph == nullptr) {
             return;
@@ -507,7 +523,11 @@ public:
 
                 const auto backend = ggml_backend_sched_get_tensor_backend(sched, node);
                 if (j > i && next) {
-                    eligible &= backend != nullptr && ggml_backend_get_device(backend) == dev;
+                    bool consumes_down = false;
+                    for (const auto * src : node->src) {
+                        consumes_down |= root(src) == down;
+                    }
+                    eligible &= consumes_down && backend != nullptr && ggml_backend_get_device(backend) == dev;
                     next = false;
                 }
 
@@ -544,26 +564,26 @@ public:
 
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) {
         std::lock_guard<std::mutex> lock(state_mutex);
-        const auto it = pending_outputs.find(src);
 
-        if (it == pending_outputs.end() ||
+        if (src != pending_output ||
             ggml_backend_get_device(backend) != ggml_backend_get_device(compute_backend)) {
             return false;
         }
 
-        auto & merge = *it->second->merge;
-        if (!merge.computed) {
-            if (!merge.all_cached) {
-                ggml_backend_tensor_set_async(compute_backend, merge.misses, src->data, 0, ggml_nbytes(src));
-            }
-
-            const auto status = ggml_backend_graph_compute_async(compute_backend, merge.graph);
-            GGML_ASSERT(status == GGML_STATUS_SUCCESS);
-            merge.computed = true;
+        GGML_ASSERT(merge != nullptr);
+        auto & m = *merge;
+        if (!m.all_cached) {
+            ggml_backend_tensor_set_async(compute_backend, m.misses, src->data, 0, ggml_nbytes(src));
         }
 
-        ggml_backend_tensor_copy_async(compute_backend, backend, merge.output, dst);
+        const auto status = ggml_backend_graph_compute_async(compute_backend, m.graph);
+        GGML_ASSERT(status == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_copy_async(compute_backend, compute_backend, m.output, dst);
 
+        // Copy on the compute stream before reusing the shared output.
+        ggml_backend_event_record(m.copied, compute_backend);
+        ggml_backend_event_wait(backend, m.copied);
+        pending_output = nullptr;
         return true;
     }
 
@@ -666,8 +686,7 @@ public:
             std::lock_guard<std::mutex> lock(state_mutex);
             ggml_backend_event_record(layer_ptr->reads_done, compute_backend);
             layer_ptr->reads_recorded = true;
-            layer_ptr->pending_output = op;
-            pending_outputs[op] = layer_ptr;
+            pending_output = op;
             observe_locked(model_key, *layer_ptr, layer_id, op->src[2]);
             clear_active_locked(*layer_ptr);
             return;
@@ -703,7 +722,7 @@ private:
     static bool is_supported_ids(const ggml_tensor * ids) {
         // Bound the cache graph and host staging sizes for verification batches.
         return ids != nullptr && ids->type == GGML_TYPE_I32 &&
-            ids->ne[0] > 0 && ids->ne[0] <= 64 && ids->ne[1] > 0 && ids->ne[1] <= 128 &&
+            ids->ne[0] > 0 && ids->ne[0] <= 64 && ids->ne[1] > 0 && ids->ne[1] <= EXPERT_CACHE_MAX_TOKENS &&
             ids->ne[2] == 1 && ids->ne[3] == 1;
     }
 
@@ -737,7 +756,6 @@ private:
             ggml_backend_event_free(layer.reads_done);
             layer.reads_done = nullptr;
         }
-        layer.merge.reset();
         for (auto & t : layer.templates) {
             if (t) {
                 free_template(*t);
@@ -1087,12 +1105,8 @@ private:
     }
 
     bool prepare_merge_locked(expert_cache_layer & layer, const ggml_tensor * ids) {
-        if (layer.merge && layer.merge->misses->ne[2] != ids->ne[1]) {
-            ggml_backend_synchronize(compute_backend);
-            layer.merge.reset();
-        }
-
-        if (!layer.merge) {
+        GGML_ASSERT(pending_output == nullptr);
+        if (!merge) {
             auto m = std::make_unique<expert_cache_merge>();
             ggml_init_params params = {
                 /*.mem_size   =*/ 8 * ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false),
@@ -1100,34 +1114,45 @@ private:
                 /*.no_alloc   =*/ true,
             };
             m->ctx = ggml_init(params);
-            if (m->ctx == nullptr) {
+            m->allocator = ggml_gallocr_new(device_buft);
+            m->copied = ggml_backend_event_new(ggml_backend_get_device(compute_backend));
+            if (m->ctx == nullptr || m->allocator == nullptr || m->copied == nullptr) {
                 return false;
             }
+            merge = std::move(m);
+        }
 
-            const int64_t rows = layer.n_expert_used * ids->ne[1];
-            m->packed = ggml_new_tensor_2d(m->ctx, GGML_TYPE_F32, layer.output_dim, 2 * rows);
-            m->ids = ggml_new_tensor_1d(m->ctx, GGML_TYPE_I32, rows);
-            m->misses = ggml_view_3d(m->ctx, m->packed, layer.output_dim, layer.n_expert_used, ids->ne[1],
-                    m->packed->nb[1], m->packed->nb[1] * layer.n_expert_used, rows * m->packed->nb[1]);
-            m->output = ggml_reshape_3d(m->ctx, ggml_get_rows(m->ctx, m->packed, m->ids),
-                    layer.output_dim, layer.n_expert_used, ids->ne[1]);
+        auto & m = *merge;
+        if (layer.output_dim > m.output_capacity || layer.n_expert_used > m.expert_capacity || ids->ne[1] > m.token_capacity) {
+            ggml_backend_synchronize(compute_backend);
+            const int64_t output_capacity = std::max(m.output_capacity, layer.output_dim);
+            const int64_t expert_capacity = std::max(m.expert_capacity, layer.n_expert_used);
+            int64_t token_capacity = m.token_capacity;
+            while (token_capacity < ids->ne[1]) {
+                token_capacity *= 2;
+            }
+            m.build(output_capacity, expert_capacity, token_capacity);
+            if (!ggml_gallocr_reserve(m.allocator, m.graph)) {
+                return false;
+            }
+            m.output_capacity = output_capacity;
+            m.expert_capacity = expert_capacity;
+            m.token_capacity = token_capacity;
+        }
 
-            m->graph = ggml_new_graph_custom(m->ctx, 8, false);
-            ggml_build_forward_expand(m->graph, m->output);
-
-            for (int i = 0; i < ggml_graph_n_nodes(m->graph); ++i) {
-                if (!ggml_backend_supports_op(compute_backend, ggml_graph_node(m->graph, i))) {
+        if (m.output->ne[0] != layer.output_dim || m.output->ne[1] != layer.n_expert_used || m.output->ne[2] != ids->ne[1]) {
+            m.build(layer.output_dim, layer.n_expert_used, ids->ne[1]);
+        }
+        if (m.output->buffer == nullptr) {
+            for (int i = 0; i < ggml_graph_n_nodes(m.graph); ++i) {
+                if (!ggml_backend_supports_op(compute_backend, ggml_graph_node(m.graph, i))) {
                     return false;
                 }
             }
-
-            m->buffer = ggml_backend_alloc_ctx_tensors(m->ctx, compute_backend);
-            if (m->buffer == nullptr) {
+            if (!ggml_gallocr_alloc_graph(m.allocator, m.graph) ||
+                ggml_backend_view_init(m.misses) != GGML_STATUS_SUCCESS) {
                 return false;
             }
-
-            m->routes.resize(rows);
-            layer.merge = std::move(m);
         }
 
         if (layer.reads_done == nullptr) {
@@ -1137,23 +1162,19 @@ private:
             }
         }
 
-        auto & m = *layer.merge;
-        const size_t rows = m.routes.size();
+        const size_t rows = (size_t) layer.n_expert_used * ids->ne[1];
+        layer.merge_routes.resize(rows);
         GGML_ASSERT(layer.active_route_positions.size() <= rows);
-
         for (size_t i = 0; i < rows; ++i) {
-            m.routes[i] = rows + i;
+            layer.merge_routes[i] = rows + i;
         }
-
         for (size_t i = 0; i < layer.active_route_positions.size(); ++i) {
             const int32_t route = layer.active_route_positions[i];
             if (route >= 0) {
-                m.routes[route] = i;
+                layer.merge_routes[route] = i;
             }
         }
-
         m.all_cached = (size_t) layer.active_hits == rows;
-        m.computed = false;
 
         return true;
     }
@@ -1210,10 +1231,6 @@ private:
 
     void start_active_locked(expert_cache_layer & layer, const ggml_tensor * ids, bool allow_gpu, ggml_tensor * op) {
         layer.active = true;
-        if (layer.pending_output != nullptr) {
-            pending_outputs.erase(layer.pending_output);
-            layer.pending_output = nullptr;
-        }
 
         layer.active_deferred = deferred_starts.count(op) != 0;
         layer.active_ids = ids;
@@ -1353,8 +1370,8 @@ private:
 
         // Templates and host buffers are complete before any asynchronous use.
         if (layer.active_deferred) {
-            ggml_backend_tensor_set_async(compute_backend, layer.merge->ids,
-                    layer.merge->routes.data(), 0, ggml_nbytes(layer.merge->ids));
+            ggml_backend_tensor_set_async(compute_backend, merge->ids,
+                    layer.merge_routes.data(), 0, ggml_nbytes(merge->ids));
         }
 
         for (const auto & batch : layer.active_batches) {
@@ -1371,8 +1388,8 @@ private:
 
             if (layer.active_deferred) {
                 auto slice = *t->output;
-                slice.buffer = layer.merge->buffer;
-                slice.data = (uint8_t *) layer.merge->packed->data + batch.route_offset * output_row_bytes;
+                slice.buffer = merge->packed->buffer;
+                slice.data = (uint8_t *) merge->packed->data + batch.route_offset * output_row_bytes;
                 ggml_backend_tensor_copy_async(compute_backend, compute_backend, t->output, &slice);
             } else {
                 ggml_backend_tensor_get_async(compute_backend, t->output,
@@ -1681,12 +1698,13 @@ private:
     ggml_backend_buffer_type_t device_buft = nullptr;
     ggml_backend_buffer_type_t host_buft = nullptr;
     ggml_gallocr_t workspace = nullptr;
+    std::unique_ptr<expert_cache_merge> merge;
     bool valid = false;
 
     std::mutex state_mutex;
     std::unordered_map<const void *, expert_cache_model> models;
     std::unordered_set<const ggml_tensor *> deferred_starts;
-    std::unordered_map<const ggml_tensor *, expert_cache_layer *> pending_outputs;
+    const ggml_tensor * pending_output = nullptr;
 
     std::mutex queue_mutex;
     std::condition_variable queue_cv;
@@ -1737,6 +1755,35 @@ extern "C" void ggml_backend_cpu_expert_cache_configure(
         uint32_t convert_workers,
         ggml_backend_dev_t device) {
     configure_expert_cache(slots, admit_window, convert_workers, device);
+}
+
+extern "C" size_t ggml_backend_cpu_expert_cache_get_buffer_size(
+        ggml_backend_dev_t device, int64_t input_dim, int64_t ffn_dim, int64_t output_dim, int64_t n_expert_used) {
+    if (input_dim <= 0 || ffn_dim <= 0 || output_dim <= 0 || n_expert_used <= 0 || n_expert_used > 64) {
+        return 0;
+    }
+
+    expert_cache_merge m;
+    m.ctx = ggml_init({ 8 * ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false), nullptr, true });
+    GGML_ASSERT(m.ctx != nullptr);
+    const auto buft = ggml_backend_dev_buffer_type(device);
+    m.allocator = ggml_gallocr_new(buft);
+    m.build(output_dim, n_expert_used, EXPERT_CACHE_MAX_TOKENS);
+    size_t merge_bytes = 0;
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(device, &props);
+    if (props.caps.events) {
+        ggml_gallocr_reserve_n_size(m.allocator, m.graph, nullptr, nullptr, &merge_bytes);
+    }
+
+    // Bound the largest template, including separate gate/up and F32 input.
+    ggml_reset(m.ctx);
+    const int batch_size = 1 << (EXPERT_CACHE_BATCH_SIZES - 1);
+    ggml_new_tensor_3d(m.ctx, GGML_TYPE_F32, input_dim, 1, batch_size);
+    ggml_new_tensor_2d(m.ctx, GGML_TYPE_I32, n_expert_used, batch_size);
+    ggml_new_tensor_3d(m.ctx, GGML_TYPE_F32, 3 * ffn_dim, n_expert_used, batch_size);
+    ggml_new_tensor_3d(m.ctx, GGML_TYPE_F32, output_dim, n_expert_used, batch_size);
+    return merge_bytes + ggml_backend_alloc_ctx_tensors_from_buft_size(m.ctx, buft);
 }
 
 

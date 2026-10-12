@@ -2496,10 +2496,11 @@ int llama_bench(int argc, char ** argv) {
         std::vector<ggml_backend_dev_t> devs_cpu;
         uint32_t ngl_full = 0, nct_full = 0, nex_full = 0, nxu_full = 0;
         uint32_t ngl_cpu  = 0, nct_cpu  = 0, nex_cpu  = 0, nxu_cpu  = 0;
+        size_t workspace_bytes = 0;
         const auto full = common_get_device_memory_data(inst.model.c_str(), &mparams_full, &cparams,
-            devs_full, ngl_full, nct_full, nex_full, nxu_full, params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            devs_full, ngl_full, nct_full, nex_full, nxu_full, params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR, nullptr, nullptr);
         const auto cpu = common_get_device_memory_data(inst.model.c_str(), &mparams_cpu_moe, &cparams,
-            devs_cpu, ngl_cpu, nct_cpu, nex_cpu, nxu_cpu, params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            devs_cpu, ngl_cpu, nct_cpu, nex_cpu, nxu_cpu, params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR, &workspace_bytes, cache_dev);
         if (nex_full == 0 || nex_cpu != nex_full) {
             throw std::runtime_error("expert cache requires a consistent routed-expert count");
         }
@@ -2525,7 +2526,7 @@ int llama_bench(int argc, char ** argv) {
         }
         const size_t n_expert = (size_t) nex_full;
         const size_t slots = (size_t) inst.expert_cache_slots;
-        return (expert_bytes / n_expert) * slots + ((expert_bytes % n_expert) * slots + n_expert - 1) / n_expert;
+        return workspace_bytes + (expert_bytes / n_expert) * slots + ((expert_bytes % n_expert) * slots + n_expert - 1) / n_expert;
     };
 
     auto configure_expert_cache = [&](const cmd_params_instance & inst) -> bool {

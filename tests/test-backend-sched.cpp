@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 static void test_round_trip(ggml_backend_dev_t dev, bool parallel, bool mixed_sources, int64_t n) {
@@ -424,6 +425,163 @@ static void test_activation_merge(ggml_backend_dev_t dev, bool parallel, bool mi
     }
 }
 
+static bool copy_cached_activation(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph *, void * data) {
+    auto copy = *static_cast<ggml_backend_cpu_expert_cache_copy_t *>(data);
+    return copy(backend, src, dst);
+}
+
+static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel) {
+    auto cpu = ggml_backend_cpu_init();
+    auto cpu_dev = ggml_backend_get_device(cpu);
+    auto reg = ggml_backend_dev_backend_reg(cpu_dev);
+    auto extras = (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    auto configure = (ggml_backend_cpu_expert_cache_configure_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_expert_cache_configure");
+    auto prepare = (ggml_backend_cpu_expert_cache_prepare_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_expert_cache_prepare");
+    auto copy = (ggml_backend_cpu_expert_cache_copy_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_expert_cache_copy");
+    ggml_backend_buffer_type_t buft = nullptr;
+    if (extras) {
+        for (auto p = extras(cpu_dev); p && *p; ++p) {
+            if (strcmp(ggml_backend_buft_name(*p), "CPU_REPACK") == 0) {
+                buft = *p;
+            }
+        }
+    }
+    if (!buft || !configure || !prepare || !copy) {
+        ggml_backend_free(cpu);
+        return;
+    }
+
+    auto gpu = ggml_backend_dev_init(dev, nullptr);
+    GGML_ASSERT(gpu);
+    ggml_backend_cpu_set_n_threads(cpu, 4);
+    constexpr int dim = 256, experts = 4, used = 2, layers = 2;
+    auto weights = ggml_init({ 3*layers*ggml_tensor_overhead(), nullptr, true });
+    ggml_tensor * w[layers][3];
+    const char * parts[] = { "gate", "up", "down" };
+    for (int layer = 0; layer < layers; ++layer) {
+        for (int part = 0; part < 3; ++part) {
+            w[layer][part] = ggml_new_tensor_3d(weights, GGML_TYPE_ZNQ4, dim, dim, experts);
+            char name[64];
+            snprintf(name, sizeof(name), "blk.%d.ffn_%s_exps.weight", layer, parts[part]);
+            ggml_set_name(w[layer][part], name);
+        }
+    }
+    auto weight_buffer = ggml_backend_alloc_ctx_tensors_from_buft(weights, buft);
+    GGML_ASSERT(weight_buffer);
+    ggml_backend_buffer_set_usage(weight_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    std::vector<float> values(dim*dim*experts), importance(dim, 1);
+    for (int layer = 0; layer < layers; ++layer) {
+        for (int part = 0; part < 3; ++part) {
+            for (size_t i = 0; i < values.size(); ++i) {
+                values[i] = 0.02f*std::sin(float(i*13 + part*7 + layer*19));
+            }
+            std::vector<unsigned char> quant(ggml_nbytes(w[layer][part]));
+            ggml_quantize_chunk(GGML_TYPE_ZNQ4, values.data(), quant.data(), 0, dim*experts, dim, importance.data());
+            ggml_backend_tensor_set(w[layer][part], quant.data(), 0, quant.size());
+        }
+    }
+
+    auto run = [&](int tokens, int pattern, int mode, int repeats) {
+        ggml_backend_t backends[] = { gpu, cpu };
+        auto sched = ggml_backend_sched_new(backends, nullptr, 2, 128, parallel, true);
+        ggml_backend_sched_set_copy_callback(sched, copy_cached_activation, &copy);
+        auto ctx = ggml_init({ 64*ggml_tensor_overhead() + ggml_graph_overhead_custom(128, false), nullptr, true });
+        auto x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, dim, 1, tokens);
+        auto ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, tokens);
+        auto scales = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, used, tokens);
+        ggml_set_input(x);
+        ggml_set_input(ids);
+        ggml_set_input(scales);
+        ggml_tensor * outputs[layers];
+        for (int layer = 0; layer < layers; ++layer) {
+            auto gate = ggml_mul_mat_id(ctx, w[layer][0], x, ids);
+            auto up = ggml_mul_mat_id(ctx, w[layer][1], x, ids);
+            auto act = ggml_glu_split(ctx, gate, up, GGML_GLU_OP_SWIGLU);
+            auto down = ggml_mul_mat_id(ctx, w[layer][2], act, ids);
+            for (auto t : { gate, up, act, down }) {
+                ggml_backend_sched_set_tensor_backend(sched, t, cpu);
+            }
+            auto weighted = ggml_mul(ctx, down, scales);
+            ggml_backend_sched_set_tensor_backend(sched, weighted, mode == 1 ? cpu : gpu);
+            if (mode == 2) {
+                ggml_set_output(down);
+            }
+            auto a = ggml_view_2d(ctx, weighted, dim, tokens, weighted->nb[2], 0);
+            auto b = ggml_view_2d(ctx, weighted, dim, tokens, weighted->nb[2], weighted->nb[1]);
+            outputs[layer] = ggml_add(ctx, a, b);
+            ggml_backend_sched_set_tensor_backend(sched, outputs[layer], gpu);
+        }
+        auto out = ggml_add(ctx, outputs[0], outputs[1]);
+        ggml_backend_sched_set_tensor_backend(sched, out, gpu);
+        ggml_set_output(out);
+        auto graph = ggml_new_graph_custom(ctx, 128, false);
+        ggml_build_forward_expand(graph, out);
+        prepare(sched, graph);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
+        std::vector<float> input(dim*tokens), factors(used*tokens), output(dim*tokens*repeats);
+        std::vector<int32_t> routes(used*tokens);
+        for (int t = 0; t < tokens; ++t) {
+            routes[t*used] = pattern == 2 ? 2 : 0;
+            routes[t*used + 1] = pattern == 0 ? 1 : pattern == 1 ? 2 : 3;
+            factors[t*used] = 0.25f;
+            factors[t*used + 1] = 0.75f;
+        }
+        for (int iteration = 0; iteration < repeats; ++iteration) {
+            for (int t = 0; t < tokens; ++t) {
+                for (int i = 0; i < dim; ++i) {
+                    input[t*dim + i] = std::cos(float(i*3 + t*5 + iteration*7))*0.25f;
+                }
+            }
+            ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
+            ggml_backend_tensor_set(ids, routes.data(), 0, ggml_nbytes(ids));
+            ggml_backend_tensor_set(scales, factors.data(), 0, ggml_nbytes(scales));
+            GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get_async(gpu, out, output.data() + iteration*dim*tokens, 0, ggml_nbytes(out));
+        }
+        ggml_backend_sched_synchronize(sched);
+        ggml_backend_sched_free(sched);
+        ggml_free(ctx);
+        return output;
+    };
+
+    const int sizes[] = { 1, 3, 8, 9, 128, 1 };
+    std::vector<std::vector<float>> expected;
+    configure(0, 0, 1, nullptr);
+    for (int tokens : sizes) {
+        for (int pattern = 0; pattern < 3; ++pattern) {
+            expected.push_back(run(tokens, pattern, 0, 4));
+        }
+    }
+    double worst = 0;
+    for (int mode = 0; mode < 3; ++mode) {
+        configure(2, 0, 1, dev);
+        size_t scenario = 0;
+        for (int tokens : sizes) {
+            for (int pattern = 0; pattern < 3; ++pattern) {
+                run(1, 0, 0, 30);
+                auto actual = run(tokens, pattern, mode, 4);
+                double error = 0, norm = 0;
+                for (size_t i = 0; i < actual.size(); ++i) {
+                    GGML_ASSERT(std::isfinite(actual[i]));
+                    const double delta = actual[i] - expected[scenario][i];
+                    error += delta*delta;
+                    norm += double(expected[scenario][i])*expected[scenario][i];
+                }
+                const double nmse = error/std::max(norm, 1e-30);
+                GGML_ASSERT(nmse < 0.001);
+                worst = std::max(worst, nmse);
+                ++scenario;
+            }
+        }
+        configure(0, 0, 1, nullptr);
+    }
+    printf("%s: expert cache reuse parallel=%d PASS (maximum nmse %g)\n", ggml_backend_dev_name(dev), parallel, worst);
+    ggml_backend_buffer_free(weight_buffer);
+    ggml_free(weights);
+    ggml_backend_free(cpu);
+    ggml_backend_free(gpu);
+}
+
 int main() {
     ggml_backend_load_all();
 
@@ -442,6 +600,7 @@ int main() {
             test_upload_lifetime(dev, parallel, true);
             test_activation_merge(dev, parallel, false);
             test_activation_merge(dev, parallel, true);
+            test_expert_cache_reuse(dev, parallel);
         }
     }
 

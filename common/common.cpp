@@ -1209,7 +1209,8 @@ static size_t common_expert_cache_fit_reserve(
         uint32_t slots,
         ggml_backend_dev_t cache_dev,
         size_t & cache_device_index,
-        uint32_t & n_expert_out) {
+        uint32_t & n_expert_out,
+        size_t & workspace_bytes) {
     if (slots == 0 || cache_dev == nullptr || mparams_cpu_moe.tensor_buft_overrides == nullptr) {
         return 0;
     }
@@ -1223,9 +1224,9 @@ static size_t common_expert_cache_fit_reserve(
     uint32_t ngl_cpu  = 0, nct_cpu  = 0, nex_cpu  = 0, nxu_cpu  = 0;
 
     const auto full = common_get_device_memory_data(
-        path_model, &mparams_full, &cparams, devs_full, ngl_full, nct_full, nex_full, nxu_full, GGML_LOG_LEVEL_ERROR);
+        path_model, &mparams_full, &cparams, devs_full, ngl_full, nct_full, nex_full, nxu_full, GGML_LOG_LEVEL_ERROR, nullptr, nullptr);
     const auto cpu = common_get_device_memory_data(
-        path_model, &mparams_cpu_moe, &cparams, devs_cpu, ngl_cpu, nct_cpu, nex_cpu, nxu_cpu, GGML_LOG_LEVEL_ERROR);
+        path_model, &mparams_cpu_moe, &cparams, devs_cpu, ngl_cpu, nct_cpu, nex_cpu, nxu_cpu, GGML_LOG_LEVEL_ERROR, &workspace_bytes, cache_dev);
 
     if (nex_full == 0 || nex_cpu != nex_full) {
         throw std::runtime_error("expert cache requested for a model without a consistent routed-expert count");
@@ -1429,15 +1430,16 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         if (cache_fixed) {
             uint32_t n_expert_unused = 0;
+            size_t workspace_bytes = 0;
             const size_t reserve = common_expert_cache_fit_reserve(
                 params.model.path.c_str(), mparams, cparams, (uint32_t) params.expert_cache_slots, cache_dev, cache_device_index,
-                n_expert_unused);
+                n_expert_unused, workspace_bytes);
             if (cache_device_index >= fit_targets.size()) {
                 throw std::runtime_error("expert cache device index exceeds fit target array");
             }
-            fit_targets[cache_device_index] += reserve;
-            COM_TRC("expert cache reserves %d slots (%.1f MiB) on %s during fit\n",
-                params.expert_cache_slots, (double) reserve / (1024.0 * 1024.0), ggml_backend_dev_name(cache_dev));
+            fit_targets[cache_device_index] += reserve + workspace_bytes;
+            COM_TRC("expert cache reserves %d slots (%.1f MiB) and %.1f MiB workspace on %s during fit\n",
+                params.expert_cache_slots, (double) reserve / (1024.0 * 1024.0), (double) workspace_bytes / (1024.0 * 1024.0), ggml_backend_dev_name(cache_dev));
         }
 
         const ggml_log_level fit_log_level = params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR;
@@ -1455,8 +1457,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         } else {
             // Size the cache from available memory, up to the model's full expert count.
             uint32_t n_expert = 0;
+            size_t workspace_bytes = 0;
             const size_t slot_bytes = common_expert_cache_fit_reserve(
-                params.model.path.c_str(), mparams, cparams, 1, cache_dev, cache_device_index, n_expert);
+                params.model.path.c_str(), mparams, cparams, 1, cache_dev, cache_device_index, n_expert, workspace_bytes);
             if (cache_device_index >= fit_targets.size()) {
                 throw std::runtime_error("expert cache device index exceeds fit target array");
             }
@@ -1484,7 +1487,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 };
 
                 std::vector<size_t> targets_i = fit_targets;
-                targets_i[cache_device_index] += (size_t) cache_slots * slot_bytes;
+                if (cache_slots != 0) {
+                    targets_i[cache_device_index] += (size_t) cache_slots * slot_bytes + workspace_bytes;
+                }
 
                 std::vector<int64_t> surplus_i(fit_targets.size(), 0);
 
@@ -1514,7 +1519,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 std::vector<int64_t> surplus(fit_targets.size(), 0);
                 fit_with_cache_reserve(0, mparams_f, cparams_f, &surplus);
 
-                slots = common_fit_expert_cache_slots_from_surplus(surplus[cache_device_index], slot_bytes, n_expert);
+                slots = common_fit_expert_cache_slots_from_surplus(surplus[cache_device_index] - (int64_t) workspace_bytes, slot_bytes, n_expert);
                 if (slots == 0) {
                     COM_WRN("expert cache auto-fit: %.1f MiB left on %s after layer offloading is not enough for a slot, disabling the cache\n",
                         (double) std::max<int64_t>(surplus[cache_device_index], 0) / (1024.0 * 1024.0), ggml_backend_dev_name(cache_dev));
@@ -1557,8 +1562,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
             params.expert_cache_slots = (int32_t) slots;
             params.expert_cache_slots_auto = false;
-            COM_TRC("expert cache reserved %d slots (%.1f MiB, %.2f MiB/slot) on %s after fit\n",
-                slots, (double) slots * slot_bytes / (1024.0 * 1024.0), (double) slot_bytes / (1024.0 * 1024.0), ggml_backend_dev_name(cache_dev));
+            COM_TRC("expert cache reserved %d slots (%.1f MiB, %.2f MiB/slot) and %.1f MiB workspace on %s after fit\n",
+                slots, (double) slots * slot_bytes / (1024.0 * 1024.0), (double) slot_bytes / (1024.0 * 1024.0),
+                slots != 0 ? (double) workspace_bytes / (1024.0 * 1024.0) : 0.0, ggml_backend_dev_name(cache_dev));
         }
     }
 

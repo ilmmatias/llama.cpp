@@ -89,6 +89,8 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
+LLAMA_API size_t llama_model_expert_cache_get_buffer_size(const struct llama_model * model, ggml_backend_dev_t device);
+
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
 // Set whether the context outputs nextn embeddings or not
