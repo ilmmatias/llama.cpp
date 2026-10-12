@@ -1970,6 +1970,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, bool
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
+    if (with_gate && tensor->op == GGML_OP_MUL_MAT && GGML_CUDA_CC_IS_RDNA2(cc) &&
+            src0->type == GGML_TYPE_Q8_0 && src0->ne[0] >= 16384 && src0->ne[1] >= 1024) {
+        return false;
+    }
+
     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
         static bool disable_dense_fusion = getenv("GGML_CUDA_DISABLE_DENSE_MMVQ_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_DENSE_MMVQ_FUSION"));
         const bool supported_arch = GGML_CUDA_CC_IS_AMD(cc) ||

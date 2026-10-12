@@ -13554,6 +13554,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int64_t rows : {1023, 1025}) {
+        for (bool with_bias : {false, true}) {
+            const ggml_glu_op op = with_bias ? GGML_GLU_OP_SWIGLU_CLAMP : GGML_GLU_OP_SWIGLU;
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, op, 1, rows, 16384,
+                false, 1, 1, false, with_bias, true, false, {1, 1}));
+        }
+    }
+
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));

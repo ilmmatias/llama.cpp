@@ -429,6 +429,8 @@ If your GPU is not officially supported you can use the environment variable [`H
 
 HIP MoE matrix multiplication uses histogram-based expert routing for batches of at least 128 tokens and up to 1024 experts. The routing pass preserves duplicate route slots and supports broadcast or strided activation inputs. Smaller batches and larger expert counts retain the warp-based routing path. This adapts the histogram routing idea from [strix-llama.cpp](https://github.com/asf0/strix-llama.cpp/tree/rdna35-perf) to the backend's physical wave size.
 
+RDNA2 uses separate projections for dense Q8_0 gates with at least 16384 input columns and 1024 output rows. Smaller gates and other quantization types retain fused matvec dispatch. This adapts the wide-gate cutoff from [strix-llama.cpp](https://github.com/asf0/strix-llama.cpp/commit/a44e83af440f5b6aa0f92da6b8cc491bbc75fa45) to measured RDNA2 shapes.
+
 ### Paged QSA KV cache
 
 For Qwen4Exp on CUDA/HIP, `LLAMA_QSA_KV_RESIDENT=16384` keeps a bounded KV page cache in GPU memory and authoritative KV data in mapped host memory. The resident token budget is rounded down to a multiple of four and must be smaller than the context size. This does not change the model's QSA selection threshold.
