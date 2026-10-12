@@ -305,6 +305,125 @@ static void test_upload_lifetime(ggml_backend_dev_t dev, bool parallel, bool use
     ggml_backend_free(gpu);
 }
 
+struct activation_merge {
+    ggml_backend_t backend;
+    const ggml_tensor * source;
+    ggml_tensor * misses;
+    ggml_tensor * result;
+    ggml_cgraph * graph;
+};
+
+static bool merge_activation(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph *, void * user_data) {
+    auto & merge = *static_cast<activation_merge *>(user_data);
+    if (src != merge.source) {
+        return false;
+    }
+
+    ggml_backend_tensor_set_async(merge.backend, merge.misses, src->data, 0, ggml_nbytes(src));
+    GGML_ASSERT(ggml_backend_graph_compute_async(merge.backend, merge.graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_copy_async(merge.backend, backend, merge.result, dst);
+
+    return true;
+}
+
+static void test_activation_merge(ggml_backend_dev_t dev, bool parallel, bool mixed_sources) {
+    constexpr int n = 65536, iterations = 12;
+    ggml_backend_t gpu = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_t cached = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_t other = mixed_sources ? ggml_backend_dev_init(dev, nullptr) : nullptr;
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    GGML_ASSERT(gpu && cached && cpu && (!mixed_sources || other));
+    ggml_backend_cpu_set_n_threads(cpu, 4);
+
+    ggml_backend_t backends[] = { gpu, mixed_sources ? other : cpu, cpu };
+    auto sched = ggml_backend_sched_new(backends, nullptr, mixed_sources ? 3 : 2, 128, parallel, true);
+
+    auto inputs = ggml_init({ 2*ggml_tensor_overhead(), nullptr, true });
+    auto x = ggml_new_tensor_1d(inputs, GGML_TYPE_F32, n);
+    auto y = ggml_new_tensor_1d(inputs, GGML_TYPE_F32, n);
+    ggml_set_input(x);
+    ggml_set_input(y);
+    auto input_buffer = ggml_backend_alloc_ctx_tensors(inputs, cpu);
+    GGML_ASSERT(input_buffer);
+
+    auto merge_ctx = ggml_init({ 8*ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false), nullptr, true });
+    auto misses = ggml_new_tensor_1d(merge_ctx, GGML_TYPE_F32, n);
+    auto resident = ggml_new_tensor_1d(merge_ctx, GGML_TYPE_F32, n);
+    auto result = ggml_add(merge_ctx, misses, ggml_scale(merge_ctx, resident, -0.5f));
+    auto merge_graph = ggml_new_graph_custom(merge_ctx, 16, false);
+    ggml_build_forward_expand(merge_graph, result);
+    auto merge_buffer = ggml_backend_alloc_ctx_tensors(merge_ctx, cached);
+    GGML_ASSERT(merge_buffer);
+
+    std::vector<float> values(n), actual(n*iterations);
+    for (int i = 0; i < n; ++i) {
+        values[i] = float(i % 17 - 8);
+    }
+
+    ggml_backend_tensor_set(resident, values.data(), 0, ggml_nbytes(resident));
+
+    auto ctx = ggml_init({ 16*ggml_tensor_overhead() + ggml_graph_overhead_custom(128, false), nullptr, true });
+    auto a = ggml_scale(ctx, x, 2);
+    ggml_backend_sched_set_tensor_backend(sched, a, cpu);
+
+    auto y_gpu = mixed_sources ? ggml_scale(ctx, y, 1) : y;
+    if (mixed_sources) {
+        ggml_backend_sched_set_tensor_backend(sched, y_gpu, other);
+    }
+
+    auto out = ggml_add(ctx, a, y_gpu);
+    ggml_backend_sched_set_tensor_backend(sched, out, gpu);
+
+    auto b = ggml_scale(ctx, out, 3);
+    ggml_backend_sched_set_tensor_backend(sched, b, cpu);
+
+    out = ggml_add(ctx, b, y);
+    ggml_backend_sched_set_tensor_backend(sched, out, gpu);
+
+    ggml_set_output(out);
+    auto graph = ggml_new_graph_custom(ctx, 128, false);
+    ggml_build_forward_expand(graph, out);
+
+    activation_merge merge = { cached, a, misses, result, merge_graph };
+    ggml_backend_sched_set_copy_callback(sched, merge_activation, &merge);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
+
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        std::fill(values.begin(), values.end(), float(iteration + 1));
+        ggml_backend_tensor_set(x, values.data(), 0, ggml_nbytes(x));
+        std::fill(values.begin(), values.end(), float(iteration + 2));
+        ggml_backend_tensor_set(y, values.data(), 0, ggml_nbytes(y));
+        GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_SUCCESS);
+
+        ggml_backend_tensor_get_async(gpu, out, actual.data() + iteration*n, 0, ggml_nbytes(out));
+    }
+
+    ggml_backend_sched_synchronize(sched);
+
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        for (int i = 0; i < n; ++i) {
+            const float expected = 6*(iteration + 1) + 4*(iteration + 2) - 1.5f*(i % 17 - 8);
+            GGML_ASSERT(actual[iteration*n + i] == expected);
+        }
+    }
+
+    printf("%s: cross-stream activation merge parallel=%d mixed_sources=%d PASS\n", ggml_backend_dev_name(dev), parallel, mixed_sources);
+
+    ggml_backend_sched_free(sched);
+    ggml_free(ctx);
+    ggml_backend_synchronize(cached);
+    ggml_backend_buffer_free(merge_buffer);
+    ggml_free(merge_ctx);
+    ggml_backend_buffer_free(input_buffer);
+    ggml_free(inputs);
+    ggml_backend_free(cpu);
+    ggml_backend_free(cached);
+    ggml_backend_free(gpu);
+    if (other != nullptr) {
+        ggml_backend_free(other);
+    }
+}
+
 int main() {
     ggml_backend_load_all();
 
@@ -321,6 +440,8 @@ int main() {
             test_expert_callback(dev, parallel);
             test_upload_lifetime(dev, parallel, false);
             test_upload_lifetime(dev, parallel, true);
+            test_activation_merge(dev, parallel, false);
+            test_activation_merge(dev, parallel, true);
         }
     }
 

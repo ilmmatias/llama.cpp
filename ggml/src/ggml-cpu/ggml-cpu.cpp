@@ -686,6 +686,15 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_expert_cache_configure") == 0) {
         return (void *) ggml_backend_cpu_expert_cache_configure;
     }
+    if (strcmp(name, "ggml_backend_cpu_expert_cache_device") == 0) {
+        return (void *) ggml_backend_cpu_expert_cache_device;
+    }
+    if (strcmp(name, "ggml_backend_cpu_expert_cache_prepare") == 0) {
+        return (void *) ggml_backend_cpu_expert_cache_prepare;
+    }
+    if (strcmp(name, "ggml_backend_cpu_expert_cache_copy") == 0) {
+        return (void *) ggml_backend_cpu_expert_cache_copy;
+    }
 
     // threadpool - TODO:  move to ggml-base
     if (strcmp(name, "ggml_threadpool_new") == 0) {

@@ -20,6 +20,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -97,6 +98,24 @@ struct expert_cache_template {
     bool input_q8 = false;
 };
 
+struct expert_cache_merge {
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_cgraph * graph = nullptr;
+    ggml_tensor * packed = nullptr;
+    ggml_tensor * ids = nullptr;
+    ggml_tensor * misses = nullptr;
+    ggml_tensor * output = nullptr;
+    std::vector<int32_t> routes;
+    bool all_cached = false;
+    bool computed = false;
+
+    ~expert_cache_merge() {
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+};
+
 static constexpr int EXPERT_CACHE_BATCH_SIZES = 4;
 
 struct expert_cache_batch {
@@ -166,6 +185,11 @@ struct expert_cache_layer {
     std::vector<expert_cache_batch> active_batches;
     int active_hits = 0;
     bool active_gpu_launched = false;
+    bool active_deferred = false;
+    const ggml_tensor * pending_output = nullptr;
+    std::unique_ptr<expert_cache_merge> merge;
+    ggml_backend_event_t reads_done = nullptr;
+    bool reads_recorded = false;
 };
 
 struct expert_cache_model {
@@ -408,7 +432,140 @@ public:
         }
     }
 
+    ggml_backend_dev_t device(const ggml_tensor * op) const {
+        if (!valid || op == nullptr || op->op != GGML_OP_MUL_MAT_ID ||
+            !is_cpu_repack_tensor(op->src[0]) || !is_supported_ids(op->src[2]) ||
+            op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
+            return nullptr;
+        }
 
+        const auto type = op->src[0]->type;
+        int layer_id = -1;
+        if ((type != GGML_TYPE_ZNQ2 && type != GGML_TYPE_ZNQ3 && type != GGML_TYPE_ZNQ4) ||
+            expert_cache_parse_tensor(op->src[0]->name, layer_id) != expert_cache_part::down) {
+            return nullptr;
+        }
+
+        auto dev = ggml_backend_get_device(compute_backend);
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+
+        return props.caps.events ? dev : nullptr;
+    }
+
+    void prepare(ggml_backend_sched_t sched, ggml_cgraph * graph) {
+        if (!valid) {
+            return;
+        }
+
+        ggml_backend_synchronize(compute_backend);
+        std::lock_guard<std::mutex> lock(state_mutex);
+        deferred_starts.clear();
+        pending_outputs.clear();
+
+        if (graph == nullptr) {
+            return;
+        }
+
+        const auto root = [](const ggml_tensor * t) {
+            while (t != nullptr && t->view_src != nullptr) {
+                t = t->view_src;
+            }
+
+            return t;
+        };
+
+        const auto is_view = [](const ggml_tensor * t) {
+            return t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE ||
+                   t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
+        };
+
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+            const auto * down = ggml_graph_node(graph, i);
+            const auto dev = device(down);
+            if (dev == nullptr || (down->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                continue;
+            }
+
+            bool eligible = true;
+            bool consumer = false;
+            bool next = true;
+
+            for (int j = 0; j < ggml_graph_n_nodes(graph); ++j) {
+                auto * node = ggml_graph_node(graph, j);
+                if (node != down && node->op == GGML_OP_MUL_MAT_ID && node->src[0] == down->src[0]) {
+                    eligible = false;
+                }
+
+                if (root(node) == down && (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                    eligible = false;
+                }
+
+                if (is_view(node)) {
+                    continue;
+                }
+
+                const auto backend = ggml_backend_sched_get_tensor_backend(sched, node);
+                if (j > i && next) {
+                    eligible &= backend != nullptr && ggml_backend_get_device(backend) == dev;
+                    next = false;
+                }
+
+                for (const auto * src : node->src) {
+                    if (root(src) == down) {
+                        consumer = true;
+                        eligible &= backend != nullptr && ggml_backend_get_device(backend) == dev;
+                    }
+                }
+            }
+
+            if (!eligible || !consumer) {
+                continue;
+            }
+
+            int layer_id = -1;
+            expert_cache_parse_tensor(down->src[0]->name, layer_id);
+
+            for (int j = 0; j < i; ++j) {
+                const auto * node = ggml_graph_node(graph, j);
+                if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] == nullptr ||
+                    node->src[0]->buffer != down->src[0]->buffer) {
+                    continue;
+                }
+
+                int id = -1;
+                const auto part = expert_cache_parse_tensor(node->src[0]->name, id);
+                if (id == layer_id && part != expert_cache_part::none && part != expert_cache_part::down) {
+                    deferred_starts.insert(node);
+                }
+            }
+        }
+    }
+
+    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        const auto it = pending_outputs.find(src);
+
+        if (it == pending_outputs.end() ||
+            ggml_backend_get_device(backend) != ggml_backend_get_device(compute_backend)) {
+            return false;
+        }
+
+        auto & merge = *it->second->merge;
+        if (!merge.computed) {
+            if (!merge.all_cached) {
+                ggml_backend_tensor_set_async(compute_backend, merge.misses, src->data, 0, ggml_nbytes(src));
+            }
+
+            const auto status = ggml_backend_graph_compute_async(compute_backend, merge.graph);
+            GGML_ASSERT(status == GGML_STATUS_SUCCESS);
+            merge.computed = true;
+        }
+
+        ggml_backend_tensor_copy_async(compute_backend, backend, merge.output, dst);
+
+        return true;
+    }
 
     const uint64_t * begin(ggml_tensor * op) {
         if (!valid || op == nullptr || op->op != GGML_OP_MUL_MAT_ID ||
@@ -478,6 +635,7 @@ public:
 
         expert_cache_layer * layer_ptr = nullptr;
         bool launched = false;
+        bool deferred = false;
         int output_rows = 0;
         const std::vector<int32_t> * route_positions = nullptr;
         size_t output_row_bytes = 0;
@@ -498,9 +656,21 @@ public:
                 return;
             }
             launched = layer.active_gpu_launched;
+            deferred = launched && layer.active_deferred;
             route_positions = &layer.active_route_positions;
             output_rows = (int) route_positions->size();
             output_row_bytes = (size_t) layer.output_dim * sizeof(float);
+        }
+
+        if (deferred) {
+            std::lock_guard<std::mutex> lock(state_mutex);
+            ggml_backend_event_record(layer_ptr->reads_done, compute_backend);
+            layer_ptr->reads_recorded = true;
+            layer_ptr->pending_output = op;
+            pending_outputs[op] = layer_ptr;
+            observe_locked(model_key, *layer_ptr, layer_id, op->src[2]);
+            clear_active_locked(*layer_ptr);
+            return;
         }
 
         if (launched) {
@@ -563,6 +733,11 @@ private:
     }
 
     void free_layer(expert_cache_layer & layer) {
+        if (layer.reads_done != nullptr) {
+            ggml_backend_event_free(layer.reads_done);
+            layer.reads_done = nullptr;
+        }
+        layer.merge.reset();
         for (auto & t : layer.templates) {
             if (t) {
                 free_template(*t);
@@ -911,6 +1086,78 @@ private:
         return ret;
     }
 
+    bool prepare_merge_locked(expert_cache_layer & layer, const ggml_tensor * ids) {
+        if (layer.merge && layer.merge->misses->ne[2] != ids->ne[1]) {
+            ggml_backend_synchronize(compute_backend);
+            layer.merge.reset();
+        }
+
+        if (!layer.merge) {
+            auto m = std::make_unique<expert_cache_merge>();
+            ggml_init_params params = {
+                /*.mem_size   =*/ 8 * ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            m->ctx = ggml_init(params);
+            if (m->ctx == nullptr) {
+                return false;
+            }
+
+            const int64_t rows = layer.n_expert_used * ids->ne[1];
+            m->packed = ggml_new_tensor_2d(m->ctx, GGML_TYPE_F32, layer.output_dim, 2 * rows);
+            m->ids = ggml_new_tensor_1d(m->ctx, GGML_TYPE_I32, rows);
+            m->misses = ggml_view_3d(m->ctx, m->packed, layer.output_dim, layer.n_expert_used, ids->ne[1],
+                    m->packed->nb[1], m->packed->nb[1] * layer.n_expert_used, rows * m->packed->nb[1]);
+            m->output = ggml_reshape_3d(m->ctx, ggml_get_rows(m->ctx, m->packed, m->ids),
+                    layer.output_dim, layer.n_expert_used, ids->ne[1]);
+
+            m->graph = ggml_new_graph_custom(m->ctx, 8, false);
+            ggml_build_forward_expand(m->graph, m->output);
+
+            for (int i = 0; i < ggml_graph_n_nodes(m->graph); ++i) {
+                if (!ggml_backend_supports_op(compute_backend, ggml_graph_node(m->graph, i))) {
+                    return false;
+                }
+            }
+
+            m->buffer = ggml_backend_alloc_ctx_tensors(m->ctx, compute_backend);
+            if (m->buffer == nullptr) {
+                return false;
+            }
+
+            m->routes.resize(rows);
+            layer.merge = std::move(m);
+        }
+
+        if (layer.reads_done == nullptr) {
+            layer.reads_done = ggml_backend_event_new(ggml_backend_get_device(compute_backend));
+            if (layer.reads_done == nullptr) {
+                return false;
+            }
+        }
+
+        auto & m = *layer.merge;
+        const size_t rows = m.routes.size();
+        GGML_ASSERT(layer.active_route_positions.size() <= rows);
+
+        for (size_t i = 0; i < rows; ++i) {
+            m.routes[i] = rows + i;
+        }
+
+        for (size_t i = 0; i < layer.active_route_positions.size(); ++i) {
+            const int32_t route = layer.active_route_positions[i];
+            if (route >= 0) {
+                m.routes[route] = i;
+            }
+        }
+
+        m.all_cached = (size_t) layer.active_hits == rows;
+        m.computed = false;
+
+        return true;
+    }
+
     bool ensure_input(size_t size) {
         if (input_size >= size) {
             return true;
@@ -963,6 +1210,12 @@ private:
 
     void start_active_locked(expert_cache_layer & layer, const ggml_tensor * ids, bool allow_gpu, ggml_tensor * op) {
         layer.active = true;
+        if (layer.pending_output != nullptr) {
+            pending_outputs.erase(layer.pending_output);
+            layer.pending_output = nullptr;
+        }
+
+        layer.active_deferred = deferred_starts.count(op) != 0;
         layer.active_ids = ids;
         layer.active_ready_masks.assign((size_t) ids->ne[1], 0);
         layer.active_slots.clear();
@@ -1090,11 +1343,20 @@ private:
         }
 
         GGML_ASSERT(layer.active_slots.size() == layer.active_route_positions.size());
-        if (!ensure_output(output_row_bytes * layer.active_route_positions.size())) {
+        if (layer.active_deferred && !prepare_merge_locked(layer, ids)) {
+            layer.active_deferred = false;
+        }
+
+        if (!layer.active_deferred && !ensure_output(output_row_bytes * layer.active_route_positions.size())) {
             return;
         }
 
         // Templates and host buffers are complete before any asynchronous use.
+        if (layer.active_deferred) {
+            ggml_backend_tensor_set_async(compute_backend, layer.merge->ids,
+                    layer.merge->routes.data(), 0, ggml_nbytes(layer.merge->ids));
+        }
+
         for (const auto & batch : layer.active_batches) {
             auto * t = batch.t;
             ggml_backend_tensor_set_async(compute_backend, t->input,
@@ -1106,8 +1368,16 @@ private:
                 ggml_backend_synchronize(compute_backend);
                 return;
             }
-            ggml_backend_tensor_get_async(compute_backend, t->output,
-                    (uint8_t *) output_ptr + batch.route_offset * output_row_bytes, 0, ggml_nbytes(t->output));
+
+            if (layer.active_deferred) {
+                auto slice = *t->output;
+                slice.buffer = layer.merge->buffer;
+                slice.data = (uint8_t *) layer.merge->packed->data + batch.route_offset * output_row_bytes;
+                ggml_backend_tensor_copy_async(compute_backend, compute_backend, t->output, &slice);
+            } else {
+                ggml_backend_tensor_get_async(compute_backend, t->output,
+                        (uint8_t *) output_ptr + batch.route_offset * output_row_bytes, 0, ggml_nbytes(t->output));
+            }
         }
         layer.active_gpu_launched = true;
     }
@@ -1115,11 +1385,13 @@ private:
     static void clear_active_locked(expert_cache_layer & layer) {
         layer.active = false;
         layer.active_ids = nullptr;
-        layer.active_ready_masks.clear();
-        layer.active_slots.clear();
-        layer.active_route_positions.clear();
-        layer.active_route_slots.clear();
-        layer.active_batches.clear();
+        if (!layer.active_deferred) {
+            layer.active_ready_masks.clear();
+            layer.active_slots.clear();
+            layer.active_route_positions.clear();
+            layer.active_route_slots.clear();
+            layer.active_batches.clear();
+        }
         layer.active_hits = 0;
         layer.active_gpu_launched = false;
     }
@@ -1355,6 +1627,9 @@ private:
                             cache_parts = layer.cache_parts;
                             part_bytes = layer.part_bytes;
                             current = true;
+                            if (layer.reads_recorded) {
+                                ggml_backend_event_wait(upload_backend, layer.reads_done);
+                            }
                         }
                     }
                 }
@@ -1410,6 +1685,8 @@ private:
 
     std::mutex state_mutex;
     std::unordered_map<const void *, expert_cache_model> models;
+    std::unordered_set<const ggml_tensor *> deferred_starts;
+    std::unordered_map<const ggml_tensor *, expert_cache_layer *> pending_outputs;
 
     std::mutex queue_mutex;
     std::condition_variable queue_cv;
@@ -1473,4 +1750,21 @@ extern "C" void ggml_backend_cpu_expert_cache_end(ggml_tensor * op) {
     if (g_expert_cache) {
         g_expert_cache->end(op);
     }
+}
+
+extern "C" ggml_backend_dev_t ggml_backend_cpu_expert_cache_device(const ggml_tensor * op) {
+    std::lock_guard<std::mutex> lock(g_expert_cache_mutex);
+    return g_expert_cache ? g_expert_cache->device(op) : nullptr;
+}
+
+extern "C" void ggml_backend_cpu_expert_cache_prepare(ggml_backend_sched_t sched, ggml_cgraph * graph) {
+    std::lock_guard<std::mutex> lock(g_expert_cache_mutex);
+    if (g_expert_cache) {
+        g_expert_cache->prepare(sched, graph);
+    }
+}
+
+extern "C" bool ggml_backend_cpu_expert_cache_copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) {
+    std::lock_guard<std::mutex> lock(g_expert_cache_mutex);
+    return g_expert_cache && g_expert_cache->copy(backend, src, dst);
 }

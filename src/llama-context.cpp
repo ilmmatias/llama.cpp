@@ -1517,6 +1517,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        if (backend_cpu != nullptr) {
+            auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+            auto prepare = (ggml_backend_cpu_expert_cache_prepare_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_expert_cache_prepare");
+            if (prepare != nullptr) {
+                prepare(sched.get(), cparams.cb_eval == nullptr ? gf : nullptr);
+            }
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -2714,6 +2722,15 @@ ggml_status llama_context::graph_compute(
 }
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
+    auto * ctx = static_cast<llama_context *>(user_data);
+    if (ctx->backend_cpu != nullptr) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(ctx->backend_cpu));
+        auto copy = (ggml_backend_cpu_expert_cache_copy_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_expert_cache_copy");
+        if (copy != nullptr && copy(backend, src, dst)) {
+            return true;
+        }
+    }
+
     auto & st = static_cast<llama_context *>(user_data)->copy_experts;
 
     // the ids must be computed before the split starts, so only the first node of the split is considered

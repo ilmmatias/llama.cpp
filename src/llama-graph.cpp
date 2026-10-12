@@ -16,6 +16,8 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include "ggml-cpu.h"
+
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -2465,7 +2467,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
         cb(experts, "ffn_moe_down_biased", il);
     }
-    bool reduce_on_cpu = n_tokens > 1 && !weight_before_ffn &&
+
+    ggml_backend_t cache_backend = nullptr;
+    if (!weight_before_ffn && backend_cpu != nullptr) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+        auto device_fn = (ggml_backend_cpu_expert_cache_device_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_expert_cache_device");
+        const auto device = device_fn != nullptr ? device_fn(experts) : nullptr;
+
+        for (int i = 0; device != nullptr && i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            auto backend = ggml_backend_sched_get_backend(sched, i);
+            if (ggml_backend_get_device(backend) == device) {
+                cache_backend = backend;
+                break;
+            }
+        }
+    }
+
+    bool reduce_on_cpu = cache_backend == nullptr && n_tokens > 1 && !weight_before_ffn &&
         experts->op == GGML_OP_MUL_MAT_ID && down_exps_b == nullptr &&
         experts->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 &&
         experts->ne[3] == 1 && weights->ne[0] == 1 && weights->ne[1] == experts->ne[1] &&
@@ -2492,6 +2510,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
+        if (cache_backend != nullptr) {
+            ggml_backend_sched_set_tensor_backend(sched, experts, cache_backend);
+        }
     }
 
     ggml_build_forward_expand(gf, experts);
@@ -2516,6 +2537,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     for (uint32_t i = 1; i < n_expert_used_il; ++i) {
         moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+        if (cache_backend != nullptr) {
+            ggml_backend_sched_set_tensor_backend(sched, moe_out, cache_backend);
+        }
 
         ggml_build_forward_expand(gf, moe_out);
     }
@@ -2523,6 +2547,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (n_expert_used_il == 1) {
         // avoid returning a non-contiguous tensor
         moe_out = ggml_cont(ctx0, moe_out);
+        if (cache_backend != nullptr) {
+            ggml_backend_sched_set_tensor_backend(sched, moe_out, cache_backend);
+        }
     }
 
     cb(moe_out, "ffn_moe_out", il);

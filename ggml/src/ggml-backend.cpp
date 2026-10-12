@@ -1819,7 +1819,7 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
-static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
+static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, ggml_backend_t & pending_upload) {
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
@@ -1843,8 +1843,11 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         ggml_backend_synchronize(split_backend);
     }
 
-    if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
+    if (sched->callback_copy != NULL && ggml_backend_buffer_is_host(input->buffer) &&
         sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+        if (!ggml_backend_sched_is_host_weight(input) && input_backend->iface.synchronize == NULL) {
+            pending_upload = split_backend;
+        }
         return;
     }
 
@@ -1902,7 +1905,7 @@ static bool ggml_backend_sched_copy_inputs_batch(
 
         if (!compatible(input)) {
             ggml_backend_sched_complete_upload(pending_upload);
-            ggml_backend_sched_copy_input(sched, split, input);
+            ggml_backend_sched_copy_input(sched, split, input, pending_upload);
             ++begin;
             continue;
         }
@@ -1927,7 +1930,7 @@ static bool ggml_backend_sched_copy_inputs_batch(
 
         if (n_copies == 1 && !upload) {
             ggml_backend_sched_complete_upload(pending_upload);
-            ggml_backend_sched_copy_input(sched, split, split->inputs[begin]);
+            ggml_backend_sched_copy_input(sched, split, split->inputs[begin], pending_upload);
         } else {
             if (user_inputs) {
                 if (sched->events[split->backend_id][sched->cur_copy] != NULL) {
@@ -1946,7 +1949,10 @@ static bool ggml_backend_sched_copy_inputs_batch(
 
                 struct ggml_tensor * copy = tensor_copy(input, split->backend_id, sched->cur_copy);
                 if (upload) {
-                    ggml_backend_tensor_set_async(dst_backend, copy, input->data, 0, ggml_nbytes(input));
+                    if (sched->callback_copy == NULL ||
+                        !sched->callback_copy(dst_backend, input, copy, &split->graph, sched->callback_copy_user_data)) {
+                        ggml_backend_tensor_set_async(dst_backend, copy, input->data, 0, ggml_nbytes(input));
+                    }
                 } else {
                     ggml_backend_tensor_get_async(src_backend, input, copy->data, 0, ggml_nbytes(input));
                 }
@@ -2005,14 +2011,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (!ggml_backend_sched_copy_inputs_batch(sched, split, prev_backend_id, pending_upload)) {
             for (int input_id = 0; input_id < split->n_inputs; input_id++) {
                 if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
-                    ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                    ggml_backend_sched_copy_input(sched, split, split->inputs[input_id], pending_upload);
                 }
             }
         }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
                 ggml_backend_sched_complete_upload(pending_upload);
-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id], pending_upload);
             }
         }
         if (split_backend->iface.synchronize == NULL) {
