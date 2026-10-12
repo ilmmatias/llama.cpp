@@ -430,7 +430,7 @@ static bool copy_cached_activation(ggml_backend_t backend, const ggml_tensor * s
     return copy(backend, src, dst);
 }
 
-static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel) {
+static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel, ggml_type type) {
     auto cpu = ggml_backend_cpu_init();
     auto cpu_dev = ggml_backend_get_device(cpu);
     auto reg = ggml_backend_dev_backend_reg(cpu_dev);
@@ -460,7 +460,7 @@ static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel) {
     const char * parts[] = { "gate", "up", "down" };
     for (int layer = 0; layer < layers; ++layer) {
         for (int part = 0; part < 3; ++part) {
-            w[layer][part] = ggml_new_tensor_3d(weights, GGML_TYPE_ZNQ4, dim, dim, experts);
+            w[layer][part] = ggml_new_tensor_3d(weights, type, dim, dim, experts);
             char name[64];
             snprintf(name, sizeof(name), "blk.%d.ffn_%s_exps.weight", layer, parts[part]);
             ggml_set_name(w[layer][part], name);
@@ -476,7 +476,7 @@ static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel) {
                 values[i] = 0.02f*std::sin(float(i*13 + part*7 + layer*19));
             }
             std::vector<unsigned char> quant(ggml_nbytes(w[layer][part]));
-            ggml_quantize_chunk(GGML_TYPE_ZNQ4, values.data(), quant.data(), 0, dim*experts, dim, importance.data());
+            ggml_quantize_chunk(type, values.data(), quant.data(), 0, dim*experts, dim, importance.data());
             ggml_backend_tensor_set(w[layer][part], quant.data(), 0, quant.size());
         }
     }
@@ -554,7 +554,7 @@ static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel) {
     }
     double worst = 0;
     for (int mode = 0; mode < 3; ++mode) {
-        configure(2, 0, 1, dev);
+        configure(2, 0, type == GGML_TYPE_ZNQ3 ? 2 : 1, dev);
         size_t scenario = 0;
         for (int tokens : sizes) {
             for (int pattern = 0; pattern < 3; ++pattern) {
@@ -575,7 +575,7 @@ static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel) {
         }
         configure(0, 0, 1, nullptr);
     }
-    printf("%s: expert cache reuse parallel=%d PASS (maximum nmse %g)\n", ggml_backend_dev_name(dev), parallel, worst);
+    printf("%s: expert cache reuse parallel=%d type=%s PASS (maximum nmse %g)\n", ggml_backend_dev_name(dev), parallel, ggml_type_name(type), worst);
     ggml_backend_buffer_free(weight_buffer);
     ggml_free(weights);
     ggml_backend_free(cpu);
@@ -600,7 +600,8 @@ int main() {
             test_upload_lifetime(dev, parallel, true);
             test_activation_merge(dev, parallel, false);
             test_activation_merge(dev, parallel, true);
-            test_expert_cache_reuse(dev, parallel);
+            test_expert_cache_reuse(dev, parallel, GGML_TYPE_ZNQ3);
+            test_expert_cache_reuse(dev, parallel, GGML_TYPE_ZNQ4);
         }
     }
 

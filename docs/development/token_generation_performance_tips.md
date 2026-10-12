@@ -27,11 +27,17 @@ Supported ZNQ expert-cache outputs stay on-device when their next consumers run 
 
 The merge workspace is shared across layers and grows with supported batch sizes rather than retaining a separate allocation for every layer. Fitting reserves its maximum size and the expert-compute workspace alongside cached weights, including loaded MTP layers. GPU events order workspace reuse without a host wait in steady-state merges.
 
+CPU builds with AVX-512F/BW convert ZNQ3 CPU_REPACK bitplanes for eight expert rows at once during GPU cache admission. Other builds keep scalar conversion. Both paths produce the same native weight bytes and use the same cache policy.
+
 CPU_REPACK `MUL_MAT` and `MUL_MAT_ID` accept F32 or the weight type's native vector-dot input type (Q8_0 or Q8_K). Prequantized inputs keep their tensor type and row strides; the CPU packs full GEMM groups without dequantizing them and reads GEMV tails directly. ZNQ expert-cache hits also accept native Q8_0 inputs, including combined gate/up weights, and pack them into the GPU's Q8_1 layout. Existing F32 graphs remain unchanged.
 
 This is an operator capability, not automatic graph quantization. Callers must explicitly produce a supported quantized tensor before a GPU-to-CPU handoff. Measure transfer and packing costs against the F32 path before using it in a model graph.
 
 Profile the active execution path before changing synchronization. Expert-cache configurations can bypass the routing-ID readback callback, and a backend transition without split inputs can still require a wait because scratch allocations are reused. Compare unprofiled `llama-bench` runs with the same context depth, offload settings, and thread count; profiler overhead can change the apparent bottleneck.
+
+HIP ZNQ4 matrix-vector kernels expand four packed codes with a byte permutation before codebook lookup. This reduces decode instructions without changing the weight format or decoded values. The path is automatic; matrix-matrix kernels keep their existing decode path.
+
+On a Ryzen 9 9950X and RX 6750 XT, the ZNQ3 admission conversion and HIP ZNQ4 byte permutation together increased Tinfield-1-ZNQ4-v2 generation throughput from 36.65 to 36.86 tokens/s (0.57%). This is a small end-to-end improvement, not the larger speedup seen in isolated conversion or matrix-vector measurements. The comparison used baseline/optimized/optimized/baseline runs with 10 repetitions each, 2048 prompt tokens, 256 generated tokens, 16 CPU threads, 32 expert-cache slots, an admission window of 1, and 2 cache workers; GPU offload, flash attention, and mlock loading were unchanged.
 
 ## CPU sampling
 

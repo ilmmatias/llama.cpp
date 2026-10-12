@@ -23,6 +23,10 @@
 #include <unordered_set>
 #include <vector>
 
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 namespace {
 static bool supports_input(const ggml_tensor * op) {
     const ggml_type type = op->src[1]->type;
@@ -303,6 +307,10 @@ static bool unpack_repacked_znq_expert(const ggml_tensor * tensor, int32_t exper
             }
             const auto * src = (const block_znq3x8 *) src_base;
             auto * out = (block_znq3 *) dst;
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX2__)
+            const __m512i table = _mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i *) znq3_spread4_table));
+            const __m512i shifts = _mm512_set_epi32(28, 24, 20, 16, 12, 8, 4, 0, 28, 24, 20, 16, 12, 8, 4, 0);
+#endif
             for (int64_t rg = 0; rg < row_groups; ++rg) {
                 for (int64_t ib = 0; ib < nblocks; ++ib) {
                     const auto & in = src[rg*nblocks + ib];
@@ -311,11 +319,8 @@ static bool unpack_repacked_znq_expert(const ggml_tensor * tensor, int32_t exper
                         b.d = in.d[r];
                         b.books = in.books[r];
 
-                        // CPU_REPACK transposes eight native ZNQ3 rows into
-                        // three 32-bit bit-planes for each four-weight group.
-                        // Rebuild two 12-bit groups at a time, yielding exactly
-                        // three native packed bytes. This is ~4x less scalar
-                        // bit work than reconstructing all 32 codes one by one.
+#if !defined(__AVX512F__) || !defined(__AVX512BW__) || !defined(__AVX2__)
+                        // Rebuild two four-code groups into three native bytes.
                         for (int pair = 0; pair < QK_ZNQ/8; ++pair) {
                             const uint32_t packed =
                                 (uint32_t) znq3_pack_four_codes(in, 2*pair + 0, r) |
@@ -324,7 +329,27 @@ static bool unpack_repacked_znq_expert(const ggml_tensor * tensor, int32_t exper
                             b.qs[3*pair + 1] = (uint8_t) (packed >> 8);
                             b.qs[3*pair + 2] = (uint8_t) (packed >> 16);
                         }
+#endif
                     }
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX2__)
+                    // Expand both groups for all eight rows.
+                    for (int pair = 0; pair < QK_ZNQ/8; ++pair) {
+                        const auto spread = [&](int plane) {
+                            const __m512i words = _mm512_inserti64x4(
+                                    _mm512_castsi256_si512(_mm256_set1_epi32(in.planes[2*pair][plane])),
+                                    _mm256_set1_epi32(in.planes[2*pair + 1][plane]), 1);
+                            const __m512i indices = _mm512_and_si512(_mm512_srlv_epi32(words, shifts), _mm512_set1_epi32(15));
+                            return _mm512_permutexvar_epi32(indices, table);
+                        };
+                        const __m512i codes = _mm512_ternarylogic_epi32(spread(0), _mm512_slli_epi32(spread(1), 1), _mm512_slli_epi32(spread(2), 2), 0xfe);
+                        const __m256i packed = _mm256_or_si256(_mm512_castsi512_si256(codes), _mm256_slli_epi32(_mm512_extracti64x4_epi64(codes, 1), 12));
+                        alignas(32) uint32_t packed_rows[8];
+                        _mm256_store_si256((__m256i *) packed_rows, packed);
+                        for (int r = 0; r < 8; ++r) {
+                            memcpy(out[(rg*8 + r)*nblocks + ib].qs + 3*pair, packed_rows + r, 3);
+                        }
+                    }
+#endif
                 }
             }
             return true;
@@ -1815,3 +1840,4 @@ extern "C" bool ggml_backend_cpu_expert_cache_copy(ggml_backend_t backend, const
     std::lock_guard<std::mutex> lock(g_expert_cache_mutex);
     return g_expert_cache && g_expert_cache->copy(backend, src, dst);
 }
+

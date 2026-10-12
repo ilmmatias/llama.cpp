@@ -47,9 +47,14 @@ static __device__ __forceinline__ int znq_pack4_cuda(const uint8_t * block, int 
     // Larger books pay off when one lane decodes several quads from the same book.
     if constexpr (bits == 2 || reuse_book) {
         uint32_t indices = 0;
+        if constexpr (bits == 4) {
+            // Selectors 0, 4, 1, 5 put the four nibble codes in separate bytes.
+            indices = __builtin_amdgcn_perm(codes >> 4, codes, 0x05010400) & 0x0f0f0f0f;
+        } else {
 #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            indices |= ((codes >> (bits*k)) & ((1u << bits) - 1)) << (8*k);
+            for (int k = 0; k < 4; ++k) {
+                indices |= ((codes >> (bits*k)) & ((1u << bits) - 1)) << (8*k);
+            }
         }
         if constexpr (bits == 2) {
             const uint32_t * table = (const uint32_t *) (kvalues_znq2 + 4*book);
