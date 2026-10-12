@@ -6345,6 +6345,31 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+struct test_mul_mat_id_routes : public test_mul_mat_id {
+    const bool skew;
+
+    test_mul_mat_id_routes(int n_mats, int n_used, int64_t n, bool b, bool skew)
+        : test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, n_mats, n_used, b, 32, n, 32), skew(skew) {}
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + "," + VAR_TO_STR(skew);
+    }
+
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_ROUTES"; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat_id::initialize_tensors(ctx);
+        ggml_tensor * ids = ggml_get_tensor(ctx, "ids");
+        std::vector<int32_t> data(ggml_nelements(ids));
+        for (int64_t token = 0; token < n; ++token) {
+            for (int slot = 0; slot < n_mats; ++slot) {
+                data[token*n_mats + slot] = skew ? n_mats - 1 : (token*17 + slot/2) % n_mats;
+            }
+        }
+        ggml_backend_tensor_set(ids, data.data(), 0, ggml_nbytes(ids));
+    }
+};
+
 // FP4 W4A8 path on the MoE path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
     test_mul_mat_id_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
@@ -12535,6 +12560,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, b, 50, 200, 64));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, b, 32, 1024, 16));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, b, 50, 200, 64));
+    }
+
+    for (bool b : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_id_routes(  63, 3,  127, b, false));
+        test_cases.emplace_back(new test_mul_mat_id_routes(  63, 3,  128, b, true));
+        test_cases.emplace_back(new test_mul_mat_id_routes(  63, 8,  129, b, false));
+        test_cases.emplace_back(new test_mul_mat_id_routes(1024, 8,  128, b, true));
+        test_cases.emplace_back(new test_mul_mat_id_routes(1024, 3, 1024, b, false));
     }
 
     // For issue 27873

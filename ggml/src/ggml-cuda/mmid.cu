@@ -130,9 +130,73 @@ static void launch_mm_ids_helper(
        ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
 }
 
+#if defined(GGML_USE_HIP)
+static __global__ void mm_ids_helper_histogram(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    __shared__ int counts[1024];
+    __shared__ int cursors[1024];
+
+    for (int expert = threadIdx.x; expert < n_experts; expert += blockDim.x) {
+        counts[expert] = 0;
+    }
+    __syncthreads();
+
+    const int n_routes = n_tokens*n_expert_used;
+    for (int route = threadIdx.x; route < n_routes; route += blockDim.x) {
+        const int token = route / n_expert_used;
+        const int slot = route % n_expert_used;
+        atomicAdd(counts + ids[token*si1 + slot], 1);
+    }
+    __syncthreads();
+
+    if (threadIdx.x < warp_size) {
+        const int chunk = (n_experts + warp_size - 1) / warp_size;
+        const int begin = threadIdx.x*chunk;
+        const int end = min(begin + chunk, n_experts);
+        int count = 0;
+        for (int expert = begin; expert < end; ++expert) {
+            count += counts[expert];
+        }
+        const int prefix = warp_prefix_inclusive_sum<int, warp_size>(count);
+        int offset = prefix - count;
+        for (int expert = begin; expert < end; ++expert) {
+            expert_bounds[expert] = offset;
+            cursors[expert] = offset;
+            offset += counts[expert];
+        }
+        if (threadIdx.x == warp_size - 1) {
+            expert_bounds[n_experts] = prefix;
+        }
+    }
+    __syncthreads();
+
+    for (int route = threadIdx.x; route < n_routes; route += blockDim.x) {
+        const int token = route / n_expert_used;
+        const int slot = route % n_expert_used;
+        const int compact = atomicAdd(cursors + ids[token*si1 + slot], 1);
+        ids_dst[compact] = route;
+        if (write_inverse) {
+            ids_src1[route] = compact;
+        } else {
+            ids_src1[compact] = token*sis1 + slot % nchannels_y;
+        }
+    }
+}
+#endif
+
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    if (n_experts <= 1024 && n_tokens >= 128) {
+        mm_ids_helper_histogram<<<1, 256, 0, stream>>>(
+            ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse);
+        return;
+    }
+#endif
+
     switch (n_expert_used) {
         case  2:
             launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
