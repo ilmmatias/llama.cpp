@@ -1824,7 +1824,7 @@ static bool rtc_profitable(const ggml_fusion_program & program, uint64_t n, bool
     }
 
     if (program.reduction.value >= 0) {
-        if (rtc_normalizes(program) && program.count < 3) {
+        if (rtc_normalizes(program) && program.count < 3 && program.values[program.count - 1].op != GGML_OP_SCALE) {
             return false;
         }
 
@@ -2214,7 +2214,8 @@ void ggml_cuda_rtc_fusion_alloc_deps(const ggml_cgraph * graph, ggml_backend_gra
     for (int i = 0; i < graph->n_nodes; ++i) {
         ggml_fusion_region region;
         ggml_fusion_program program;
-        if (!ggml_fusion_build(graph, i, region, program) || program.count < 3 || !rtc_normalizes(program) || rtc_reduction_preferred(graph, region, program)) {
+        if (!ggml_fusion_build(graph, i, region, program) || program.count < 2 || !rtc_normalizes(program) ||
+            (program.count == 2 && program.values[1].op != GGML_OP_SCALE) || rtc_reduction_preferred(graph, region, program)) {
             continue;
         }
 

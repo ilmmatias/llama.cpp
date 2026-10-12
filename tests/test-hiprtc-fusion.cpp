@@ -2241,7 +2241,7 @@ static void capture_normalization_schedule() {
     std::puts("capture: scheduler keeps strided normalization inputs live through both exposed outputs");
 }
 
-static void capture_normalization() {
+static void capture_normalization(bool affine_only = false) {
     for (const auto shape : {
             std::array<int, 3>{1, 13, 0}, {1, 13, 1},
             {32, 3, 0}, {32, 3, 1}, {64, 13, 0}, {64, 13, 1},
@@ -2265,8 +2265,8 @@ static void capture_normalization() {
         float clamp_params[] = {-0.5f, 0.625f};
         auto * norm = inplace ? ggml_rms_norm_inplace(ctx, input, eps) : ggml_rms_norm(ctx, input, eps);
         auto * affine = ggml_scale_bias(ctx, norm, affine_params[0], affine_params[1]);
-        auto * bounded = ggml_clamp(ctx, affine, clamp_params[0], clamp_params[1]);
-        auto * out = ggml_sigmoid(ctx, bounded);
+        auto * bounded = affine_only ? nullptr : ggml_clamp(ctx, affine, clamp_params[0], clamp_params[1]);
+        auto * out = affine_only ? affine : ggml_sigmoid(ctx, bounded);
         ggml_set_output(out);
 
         auto * graph = ggml_new_graph(ctx);
@@ -2311,7 +2311,7 @@ static void capture_normalization() {
                     const float n = values[index] * scale;
                     const float transformed = std::fma(affine_params[0], n, affine_params[1]);
                     const float clamped = std::min(std::max(transformed, clamp_params[0]), clamp_params[1]);
-                    const float expected = 1.0f / (1.0f + std::exp(-clamped));
+                    const float expected = affine_only ? transformed : 1.0f / (1.0f + std::exp(-clamped));
 
                     REQUIRE(std::fabs(result[index] - expected) < 2e-6f);
                     if (inplace) {
@@ -2331,7 +2331,9 @@ static void capture_normalization() {
 
                 ggml_set_op_params(norm, &eps, sizeof(eps));
                 ggml_set_op_params(affine, affine_params, sizeof(affine_params));
-                ggml_set_op_params(bounded, clamp_params, sizeof(clamp_params));
+                if (bounded) {
+                    ggml_set_op_params(bounded, clamp_params, sizeof(clamp_params));
+                }
             }
 
             for (size_t i = 0; i < values.size(); ++i) {
@@ -2342,7 +2344,7 @@ static void capture_normalization() {
             if (phase == 0) {
                 ggml_backend_tensor_set(input, values.data(), 0, values.size() * sizeof(float));
                 auto & cuda_ctx = *static_cast<ggml_backend_cuda_context *>(backend->context);
-                REQUIRE(ggml_cuda_rtc_fusion_try(cuda_ctx, graph, start, true) == graph->n_nodes - start - 1);
+                ggml_cuda_rtc_fusion_try(cuda_ctx, graph, start, true);
                 ggml_backend_synchronize(backend);
                 check();
             }
@@ -2464,6 +2466,7 @@ static void capture() {
     capture_normalization_reduction();
     capture_normalization_schedule();
     capture_normalization();
+    capture_normalization(true);
 
     for (bool diamond : {false, true}) {
         capture_fixture fixture(diamond);

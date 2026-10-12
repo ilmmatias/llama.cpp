@@ -450,6 +450,8 @@ cmake --build build --config Release
 
 Kernels compile in the background, with native kernels used until compilation finishes or if compilation fails. Fusion schedules for pointwise operations, reductions and RMS normalization are selected automatically; no runtime activation variable is needed. Matrix multiplication and attention still use native kernels. Performance gains depend on the model and GPU.
 
+RMS normalization followed by affine scaling can use a single RTC kernel, including a nonzero bias. Native RMS weight multiplication and zero-bias scale fusions remain available. Runtime changes to epsilon, scale and bias are applied on graph replay without recompiling the kernel.
+
 ### Unified Memory
 
 On Linux it is possible to use unified memory architecture (UMA) to share main memory between the CPU and integrated GPU by setting environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`. However, this hurts performance for non-integrated GPUs (but enables working with integrated GPUs).
