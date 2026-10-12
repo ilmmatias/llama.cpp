@@ -33,6 +33,10 @@ This is an operator capability, not automatic graph quantization. Callers must e
 
 Profile the active execution path before changing synchronization. Expert-cache configurations can bypass the routing-ID readback callback, and a backend transition without split inputs can still require a wait because scratch allocations are reused. Compare unprofiled `llama-bench` runs with the same context depth, offload settings, and thread count; profiler overhead can change the apparent bottleneck.
 
+## CPU sampling
+
+With large vocabularies, CPU repetition, frequency and presence penalties can add noticeable sampling latency. Candidates indexed by token ID use direct updates for the tokens in the penalty window; other layouts retain the full scan when direct indexing is not valid. This follows the [sparse penalty update in strix-llama.cpp](https://github.com/asf0/strix-llama.cpp/commit/4202e1b56c401ef052b17c5c7bbd3e1dbdc855c6) and does not change penalty arithmetic or token-window eviction.
+
 # Example of runtime flags effect on inference speed benchmark
 These runs were tested on the following machine:
 GPU: A6000 (48GB VRAM)

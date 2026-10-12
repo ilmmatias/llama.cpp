@@ -188,6 +188,48 @@ static void test_penalties(
     tester.check();
 }
 
+static void test_penalties_candidates() {
+    const std::vector<llama_token> history = { 3, 7, 7, 60, 3, 3, 12 };
+    const float configurations[][3] = { {1.25f, 0.5f, 1.5f}, {1.0f, 0.0f, 1.5f} };
+    for (const auto & penalties : configurations) {
+        for (int layout = 0; layout < 5; ++layout) {
+            std::vector<llama_token_data> data;
+            for (llama_token id = 0; id < 64; ++id) {
+                data.push_back({id, float(id % 9 - 4), 0.0f});
+            }
+            if (layout == 1) {
+                std::reverse(data.begin(), data.end());
+            } else if (layout == 2) {
+                data = { data[60], data[12], data[3], data[7] };
+            } else if (layout == 3) {
+                data.resize(32);
+            } else if (layout == 4) {
+                data.clear();
+            }
+
+            auto expected = data;
+            for (auto & token : expected) {
+                const int count = std::count(history.end() - 4, history.end(), token.id);
+                if (count > 0) {
+                    token.logit = token.logit <= 0 ? token.logit * penalties[0] : token.logit / penalties[0];
+                    token.logit -= float(count) * penalties[1] + penalties[2];
+                }
+            }
+
+            auto * sampler = llama_sampler_init_penalties(64, 4, penalties[0], penalties[1], penalties[2]);
+            for (llama_token id : history) {
+                llama_sampler_accept(sampler, id);
+            }
+            llama_token_data_array candidates = { data.data(), data.size(), -1, false };
+            llama_sampler_apply(sampler, &candidates);
+            for (size_t i = 0; i < data.size(); ++i) {
+                GGML_ASSERT(data[i].logit == expected[i].logit);
+            }
+            llama_sampler_free(sampler);
+        }
+    }
+}
+
 static void test_dry(
     const std::vector<float> & probs, const std::vector<llama_token> & last_tokens,
     const std::vector<float> & expected_probs, float dry_multiplier, float dry_base,
@@ -384,6 +426,7 @@ int main(void) {
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0},             {0.000011f, 0.249997f, 0.249997f, 0.249997f, 0.249997f}, 1.0f, 5.0f, 5.0f);
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2},       {0.000023f, 0.000023f, 0.000023f, 0.499966f, 0.499966f}, 1.0f, 5.0f, 5.0f);
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2, 0, 0}, {0.000000f, 0.000023f, 0.000023f, 0.499977f, 0.499977f}, 1.0f, 5.0f, 5.0f);
+    test_penalties_candidates();
 
 
     test_dry({0.25f, 0.25f, 0.25f, 0.25f}, {0, 1}, {0.25f, 0.25f, 0.25f, 0.25f}, 1.0f, 1.1f, 2, 4, {});
