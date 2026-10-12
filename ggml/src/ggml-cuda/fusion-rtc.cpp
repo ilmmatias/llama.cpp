@@ -459,7 +459,7 @@ static void rtc_reduce_loads(std::string & source, const ggml_fusion_program & p
 static std::string rtc_emit_reduction(const ggml_fusion_program & program, const ggml_fusion_schedule & schedule) {
     const auto & reduction = program.values[program.reduction.value];
     const std::string wave = std::to_string(schedule.wave);
-    const bool wave_only = schedule.threads == schedule.wave;
+    const bool wave_only = schedule.threads <= schedule.wave;
     const uint32_t row_tile = rtc_rows_per_block(schedule);
     const std::string tile = std::to_string(row_tile);
     const std::string row_guard = row_tile > 1 ? "row < rows && " : "";
@@ -529,7 +529,7 @@ static std::string rtc_emit_reduction(const ggml_fusion_program & program, const
 
     const std::string input = rtc_value(reduction.src[0]);
     source += rtc_normalizes(program) ? "        sum = fmaf(" + input + ", " + input + ", sum);\n" : "        sum += " + input + ";\n";
-    source += wave_only ? "    }\n    sum = rtc_wave_sum(sum);\n" : "    }\n    sum = rtc_block_sum(sum, shared);\n";
+    source += schedule.threads == 1 ? "    }\n" : wave_only ? "    }\n    sum = rtc_wave_sum(sum);\n" : "    }\n    sum = rtc_block_sum(sum, shared);\n";
 
     if (rtc_normalizes(program)) {
         if (wave_only) {
@@ -1915,6 +1915,19 @@ static bool rtc_select_schedule(const ggml_fusion_program & program, uint64_t n,
             schedule.tile = 4096;
             schedule.stages = 2;
             schedule.scratch = 16384;
+        }
+
+        if (!rtc_normalizes(program) && program.reduction.axes == 1 && columns <= 32) {
+            // Keep adjacent rows in adjacent lanes for transposed inputs.
+            for (int k = 0; k < program.inputs; ++k) {
+                const auto & access = program.accesses[k];
+                if (access.domain == 1 && access.ne[0] > 1 && access.ne[1] > 1 &&
+                    access.nb[1] == sizeof(float) && access.nb[0] >= access.ne[1]*sizeof(float)) {
+                    schedule.threads = 1;
+                    schedule.tile = 128;
+                    break;
+                }
+            }
         }
     }
 

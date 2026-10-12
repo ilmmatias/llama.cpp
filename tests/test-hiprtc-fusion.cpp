@@ -1823,9 +1823,11 @@ static void capture_split_rows() {
 static void capture_reductions() {
     for (int iteration = 0; iteration < 100; ++iteration) {
         const bool full = iteration % 2 != 0;
-        const int columns = full ? 8193 : 257;
-        const int rows = full ? 1 : 4;
+        const bool transposed = iteration % 6 == 0;
+        const int columns = transposed ? 17 : full ? 8193 : 257;
+        const int rows = transposed ? 129 : full ? 1 : 4;
         const int stages = full ? 2 : 1;
+        const bool strided = iteration % 3 == 0;
 
         auto backend = ggml_backend_cuda_init(0);
         REQUIRE(backend);
@@ -1835,8 +1837,16 @@ static void capture_reductions() {
 
         auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, columns, rows);
         auto * alternate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, columns, rows);
+        auto * storage = strided ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, transposed ? rows : 2*columns + 3, transposed ? columns : rows) : nullptr;
+        ggml_tensor * weights = nullptr;
+        if (strided) {
+            weights = transposed ? ggml_transpose(ctx, storage) : ggml_view_2d(ctx, storage, columns, rows, storage->nb[1], sizeof(float));
+            if (!transposed) {
+                weights->nb[0] = 2*sizeof(float);
+            }
+        }
         ggml_set_input(input);
-        auto * affine = ggml_scale_bias(ctx, input, 2.0f, 1.0f);
+        auto * affine = ggml_scale_bias(ctx, strided ? ggml_mul(ctx, input, weights) : input, 2.0f, 1.0f);
         auto * producer = ggml_neg(ctx, affine);
         auto * reduced = full ? ggml_sum(ctx, producer) : ggml_sum_rows(ctx, producer);
         auto * out = ggml_scale_bias(ctx, reduced, 0.5f, -1.0f);
@@ -1851,6 +1861,16 @@ static void capture_reductions() {
 
         std::vector<float> values(columns * rows);
         float bias = 1.0f;
+        if (strided) {
+            std::vector<float> data(ggml_nelements(storage), 12345.0f);
+            for (int row = 0; row < rows; ++row) {
+                for (int column = 0; column < columns; ++column) {
+                    const int offset = transposed ? column*rows + row : row*(2*columns + 3) + 2*column + 1;
+                    data[offset] = 1 + (row + column) % 3;
+                }
+            }
+            ggml_backend_tensor_set(storage, data.data(), 0, ggml_nbytes(storage));
+        }
 
         auto upload = [&](int shift) {
             const float probes[] = {-4, 4, 0, 8};
@@ -1868,7 +1888,8 @@ static void capture_reductions() {
             for (int row = 0; row < rows; ++row) {
                 double sum = 0;
                 for (int column = 0; column < columns; ++column) {
-                    sum -= 2.0 * values[row * columns + column] + bias;
+                    const int weight = strided ? 1 + (row + column) % 3 : 1;
+                    sum -= 2.0 * values[row * columns + column] * weight + bias;
                 }
 
                 REQUIRE(result[row] == float(sum * 0.5 - 1.0));

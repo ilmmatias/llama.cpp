@@ -454,6 +454,8 @@ Kernels compile in the background, with native kernels used until compilation fi
 
 RMS normalization followed by affine scaling can use a single RTC kernel, including a nonzero bias. Native RMS weight multiplication and zero-bias scale fusions remain available. Runtime changes to epsilon, scale and bias are applied on graph replay without recompiling the kernel.
 
+RTC reductions accept strided F32 inputs. Small reductions over transposed inputs assign one row to each lane to keep memory accesses coalesced. This allows expert weighting, row reduction and a shared-expert addition to run in one generated kernel without a contiguous intermediate.
+
 ### Unified Memory
 
 On Linux it is possible to use unified memory architecture (UMA) to share main memory between the CPU and integrated GPU by setting environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`. However, this hurts performance for non-integrated GPUs (but enables working with integrated GPUs).

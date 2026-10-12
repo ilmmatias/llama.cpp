@@ -522,8 +522,7 @@ bool ggml_fusion_build(const ggml_cgraph * graph, int start, ggml_fusion_region 
             program.reduction.axes = graph->nodes[start + reduced]->op == GGML_OP_SUM ? 15 : 1;
             for (int k = 0; k < program.inputs; ++k) {
                 const auto & access = program.accesses[k];
-                if (access.type != GGML_TYPE_F32 ||
-                    (access.domain == 1 && access.ne[0] > 1 && access.nb[0] != sizeof(float))) {
+                if (access.type != GGML_TYPE_F32) {
                     valid = false;
                 }
             }
