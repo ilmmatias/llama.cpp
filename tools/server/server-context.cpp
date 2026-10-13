@@ -4320,7 +4320,7 @@ private:
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
-                        if (!synth_probs.empty()) {
+                        if (!synth_probs.empty() || slot.use_spec_rejection()) {
                             common_sampler_copy(smpl_save.get(), slot.smpl.get());
                         }
 
