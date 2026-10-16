@@ -8,75 +8,75 @@
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
-            mul_mat_q_case<GGML_TYPE_Q1_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q1_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q2_0:
-            mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q2_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q4_0:
-            mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q4_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q4_1:
-            mul_mat_q_case<GGML_TYPE_Q4_1>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q4_1, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q5_0:
-            mul_mat_q_case<GGML_TYPE_Q5_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q5_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q5_1:
-            mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q5_1, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q8_0:
-            mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q8_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
 // -----------------------------------------------------------------------
         case GGML_TYPE_Q2_K:
-            mul_mat_q_case<GGML_TYPE_Q2_K>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q2_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q3_K:
-            mul_mat_q_case<GGML_TYPE_Q3_K>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q3_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q4_K:
-            mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q4_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q5_K:
-            mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q5_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q6_K:
-            mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q6_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
 // -----------------------------------------------------------------------
         case GGML_TYPE_IQ1_S:
-            mul_mat_q_case<GGML_TYPE_IQ1_S>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ1_S, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ2_XXS:
-            mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ2_XXS, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ2_XS:
-            mul_mat_q_case<GGML_TYPE_IQ2_XS>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ2_XS, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ2_S:
-            mul_mat_q_case<GGML_TYPE_IQ2_S>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ2_S, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ3_XXS:
-            mul_mat_q_case<GGML_TYPE_IQ3_XXS>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ3_XXS, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ3_S:
-            mul_mat_q_case<GGML_TYPE_IQ3_S>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ3_S, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ4_XS:
-            mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ4_XS, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_ZNQ2:
-            mul_mat_q_case<GGML_TYPE_ZNQ2>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_ZNQ2, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_ZNQ3:
-            mul_mat_q_case<GGML_TYPE_ZNQ3>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_ZNQ3, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_ZNQ4:
-            mul_mat_q_case<GGML_TYPE_ZNQ4>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_ZNQ4, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ4_NL:
-            mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ4_NL, GGML_PREC_Q8>(ctx, args, stream);
             break;
 // -----------------------------------------------------------------------
         case GGML_TYPE_MXFP4:
@@ -85,19 +85,52 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
                 mul_mat_q_case<GGML_TYPE_MXFP4, GGML_PREC_Q4>(ctx, args, stream);
                 break;
             }
-            mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_MXFP4, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_NVFP4:
             if (prec_src1 == GGML_PREC_Q4) {
                 mul_mat_q_case<GGML_TYPE_NVFP4, GGML_PREC_Q4>(ctx, args, stream);
                 break;
             }
-            mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_NVFP4, GGML_PREC_Q8>(ctx, args, stream);
             break;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
+}
+
+static int ggml_cuda_mmq_select_J(
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        const int cc, const size_t smpbo, const ggml_prec prec_src1, size_t & src1_q8_1_padding) {
+    const bool fallback = ggml_cuda_mmq_needs_fallback(src0->ne[1]);
+    int64_t ncols_opt = ids ? src1->ne[2] : src1->ne[1];
+    if (ids && (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc))) {
+        // Each expert sees this many rows on average.
+        ncols_opt = (src1->ne[2]*ids->ne[0] + src0->ne[2] - 1) / src0->ne[2];
+    }
+
+    int J_best = 0;
+    int nthreads_best = 0;
+    int ntiles_J_best = INT_MAX;
+    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J, fallback, cc, prec_src1);
+        if (config.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(config, cc) > smpbo) {
+            continue;
+        }
+        const int ntiles_x = (ncols_opt + config.J - 1) / config.J;
+        if (ntiles_x < ntiles_J_best) {
+            J_best = J;
+            nthreads_best = config.nthreads;
+            ntiles_J_best = ntiles_x;
+        }
+    }
+    GGML_ASSERT(J_best > 0);
+
+    // Tile loads round up to a full parallel load chunk.
+    const size_t src1_load_chunk_size = nthreads_best * sizeof(int);
+    src1_q8_1_padding = ((J_best * sizeof(block_q8_1_mmq) + src1_load_chunk_size - 1) / src1_load_chunk_size)
+        * src1_load_chunk_size;
+    return J_best;
 }
 
 void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst0, ggml_tensor * dst1) {
@@ -109,6 +142,8 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const ggml_tensor * src1 = dst0->src[1];
     const ggml_tensor * ids = dst0->src[2];
     const ggml_tensor * src0 = src0s[0];
+    const size_t smpbo = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
+    int J_best[2] = {};
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     for (const ggml_tensor * weights : src0s) {
@@ -134,10 +169,10 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             GGML_ASSERT(src0->ne[0] == src0_i->ne[0] && src0->ne[2] == src0_i->ne[2] && src0->ne[3] == src0_i->ne[3]);
             GGML_ASSERT(src0_i->ne[0] == src1->ne[0]);
             GGML_ASSERT(mmq_get_q8_1_ds_layout(src0->type) == mmq_get_q8_1_ds_layout(src0_i->type));
-            const bool fallback = src0_i->ne[1] % 128 != 0;
+            size_t padding;
+            J_best[i] = ggml_cuda_mmq_select_J(src0_i, src1, nullptr, cc, smpbo, GGML_PREC_Q8, padding);
             nbytes_src1_q8_1 = std::max(nbytes_src1_q8_1,
-                src1->ne[3] * src1->ne[2] * src1->ne[1] * ne10_padded * sizeof(block_q8_1_mmq) / QK8_1_MMQ +
-                ggml_cuda_mmq_get_J_max(src0_i->type, fallback, cc, src1->ne[1]) * sizeof(block_q8_1_mmq));
+                src1->ne[3] * src1->ne[2] * src1->ne[1] * ne10_padded * sizeof(block_q8_1_mmq) / QK8_1_MMQ + padding);
         }
 
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
@@ -157,7 +192,7 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 src0_i->ne[0], src0_i->ne[1], src1->ne[1], (int64_t) (src0_i->nb[1] / ggml_type_size(src0_i->type)), src1->ne[1], (int64_t) (dst_i->nb[1] / sizeof(float)),
                 src0_i->ne[2], src1->ne[2], (int64_t) (src0_i->nb[2] / ggml_type_size(src0_i->type)), s12_q, (int64_t) (dst_i->nb[2] / sizeof(float)),
                 src0_i->ne[3], src1->ne[3], (int64_t) (src0_i->nb[3] / ggml_type_size(src0_i->type)), s13_q, (int64_t) (dst_i->nb[3] / sizeof(float)),
-                src1->ne[1], src1->ne[1]};
+                src1->ne[1], J_best[i]};
             ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, GGML_PREC_Q8);
         }
         return;
@@ -176,16 +211,6 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
     const bool dedup_bcast = src1->ne[1] == 1 && n_expert_used > 1;
 
-    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), src0->ne[2] + 1);
-
-    const int si1  = ids->nb[1] / ggml_element_size(ids);
-    const int sis1 = src1->nb[2] / src1->nb[1];
-    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-        src0->ne[2], n_tokens, n_expert_used, src1->ne[1], si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
-    CUDA_CHECK(cudaGetLastError());
-
     size_t nbytes_src1_q8_1 = n_tokens*n_expert_used*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ;
     for (int i = 0; i < 2; ++i) {
         const ggml_tensor * src0_i = src0s[i];
@@ -197,11 +222,21 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         GGML_ASSERT(src0_i->ne[0] == src1->ne[0]);
         GGML_ASSERT(dst_i->ne[1] == n_expert_used);
 
-        const bool fallback = src0_i->ne[1] % 128 != 0;
+        size_t padding;
+        J_best[i] = ggml_cuda_mmq_select_J(src0_i, src1, ids, cc, smpbo, GGML_PREC_Q8, padding);
         nbytes_src1_q8_1 = std::max(nbytes_src1_q8_1,
-            n_tokens*n_expert_used*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ +
-            ggml_cuda_mmq_get_J_max(src0_i->type, fallback, cc, n_tokens) * sizeof(block_q8_1_mmq));
+            n_tokens*n_expert_used*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ + padding);
     }
+
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows + std::max(J_best[0], J_best[1]) - 1);
+    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), src0->ne[2] + 1);
+
+    const int si1  = ids->nb[1] / ggml_element_size(ids);
+    const int sis1 = src1->nb[2] / src1->nb[1];
+    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+        src0->ne[2], n_tokens, n_expert_used, src1->ne[1], si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+    CUDA_CHECK(cudaGetLastError());
 
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     const int64_t s11 = src1->nb[1] / ggml_type_size(src1->type);
@@ -235,7 +270,7 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             src0_i->ne[0], src0_i->ne[1], ne_get_rows, s01, ne_get_rows, s1,
             src0_i->ne[2], src0_i->ne[2], s02, s12_q, s2,
             src0_i->ne[3], src1->ne[3], s03, s13_q, s3,
-            n_tokens, ne_get_rows};
+            ne_get_rows, J_best[i]};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, GGML_PREC_Q8);
     }
 }
@@ -291,7 +326,10 @@ static void ggml_cuda_mul_mat_q_impl(
     GGML_TENSOR_BINARY_OP_LOCALS;
 
     cudaStream_t stream = ctx.stream();
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    const int    id    = ggml_cuda_get_device();
+    const int    cc    = ggml_cuda_info().devices[id].cc;
+    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
 
     const size_t ts_src0 = ggml_type_size(src0->type);
     const size_t ts_src1 = ggml_type_size(src1->type);
@@ -334,17 +372,17 @@ static void ggml_cuda_mul_mat_q_impl(
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
-    const bool fallback = ne01 % 128 != 0;
-
     const ggml_prec prec_src1 = ggml_cuda_mmq_get_prec_src1(src0, dst, cc);
 
     const bool use_native_fp4 = prec_src1 == GGML_PREC_Q4;
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
+    size_t src1_q8_1_padding;
+    const int J_best = ggml_cuda_mmq_select_J(src0, src1, ids, cc, smpbo, prec_src1, src1_q8_1_padding);
+
     if (!ids) {
-        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
-            ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
@@ -387,7 +425,7 @@ static void ggml_cuda_mul_mat_q_impl(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1, ne1};
+            ne1, J_best};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         return;
     }
@@ -401,7 +439,7 @@ static void ggml_cuda_mul_mat_q_impl(
     GGML_ASSERT(ne1 == n_expert_used);
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows + J_best-1); // Needs to be padded for unconditional memory access.
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
 
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
@@ -418,8 +456,7 @@ static void ggml_cuda_mul_mat_q_impl(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne12) * sizeof(block_q8_1_mmq);
+    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
     if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
@@ -466,13 +503,6 @@ static void ggml_cuda_mul_mat_q_impl(
                                          ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13 = ne12*s12;
 
-    // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-    // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
-    int64_t ncols_opt = ne12;
-    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
-        ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
-    }
-
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
@@ -480,10 +510,8 @@ static void ggml_cuda_mul_mat_q_impl(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        // With unique routing IDs, an expert can receive at most ne12 rows. Duplicate routes can make an expert
-        // receive more than one row per token, so ne12 is no longer a valid launch bound. Use the total compact
-        // row count as a conservative bound; kernels still use expert_bounds to skip tiles outside each expert.
-        ne_get_rows, ncols_opt};
+        // Duplicate routes can give an expert more than one row per token.
+        ne_get_rows, J_best};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }

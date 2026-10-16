@@ -5253,11 +5253,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // row groups
         const int n_ids = ids->ne[0]; // n_expert_used
         const int n_as  = ne02;       // n_expert
+        const bool use_expert_cache = params->expert_cache != nullptr && ggml_cpu_expert_cache_supports_ids(ids);
 
         // Thread 0 freezes the batch's hits and launches cached expert work.
         const uint64_t * cached_route_masks = nullptr;
-        if (ith == 0) {
-            cached_route_masks = ggml_backend_cpu_expert_cache_begin(op);
+        if (use_expert_cache && ith == 0) {
+            cached_route_masks = ggml_backend_cpu_expert_cache_begin(params->expert_cache, op);
             if (cached_route_masks != nullptr) {
                 for (int64_t token = 0; token < ids->ne[1]; ++token) {
                     for (int id = 0; id < n_ids; ++id) {
@@ -5570,8 +5571,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 current_task = ggml_threadpool_chunk_add(params->threadpool, 1);
             }
 
-            if (ith == 0) {
-                ggml_backend_cpu_expert_cache_end(op);
+            if (use_expert_cache) {
+                ggml_barrier(params->threadpool);
+                if (ith == 0) {
+                    ggml_backend_cpu_expert_cache_end(params->expert_cache, op);
+                }
             }
             return;
         }
@@ -5657,8 +5661,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             expert_row_base += cne1;
         }
 
-        if (ith == 0) {
-            ggml_backend_cpu_expert_cache_end(op);
+        if (use_expert_cache) {
+            ggml_barrier(params->threadpool);
+            if (ith == 0) {
+                ggml_backend_cpu_expert_cache_end(params->expert_cache, op);
+            }
         }
 
 #undef MMID_MATRIX_ROW

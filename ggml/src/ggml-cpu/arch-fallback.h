@@ -100,7 +100,6 @@
 #define ggml_gemm_iqp_8x8_q8_K_p4_generic ggml_gemm_iqp_8x8_q8_K_p4
 #elif defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
 // quants.c
-#define ggml_vec_dot_q2_0_q8_0_generic ggml_vec_dot_q2_0_q8_0
 #define ggml_vec_dot_znq2_q8_0_generic ggml_vec_dot_znq2_q8_0
 #define ggml_vec_dot_znq3_q8_0_generic ggml_vec_dot_znq3_q8_0
 // repack.cpp

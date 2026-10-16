@@ -1147,15 +1147,6 @@ static void common_init_sampler_from_model(
 }
 
 
-static void * common_expert_cache_proc_get(const char * name) {
-    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    if (cpu_dev == nullptr) {
-        return nullptr;
-    }
-
-    auto * reg = ggml_backend_dev_backend_reg(cpu_dev);
-    return ggml_backend_reg_get_proc_address(reg, name);
-}
 
 static ggml_backend_dev_t common_expert_cache_device_get(const common_params & params) {
     for (auto * dev : params.devices) {
@@ -1178,14 +1169,30 @@ static ggml_backend_dev_t common_expert_cache_device_get(const common_params & p
 }
 
 static void common_expert_cache_prepare_params(common_params & params) {
-    if (params.expert_cache_slots <= 0 && !params.expert_cache_slots_auto) {
+    if (params.expert_cache_slots < 0) {
+        throw std::invalid_argument("expert cache slots must be non-negative");
+    }
+    if (params.expert_cache_admit_window < 0) {
+        throw std::invalid_argument("expert cache admission window must be non-negative");
+    }
+    if (params.expert_cache_workers <= 0) {
+        throw std::invalid_argument("expert cache requires --expert-cache-workers > 0");
+    }
+    const bool cache_slots = params.expert_cache_slots > 0 || params.expert_cache_slots_auto;
+    if (params.moe_cache_size > 0 && cache_slots) {
+        throw std::invalid_argument("--moe-cache-mib cannot be combined with --expert-cache-slots");
+    }
+    if (!cache_slots && params.moe_cache_size == 0) {
         return;
     }
     if (params.expert_cache_slots_auto && !params.fit_params) {
         throw std::invalid_argument("--expert-cache-slots auto requires --fit; pick an explicit number of slots to run without fitting");
     }
-    if (params.expert_cache_moe_placement_explicit) {
+    if (cache_slots && params.expert_cache_moe_placement_explicit) {
         throw std::invalid_argument("--expert-cache-slots cannot be combined with --cpu-moe/--n-cpu-moe");
+    }
+    if (params.expert_cache_moe_placement_explicit) {
+        return;
     }
 
     const auto cpu_buft = ggml_backend_cpu_buffer_type();
@@ -1202,102 +1209,68 @@ static void common_expert_cache_prepare_params(common_params & params) {
     params.tensor_buft_overrides.insert(params.tensor_buft_overrides.begin(), llm_ffn_exps_cpu_override());
 }
 
-static size_t common_expert_cache_fit_reserve(
+struct common_expert_cache_fit_device {
+    size_t index;
+    ggml_backend_dev_t dev;
+    size_t expert_bytes;
+    size_t slot_bytes;
+    size_t aligned_bytes;
+    size_t workspace_bytes;
+};
+
+static std::vector<common_expert_cache_fit_device> common_expert_cache_fit_reserve(
         const char * path_model,
-        const llama_model_params & mparams_cpu_moe,
+        const llama_model_params & mparams,
         const llama_context_params & cparams,
         uint32_t slots,
         ggml_backend_dev_t cache_dev,
-        size_t & cache_device_index,
         uint32_t & n_expert_out,
-        size_t & workspace_bytes) {
-    if (slots == 0 || cache_dev == nullptr || mparams_cpu_moe.tensor_buft_overrides == nullptr) {
-        return 0;
+        size_t & n_gpu_devices_out) {
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t ngl = 0, nct = 0, nex = 0, nxu = 0;
+    size_t workspace_bytes = 0, expert_bytes = 0, aligned_bytes = 0;
+    auto cparams_query = cparams;
+    cparams_query.moe_cache_size = 0;
+    cparams_query.expert_cache_slots = slots;
+    common_get_device_memory_data(
+        path_model, &mparams, &cparams_query, devs, ngl, nct, nex, nxu,
+        GGML_LOG_LEVEL_ERROR, &workspace_bytes, cache_dev, &expert_bytes, &aligned_bytes);
+    if (nex == 0) {
+        throw std::runtime_error("expert cache requested for a model without routed experts");
     }
 
-    llama_model_params mparams_full = mparams_cpu_moe;
-    mparams_full.tensor_buft_overrides = mparams_cpu_moe.tensor_buft_overrides + 1; // skip cache-owned CPU MoE override
-
-    std::vector<ggml_backend_dev_t> devs_full;
-    std::vector<ggml_backend_dev_t> devs_cpu;
-    uint32_t ngl_full = 0, nct_full = 0, nex_full = 0, nxu_full = 0;
-    uint32_t ngl_cpu  = 0, nct_cpu  = 0, nex_cpu  = 0, nxu_cpu  = 0;
-
-    const auto full = common_get_device_memory_data(
-        path_model, &mparams_full, &cparams, devs_full, ngl_full, nct_full, nex_full, nxu_full, GGML_LOG_LEVEL_ERROR, nullptr, nullptr);
-    const auto cpu = common_get_device_memory_data(
-        path_model, &mparams_cpu_moe, &cparams, devs_cpu, ngl_cpu, nct_cpu, nex_cpu, nxu_cpu, GGML_LOG_LEVEL_ERROR, &workspace_bytes, cache_dev);
-
-    if (nex_full == 0 || nex_cpu != nex_full) {
-        throw std::runtime_error("expert cache requested for a model without a consistent routed-expert count");
-    }
-
-    size_t expert_bytes = 0;
-    for (size_t i = 0; i < devs_full.size(); ++i) {
-        for (size_t j = 0; j < devs_cpu.size(); ++j) {
-            if (devs_full[i] == devs_cpu[j] && full[i].model > cpu[j].model) {
-                expert_bytes += full[i].model - cpu[j].model;
-                break;
-            }
+    std::vector<common_expert_cache_fit_device> devices;
+    n_gpu_devices_out = 0;
+    for (size_t i = 0; i < devs.size(); ++i) {
+        const auto type = ggml_backend_dev_type(devs[i]);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
         }
-    }
-
-    cache_device_index = devs_cpu.size();
-    for (size_t i = 0; i < devs_cpu.size(); ++i) {
-        if (devs_cpu[i] == cache_dev) {
-            cache_device_index = i;
-            break;
+        ++n_gpu_devices_out;
+        size_t device_workspace_bytes = workspace_bytes;
+        size_t device_expert_bytes = expert_bytes;
+        size_t device_aligned_bytes = aligned_bytes;
+        if (devs[i] != cache_dev) {
+            std::vector<ggml_backend_dev_t> devs_unused;
+            common_get_device_memory_data(
+                path_model, &mparams, &cparams_query, devs_unused, ngl, nct, nex, nxu,
+                GGML_LOG_LEVEL_ERROR, &device_workspace_bytes, devs[i], &device_expert_bytes, &device_aligned_bytes);
         }
+        if (device_expert_bytes == 0) {
+            continue;
+        }
+        const size_t slot_bytes = device_expert_bytes / nex + (device_expert_bytes % nex != 0);
+        devices.push_back({i, devs[i], device_expert_bytes, slot_bytes, device_aligned_bytes, device_workspace_bytes});
     }
-    if (cache_device_index == devs_cpu.size()) {
-        throw std::runtime_error("expert cache device is not part of the model device set");
-    }
-    if (expert_bytes == 0) {
-        throw std::runtime_error("unable to estimate routed-expert cache memory for --fit");
-    }
-
-    n_expert_out = nex_full;
-
-    const size_t n_expert = (size_t) nex_full;
-    return (expert_bytes / n_expert) * slots + ((expert_bytes % n_expert) * slots + n_expert - 1) / n_expert;
-}
-
-static void common_expert_cache_reset() {
-    if (auto fn = reinterpret_cast<ggml_backend_cpu_expert_cache_configure_t>(
-            common_expert_cache_proc_get("ggml_backend_cpu_expert_cache_configure"))) {
-        fn(0, 0, 1, nullptr);
-    }
+    n_expert_out = nex;
+    return devices;
 }
 
 
-static void common_expert_cache_configure(const common_params & params) {
-    if (params.expert_cache_slots <= 0) {
-        common_expert_cache_reset();
-        return;
-    }
-    if (params.expert_cache_workers <= 0) {
-        throw std::invalid_argument("expert cache requires --expert-cache-workers > 0");
-    }
 
-    ggml_backend_dev_t cache_dev = common_expert_cache_device_get(params);
-    if (cache_dev == nullptr) {
-        throw std::runtime_error("expert cache requested but no GPU device is available");
-    }
-
-    auto fn = reinterpret_cast<ggml_backend_cpu_expert_cache_configure_t>(
-        common_expert_cache_proc_get("ggml_backend_cpu_expert_cache_configure"));
-    if (fn == nullptr) {
-        throw std::runtime_error("CPU backend does not provide routed-expert cache support");
-    }
-    fn((uint32_t) params.expert_cache_slots,
-       (uint32_t) params.expert_cache_admit_window,
-       (uint32_t) params.expert_cache_workers,
-       cache_dev);
-}
 
 struct common_init_result::impl {
     impl() = default;
-    ~impl() { common_expert_cache_reset(); }
 
     // note: the order in which model, context, etc. are declared matters because their destructors will be called bottom-to-top
 
@@ -1320,6 +1293,11 @@ static const std::map<common_decision_type, std::string> COMMON_DECISION_TYPE_NA
     { COMMON_DECISION_TYPE_LAYA,           "laya"          },
     { COMMON_DECISION_TYPE_CLEF,           "clef"          },
     { COMMON_DECISION_TYPE_PPLX_DECIDER,   "pplx-decider"  },
+    { COMMON_DECISION_TYPE_VLLM_DECISION2, "vllm-decision2" },
+    { COMMON_DECISION_TYPE_VLLM_D3,        "vllm-d3"        },
+    { COMMON_DECISION_TYPE_LFM2_D1,        "lfm2-d1"       },
+    { COMMON_DECISION_TYPE_LFM2_D1_OMNI,   "lfm2-d1-omni"  },
+    // for future models, ALWAYS add org name prefix to avoid name collisions, e.g. "orgname-modelname"
 };
 
 static common_decision_type common_decision_type_from_string(const std::string & str) {
@@ -1343,7 +1321,9 @@ common_decision_type common_get_decision_type(const struct llama_model * model) 
     return common_decision_type_from_string(buf);
 }
 
-common_decision_type common_get_decision_type(const std::string & fname) {
+common_gguf_info common_get_gguf_info(const std::string & fname) {
+    common_gguf_info info;
+
     struct gguf_init_params gguf_params = {
         /* .no_alloc = */ true,
         /* .ctx      = */ nullptr,
@@ -1351,31 +1331,32 @@ common_decision_type common_get_decision_type(const std::string & fname) {
 
     gguf_context_ptr gguf_ctx(gguf_init_from_file(fname.c_str(), gguf_params));
     if (!gguf_ctx) {
-        return COMMON_DECISION_TYPE_UNKNOWN; // missing or unreadable file
+        return info; // missing or unreadable file
     }
 
-    std::string arch;
     const int64_t arch_id = gguf_find_key(gguf_ctx.get(), "general.architecture");
-    if (arch_id < 0) {
-        return COMMON_DECISION_TYPE_UNKNOWN; // no architecture in the metadata
+    if (arch_id < 0 || gguf_get_kv_type(gguf_ctx.get(), arch_id) != GGUF_TYPE_STRING) {
+        return info; // no architecture in the metadata
     }
-    if (gguf_get_kv_type(gguf_ctx.get(), arch_id) != GGUF_TYPE_STRING) {
-        return COMMON_DECISION_TYPE_UNKNOWN; // malformed metadata
-    }
-    arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
+    const std::string arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
     if (arch.empty()) {
-        return COMMON_DECISION_TYPE_UNKNOWN;
+        return info;
     }
 
-    const std::string key = arch + ".decision.type";
-    const int64_t type_id = gguf_find_key(gguf_ctx.get(), key.c_str());
+    const int64_t type_id = gguf_find_key(gguf_ctx.get(), (arch + ".decision.type").c_str());
     if (type_id < 0) {
-        return COMMON_DECISION_TYPE_NONE;
+        info.decision_type = COMMON_DECISION_TYPE_NONE;
+    } else if (gguf_get_kv_type(gguf_ctx.get(), type_id) == GGUF_TYPE_STRING) {
+        info.decision_type = common_decision_type_from_string(gguf_get_val_str(gguf_ctx.get(), type_id));
     }
-    if (gguf_get_kv_type(gguf_ctx.get(), type_id) != GGUF_TYPE_STRING) {
-        return COMMON_DECISION_TYPE_UNKNOWN; // malformed metadata
+
+    // same key and type as the model loader
+    const int64_t ctx_id = gguf_find_key(gguf_ctx.get(), (arch + ".context_length").c_str());
+    if (ctx_id >= 0 && gguf_get_kv_type(gguf_ctx.get(), ctx_id) == GGUF_TYPE_UINT32) {
+        info.n_ctx_train = gguf_get_val_u32(gguf_ctx.get(), ctx_id);
     }
-    return common_decision_type_from_string(gguf_get_val_str(gguf_ctx.get(), type_id));
+
+    return info;
 }
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
@@ -1414,88 +1395,113 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         const bool cache_fixed = params.expert_cache_slots > 0;
         const bool cache_auto  = params.expert_cache_slots_auto;
+        const bool cache_bytes = params.moe_cache_size > 0;
 
         // the fit appends its own overrides to this array: capture the prepared state so every fit pass can start from it
         const std::vector<llama_model_tensor_buft_override> overrides_base = params.tensor_buft_overrides;
 
+        std::vector<common_expert_cache_fit_device> cache_devices;
+        uint32_t n_expert = 0;
+        size_t n_cache_gpu_devices = 0;
         ggml_backend_dev_t cache_dev = nullptr;
-        size_t cache_device_index = 0;
-
-        if (cache_fixed || cache_auto) {
+        uint32_t cache_reserve_slots = cache_fixed ? (uint32_t) params.expert_cache_slots : cache_auto ? 1 : 0;
+        if (cache_fixed || cache_auto || cache_bytes) {
             cache_dev = common_expert_cache_device_get(params);
             if (cache_dev == nullptr) {
                 throw std::runtime_error("expert cache requested but no GPU device is available");
             }
+            cache_devices = common_expert_cache_fit_reserve(
+                params.model.path.c_str(), mparams, cparams, cache_reserve_slots, cache_dev, n_expert, n_cache_gpu_devices);
+            for (const auto & device : cache_devices) {
+                if (device.index >= fit_targets.size()) {
+                    throw std::runtime_error("expert cache device index exceeds fit target array");
+                }
+            }
         }
 
-        if (cache_fixed) {
-            uint32_t n_expert_unused = 0;
-            size_t workspace_bytes = 0;
-            const size_t reserve = common_expert_cache_fit_reserve(
-                params.model.path.c_str(), mparams, cparams, (uint32_t) params.expert_cache_slots, cache_dev, cache_device_index,
-                n_expert_unused, workspace_bytes);
-            if (cache_device_index >= fit_targets.size()) {
-                throw std::runtime_error("expert cache device index exceeds fit target array");
-            }
-            fit_targets[cache_device_index] += reserve + workspace_bytes;
-            COM_TRC("expert cache reserves %d slots (%.1f MiB) and %.1f MiB workspace on %s during fit\n",
-                params.expert_cache_slots, (double) reserve / (1024.0 * 1024.0), (double) workspace_bytes / (1024.0 * 1024.0), ggml_backend_dev_name(cache_dev));
-        }
 
         const ggml_log_level fit_log_level = params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR;
         const common_fit_extra_model * extra_ptr = has_draft || spec_mtp ? &extra : nullptr;
 
-        if (!cache_auto) {
-            common_fit_params(params.model.path.c_str(), &mparams, &cparams,
-                params.tensor_split,
-                params.tensor_buft_overrides.data(),
-                fit_targets.data(),
-                params.fit_params_min_ctx,
-                extra_ptr,
-                fit_log_level,
-                cache_fixed);
-        } else {
-            // Size the cache from available memory, up to the model's full expert count.
-            uint32_t n_expert = 0;
-            size_t workspace_bytes = 0;
-            const size_t slot_bytes = common_expert_cache_fit_reserve(
-                params.model.path.c_str(), mparams, cparams, 1, cache_dev, cache_device_index, n_expert, workspace_bytes);
-            if (cache_device_index >= fit_targets.size()) {
-                throw std::runtime_error("expert cache device index exceeds fit target array");
+        // The fitter can move layers between devices. Retain every observed device requirement so refits cannot oscillate.
+        const auto grow_cache_reserve = [&](uint32_t cache_slots, std::vector<size_t> & reserves) {
+            if (cache_slots == 0 && !cache_bytes) {
+                return false;
             }
+            size_t total_expert_bytes = 0;
+            if (cache_bytes) {
+                for (const auto & device : cache_devices) {
+                    total_expert_bytes += device.expert_bytes;
+                }
+            }
+            bool grew = false;
+            for (const auto & device : cache_devices) {
+                if (device.index >= reserves.size()) {
+                    throw std::runtime_error("expert cache device index exceeds fit target array");
+                }
+                size_t reserve;
+                if (cache_bytes) {
+                    reserve = (size_t) ((long double) params.moe_cache_size * device.expert_bytes / total_expert_bytes);
+                } else {
+                    reserve = device.aligned_bytes;
+                }
+                const size_t required = reserve + device.workspace_bytes;
+                if (required > reserves[device.index]) {
+                    reserves[device.index] = required;
+                    grew = true;
+                    COM_TRC("expert cache reserves %.1f MiB and %.1f MiB workspace on %s during fit\n",
+                        (double) reserve / (1024.0 * 1024.0), (double) device.workspace_bytes / (1024.0 * 1024.0),
+                        ggml_backend_dev_name(device.dev));
+                }
+            }
+            return grew;
+        };
 
-            // one cache slot across all MoE layers: expert_bytes / n_expert
-            const uint32_t slot_cap = common_fit_expert_cache_slots_from_surplus(INT64_MAX, slot_bytes, n_expert);
-            uint32_t slots = 0;
+        std::vector<float> tensor_split_base;
+        if (!cache_auto && n_cache_gpu_devices > 1) {
+            tensor_split_base.assign(std::begin(params.tensor_split), std::end(params.tensor_split));
+        }
+        const auto fit_with_cache_reserve = [&](uint32_t cache_slots, llama_model_params & mparams_o, llama_context_params & cparams_o, std::vector<int64_t> * surplus_out) {
+            std::vector<size_t> reserves(fit_targets.size(), 0);
+            bool first_pass = true;
+            for (;;) {
+                if (cache_auto) {
+                    std::memset(params.tensor_split, 0, sizeof(params.tensor_split));
+                } else if (!tensor_split_base.empty()) {
+                    std::copy(tensor_split_base.begin(), tensor_split_base.end(), params.tensor_split);
+                }
+                params.tensor_buft_overrides = overrides_base;
 
-            const auto fit_with_cache_reserve = [&](uint32_t cache_slots, llama_model_params & mparams_o, llama_context_params & cparams_o, std::vector<int64_t> * surplus_out) {
-                // each pass needs clean model/context params: fit writes into everything it is handed
+                // Every pass starts from the user's parameters, not the previous fit's output.
                 auto mparams_i     = common_model_params_to_llama(params);
                 auto cparams_i     = common_context_params_to_llama(params);
+                if (first_pass) {
+                    if (cache_reserve_slots != cache_slots) {
+                        cache_devices = common_expert_cache_fit_reserve(
+                            params.model.path.c_str(), mparams_i, cparams_i, cache_slots,
+                            cache_dev, n_expert, n_cache_gpu_devices);
+                        cache_reserve_slots = cache_slots;
+                    }
+                    grow_cache_reserve(cache_slots, reserves);
+                    first_pass = false;
+                }
                 auto mparams_dft_i = common_model_params_to_llama(params_dft);
                 auto cparams_dft_i = common_context_params_to_llama(params_dft);
                 if (spec_mtp) {
                     cparams_dft_i.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
                 }
                 cparams_dft_i.n_rs_seq = 0;
-
                 const common_fit_extra_model extra_i = {
                     /*.path_model   =*/ params_dft.model.path.c_str(),
                     /*.mparams      =*/ &mparams_dft_i,
                     /*.cparams      =*/ &cparams_dft_i,
-                    /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
+                    /*.shares_model =*/ !has_draft,
                 };
 
                 std::vector<size_t> targets_i = fit_targets;
-                if (cache_slots != 0) {
-                    targets_i[cache_device_index] += (size_t) cache_slots * slot_bytes + workspace_bytes;
+                for (size_t i = 0; i < targets_i.size(); ++i) {
+                    targets_i[i] += reserves[i];
                 }
-
-                std::vector<int64_t> surplus_i(fit_targets.size(), 0);
-
-                std::memset(params.tensor_split, 0, sizeof(params.tensor_split));
-                params.tensor_buft_overrides = overrides_base;
-
                 const auto status = common_fit_params(params.model.path.c_str(), &mparams_i, &cparams_i,
                     params.tensor_split,
                     params.tensor_buft_overrides.data(),
@@ -1503,13 +1509,44 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                     params.fit_params_min_ctx,
                     has_draft || spec_mtp ? &extra_i : nullptr,
                     fit_log_level,
-                    true, // keep_moe_cpu: the routed experts stay in system memory, the cache covers the hot ones
-                    surplus_out != nullptr ? surplus_out->data() : surplus_i.data());
+                    true,
+                    surplus_out != nullptr ? surplus_out->data() : nullptr);
 
-                mparams_o = mparams_i;
-                cparams_o = cparams_i;
-                return status;
-            };
+                bool grew = false;
+                if (status == COMMON_PARAMS_FIT_STATUS_SUCCESS && n_cache_gpu_devices > 1) {
+                    cache_devices = common_expert_cache_fit_reserve(
+                        params.model.path.c_str(), mparams_i, cparams_i, cache_slots, cache_dev, n_expert, n_cache_gpu_devices);
+                    grew = grow_cache_reserve(cache_slots, reserves);
+                }
+                if (!grew) {
+                    mparams_o = mparams_i;
+                    cparams_o = cparams_i;
+                    return status;
+                }
+            }
+        };
+
+        if (!cache_auto) {
+            if (cache_fixed || cache_bytes) {
+                fit_with_cache_reserve((uint32_t) params.expert_cache_slots, mparams, cparams, nullptr);
+            } else {
+                common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+                    params.tensor_split,
+                    params.tensor_buft_overrides.data(),
+                    fit_targets.data(),
+                    params.fit_params_min_ctx,
+                    extra_ptr,
+                    fit_log_level,
+                    false);
+            }
+        } else {
+            // Each device covers its assigned MoE layers; every device must fit the chosen slot count.
+            uint32_t slot_cap = cache_devices.empty() ? 0 : n_expert;
+            for (const auto & device : cache_devices) {
+                slot_cap = std::min(slot_cap, common_fit_expert_cache_slots_from_surplus(INT64_MAX, device.slot_bytes, n_expert));
+            }
+            uint32_t slots = 0;
+
 
             llama_model_params   mparams_f;
             llama_context_params cparams_f;
@@ -1519,10 +1556,24 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 std::vector<int64_t> surplus(fit_targets.size(), 0);
                 fit_with_cache_reserve(0, mparams_f, cparams_f, &surplus);
 
-                slots = common_fit_expert_cache_slots_from_surplus(surplus[cache_device_index] - (int64_t) workspace_bytes, slot_bytes, n_expert);
+                slots = cache_devices.empty() ? 0 : slot_cap;
+                const common_expert_cache_fit_device * limiting_device = nullptr;
+                for (const auto & device : cache_devices) {
+                    const uint32_t device_slots = common_fit_expert_cache_slots_from_surplus(
+                        surplus[device.index] - (int64_t) device.workspace_bytes, device.slot_bytes, n_expert);
+                    if (device_slots <= slots) {
+                        slots = device_slots;
+                        limiting_device = &device;
+                    }
+                }
                 if (slots == 0) {
-                    COM_WRN("expert cache auto-fit: %.1f MiB left on %s after layer offloading is not enough for a slot, disabling the cache\n",
-                        (double) std::max<int64_t>(surplus[cache_device_index], 0) / (1024.0 * 1024.0), ggml_backend_dev_name(cache_dev));
+                    if (limiting_device != nullptr) {
+                        COM_WRN("expert cache auto-fit: %.1f MiB left on %s after layer offloading is not enough for a slot, disabling the cache\n",
+                            (double) std::max<int64_t>(surplus[limiting_device->index], 0) / (1024.0 * 1024.0),
+                            ggml_backend_dev_name(limiting_device->dev));
+                    } else {
+                        COM_WRN("expert cache auto-fit: %s\n", "no host experts are assigned to a GPU, disabling the cache");
+                    }
                 } else {
                     // refit with the cache footprint reserved so that KV and scratch buffers do not claim it
                     fit_with_cache_reserve(slots, mparams_f, cparams_f, nullptr);
@@ -1541,7 +1592,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
                     const auto status_i = fit_with_cache_reserve(mid, mparams_i, cparams_i, &surplus_i);
 
-                    if (status_i == COMMON_PARAMS_FIT_STATUS_SUCCESS && surplus_i[cache_device_index] >= 0) {
+                    if (status_i == COMMON_PARAMS_FIT_STATUS_SUCCESS && !cache_devices.empty() &&
+                        std::all_of(cache_devices.begin(), cache_devices.end(), [&](const common_expert_cache_fit_device & device) {
+                            return surplus_i[device.index] >= 0;
+                        })) {
                         lo = mid;
                     } else {
                         hi = mid;
@@ -1553,7 +1607,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                     COM_WRN("expert cache auto-fit: %s\n", "not even a single slot/layer keeps the fit feasible, disabling the cache");
                 }
 
-                // commit the search result: fit the final params with the cache footprint reserved on the cache device
+                // commit the search result with the cache footprint reserved on every cache device
                 fit_with_cache_reserve(slots, mparams_f, cparams_f, nullptr);
             }
 
@@ -1562,12 +1616,16 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
             params.expert_cache_slots = (int32_t) slots;
             params.expert_cache_slots_auto = false;
-            COM_TRC("expert cache reserved %d slots (%.1f MiB, %.2f MiB/slot) and %.1f MiB workspace on %s after fit\n",
-                slots, (double) slots * slot_bytes / (1024.0 * 1024.0), (double) slot_bytes / (1024.0 * 1024.0),
-                slots != 0 ? (double) workspace_bytes / (1024.0 * 1024.0) : 0.0, ggml_backend_dev_name(cache_dev));
+            cparams.expert_cache_slots = slots;
+            for (const auto & device : cache_devices) {
+                COM_TRC("expert cache reserved %d slots (%.1f MiB, %.2f MiB/slot) and %.1f MiB workspace on %s after fit\n",
+                    slots, (double) device.aligned_bytes / (1024.0 * 1024.0), (double) device.slot_bytes / (1024.0 * 1024.0),
+                    slots != 0 ? (double) device.workspace_bytes / (1024.0 * 1024.0) : 0.0, ggml_backend_dev_name(device.dev));
+            }
         }
     }
 
+    mparams.expert_cache = cparams.expert_cache_slots > 0 || cparams.moe_cache_size > 0;
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
         return;
@@ -1584,7 +1642,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // these decision models return a score for each token via the embeddings output
     // TODO: maybe improve this in the future
     const auto decision_type = common_get_decision_type(model);
-    if (decision_type == COMMON_DECISION_TYPE_LAYA || decision_type == COMMON_DECISION_TYPE_KEV || decision_type == COMMON_DECISION_TYPE_CLEF) {
+    if (decision_type == COMMON_DECISION_TYPE_LAYA || decision_type == COMMON_DECISION_TYPE_KEV || decision_type == COMMON_DECISION_TYPE_CLEF ||
+        decision_type == COMMON_DECISION_TYPE_LFM2_D1_OMNI || decision_type == COMMON_DECISION_TYPE_VLLM_DECISION2) {
         params.embedding    = true;
         params.pooling_type = LLAMA_POOLING_TYPE_NONE;
 
@@ -1668,8 +1727,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     pimpl->context.reset(lctx);
 
-    common_expert_cache_configure(params);
-
     set_process_priority(params.cpuparams.priority);
 
     pimpl->threadpools.init(lctx, params);
@@ -1698,6 +1755,14 @@ void common_init_result::reset_samplers() {
 
 std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
+}
+
+// only for warmup and probe decodes, fill zeros as dummy input
+static void common_batch_set_zero_state(common_batch & batch, const llama_model * model, std::vector<float> & zeros) {
+    zeros.assign(llama_model_n_embd_nextn(model), 0.0f);
+    for (int32_t i = 0; i < batch.size(); ++i) {
+        batch.set_embd_state(i, { zeros.data(), 1, zeros.size() });
+    }
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
@@ -1806,6 +1871,8 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         if (llama_model_has_decoder(model)) {
             tmp.resize(std::min(tmp.size(), (size_t) params.n_batch));
             common_batch batch = common_batch_get_one(lctx, tmp);
+            std::vector<float> zeros;
+            common_batch_set_zero_state(batch, model, zeros);
             llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         }
         llama_memory_clear(llama_get_memory(lctx), true);
@@ -1873,6 +1940,8 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     int ret;
     {
         common_batch batch = common_batch_get_one(ctx, tmp);
+        std::vector<float> zeros;
+        common_batch_set_zero_state(batch, llama_get_model(ctx), zeros);
         ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
     }
     if (ret != 0) {
@@ -1985,6 +2054,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    mparams.expert_cache                = params.expert_cache_slots > 0 || params.expert_cache_slots_auto || params.moe_cache_size > 0;
 
     return mparams;
 }
@@ -2024,6 +2094,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+
+    cparams.moe_cache_size = params.moe_cache_size;
+    cparams.expert_cache_slots        = params.expert_cache_slots;
+    cparams.expert_cache_admit_window = params.expert_cache_admit_window;
+    cparams.expert_cache_workers      = params.expert_cache_workers;
 
     return cparams;
 }
@@ -2456,7 +2531,7 @@ void common_batch::clear() {
 }
 
 int32_t common_batch::add(llama_token id, llama_pos pos, llama_seq_id seq_id, bool output) {
-    tokens.push_back({ id, { pos, 0, 0, 0 }, seq_id, output, { nullptr, 0, 0 }, {} });
+    tokens.push_back({ id, { pos, 0, 0, 0 }, seq_id, output, { nullptr, 0, 0 }, { nullptr, 0, 0 }, {} });
     return size() - 1;
 }
 
@@ -2494,8 +2569,16 @@ bool common_batch::set_embd(int32_t idx, llama_embd embd) {
     return true;
 }
 
+bool common_batch::set_embd_state(int32_t idx, llama_embd state) {
+    if (idx < 0 || idx >= size() || tokens[idx].state.data != nullptr) {
+        return false;
+    }
+    tokens[idx].state = state;
+    return true;
+}
+
 int32_t common_batch::add_embd(llama_embd embd, const llama_pos * pos, llama_seq_id seq_id, bool output) {
-    token t = { LLAMA_TOKEN_NULL, { 0, 0, 0, 0 }, seq_id, output, embd, {} };
+    token t = { LLAMA_TOKEN_NULL, { 0, 0, 0, 0 }, seq_id, output, embd, { nullptr, 0, 0 }, {} };
     for (int32_t j = 0; j < n_pos; ++j) {
         t.pos[j] = pos[j];
     }
@@ -2539,6 +2622,9 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
         }
         if (t.output) {
             llama_batch_ext_set_output_logits(res, idx, true);
+        }
+        if (t.state.data) {
+            llama_batch_ext_set_embd_state(res, idx, t.state); // contexts without a state input ignore it
         }
         if (t.decision_order != 0) {
             llama_batch_ext_set_decision_order(res, idx, (llama_decision_order) t.decision_order);
@@ -2686,40 +2772,36 @@ void common_prompt_checkpoint::update_dft(
     }
 }
 
-void common_prompt_checkpoint::load_tgt(
+bool common_prompt_checkpoint::load_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) const {
     if (ctx == nullptr) {
-        return;
+        return true;
     }
 
     if (data_tgt.empty()) {
-        return;
+        return true;
     }
 
     const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
-    if (n != data_tgt.size()) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_tgt.size(), n);
-    }
+    return n == data_tgt.size();
 }
 
-void common_prompt_checkpoint::load_dft(
+bool common_prompt_checkpoint::load_dft(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) const {
     if (ctx == nullptr) {
-        return;
+        return true;
     }
 
     if (data_dft.empty()) {
-        return;
+        return true;
     }
 
     const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
-    if (n != data_dft.size()) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_dft.size(), n);
-    }
+    return n == data_dft.size();
 }
 
 void common_prompt_checkpoint::clear_tgt() {

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -31,8 +32,8 @@ namespace {
 static bool supports_input(const ggml_tensor * op) {
     const ggml_type type = op->src[1]->type;
     return type == GGML_TYPE_F32 ||
-           ((type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q8_K) &&
-            type == ggml_get_type_traits_cpu(op->src[0]->type)->vec_dot_type);
+           (type == ggml_get_type_traits_cpu(op->src[0]->type)->vec_dot_type &&
+            ggml_get_type_traits(type)->to_float != nullptr);
 }
 
 static void pack_input_q8_1(const void * input, ggml_type type, void * output, int64_t n) {
@@ -59,6 +60,16 @@ static void pack_input_q8_1(const void * input, ggml_type type, void * output, i
             dequantize_row_q8_K(in + b, values, QK_K);
             quantize_row_q8_1(values, out + b * (QK_K / QK8_1), QK_K);
         }
+    }
+}
+
+static void pack_input_f32(const void * input, ggml_type type, void * output, int64_t n) {
+    if (type == GGML_TYPE_F32) {
+        memcpy(output, input, n * sizeof(float));
+    } else {
+        const auto * traits = ggml_get_type_traits(type);
+        GGML_ASSERT(traits->to_float != nullptr);
+        traits->to_float(input, static_cast<float *>(output), n);
     }
 }
 
@@ -100,6 +111,7 @@ struct expert_cache_template {
     ggml_tensor * ids = nullptr;
     ggml_tensor * output = nullptr;
     bool input_q8 = false;
+    uint64_t workspace_generation = 0;
 };
 
 struct expert_cache_merge {
@@ -136,7 +148,6 @@ struct expert_cache_merge {
 };
 
 static constexpr int EXPERT_CACHE_BATCH_SIZES = 4;
-static constexpr int EXPERT_CACHE_MAX_TOKENS = 128;
 
 struct expert_cache_batch {
     expert_cache_template * t;
@@ -180,6 +191,8 @@ struct expert_cache_layer {
 
     bool checked = false;
     bool compatible = false;
+    bool projection_only = false;
+    bool force_projection = false;
     int64_t n_expert_used = 0;
     int64_t input_dim = 0;
     int64_t ffn_dim = 0;
@@ -193,10 +206,13 @@ struct expert_cache_layer {
 
     std::vector<std::unique_ptr<expert_cache_template>> templates;
     std::vector<uint8_t> template_failed;
+    std::array<std::vector<std::unique_ptr<expert_cache_template>>, 5> projection_templates;
+    std::array<std::vector<uint8_t>, 5> projection_failed;
 
     // Freeze all token routes until down finishes. New admissions become
     // visible only to the next batch.
     bool active = false;
+    expert_cache_part active_part = expert_cache_part::none;
     const ggml_tensor * active_ids = nullptr;
     std::vector<uint64_t> active_ready_masks;
     std::vector<int32_t> active_slots;
@@ -211,12 +227,7 @@ struct expert_cache_layer {
     bool reads_recorded = false;
 };
 
-struct expert_cache_model {
-    std::unordered_map<int, std::unique_ptr<expert_cache_layer>> layers;
-};
-
 struct expert_cache_request {
-    const void * model_key;
     int layer;
     int32_t expert;
     int32_t slot;
@@ -455,10 +466,8 @@ public:
         if (output_buffer != nullptr) {
             ggml_backend_buffer_free(output_buffer);
         }
-        for (auto & model_it : models) {
-            for (auto & layer_it : model_it.second.layers) {
-                free_layer(*layer_it.second);
-            }
+        for (auto & layer : layers) {
+            free_layer(*layer.second);
         }
         if (workspace != nullptr) {
             ggml_gallocr_free(workspace);
@@ -473,25 +482,47 @@ public:
         }
     }
 
+    bool is_valid() const { return valid; }
+    ggml_backend_dev_t get_device() const { return ggml_backend_get_device(compute_backend); }
+    uint64_t hits() const { return gpu_hits.load(std::memory_order_relaxed); }
+
+    void register_weights(const ggml_tensor * weights) {
+        int layer_id = -1;
+        const auto part = expert_cache_parse_tensor(weights->name, layer_id);
+        if (part != expert_cache_part::none && layer_id >= 0) {
+            registered.insert(weights);
+            register_part(get_layer(layer_id), part, weights);
+        }
+    }
+
+    size_t memory() {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        size_t bytes = workspace ? ggml_gallocr_get_buffer_size(workspace, 0) : 0;
+        if (merge) {
+            bytes += ggml_gallocr_get_buffer_size(merge->allocator, 0);
+        }
+        for (const auto & layer : layers) {
+            if (layer.second->cache_buffer) {
+                bytes += ggml_backend_buffer_get_size(layer.second->cache_buffer);
+            }
+        }
+        return bytes;
+    }
+
     ggml_backend_dev_t device(const ggml_tensor * op) const {
         if (!valid || op == nullptr || op->op != GGML_OP_MUL_MAT_ID ||
-            !is_cpu_repack_tensor(op->src[0]) || !is_supported_ids(op->src[2]) ||
+            registered.count(op->src[0]) == 0) {
+            return nullptr;
+        }
+        return ggml_backend_get_device(compute_backend);
+    }
+
+    ggml_backend_dev_t offload_device(const ggml_tensor * op) const {
+        if (op == nullptr || !ggml_cpu_expert_cache_supports_ids(op->src[2]) ||
             op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
             return nullptr;
         }
-
-        const auto type = op->src[0]->type;
-        int layer_id = -1;
-        if ((type != GGML_TYPE_ZNQ2 && type != GGML_TYPE_ZNQ3 && type != GGML_TYPE_ZNQ4) ||
-            expert_cache_parse_tensor(op->src[0]->name, layer_id) != expert_cache_part::down) {
-            return nullptr;
-        }
-
-        auto dev = ggml_backend_get_device(compute_backend);
-        ggml_backend_dev_props props;
-        ggml_backend_dev_get_props(dev, &props);
-
-        return props.caps.events ? dev : nullptr;
+        return device(op);
     }
 
     void prepare(ggml_backend_sched_t sched, ggml_cgraph * graph) {
@@ -501,10 +532,11 @@ public:
 
         ggml_backend_synchronize(compute_backend);
         std::lock_guard<std::mutex> lock(state_mutex);
-        deferred_starts.clear();
         pending_output = nullptr;
+        host_intermediates = graph == nullptr;
 
         if (graph == nullptr) {
+            deferred_starts.clear();
             return;
         }
 
@@ -523,8 +555,46 @@ public:
 
         for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
             const auto * down = ggml_graph_node(graph, i);
-            const auto dev = device(down);
-            if (dev == nullptr || (down->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            const auto dev = offload_device(down);
+            if (dev == nullptr) {
+                continue;
+            }
+            int discovered_id = -1;
+            if (expert_cache_parse_tensor(down->src[0]->name, discovered_id) != expert_cache_part::down) {
+                continue;
+            }
+            for (auto it = deferred_starts.begin(); it != deferred_starts.end();) {
+                it = it->second == discovered_id ? deferred_starts.erase(it) : std::next(it);
+            }
+            auto & layer = get_layer(discovered_id);
+            layer.force_projection = false;
+            const auto * act = down->src[1];
+            if (act && act->op == GGML_OP_GLU) {
+                std::array<const ggml_tensor *, 5> intermediates = { act, act->src[0], act->src[1] };
+                for (int j = 0; j < 2; ++j) {
+                    const auto * input = act->src[j];
+                    if (input && input->op == GGML_OP_VIEW) {
+                        intermediates[3 + j] = input->src[0];
+                    }
+                }
+                const auto internal = [&](const ggml_tensor * t) {
+                    return t && std::find(intermediates.begin(), intermediates.end(), t) != intermediates.end();
+                };
+                for (int j = 0; j < ggml_graph_n_nodes(graph); ++j) {
+                    const auto * node = ggml_graph_node(graph, j);
+                    if (internal(node)) {
+                        layer.force_projection |= (node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0;
+                    } else if (node != down) {
+                        for (const auto * src : node->src) {
+                            layer.force_projection |= internal(src);
+                        }
+                    }
+                }
+            }
+            discover_locked(layer, down);
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            if (!props.caps.events || (down->flags & GGML_TENSOR_FLAG_OUTPUT)) {
                 continue;
             }
 
@@ -573,15 +643,14 @@ public:
 
             for (int j = 0; j < i; ++j) {
                 const auto * node = ggml_graph_node(graph, j);
-                if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] == nullptr ||
-                    node->src[0]->buffer != down->src[0]->buffer) {
+                if (node->op != GGML_OP_MUL_MAT_ID || registered.count(node->src[0]) == 0) {
                     continue;
                 }
 
                 int id = -1;
                 const auto part = expert_cache_parse_tensor(node->src[0]->name, id);
                 if (id == layer_id && part != expert_cache_part::none && part != expert_cache_part::down) {
-                    deferred_starts.insert(node);
+                    deferred_starts[node] = layer_id;
                 }
             }
         }
@@ -614,28 +683,25 @@ public:
 
     const uint64_t * begin(ggml_tensor * op) {
         if (!valid || op == nullptr || op->op != GGML_OP_MUL_MAT_ID ||
-            op->src[0] == nullptr || op->src[2] == nullptr || !is_cpu_repack_tensor(op->src[0])) {
+            op->src[0] == nullptr || op->src[2] == nullptr || registered.count(op->src[0]) == 0) {
             return nullptr;
         }
 
         int layer_id = -1;
         const auto part = expert_cache_parse_tensor(op->src[0]->name, layer_id);
-        if (part == expert_cache_part::none || layer_id < 0 || !is_supported_ids(op->src[2])) {
-            return nullptr;
-        }
-
-        const void * model_key = op->src[0]->buffer != nullptr ? (const void *) op->src[0]->buffer : op->src[0]->data;
-        if (model_key == nullptr) {
+        if (part == expert_cache_part::none || layer_id < 0 || !ggml_cpu_expert_cache_supports_ids(op->src[2])) {
             return nullptr;
         }
 
         std::lock_guard<std::mutex> lock(state_mutex);
-        auto & model = models[model_key];
-        auto & layer = get_layer(model, layer_id);
+        auto & layer = get_layer(layer_id);
         register_part(layer, part, op->src[0]);
+        if (host_intermediates) {
+            layer.projection_only = true;
+        }
 
-        if (part == expert_cache_part::down && !layer.checked) {
-            detect_locked(layer, op);
+        if (part == expert_cache_part::down && (!layer.checked || layer.cache_buffer == nullptr)) {
+            discover_locked(layer, op);
             if (!layer.compatible || !prepare_layer(layer, layer_id)) {
                 layer.compatible = false;
                 return nullptr;
@@ -649,12 +715,14 @@ public:
         }
 
         if (!layer.active) {
-            if (part == expert_cache_part::down) {
-                // This should only happen after an unexpected graph/order change.
+            if (layer.projection_only) {
+                start_projection_locked(layer, part, op);
+            } else if (part == expert_cache_part::down) {
                 start_active_locked(layer, op->src[2], /*allow_gpu=*/ false, op);
                 return nullptr;
+            } else {
+                start_active_locked(layer, op->src[2], /*allow_gpu=*/ true, op);
             }
-            start_active_locked(layer, op->src[2], /*allow_gpu=*/ true, op);
         } else if (layer.active_ids != op->src[2]) {
             return nullptr;
         }
@@ -670,11 +738,7 @@ public:
 
         int layer_id = -1;
         const auto part = expert_cache_parse_tensor(op->src[0]->name, layer_id);
-        if (part != expert_cache_part::down || layer_id < 0 || !is_supported_ids(op->src[2])) {
-            return;
-        }
-        const void * model_key = op->src[0]->buffer != nullptr ? (const void *) op->src[0]->buffer : op->src[0]->data;
-        if (model_key == nullptr) {
+        if (part == expert_cache_part::none || layer_id < 0 || !ggml_cpu_expert_cache_supports_ids(op->src[2])) {
             return;
         }
 
@@ -687,16 +751,15 @@ public:
 
         {
             std::lock_guard<std::mutex> lock(state_mutex);
-            auto mit = models.find(model_key);
-            if (mit == models.end()) {
-                return;
-            }
-            auto lit = mit->second.layers.find(layer_id);
-            if (lit == mit->second.layers.end()) {
+            auto lit = layers.find(layer_id);
+            if (lit == layers.end()) {
                 return;
             }
             layer_ptr = lit->second.get();
             auto & layer = *layer_ptr;
+            if (part != expert_cache_part::down && !layer.projection_only) {
+                return;
+            }
             if (!layer.compatible || !layer.active || layer.active_ids != op->src[2]) {
                 return;
             }
@@ -704,7 +767,7 @@ public:
             deferred = launched && layer.active_deferred;
             route_positions = &layer.active_route_positions;
             output_rows = (int) route_positions->size();
-            output_row_bytes = (size_t) layer.output_dim * sizeof(float);
+            output_row_bytes = (size_t) op->ne[0] * sizeof(float);
         }
 
         if (deferred) {
@@ -712,7 +775,7 @@ public:
             ggml_backend_event_record(layer_ptr->reads_done, compute_backend);
             layer_ptr->reads_recorded = true;
             pending_output = op;
-            observe_locked(model_key, *layer_ptr, layer_id, op->src[2]);
+            observe_locked(*layer_ptr, layer_id, op->src[2]);
             clear_active_locked(*layer_ptr);
             return;
         }
@@ -735,24 +798,18 @@ public:
 
         {
             std::lock_guard<std::mutex> lock(state_mutex);
-            // model/layer storage cannot be erased while configured; use the
-            // pointers obtained above after the GPU wait.
-            observe_locked(model_key, *layer_ptr, layer_id, op->src[2]);
+            // Layer storage stays valid until the workers stop.
+            if (part == expert_cache_part::down) {
+                observe_locked(*layer_ptr, layer_id, op->src[2]);
+            }
             clear_active_locked(*layer_ptr);
         }
     }
 
 private:
 
-    static bool is_supported_ids(const ggml_tensor * ids) {
-        // Bound the cache graph and host staging sizes for verification batches.
-        return ids != nullptr && ids->type == GGML_TYPE_I32 &&
-            ids->ne[0] > 0 && ids->ne[0] <= 64 && ids->ne[1] > 0 && ids->ne[1] <= EXPERT_CACHE_MAX_TOKENS &&
-            ids->ne[2] == 1 && ids->ne[3] == 1;
-    }
-
-    static expert_cache_layer & get_layer(expert_cache_model & model, int layer_id) {
-        auto & ptr = model.layers[layer_id];
+    expert_cache_layer & get_layer(int layer_id) {
+        auto & ptr = layers[layer_id];
         if (!ptr) {
             ptr = std::make_unique<expert_cache_layer>();
         }
@@ -786,6 +843,13 @@ private:
                 free_template(*t);
             }
         }
+        for (auto & templates : layer.projection_templates) {
+            for (auto & t : templates) {
+                if (t) {
+                    free_template(*t);
+                }
+            }
+        }
         if (layer.cache_buffer != nullptr) {
             ggml_backend_buffer_free(layer.cache_buffer);
             layer.cache_buffer = nullptr;
@@ -811,10 +875,13 @@ private:
             }
             layer.parts = { layer.gate_up, layer.down };
         } else {
-            if (layer.gate == nullptr || layer.up == nullptr || layer.down == nullptr) {
+            if (layer.up == nullptr || layer.down == nullptr) {
                 return false;
             }
-            layer.parts = { layer.gate, layer.up, layer.down };
+            layer.parts = { layer.up, layer.down };
+            if (layer.gate != nullptr) {
+                layer.parts.insert(layer.parts.begin(), layer.gate);
+            }
         }
 
         layer.n_expert = layer.down->ne[2];
@@ -900,13 +967,13 @@ private:
             }
         }
 
-        if (layer.gate_up != nullptr) {
-            layer.cache_gate_up = layer.cache_parts[0];
-            layer.cache_down = layer.cache_parts[1];
-        } else {
-            layer.cache_gate = layer.cache_parts[0];
-            layer.cache_up = layer.cache_parts[1];
-            layer.cache_down = layer.cache_parts[2];
+        for (size_t i = 0; i < layer.parts.size(); ++i) {
+            const auto * src = layer.parts[i];
+            auto * cached = layer.cache_parts[i];
+            if (src == layer.gate)    { layer.cache_gate = cached; }
+            if (src == layer.up)      { layer.cache_up = cached; }
+            if (src == layer.gate_up) { layer.cache_gate_up = cached; }
+            if (src == layer.down)    { layer.cache_down = cached; }
         }
 
         layer.expert_to_slot.assign((size_t) layer.n_expert, -1);
@@ -921,7 +988,53 @@ private:
         return true;
     }
 
-    void detect_locked(expert_cache_layer & layer, ggml_tensor * down_op) {
+    void discover_locked(expert_cache_layer & layer, const ggml_tensor * down_op) {
+        const bool checked = layer.checked;
+        const bool projection = layer.projection_only;
+        const auto dimensions = std::array<int64_t, 4>{ layer.n_expert_used, layer.input_dim, layer.ffn_dim, layer.output_dim };
+        const auto glu_params = layer.glu_params;
+        const auto gate_params = layer.gate_params;
+        const auto up_params = layer.up_params;
+        const auto gate_up_params = layer.gate_up_params;
+        const auto down_params = layer.down_params;
+        detect_locked(layer, down_op);
+        layer.projection_only = host_intermediates || layer.force_projection || !layer.compatible;
+        if (layer.projection_only && layer.down && (layer.up || layer.gate_up)) {
+            layer.n_expert_used = down_op->src[2]->ne[0];
+            layer.input_dim = layer.gate_up ? layer.gate_up->ne[0] : layer.up->ne[0];
+            layer.ffn_dim = layer.down->ne[0];
+            layer.output_dim = layer.down->ne[1];
+            layer.compatible = true;
+        }
+        const auto new_dimensions = std::array<int64_t, 4>{ layer.n_expert_used, layer.input_dim, layer.ffn_dim, layer.output_dim };
+        if (!checked || projection != layer.projection_only || dimensions != new_dimensions ||
+            glu_params != layer.glu_params || gate_params != layer.gate_params || up_params != layer.up_params ||
+            gate_up_params != layer.gate_up_params || down_params != layer.down_params) {
+            for (auto & t : layer.templates) {
+                if (t) {
+                    free_template(*t);
+                }
+            }
+            layer.templates.clear();
+            for (auto & templates : layer.projection_templates) {
+                for (auto & t : templates) {
+                    if (t) {
+                        free_template(*t);
+                    }
+                }
+                templates.clear();
+            }
+            const size_t count = ((size_t) layer.n_expert_used + 1) * EXPERT_CACHE_BATCH_SIZES;
+            layer.templates.resize(count);
+            layer.template_failed.assign(count, 0);
+            for (size_t i = 0; i < layer.projection_templates.size(); ++i) {
+                layer.projection_templates[i].resize(count);
+                layer.projection_failed[i].assign(count, 0);
+            }
+        }
+    }
+
+    void detect_locked(expert_cache_layer & layer, const ggml_tensor * down_op) {
         layer.checked = true;
         layer.compatible = false;
 
@@ -1015,9 +1128,42 @@ private:
         layer.glu_op = ggml_get_glu_op(act);
         memcpy(layer.glu_params.data(), act->op_params, GGML_MAX_OP_PARAMS);
         memcpy(layer.down_params.data(), down_op->op_params, GGML_MAX_OP_PARAMS);
-        layer.templates.resize(((size_t) layer.n_expert_used + 1) * EXPERT_CACHE_BATCH_SIZES);
-        layer.template_failed.assign(layer.templates.size(), 0);
         layer.compatible = true;
+    }
+
+    bool allocate_template(expert_cache_template & t) {
+        if (t.workspace_generation != 0 && t.workspace_generation == workspace_generation) {
+            return true;
+        }
+        ggml_backend_synchronize(compute_backend);
+        if (t.workspace_generation != 0) {
+            const auto begin = reinterpret_cast<uintptr_t>(ggml_get_mem_buffer(t.ctx));
+            const auto end = begin + ggml_get_mem_size(t.ctx);
+            for (auto * tensor = ggml_get_first_tensor(t.ctx); tensor; tensor = ggml_get_next_tensor(t.ctx, tensor)) {
+                const auto * root = tensor;
+                while (root->view_src) {
+                    root = root->view_src;
+                }
+                const auto address = reinterpret_cast<uintptr_t>(root);
+                if (address < begin || address >= end) {
+                    continue;
+                }
+                tensor->data = nullptr;
+                tensor->buffer = nullptr;
+            }
+        }
+        if (workspace == nullptr) {
+            workspace = ggml_gallocr_new(device_buft);
+        }
+        const size_t before = ggml_gallocr_get_buffer_size(workspace, 0);
+        if (!ggml_gallocr_alloc_graph(workspace, t.graph)) {
+            return false;
+        }
+        if (before != ggml_gallocr_get_buffer_size(workspace, 0)) {
+            ++workspace_generation;
+        }
+        t.workspace_generation = workspace_generation;
+        return true;
     }
 
     expert_cache_template * get_template_locked(expert_cache_layer & layer, int hit_count, int batch_size) {
@@ -1032,7 +1178,7 @@ private:
             return nullptr;
         }
         if (layer.templates[key]) {
-            return layer.templates[key].get();
+            return allocate_template(*layer.templates[key]) ? layer.templates[key].get() : nullptr;
         }
 
         auto t = std::make_unique<expert_cache_template>();
@@ -1049,7 +1195,9 @@ private:
         }
 
         // Native Q8_1 skips the input conversion.
-        t->input_q8 = layer.input_dim % ggml_blck_size(GGML_TYPE_Q8_1) == 0;
+        const auto input_type = layer.gate_up ? layer.gate_up->type : layer.gate->type;
+        t->input_q8 = (input_type == GGML_TYPE_ZNQ2 || input_type == GGML_TYPE_ZNQ3 || input_type == GGML_TYPE_ZNQ4) &&
+            layer.input_dim % ggml_blck_size(GGML_TYPE_Q8_1) == 0;
         t->input = ggml_new_tensor_3d(t->ctx, t->input_q8 ? GGML_TYPE_Q8_1 : GGML_TYPE_F32, layer.input_dim, 1, batch_size);
         t->ids = ggml_new_tensor_2d(t->ctx, GGML_TYPE_I32, hit_count, batch_size);
 
@@ -1106,11 +1254,7 @@ private:
         memcpy(t->output->op_params, layer.down_params.data(), GGML_MAX_OP_PARAMS);
         ggml_build_forward_expand(t->graph, t->output);
 
-        if (workspace == nullptr) {
-            workspace = ggml_gallocr_new(device_buft);
-        }
-
-        if (!ggml_gallocr_alloc_graph(workspace, t->graph)) {
+        if (!allocate_template(*t)) {
             free_template(*t);
             layer.template_failed[key] = 1;
             return nullptr;
@@ -1127,6 +1271,57 @@ private:
         auto * ret = t.get();
         layer.templates[key] = std::move(t);
         return ret;
+    }
+
+    expert_cache_template * get_projection_template_locked(
+            expert_cache_layer & layer, expert_cache_part part, const ggml_tensor * op, int hit_count, int batch_size) {
+        size_t batch_idx = 0;
+        while ((1 << batch_idx) < batch_size) {
+            ++batch_idx;
+        }
+        const size_t key = hit_count * EXPERT_CACHE_BATCH_SIZES + batch_idx;
+        auto & templates = layer.projection_templates[(size_t) part];
+        auto & failed = layer.projection_failed[(size_t) part];
+        if (key >= templates.size() || failed[key]) {
+            return nullptr;
+        }
+        if (templates[key] && memcmp(templates[key]->output->op_params, op->op_params, GGML_MAX_OP_PARAMS) != 0) {
+            free_template(*templates[key]);
+            templates[key].reset();
+        }
+        if (templates[key]) {
+            return allocate_template(*templates[key]) ? templates[key].get() : nullptr;
+        }
+        ggml_tensor * weights = nullptr;
+        switch (part) {
+            case expert_cache_part::gate:    weights = layer.cache_gate; break;
+            case expert_cache_part::up:      weights = layer.cache_up; break;
+            case expert_cache_part::gate_up: weights = layer.cache_gate_up; break;
+            case expert_cache_part::down:    weights = layer.cache_down; break;
+            case expert_cache_part::none: return nullptr;
+        }
+        if (!weights) {
+            return nullptr;
+        }
+        auto t = std::make_unique<expert_cache_template>();
+        t->ctx = ggml_init({ 4 * ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false), nullptr, true });
+        if (!t->ctx) {
+            return nullptr;
+        }
+        t->input = ggml_new_tensor_3d(t->ctx, GGML_TYPE_F32, weights->ne[0], hit_count, batch_size);
+        t->ids = ggml_new_tensor_2d(t->ctx, GGML_TYPE_I32, hit_count, batch_size);
+        t->output = ggml_mul_mat_id(t->ctx, weights, t->input, t->ids);
+        memcpy(t->output->op_params, op->op_params, GGML_MAX_OP_PARAMS);
+        t->graph = ggml_new_graph_custom(t->ctx, 8, false);
+        ggml_build_forward_expand(t->graph, t->output);
+        if (!ggml_backend_supports_op(compute_backend, t->output) || !allocate_template(*t)) {
+            free_template(*t);
+            failed[key] = 1;
+            return nullptr;
+        }
+        auto * result = t.get();
+        templates[key] = std::move(t);
+        return result;
     }
 
     bool prepare_merge_locked(expert_cache_layer & layer, const ggml_tensor * ids) {
@@ -1254,10 +1449,15 @@ private:
         return output_ptr != nullptr;
     }
 
+    void start_projection_locked(expert_cache_layer & layer, expert_cache_part part, ggml_tensor * op) {
+        layer.active_part = part;
+        start_active_locked(layer, op->src[2], true, op);
+    }
+
     void start_active_locked(expert_cache_layer & layer, const ggml_tensor * ids, bool allow_gpu, ggml_tensor * op) {
         layer.active = true;
 
-        layer.active_deferred = deferred_starts.count(op) != 0;
+        layer.active_deferred = !layer.projection_only && deferred_starts.count(op) != 0;
         layer.active_ids = ids;
         layer.active_ready_masks.assign((size_t) ids->ne[1], 0);
         layer.active_slots.clear();
@@ -1287,20 +1487,27 @@ private:
         }
         layer.active_hits = (int) layer.active_slots.size();
 
+        const bool projection = layer.projection_only;
         if (!allow_gpu || layer.active_hits == 0 || op == nullptr || op->src[1] == nullptr ||
-            !supports_input(op) || op->src[1]->ne[1] != 1 ||
+            !supports_input(op) || (op->src[1]->ne[1] != 1 && (!projection || op->src[1]->ne[1] != ids->ne[0])) ||
             op->src[1]->ne[2] != ids->ne[1] || op->src[1]->ne[3] != 1) {
             return;
         }
 
-        const size_t output_row_bytes = (size_t) layer.output_dim * sizeof(float);
-        const size_t input_row_bytes = (size_t) layer.input_dim * sizeof(float);
-        if (!ensure_input(GGML_PAD(input_row_bytes, 64) * ids->ne[1])) {
+        const int64_t input_dim = projection ? op->src[0]->ne[0] : layer.input_dim;
+        const int64_t output_dim = projection ? op->ne[0] : layer.output_dim;
+        const size_t output_row_bytes = (size_t) output_dim * sizeof(float);
+        const size_t input_row_bytes = (size_t) input_dim * sizeof(float);
+        if (!ensure_input(GGML_PAD(input_row_bytes * (projection ? ids->ne[0] : 1), 64) * ids->ne[1])) {
             return;
         }
 
+        const auto get_template = [&](int hits, int batch) {
+            return projection ? get_projection_template_locked(layer, layer.active_part, op, hits, batch) :
+                get_template_locked(layer, hits, batch);
+        };
         const int max_batch = 1 << (EXPERT_CACHE_BATCH_SIZES - 1);
-        if (get_template_locked(layer, layer.n_expert_used, max_batch) == nullptr) {
+        if (get_template(layer.n_expert_used, max_batch) == nullptr) {
             return;
         }
 
@@ -1336,7 +1543,7 @@ private:
                     padded_hits = std::max(padded_hits, token_hits[(size_t) tokens[first + i]]);
                 }
 
-                t = get_template_locked(layer, padded_hits, batch_size);
+                t = get_template(padded_hits, batch_size);
                 if (t != nullptr || batch_size == 1) {
                     break;
                 }
@@ -1351,10 +1558,12 @@ private:
                 const int64_t token = tokens[first + i];
                 const auto * input_data = (const uint8_t *) op->src[1]->data + token * op->src[1]->nb[2];
                 auto * packed = (uint8_t *) input_ptr + input_offset + i * t->input->nb[2];
-                if (t->input_q8) {
-                    pack_input_q8_1(input_data, op->src[1]->type, packed, layer.input_dim);
-                } else {
-                    memcpy(packed, input_data, input_row_bytes);
+                if (!projection) {
+                    if (t->input_q8) {
+                        pack_input_q8_1(input_data, op->src[1]->type, packed, input_dim);
+                    } else {
+                        pack_input_f32(input_data, op->src[1]->type, packed, input_dim);
+                    }
                 }
 
                 int hits = 0;
@@ -1368,6 +1577,10 @@ private:
                         if (pad_slot < 0) {
                             pad_slot = slot;
                         }
+                        if (projection) {
+                            const auto * row = input_data + (id % op->src[1]->ne[1]) * op->src[1]->nb[1];
+                            pack_input_f32(row, op->src[1]->type, packed + hits * t->input->nb[1], input_dim);
+                        }
                         ++hits;
                     }
                 }
@@ -1376,6 +1589,9 @@ private:
                 for (; hits < padded_hits; ++hits) {
                     layer.active_slots.push_back(pad_slot);
                     layer.active_route_positions.push_back(-1);
+                    if (projection) {
+                        memcpy(packed + hits * t->input->nb[1], packed, input_row_bytes);
+                    }
                 }
             }
 
@@ -1422,6 +1638,7 @@ private:
             }
         }
         layer.active_gpu_launched = true;
+        gpu_hits.fetch_add(layer.active_hits, std::memory_order_relaxed);
     }
 
     static void clear_active_locked(expert_cache_layer & layer) {
@@ -1438,7 +1655,7 @@ private:
         layer.active_gpu_launched = false;
     }
 
-    void observe_locked(const void * model_key, expert_cache_layer & layer, int layer_id, const ggml_tensor * ids) {
+    void observe_locked(expert_cache_layer & layer, int layer_id, const ggml_tensor * ids) {
         const int64_t first_token = layer.observed_tokens;
         layer.observed_tokens += ids->ne[1];
         layer.admissions.clear();
@@ -1476,13 +1693,13 @@ private:
         for (const int32_t expert : layer.admissions) {
             layer.admission_pending[(size_t) expert] = 0;
             if (layer.expert_to_slot[(size_t) expert] < 0) {
-                admit_expert_locked(model_key, layer, layer_id, expert);
+                admit_expert_locked(layer, layer_id, expert);
             }
         }
     }
 
 
-    void admit_expert_locked(const void * model_key, expert_cache_layer & layer, int layer_id, int32_t expert) {
+    void admit_expert_locked(expert_cache_layer & layer, int layer_id, int32_t expert) {
         int32_t slot = -1;
         for (uint32_t i = 0; i < slots; ++i) {
             if (layer.slot_to_expert[i] < 0) {
@@ -1508,7 +1725,7 @@ private:
 
         {
             std::lock_guard<std::mutex> qlock(queue_mutex);
-            queue.push_back({ model_key, layer_id, expert, slot, generation });
+            queue.push_back({ layer_id, expert, slot, generation });
         }
         queue_cv.notify_one();
     }
@@ -1584,12 +1801,8 @@ private:
             std::vector<size_t> part_bytes;
             {
                 std::lock_guard<std::mutex> lock(state_mutex);
-                auto mit = models.find(req.model_key);
-                if (mit == models.end()) {
-                    continue;
-                }
-                auto lit = mit->second.layers.find(req.layer);
-                if (lit == mit->second.layers.end()) {
+                auto lit = layers.find(req.layer);
+                if (lit == layers.end()) {
                     continue;
                 }
                 auto & layer = *lit->second;
@@ -1658,20 +1871,17 @@ private:
             bool current = false;
             {
                 std::lock_guard<std::mutex> lock(state_mutex);
-                auto mit = models.find(req.model_key);
-                if (mit != models.end()) {
-                    auto lit = mit->second.layers.find(req.layer);
-                    if (lit != mit->second.layers.end()) {
-                        auto & layer = *lit->second;
-                        if (req.slot >= 0 && (size_t) req.slot < layer.slot_generation.size() &&
-                            layer.slot_generation[(size_t) req.slot] == req.generation &&
-                            layer.slot_to_expert[(size_t) req.slot] == req.expert) {
-                            cache_parts = layer.cache_parts;
-                            part_bytes = layer.part_bytes;
-                            current = true;
-                            if (layer.reads_recorded) {
-                                ggml_backend_event_wait(upload_backend, layer.reads_done);
-                            }
+                auto lit = layers.find(req.layer);
+                if (lit != layers.end()) {
+                    auto & layer = *lit->second;
+                    if (req.slot >= 0 && (size_t) req.slot < layer.slot_generation.size() &&
+                        layer.slot_generation[(size_t) req.slot] == req.generation &&
+                        layer.slot_to_expert[(size_t) req.slot] == req.expert) {
+                        cache_parts = layer.cache_parts;
+                        part_bytes = layer.part_bytes;
+                        current = true;
+                        if (layer.reads_recorded) {
+                            ggml_backend_event_wait(upload_backend, layer.reads_done);
                         }
                     }
                 }
@@ -1694,17 +1904,13 @@ private:
 
             {
                 std::lock_guard<std::mutex> lock(state_mutex);
-                auto mit = models.find(req.model_key);
-                if (mit != models.end()) {
-                    auto lit = mit->second.layers.find(req.layer);
-                    if (lit != mit->second.layers.end()) {
-                        auto & layer = *lit->second;
-                        if ((size_t) req.slot < layer.slot_generation.size() &&
-                            layer.slot_generation[(size_t) req.slot] == req.generation &&
-                            layer.slot_to_expert[(size_t) req.slot] == req.expert) {
-                            layer.slot_ready[(size_t) req.slot] = 1;
-                        } else {
-                        }
+                auto lit = layers.find(req.layer);
+                if (lit != layers.end()) {
+                    auto & layer = *lit->second;
+                    if ((size_t) req.slot < layer.slot_generation.size() &&
+                        layer.slot_generation[(size_t) req.slot] == req.generation &&
+                        layer.slot_to_expert[(size_t) req.slot] == req.expert) {
+                        layer.slot_ready[(size_t) req.slot] = 1;
                     }
                 }
             }
@@ -1723,12 +1929,16 @@ private:
     ggml_backend_buffer_type_t device_buft = nullptr;
     ggml_backend_buffer_type_t host_buft = nullptr;
     ggml_gallocr_t workspace = nullptr;
+    uint64_t workspace_generation = 1;
     std::unique_ptr<expert_cache_merge> merge;
     bool valid = false;
+    bool host_intermediates = false;
+    std::atomic<uint64_t> gpu_hits{0};
+    std::unordered_set<const ggml_tensor *> registered;
 
     std::mutex state_mutex;
-    std::unordered_map<const void *, expert_cache_model> models;
-    std::unordered_set<const ggml_tensor *> deferred_starts;
+    std::unordered_map<int, std::unique_ptr<expert_cache_layer>> layers;
+    std::unordered_map<const ggml_tensor *, int> deferred_starts;
     const ggml_tensor * pending_output = nullptr;
 
     std::mutex queue_mutex;
@@ -1758,28 +1968,84 @@ private:
 
 };
 
-std::mutex g_expert_cache_mutex;
-std::unique_ptr<expert_cache> g_expert_cache;
-
-static void configure_expert_cache(uint32_t slots, uint32_t admit_window, uint32_t convert_workers,
-                                   ggml_backend_dev_t device) {
-    std::lock_guard<std::mutex> lock(g_expert_cache_mutex);
-    g_expert_cache.reset();
-    if (slots == 0 || device == nullptr) {
-        return;
-    }
-    g_expert_cache = std::make_unique<expert_cache>(slots, admit_window, convert_workers, device);
-}
 
 } // namespace
 
 
-extern "C" void ggml_backend_cpu_expert_cache_configure(
-        uint32_t slots,
-        uint32_t admit_window,
-        uint32_t convert_workers,
-        ggml_backend_dev_t device) {
-    configure_expert_cache(slots, admit_window, convert_workers, device);
+struct ggml_backend_cpu_expert_cache {
+    std::vector<std::unique_ptr<expert_cache>> devices;
+    std::unordered_map<const ggml_tensor *, expert_cache *> weights;
+
+    expert_cache * find(const ggml_tensor * op) const {
+        if (!op || op->op != GGML_OP_MUL_MAT_ID) {
+            return nullptr;
+        }
+        const auto it = weights.find(op->src[0]);
+        return it == weights.end() ? nullptr : it->second;
+    }
+};
+
+extern "C" ggml_backend_cpu_expert_cache_t ggml_backend_cpu_expert_cache_create() {
+    return new ggml_backend_cpu_expert_cache;
+}
+
+extern "C" void ggml_backend_cpu_expert_cache_free(ggml_backend_cpu_expert_cache_t cache) {
+    delete cache;
+}
+
+extern "C" bool ggml_backend_cpu_expert_cache_add_device(
+        ggml_backend_cpu_expert_cache_t cache, uint32_t slots, uint32_t admit_window,
+        uint32_t convert_workers, ggml_backend_dev_t device) {
+    if (!cache || !device || !slots || !convert_workers) {
+        return false;
+    }
+    for (const auto & entry : cache->devices) {
+        if (entry->get_device() == device) {
+            return false;
+        }
+    }
+    auto entry = std::make_unique<expert_cache>(slots, admit_window, convert_workers, device);
+    if (!entry->is_valid()) {
+        return false;
+    }
+    cache->devices.push_back(std::move(entry));
+    return true;
+}
+
+extern "C" void ggml_backend_cpu_expert_cache_register(
+        ggml_backend_cpu_expert_cache_t cache, ggml_backend_dev_t device, const ggml_tensor * weights) {
+    if (!cache || !weights) {
+        return;
+    }
+    for (const auto & entry : cache->devices) {
+        if (entry->get_device() == device) {
+            entry->register_weights(weights);
+            cache->weights[weights] = entry.get();
+            return;
+        }
+    }
+}
+
+extern "C" size_t ggml_backend_cpu_expert_cache_memory(
+        ggml_backend_cpu_expert_cache_t cache, ggml_backend_dev_t device) {
+    if (cache) {
+        for (const auto & entry : cache->devices) {
+            if (entry->get_device() == device) {
+                return entry->memory();
+            }
+        }
+    }
+    return 0;
+}
+
+extern "C" uint64_t ggml_backend_cpu_expert_cache_hits(ggml_backend_cpu_expert_cache_t cache) {
+    uint64_t hits = 0;
+    if (cache) {
+        for (const auto & entry : cache->devices) {
+            hits += entry->hits();
+        }
+    }
+    return hits;
 }
 
 extern "C" size_t ggml_backend_cpu_expert_cache_get_buffer_size(
@@ -1793,7 +2059,7 @@ extern "C" size_t ggml_backend_cpu_expert_cache_get_buffer_size(
     GGML_ASSERT(m.ctx != nullptr);
     const auto buft = ggml_backend_dev_buffer_type(device);
     m.allocator = ggml_gallocr_new(buft);
-    m.build(output_dim, n_expert_used, EXPERT_CACHE_MAX_TOKENS);
+    m.build(output_dim, n_expert_used, GGML_CPU_EXPERT_CACHE_MAX_TOKENS);
     size_t merge_bytes = 0;
     ggml_backend_dev_props props;
     ggml_backend_dev_get_props(device, &props);
@@ -1808,36 +2074,56 @@ extern "C" size_t ggml_backend_cpu_expert_cache_get_buffer_size(
     ggml_new_tensor_2d(m.ctx, GGML_TYPE_I32, n_expert_used, batch_size);
     ggml_new_tensor_3d(m.ctx, GGML_TYPE_F32, 3 * ffn_dim, n_expert_used, batch_size);
     ggml_new_tensor_3d(m.ctx, GGML_TYPE_F32, output_dim, n_expert_used, batch_size);
-    return merge_bytes + ggml_backend_alloc_ctx_tensors_from_buft_size(m.ctx, buft);
+    size_t workspace_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(m.ctx, buft);
+    ggml_reset(m.ctx);
+    ggml_new_tensor_3d(m.ctx, GGML_TYPE_F32, std::max(input_dim + 2 * ffn_dim, ffn_dim + output_dim), n_expert_used, batch_size);
+    ggml_new_tensor_2d(m.ctx, GGML_TYPE_I32, n_expert_used, batch_size);
+    workspace_bytes = std::max(workspace_bytes, ggml_backend_alloc_ctx_tensors_from_buft_size(m.ctx, buft));
+    return merge_bytes + workspace_bytes;
 }
 
 
-extern "C" const uint64_t * ggml_backend_cpu_expert_cache_begin(ggml_tensor * op) {
-    std::lock_guard<std::mutex> lock(g_expert_cache_mutex);
-    return g_expert_cache ? g_expert_cache->begin(op) : nullptr;
+extern "C" const uint64_t * ggml_backend_cpu_expert_cache_begin(ggml_backend_cpu_expert_cache_t cache, ggml_tensor * op) {
+    auto * entry = cache ? cache->find(op) : nullptr;
+    return entry ? entry->begin(op) : nullptr;
 }
 
-extern "C" void ggml_backend_cpu_expert_cache_end(ggml_tensor * op) {
-    std::lock_guard<std::mutex> lock(g_expert_cache_mutex);
-    if (g_expert_cache) {
-        g_expert_cache->end(op);
+extern "C" void ggml_backend_cpu_expert_cache_end(ggml_backend_cpu_expert_cache_t cache, ggml_tensor * op) {
+    if (auto * entry = cache ? cache->find(op) : nullptr) {
+        entry->end(op);
     }
 }
 
-extern "C" ggml_backend_dev_t ggml_backend_cpu_expert_cache_device(const ggml_tensor * op) {
-    std::lock_guard<std::mutex> lock(g_expert_cache_mutex);
-    return g_expert_cache ? g_expert_cache->device(op) : nullptr;
+extern "C" ggml_backend_dev_t ggml_backend_cpu_expert_cache_device(
+        ggml_backend_cpu_expert_cache_t cache, const ggml_tensor * op) {
+    auto * entry = cache ? cache->find(op) : nullptr;
+    return entry ? entry->device(op) : nullptr;
 }
 
-extern "C" void ggml_backend_cpu_expert_cache_prepare(ggml_backend_sched_t sched, ggml_cgraph * graph) {
-    std::lock_guard<std::mutex> lock(g_expert_cache_mutex);
-    if (g_expert_cache) {
-        g_expert_cache->prepare(sched, graph);
+extern "C" ggml_backend_dev_t ggml_backend_cpu_expert_cache_offload_device(
+        ggml_backend_cpu_expert_cache_t cache, const ggml_tensor * op) {
+    auto * entry = cache ? cache->find(op) : nullptr;
+    return entry ? entry->offload_device(op) : nullptr;
+}
+
+extern "C" void ggml_backend_cpu_expert_cache_prepare(
+        ggml_backend_cpu_expert_cache_t cache, ggml_backend_sched_t sched, ggml_cgraph * graph) {
+    if (cache) {
+        for (const auto & entry : cache->devices) {
+            entry->prepare(sched, graph);
+        }
     }
 }
 
-extern "C" bool ggml_backend_cpu_expert_cache_copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) {
-    std::lock_guard<std::mutex> lock(g_expert_cache_mutex);
-    return g_expert_cache && g_expert_cache->copy(backend, src, dst);
+extern "C" bool ggml_backend_cpu_expert_cache_copy(
+        ggml_backend_cpu_expert_cache_t cache, ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) {
+    if (cache) {
+        for (const auto & entry : cache->devices) {
+            if (entry->copy(backend, src, dst)) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 

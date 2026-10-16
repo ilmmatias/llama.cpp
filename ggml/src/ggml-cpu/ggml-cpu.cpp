@@ -108,6 +108,8 @@ struct ggml_backend_cpu_context {
     void *              abort_callback_data;
 
     bool                use_ref;  // use reference implementation
+
+    ggml_backend_cpu_expert_cache_t expert_cache; // non-owning
 };
 
 static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
@@ -147,6 +149,7 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
     cpu_plan->cplan.abort_callback      = cpu_ctx->abort_callback;
     cpu_plan->cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cpu_plan->cplan.use_ref             = cpu_ctx->use_ref;
+    cpu_plan->cplan.expert_cache        = cpu_ctx->expert_cache;
 
     return cpu_plan;
 }
@@ -161,11 +164,11 @@ static void ggml_backend_cpu_graph_plan_free(ggml_backend_t backend, ggml_backen
 }
 
 static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
+    struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
     struct ggml_backend_plan_cpu * cpu_plan = (struct ggml_backend_plan_cpu *)plan;
 
+    cpu_plan->cplan.expert_cache = cpu_ctx->expert_cache;
     return ggml_graph_compute(&cpu_plan->cgraph, &cpu_plan->cplan);
-
-    GGML_UNUSED(backend);
 }
 
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -187,6 +190,7 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback      = cpu_ctx->abort_callback;
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cplan.use_ref             = cpu_ctx->use_ref;
+    cplan.expert_cache        = cpu_ctx->expert_cache;
 
     return ggml_graph_compute(cgraph, &cplan);
 }
@@ -231,6 +235,7 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     ctx->abort_callback      = NULL;
     ctx->abort_callback_data = NULL;
     ctx->use_ref             = false;
+    ctx->expert_cache        = nullptr;
 
     ggml_backend_t cpu_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_cpu_guid(),
@@ -283,6 +288,13 @@ void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref) {
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
     ctx->use_ref = use_ref;
+}
+
+void ggml_backend_cpu_set_expert_cache(ggml_backend_t backend_cpu, ggml_backend_cpu_expert_cache_t cache) {
+    GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
+
+    struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
+    ctx->expert_cache = cache;
 }
 
 // CPU backend - device
@@ -683,17 +695,44 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
         return (void *)ggml_backend_cpu_set_use_ref;
     }
-    if (strcmp(name, "ggml_backend_cpu_expert_cache_configure") == 0) {
-        return (void *) ggml_backend_cpu_expert_cache_configure;
+    if (strcmp(name, "ggml_backend_cpu_expert_cache_create") == 0) {
+        return (void *) ggml_backend_cpu_expert_cache_create;
+    }
+    if (strcmp(name, "ggml_backend_cpu_expert_cache_free") == 0) {
+        return (void *) ggml_backend_cpu_expert_cache_free;
+    }
+    if (strcmp(name, "ggml_backend_cpu_expert_cache_add_device") == 0) {
+        return (void *) ggml_backend_cpu_expert_cache_add_device;
+    }
+    if (strcmp(name, "ggml_backend_cpu_expert_cache_register") == 0) {
+        return (void *) ggml_backend_cpu_expert_cache_register;
+    }
+    if (strcmp(name, "ggml_backend_cpu_set_expert_cache") == 0) {
+        return (void *) ggml_backend_cpu_set_expert_cache;
+    }
+    if (strcmp(name, "ggml_backend_cpu_expert_cache_begin") == 0) {
+        return (void *) ggml_backend_cpu_expert_cache_begin;
+    }
+    if (strcmp(name, "ggml_backend_cpu_expert_cache_end") == 0) {
+        return (void *) ggml_backend_cpu_expert_cache_end;
     }
     if (strcmp(name, "ggml_backend_cpu_expert_cache_device") == 0) {
         return (void *) ggml_backend_cpu_expert_cache_device;
+    }
+    if (strcmp(name, "ggml_backend_cpu_expert_cache_offload_device") == 0) {
+        return (void *) ggml_backend_cpu_expert_cache_offload_device;
     }
     if (strcmp(name, "ggml_backend_cpu_expert_cache_prepare") == 0) {
         return (void *) ggml_backend_cpu_expert_cache_prepare;
     }
     if (strcmp(name, "ggml_backend_cpu_expert_cache_copy") == 0) {
         return (void *) ggml_backend_cpu_expert_cache_copy;
+    }
+    if (strcmp(name, "ggml_backend_cpu_expert_cache_memory") == 0) {
+        return (void *) ggml_backend_cpu_expert_cache_memory;
+    }
+    if (strcmp(name, "ggml_backend_cpu_expert_cache_hits") == 0) {
+        return (void *) ggml_backend_cpu_expert_cache_hits;
     }
     if (strcmp(name, "ggml_backend_cpu_expert_cache_get_buffer_size") == 0) {
         return (void *) ggml_backend_cpu_expert_cache_get_buffer_size;

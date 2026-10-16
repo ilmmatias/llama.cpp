@@ -358,6 +358,9 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        // Set before loading if a context will use expert_cache_slots or moe_cache_size.
+        // Keeps native host expert weights GPU-copyable while preserving supported ZNQ CPU repacking.
+        bool expert_cache;
     };
 
     struct llama_sampler_seq_config {
@@ -400,6 +403,11 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
+        size_t moe_cache_size; // alternative expert cache budget in bytes, split by host expert placement; mutually exclusive with expert_cache_slots [EXPERIMENTAL]
+        uint32_t expert_cache_slots;        // cached experts per host-resident layer, 0 = disabled [EXPERIMENTAL]
+        uint32_t expert_cache_admit_window; // repeat-admission window in evaluated tokens, 0 = admit every miss [EXPERIMENTAL]
+        uint32_t expert_cache_workers;      // asynchronous admission workers per device [EXPERIMENTAL]
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution
@@ -407,7 +415,7 @@ extern "C" {
         void *              abort_callback_data;
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
-        bool embeddings;  // if true, extract embeddings (together with logits)
+        bool embeddings;  // if true, extract embeddings (together with logits, except for a pooling type other than NONE)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU
         bool no_perf;     // measure performance timings
         bool op_offload;  // offload host tensor operations to device
@@ -1058,6 +1066,8 @@ extern "C" {
     // "state" here means extra hidden state carried over from a previous stage, e.g.:
     //   - MTP: state from N layers of the target model
     //   - Qwen3 VL (deepstack): state from N layers of the vision encoder
+    //   - LiliCorr: context embeddings for the transformers
+    // Returns false if the context does not take a state embedding (MTP and LiliCorr contexts do)
     LLAMA_API bool llama_batch_ext_set_embd_state(
                                 struct llama_batch_ext * batch,
                                                int32_t   idx,
@@ -1079,7 +1089,7 @@ extern "C" {
 
     // Set custom position for the token at index idx in the batch
     // For M-RoPE models:
-    //     - Embedding tokens must have multiple positions per token
+    //     - Embedding tokens must have n_pos_per_embd positions per token, in order [t, y, x, z]; t is also the KV cache position
     //     - Text token only requires one single position per token
     LLAMA_API bool llama_batch_ext_set_pos(
                                 struct llama_batch_ext * batch,
@@ -1687,6 +1697,8 @@ extern "C" {
         int32_t n_p_eval;   // number of prompt tokens
         int32_t n_eval;     // number of generated tokens
         int32_t n_reused;   // number of times a ggml compute graph had been reused
+        int32_t n_reallocs_same; // number of graph reallocations during inference with an unchanged graph size
+        int32_t n_reallocs_diff; // number of graph reallocations during inference with a changed graph size
     };
 
     struct llama_perf_sampler_data {

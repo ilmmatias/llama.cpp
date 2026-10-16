@@ -1288,7 +1288,7 @@ struct model_file_shape {
     bool is_split = false;
     std::string arch;
     uint32_t n_layer_all = 0;
-    uint32_t n_embd_out = 0;
+    uint32_t n_embd_nextn = 0;
     std::set<uint32_t> nextn_idx;
     bool has_trunk = false;
     bool has_nextn = false;
@@ -1324,9 +1324,16 @@ static model_file_shape model_read_file_shape(const std::string & model_path) {
         const int64_t embd_out_key = gguf_find_key(ctx_gguf, (prefix + "embedding_length_out").c_str());
         const int64_t embd_key     = gguf_find_key(ctx_gguf, (prefix + "embedding_length").c_str());
         if (embd_out_key >= 0 && gguf_get_kv_type(ctx_gguf, embd_out_key) == GGUF_TYPE_UINT32) {
-            shape.n_embd_out = gguf_get_val_u32(ctx_gguf, embd_out_key);
+            shape.n_embd_nextn = gguf_get_val_u32(ctx_gguf, embd_out_key);
         } else if (embd_key >= 0 && gguf_get_kv_type(ctx_gguf, embd_key) == GGUF_TYPE_UINT32) {
-            shape.n_embd_out = gguf_get_val_u32(ctx_gguf, embd_key);
+            shape.n_embd_nextn = gguf_get_val_u32(ctx_gguf, embd_key);
+        }
+        if (shape.arch == "deepseek4" || shape.arch == "qwen4exp") {
+            const int64_t hc_key = gguf_find_key(ctx_gguf, (prefix + "hyper_connection.count").c_str());
+            if (embd_key >= 0 && gguf_get_kv_type(ctx_gguf, embd_key) == GGUF_TYPE_UINT32 &&
+                    hc_key >= 0 && gguf_get_kv_type(ctx_gguf, hc_key) == GGUF_TYPE_UINT32) {
+                shape.n_embd_nextn = gguf_get_val_u32(ctx_gguf, embd_key) * gguf_get_val_u32(ctx_gguf, hc_key);
+            }
         }
     }
 
@@ -1377,7 +1384,7 @@ static std::unique_ptr<nextn_collector> nextn_collector_init(llama_model * model
 
     auto res = std::make_unique<nextn_collector>();
     res->ctx.reset(ctx);
-    res->n_embd = llama_model_n_embd_out(model);
+    res->n_embd = llama_model_n_embd_nextn(model);
     res->own_lm_head = own_lm_head;
     res->batch = common_batch(ctx);
 
@@ -1942,8 +1949,8 @@ int main(int argc, char ** argv) {
                 LOG_ERR("%s: no NextN tensors at layer index %u in '%s' found\n", __func__, shape.n_trunk(), path_md.c_str());
                 return 1;
             }
-            if (shape.valid && shape_md.n_embd_out != shape.n_embd_out) {
-                LOG_ERR("%s: the draft output width %u does not match the target's %u\n", __func__, shape_md.n_embd_out, shape.n_embd_out);
+            if (shape.valid && shape_md.n_embd_nextn != shape.n_embd_nextn) {
+                LOG_ERR("%s: the draft NextN state width %u does not match the target's %u\n", __func__, shape_md.n_embd_nextn, shape.n_embd_nextn);
                 return 1;
             }
             for (const auto type : params.speculative.types) {

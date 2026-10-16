@@ -7,12 +7,29 @@
 extern "C" {
 #endif
 
-    typedef void (*ggml_backend_cpu_expert_cache_configure_t)(
-        uint32_t slots, uint32_t admit_window, uint32_t convert_workers,
+    struct ggml_backend_cpu_expert_cache;
+    typedef struct ggml_backend_cpu_expert_cache * ggml_backend_cpu_expert_cache_t;
+
+    typedef ggml_backend_cpu_expert_cache_t (*ggml_backend_cpu_expert_cache_create_t)(void);
+    typedef void (*ggml_backend_cpu_expert_cache_free_t)(ggml_backend_cpu_expert_cache_t cache);
+    typedef bool (*ggml_backend_cpu_expert_cache_add_device_t)(
+        ggml_backend_cpu_expert_cache_t cache, uint32_t slots, uint32_t admit_window, uint32_t convert_workers,
         ggml_backend_dev_t device);
-    typedef ggml_backend_dev_t (*ggml_backend_cpu_expert_cache_device_t)(const struct ggml_tensor * op);
-    typedef void (*ggml_backend_cpu_expert_cache_prepare_t)(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
-    typedef bool (*ggml_backend_cpu_expert_cache_copy_t)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst);
+    typedef void (*ggml_backend_cpu_expert_cache_register_t)(
+        ggml_backend_cpu_expert_cache_t cache, ggml_backend_dev_t device, const struct ggml_tensor * weights);
+    typedef void (*ggml_backend_cpu_set_expert_cache_t)(ggml_backend_t backend_cpu, ggml_backend_cpu_expert_cache_t cache);
+    typedef const uint64_t * (*ggml_backend_cpu_expert_cache_begin_t)(
+        ggml_backend_cpu_expert_cache_t cache, struct ggml_tensor * op);
+    typedef void (*ggml_backend_cpu_expert_cache_end_t)(ggml_backend_cpu_expert_cache_t cache, struct ggml_tensor * op);
+    typedef ggml_backend_dev_t (*ggml_backend_cpu_expert_cache_device_t)(
+        ggml_backend_cpu_expert_cache_t cache, const struct ggml_tensor * op);
+    typedef void (*ggml_backend_cpu_expert_cache_prepare_t)(
+        ggml_backend_cpu_expert_cache_t cache, ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    typedef bool (*ggml_backend_cpu_expert_cache_copy_t)(
+        ggml_backend_cpu_expert_cache_t cache, ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst);
+    typedef size_t (*ggml_backend_cpu_expert_cache_memory_t)(
+        ggml_backend_cpu_expert_cache_t cache, ggml_backend_dev_t device);
+    typedef uint64_t (*ggml_backend_cpu_expert_cache_hits_t)(ggml_backend_cpu_expert_cache_t cache);
     typedef size_t (*ggml_backend_cpu_expert_cache_get_buffer_size_t)(
         ggml_backend_dev_t device, int64_t input_dim, int64_t ffn_dim, int64_t output_dim, int64_t n_expert_used);
 
@@ -31,6 +48,9 @@ extern "C" {
 
         // use only reference implementations
         bool use_ref;
+
+        // non-owning expert cache, shared by computations in this plan
+        ggml_backend_cpu_expert_cache_t expert_cache;
     };
 
     // numa strategies
@@ -146,6 +166,42 @@ extern "C" {
     GGML_BACKEND_API void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data);
 
     GGML_BACKEND_API void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref);
+
+    // The caller owns the cache and must keep it alive while attached to a backend or plan.
+    GGML_BACKEND_API ggml_backend_cpu_expert_cache_t ggml_backend_cpu_expert_cache_create(void);
+    GGML_BACKEND_API void ggml_backend_cpu_expert_cache_free(ggml_backend_cpu_expert_cache_t cache);
+    GGML_BACKEND_API bool ggml_backend_cpu_expert_cache_add_device(
+        ggml_backend_cpu_expert_cache_t cache, uint32_t slots, uint32_t admit_window, uint32_t convert_workers,
+        ggml_backend_dev_t device);
+    // Register borrowed host weights with their model-assigned device before computation.
+    // GPU allocations are deferred until an op supplies the actual execution dimensions.
+    GGML_BACKEND_API void ggml_backend_cpu_expert_cache_register(
+        ggml_backend_cpu_expert_cache_t cache, ggml_backend_dev_t device, const struct ggml_tensor * weights);
+    GGML_BACKEND_API void ggml_backend_cpu_set_expert_cache(ggml_backend_t backend_cpu, ggml_backend_cpu_expert_cache_t cache);
+
+    // begin() freezes route-position masks, valid until end(), and starts ready GPU hits.
+    // CPU consumers retain the host join; NULL masks mean CPU-only work for this op.
+    GGML_BACKEND_API const uint64_t * ggml_backend_cpu_expert_cache_begin(
+        ggml_backend_cpu_expert_cache_t cache, struct ggml_tensor * op);
+    GGML_BACKEND_API void ggml_backend_cpu_expert_cache_end(
+        ggml_backend_cpu_expert_cache_t cache, struct ggml_tensor * op);
+    // Registered owner, including CPU-only batches.
+    GGML_BACKEND_API ggml_backend_dev_t ggml_backend_cpu_expert_cache_device(
+        ggml_backend_cpu_expert_cache_t cache, const struct ggml_tensor * op);
+    // Cache offload eligibility for this operation and batch.
+    GGML_BACKEND_API ggml_backend_dev_t ggml_backend_cpu_expert_cache_offload_device(
+        ggml_backend_cpu_expert_cache_t cache, const struct ggml_tensor * op);
+    GGML_BACKEND_API void ggml_backend_cpu_expert_cache_prepare(
+        ggml_backend_cpu_expert_cache_t cache, ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    GGML_BACKEND_API bool ggml_backend_cpu_expert_cache_copy(
+        ggml_backend_cpu_expert_cache_t cache, ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst);
+    // Current GPU allocations, including cache, workspace, merge and staging buffers.
+    GGML_BACKEND_API size_t ggml_backend_cpu_expert_cache_memory(
+        ggml_backend_cpu_expert_cache_t cache, ggml_backend_dev_t device);
+    // Cumulative ready routes successfully submitted to a GPU across all cache devices.
+    GGML_BACKEND_API uint64_t ggml_backend_cpu_expert_cache_hits(ggml_backend_cpu_expert_cache_t cache);
+    GGML_BACKEND_API size_t ggml_backend_cpu_expert_cache_get_buffer_size(
+        ggml_backend_dev_t device, int64_t input_dim, int64_t ffn_dim, int64_t output_dim, int64_t n_expert_used);
 
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 

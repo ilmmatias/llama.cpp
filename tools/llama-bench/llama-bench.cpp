@@ -451,7 +451,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
-    printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
+    printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 0)\n");
     if (llama_supports_rpc()) {
         printf("  -rpc, --rpc <rpc_servers>                   register RPC devices (comma separated)\n");
     }
@@ -1311,6 +1311,7 @@ struct cmd_params_instance {
         mparams.tensor_split  = tensor_split.data();
         mparams.no_host       = no_host;
         mparams.use_extra_bufts = repack;
+        mparams.expert_cache   = expert_cache_slots > 0;
 
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {
@@ -1375,6 +1376,9 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+        cparams.expert_cache_slots        = expert_cache_slots;
+        cparams.expert_cache_admit_window = expert_cache_admit_window;
+        cparams.expert_cache_workers      = expert_cache_workers;
 
         return cparams;
     }
@@ -2414,24 +2418,13 @@ int llama_bench(int argc, char ** argv) {
     auto * ggml_threadpool_new_fn = (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_new");
     auto * ggml_threadpool_free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_free");
 
-    auto * expert_cache_configure_fn = reinterpret_cast<ggml_backend_cpu_expert_cache_configure_t>(
-        ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_expert_cache_configure"));
-    auto reset_expert_cache = [&]() {
-        if (expert_cache_configure_fn != nullptr) {
-            expert_cache_configure_fn(0, 0, 1, nullptr);
-        }
-    };
+    if (std::any_of(params.expert_cache_workers.begin(), params.expert_cache_workers.end(), [](int n) { return n <= 0; })) {
+        fprintf(stderr, "%s: error: --expert-cache-workers must be > 0\n", __func__);
+        return 1;
+    }
     const bool expert_cache_enabled =
         std::any_of(params.expert_cache_slots.begin(), params.expert_cache_slots.end(), [](int n) { return n > 0; });
     if (expert_cache_enabled) {
-        if (expert_cache_configure_fn == nullptr) {
-            fprintf(stderr, "%s: error: CPU backend does not provide routed-expert cache support\n", __func__);
-            return 1;
-        }
-        if (std::any_of(params.expert_cache_workers.begin(), params.expert_cache_workers.end(), [](int n) { return n <= 0; })) {
-            fprintf(stderr, "%s: error: --expert-cache-workers must be > 0\n", __func__);
-            return 1;
-        }
         if (std::any_of(params.n_cpu_moe.begin(), params.n_cpu_moe.end(), [](int n) { return n > 0; })) {
             fprintf(stderr, "%s: error: --expert-cache-slots cannot be combined with --n-cpu-moe\n", __func__);
             return 1;
@@ -2486,65 +2479,49 @@ int llama_bench(int argc, char ** argv) {
         return nullptr;
     };
 
-    auto expert_cache_fit_reserve = [&](const cmd_params_instance & inst, const llama_model_params & mparams_cpu_moe,
+    auto expert_cache_fit_reserve = [&](const cmd_params_instance & inst, const llama_model_params & mparams,
                                         const llama_context_params & cparams, ggml_backend_dev_t cache_dev,
-                                        size_t & cache_device_index) -> size_t {
-        llama_model_params mparams_full = mparams_cpu_moe;
-        mparams_full.tensor_buft_overrides = mparams_cpu_moe.tensor_buft_overrides + 1;
-
-        std::vector<ggml_backend_dev_t> devs_full;
-        std::vector<ggml_backend_dev_t> devs_cpu;
-        uint32_t ngl_full = 0, nct_full = 0, nex_full = 0, nxu_full = 0;
-        uint32_t ngl_cpu  = 0, nct_cpu  = 0, nex_cpu  = 0, nxu_cpu  = 0;
-        size_t workspace_bytes = 0;
-        const auto full = common_get_device_memory_data(inst.model.c_str(), &mparams_full, &cparams,
-            devs_full, ngl_full, nct_full, nex_full, nxu_full, params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR, nullptr, nullptr);
-        const auto cpu = common_get_device_memory_data(inst.model.c_str(), &mparams_cpu_moe, &cparams,
-            devs_cpu, ngl_cpu, nct_cpu, nex_cpu, nxu_cpu, params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR, &workspace_bytes, cache_dev);
-        if (nex_full == 0 || nex_cpu != nex_full) {
-            throw std::runtime_error("expert cache requires a consistent routed-expert count");
+                                        std::vector<size_t> & reserves, size_t & n_gpu_devices) {
+        const auto log_level = params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR;
+        std::vector<ggml_backend_dev_t> devs;
+        uint32_t ngl = 0, nct = 0, nex = 0, nxu = 0;
+        size_t workspace_bytes = 0, cache_bytes = 0;
+        common_get_device_memory_data(inst.model.c_str(), &mparams, &cparams,
+            devs, ngl, nct, nex, nxu, log_level, &workspace_bytes, cache_dev, nullptr, &cache_bytes);
+        if (nex == 0) {
+            throw std::runtime_error("expert cache requested for a model without routed experts");
         }
 
-        size_t expert_bytes = 0;
-        for (size_t i = 0; i < devs_full.size(); ++i) {
-            for (size_t j = 0; j < devs_cpu.size(); ++j) {
-                if (devs_full[i] == devs_cpu[j] && full[i].model > cpu[j].model) {
-                    expert_bytes += full[i].model - cpu[j].model;
-                    break;
-                }
+        bool grew = false;
+        n_gpu_devices = 0;
+        for (size_t i = 0; i < devs.size(); ++i) {
+            const auto type = ggml_backend_dev_type(devs[i]);
+            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                continue;
+            }
+            ++n_gpu_devices;
+            size_t device_workspace_bytes = workspace_bytes;
+            size_t device_cache_bytes = cache_bytes;
+            if (devs[i] != cache_dev) {
+                std::vector<ggml_backend_dev_t> devs_unused;
+                common_get_device_memory_data(inst.model.c_str(), &mparams, &cparams,
+                    devs_unused, ngl, nct, nex, nxu, log_level, &device_workspace_bytes, devs[i], nullptr, &device_cache_bytes);
+            }
+            if (device_cache_bytes == 0) {
+                continue;
+            }
+            if (i >= reserves.size()) {
+                throw std::runtime_error("expert cache device index exceeds fit margin array");
+            }
+            const size_t required = device_cache_bytes + device_workspace_bytes;
+            if (required > reserves[i]) {
+                reserves[i] = required;
+                grew = true;
             }
         }
-        cache_device_index = devs_cpu.size();
-        for (size_t i = 0; i < devs_cpu.size(); ++i) {
-            if (devs_cpu[i] == cache_dev) {
-                cache_device_index = i;
-                break;
-            }
-        }
-        if (cache_device_index == devs_cpu.size() || expert_bytes == 0) {
-            throw std::runtime_error("unable to estimate expert-cache fit reservation");
-        }
-        const size_t n_expert = (size_t) nex_full;
-        const size_t slots = (size_t) inst.expert_cache_slots;
-        return workspace_bytes + (expert_bytes / n_expert) * slots + ((expert_bytes % n_expert) * slots + n_expert - 1) / n_expert;
+        return grew;
     };
 
-    auto configure_expert_cache = [&](const cmd_params_instance & inst) -> bool {
-        if (inst.expert_cache_slots <= 0) {
-            return true;
-        }
-        ggml_backend_dev_t cache_dev = expert_cache_device(inst);
-        if (cache_dev == nullptr) {
-            fprintf(stderr, "%s: error: expert cache requested but no GPU device is available\n", __func__);
-            return false;
-        }
-        expert_cache_configure_fn(
-            (uint32_t) inst.expert_cache_slots,
-            (uint32_t) inst.expert_cache_admit_window,
-            (uint32_t) inst.expert_cache_workers,
-            cache_dev);
-        return true;
-    };
 
     llama_model *               lmodel    = nullptr;
     const cmd_params_instance * prev_inst = nullptr;
@@ -2584,7 +2561,6 @@ int llama_bench(int argc, char ** argv) {
         if (do_fit) {
             // free the previous model so fit sees full free VRAM
             if (lmodel) {
-                reset_expert_cache();
                 llama_model_free(lmodel);
                 lmodel    = nullptr;
                 prev_inst = nullptr;
@@ -2600,37 +2576,54 @@ int llama_bench(int argc, char ** argv) {
             mparams.tensor_buft_overrides = fit_overrides.data();
             cparams.n_ctx = 0;
 
-            std::vector<size_t> margins(llama_max_devices(), inst.fit_target * 1024 * 1024);
+
+            // fit at least the requested minimum context size, not just the tokens the benchmark processes
+            uint32_t n_ctx_needed = std::max<uint32_t>(inst.n_prompt + inst.n_gen + inst.n_depth, inst.fit_min_ctx);
+            cparams.n_ctx = std::max(cparams.n_ctx, n_ctx_needed);
+
+            std::vector<size_t> cache_reserves;
+            size_t n_cache_gpu_devices = 0;
+            ggml_backend_dev_t cache_dev = nullptr;
             if (inst.expert_cache_slots > 0) {
-                ggml_backend_dev_t cache_dev = expert_cache_device(inst);
+                cache_dev = expert_cache_device(inst);
                 if (cache_dev == nullptr) {
                     throw std::runtime_error("expert cache requested but no GPU device is available");
                 }
-                size_t cache_device_index = 0;
-                const size_t reserve = expert_cache_fit_reserve(inst, mparams, cparams, cache_dev, cache_device_index);
-                if (cache_device_index >= margins.size()) {
-                    throw std::runtime_error("expert cache device index exceeds fit margin array");
-                }
-                margins[cache_device_index] += reserve;
+                cache_reserves.assign(llama_max_devices(), 0);
+                expert_cache_fit_reserve(inst, mparams, cparams, cache_dev, cache_reserves, n_cache_gpu_devices);
             }
-
-            uint32_t n_ctx_needed = inst.n_prompt + inst.n_gen + inst.n_depth;
-            cparams.n_ctx = std::max(cparams.n_ctx, n_ctx_needed);
-
-            common_fit_params(inst.model.c_str(), &mparams, &cparams,
-                fit_tensor_split.data(),
-                fit_overrides.data(),
-                margins.data(),
-                inst.fit_min_ctx,
-                nullptr,
-                params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
-                inst.expert_cache_slots > 0);
+            const auto mparams_base = mparams;
+            const auto cparams_base = cparams;
+            std::vector<size_t> margins(llama_max_devices());
+            for (;;) {
+                std::fill(fit_tensor_split.begin(), fit_tensor_split.end(), 0.0f);
+                std::fill(fit_overrides.begin(), fit_overrides.end(), llama_model_tensor_buft_override{nullptr, nullptr});
+                if (inst.expert_cache_slots > 0) {
+                    fit_overrides[0] = llm_ffn_exps_cpu_override();
+                }
+                mparams = mparams_base;
+                cparams = cparams_base;
+                for (size_t i = 0; i < margins.size(); ++i) {
+                    margins[i] = inst.fit_target * 1024 * 1024 + (cache_reserves.empty() ? 0 : cache_reserves[i]);
+                }
+                const auto status = common_fit_params(inst.model.c_str(), &mparams, &cparams,
+                    fit_tensor_split.data(),
+                    fit_overrides.data(),
+                    margins.data(),
+                    inst.fit_min_ctx,
+                    nullptr,
+                    params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
+                    inst.expert_cache_slots > 0);
+                if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS || n_cache_gpu_devices <= 1 ||
+                    !expert_cache_fit_reserve(inst, mparams, cparams, cache_dev, cache_reserves, n_cache_gpu_devices)) {
+                    break;
+                }
+            }
        }
 
         // keep the same model between tests when possible
         if (!lmodel || !prev_inst || !inst.equal_mparams(*prev_inst)) {
             if (lmodel) {
-                reset_expert_cache();
                 llama_model_free(lmodel);
             }
 
@@ -2645,17 +2638,10 @@ int llama_bench(int argc, char ** argv) {
         llama_context * ctx = llama_init_from_model(lmodel, cparams);
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
-            reset_expert_cache();
             llama_model_free(lmodel);
             return 1;
         }
 
-        if (!configure_expert_cache(inst)) {
-            llama_free(ctx);
-            reset_expert_cache();
-            llama_model_free(lmodel);
-            return 1;
-        }
 
         test t(inst, lmodel, ctx);
 
@@ -2670,7 +2656,6 @@ int llama_bench(int argc, char ** argv) {
         if (!parse_cpu_mask(t.cpu_mask, tpp.cpumask)) {
             fprintf(stderr, "%s: failed to parse cpu-mask: %s\n", __func__, t.cpu_mask.c_str());
             llama_free(ctx);
-            reset_expert_cache();
             llama_model_free(lmodel);
             exit(1);
         }
@@ -2686,7 +2671,6 @@ int llama_bench(int argc, char ** argv) {
             if (!threadpool_batch) {
                 fprintf(stderr, "%s: batch threadpool create failed : n_threads %d\n", __func__, tpp_batch.n_threads);
                 llama_free(ctx);
-                reset_expert_cache();
                 llama_model_free(lmodel);
                 exit(1);
             }
@@ -2701,7 +2685,6 @@ int llama_bench(int argc, char ** argv) {
             fprintf(stderr, "%s: threadpool create failed : n_threads %d\n", __func__, tpp.n_threads);
             ggml_threadpool_free_fn(threadpool_batch);
             llama_free(ctx);
-            reset_expert_cache();
             llama_model_free(lmodel);
             exit(1);
         }
@@ -2719,7 +2702,6 @@ int llama_bench(int argc, char ** argv) {
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt warmup\n", __func__);
                     llama_free(ctx);
-                    reset_expert_cache();
                     llama_model_free(lmodel);
                     exit(1);
                 }
@@ -2732,7 +2714,6 @@ int llama_bench(int argc, char ** argv) {
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen warmup\n", __func__);
                     llama_free(ctx);
-                    reset_expert_cache();
                     llama_model_free(lmodel);
                     exit(1);
                 }
@@ -2763,7 +2744,6 @@ int llama_bench(int argc, char ** argv) {
                     if (!res) {
                         fprintf(stderr, "%s: error: failed to run depth\n", __func__);
                         llama_free(ctx);
-                        reset_expert_cache();
                         llama_model_free(lmodel);
                         exit(1);
                     }
@@ -2791,7 +2771,6 @@ int llama_bench(int argc, char ** argv) {
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt\n", __func__);
                     llama_free(ctx);
-                    reset_expert_cache();
                     llama_model_free(lmodel);
                     exit(1);
                 }
@@ -2805,7 +2784,6 @@ int llama_bench(int argc, char ** argv) {
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen\n", __func__);
                     llama_free(ctx);
-                    reset_expert_cache();
                     llama_model_free(lmodel);
                     exit(1);
                 }
@@ -2829,15 +2807,11 @@ int llama_bench(int argc, char ** argv) {
 
         llama_free(ctx);
 
-        if (inst.expert_cache_slots > 0) {
-            reset_expert_cache();
-        }
 
         ggml_threadpool_free_fn(threadpool_batch);
         ggml_threadpool_free_fn(threadpool);
     }
 
-    reset_expert_cache();
     llama_model_free(lmodel);
 
     if (p) {

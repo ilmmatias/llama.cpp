@@ -16,6 +16,7 @@
 #include "common.h"
 #include "tiled/tiled.h"
 #include "iqp.h"
+#include "expert-cache.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -1592,6 +1593,36 @@ static void ggml_compute_forward_mul_mat_id(
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
 
+    const bool use_expert_cache = params->expert_cache != NULL && ggml_cpu_expert_cache_supports_ids(ids);
+    const uint64_t * cached_route_masks = NULL;
+    struct ggml_compute_params cache_params;
+    if (use_expert_cache) {
+        // Publish one frozen mask pointer to all workers without allocating per-op state.
+        // The plan reserves this prefix even when the cache is attached after planning.
+        cache_params = *params;
+        cache_params.wdata = (void *) GGML_PAD((uintptr_t) params->wdata + sizeof(cached_route_masks), 64);
+        const size_t prefix_size = (char *) cache_params.wdata - (char *) params->wdata;
+        GGML_ASSERT(params->wsize >= prefix_size);
+        cache_params.wsize -= prefix_size;
+
+        if (ith == 0) {
+            cached_route_masks = ggml_backend_cpu_expert_cache_begin(params->expert_cache, dst);
+            memcpy(params->wdata, &cached_route_masks, sizeof(cached_route_masks));
+            if (cached_route_masks != NULL) {
+                for (int64_t token = 0; token < ids->ne[1]; ++token) {
+                    for (int id = 0; id < n_ids; ++id) {
+                        if (cached_route_masks[token] & (UINT64_C(1) << id)) {
+                            memset((char *) dst->data + token*nb2 + (size_t) id*nb1, 0, (size_t) ne01*sizeof(float));
+                        }
+                    }
+                }
+            }
+        }
+        ggml_barrier(params->threadpool);
+        memcpy(&cached_route_masks, params->wdata, sizeof(cached_route_masks));
+        params = &cache_params;
+    }
+
     void * wdata_cur = params->wdata;
 
     if (src1->type != vec_dot_type) {
@@ -1626,13 +1657,25 @@ static void ggml_compute_forward_mul_mat_id(
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
-    // single-token fast path: each thread converts src1 for itself and computes a static slice of every used expert's rows, so no shared row buffer and no barrier is needed
+    // Without a cache, private conversion and static row slices need no barrier.
     if (single_token && !iqp) {
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
         const void * src1_q = src1->data;
         if (src1_priv) {
             char * priv = src1_priv + (size_t) ith * ne11 * row_size;
             for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                if (cached_route_masks != NULL) {
+                    bool needed = false;
+                    for (int64_t id = i11; id < n_ids; id += ne11) {
+                        if ((cached_route_masks[0] & (UINT64_C(1) << id)) == 0) {
+                            needed = true;
+                            break;
+                        }
+                    }
+                    if (!needed) {
+                        continue;
+                    }
+                }
                 from_float((const float *) ((const char *) src1->data + i11*nb11), priv + i11*row_size, ne10);
             }
             src1_q = priv;
@@ -1643,6 +1686,9 @@ static void ggml_compute_forward_mul_mat_id(
         const int64_t ir0_end   = MIN(ir0_start + dr0, ne01);
         if (ir0_start < ir0_end) {
             for (int id = 0; id < n_ids; ++id) {
+                if (cached_route_masks != NULL && (cached_route_masks[0] & (UINT64_C(1) << id))) {
+                    continue;
+                }
                 const int32_t cur_a = *(const int32_t *) ((const char *) ids->data + id*ids->nb[0]);
                 GGML_ASSERT(cur_a >= 0 && cur_a < n_as);
                 const struct mmid_row_mapping direct = { id, 0 };
@@ -1650,6 +1696,12 @@ static void ggml_compute_forward_mul_mat_id(
                     dst, src0, src1, ids, cur_a,
                     ir0_start, ir0_end, 0, 1,
                     (const char *) src0->data + cur_a*nb02, NULL, row_size, src1_cont, src1_q, &direct);
+            }
+        }
+        if (params->expert_cache != NULL) {
+            ggml_barrier(params->threadpool);
+            if (ith == 0) {
+                ggml_backend_cpu_expert_cache_end(params->expert_cache, dst);
             }
         }
         return;
@@ -1685,6 +1737,9 @@ static void ggml_compute_forward_mul_mat_id(
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
+                if (cached_route_masks != NULL && (cached_route_masks[iid1] & (UINT64_C(1) << id))) {
+                    continue;
+                }
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
                 assert(i02 >= 0 && i02 < n_as);
@@ -1772,6 +1827,13 @@ static void ggml_compute_forward_mul_mat_id(
             }
 
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
+        }
+    }
+
+    if (use_expert_cache) {
+        ggml_barrier(params->threadpool);
+        if (ith == 0) {
+            ggml_backend_cpu_expert_cache_end(params->expert_cache, dst);
         }
     }
 }
@@ -2416,11 +2478,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_MOE_REDUCE:
         case GGML_OP_OUT_PROD:
+        case GGML_OP_SET_ROWS:
             {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_GET_ROWS:
-        case GGML_OP_SET_ROWS:
             {
                 // FIXME: get_rows can use additional threads, but the cost of launching additional threads
                 // decreases performance with GPU offloading
@@ -3118,6 +3180,12 @@ struct ggml_cplan ggml_graph_plan(
             }
         }
 
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            // Cache mask pointer and alignment prefix, including extra-buffer overrides.
+            // The backend attaches its cache only after this plan has been sized.
+            cur += sizeof(const uint64_t *) + 64;
+        }
+
         work_size = MAX(work_size, cur);
     }
 
@@ -3129,6 +3197,7 @@ struct ggml_cplan ggml_graph_plan(
     cplan.n_threads  = MIN(max_tasks, n_threads);
     cplan.work_size  = work_size;
     cplan.work_data  = NULL;
+    cplan.expert_cache = NULL;
 
     return cplan;
 }
@@ -3207,6 +3276,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.wdata      =*/ cplan->work_data,
         /*.threadpool =*/ tp,
         /*.use_ref    =*/ cplan->use_ref,
+        /*.expert_cache =*/ cplan->expert_cache,
     };
 
 #ifdef GGML_USE_OPENMP
@@ -3592,6 +3662,12 @@ void ggml_cpu_fp32_to_fp16(const float * x, ggml_fp16_t * y, int64_t n) {
         vfloat32m2_t vx = __riscv_vle32_v_f32m2(&x[i], vl);
         vfloat16m1_t vy = __riscv_vfncvt_f_f_w_f16m1(vx, vl);
         __riscv_vse16_v_f16m1((_Float16 *)&y[i], vy, vl);
+    }
+#elif defined(__VXE__) || defined(__VXE2__)
+    for (; i + 7 < n; i += 8) {
+        const uint32x4_t v_yl = __lzs_f32cx4_to_f16(vec_xl(0, x + i + 0));
+        const uint32x4_t v_yh = __lzs_f32cx4_to_f16(vec_xl(0, x + i + 4));
+        vec_xst(vec_pack(v_yl, v_yh), 0, (uint16_t *)(y + i));
     }
 #endif
     for (; i < n; ++i) {

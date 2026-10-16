@@ -84,5 +84,5 @@ struct ggml_fusion_cache_key {
     uint8_t bytes[8192] = {};
 };
 
-bool ggml_fusion_build(const ggml_cgraph * graph, int start, ggml_fusion_region & region, ggml_fusion_program & program);
-bool ggml_fusion_make_key(const ggml_fusion_program & program, const ggml_fusion_schedule & schedule, ggml_fusion_cache_key & key);
+GGML_API bool ggml_fusion_build(const ggml_cgraph * graph, int start, ggml_fusion_region & region, ggml_fusion_program & program);
+GGML_API bool ggml_fusion_make_key(const ggml_fusion_program & program, const ggml_fusion_schedule & schedule, ggml_fusion_cache_key & key);

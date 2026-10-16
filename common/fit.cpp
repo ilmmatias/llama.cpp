@@ -41,7 +41,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const llama_model_params * mparams_link = nullptr,
         const llama_context_params * cparams_link = nullptr,
         size_t * cache_workspace_size = nullptr,
-        ggml_backend_dev_t cache_dev = nullptr) {
+        ggml_backend_dev_t cache_dev = nullptr,
+        size_t * cache_expert_size = nullptr,
+        size_t * cache_size = nullptr) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -193,6 +195,12 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     if (cache_workspace_size != nullptr) {
         *cache_workspace_size = llama_model_expert_cache_get_buffer_size(model, cache_dev);
     }
+    if (cache_expert_size != nullptr) {
+        *cache_expert_size = llama_model_expert_cache_get_weight_size(model, cache_dev);
+    }
+    if (cache_size != nullptr) {
+        *cache_size = llama_model_expert_cache_get_cache_size(model, cache_dev, cparams->expert_cache_slots);
+    }
 
     llama_free(ctx);
     llama_model_free(model);
@@ -214,10 +222,12 @@ common_device_memory_data_vec common_get_device_memory_data(
         uint32_t & hp_n_expert_used_max,
         ggml_log_level log_level,
         size_t * cache_workspace_size,
-        ggml_backend_dev_t cache_dev) {
+        ggml_backend_dev_t cache_dev,
+        size_t * cache_expert_size,
+        size_t * cache_size) {
     std::vector<llama_device_memory_data> impl = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, hp_n_expert_used_max, log_level,
-            nullptr, nullptr, nullptr, cache_workspace_size, cache_dev);
+            nullptr, nullptr, nullptr, cache_workspace_size, cache_dev, cache_expert_size, cache_size);
 
     common_device_memory_data_vec ret(impl.size());
     for (size_t i = 0; i < impl.size(); i++) {

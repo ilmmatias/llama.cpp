@@ -1,32 +1,11 @@
 #pragma once
 
 #include "ggml-cpu.h"
-#include "ggml.h"
 
-#include <stdint.h>
+enum { GGML_CPU_EXPERT_CACHE_MAX_TOKENS = 128 };
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-void ggml_backend_cpu_expert_cache_configure(
-        uint32_t slots,
-        uint32_t admit_window,
-        uint32_t convert_workers,
-        ggml_backend_dev_t device);
-
-// begin() freezes the batch's ready hits and launches cached expert work.
-// Returns one route-position mask per ids token, or NULL for CPU-only work.
-// Masks remain valid until end(). CPU consumers keep the host join.
-const uint64_t * ggml_backend_cpu_expert_cache_begin(struct ggml_tensor * op);
-void             ggml_backend_cpu_expert_cache_end  (struct ggml_tensor * op);
-
-ggml_backend_dev_t ggml_backend_cpu_expert_cache_device(const struct ggml_tensor * op);
-void ggml_backend_cpu_expert_cache_prepare(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
-bool ggml_backend_cpu_expert_cache_copy(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst);
-size_t ggml_backend_cpu_expert_cache_get_buffer_size(
-        ggml_backend_dev_t device, int64_t input_dim, int64_t ffn_dim, int64_t output_dim, int64_t n_expert_used);
-
-#ifdef __cplusplus
+static inline bool ggml_cpu_expert_cache_supports_ids(const struct ggml_tensor * ids) {
+    return ids != NULL && ids->type == GGML_TYPE_I32 &&
+        ids->ne[0] > 0 && ids->ne[0] <= 64 && ids->ne[1] > 0 && ids->ne[1] <= GGML_CPU_EXPERT_CACHE_MAX_TOKENS &&
+        ids->ne[2] == 1 && ids->ne[3] == 1;
 }
-#endif

@@ -35,7 +35,7 @@ options:
   --progress                                print test progress indicators
   --no-warmup                               skip warmup runs before benchmarking
   -fitt, --fit-target <MiB>                 fit model to device memory with this margin per device in MiB (default: off)
-  -fitc, --fit-ctx <n>                      minimum ctx size for --fit-target (default: 4096)
+  -fitc, --fit-ctx <n>                      minimum ctx size for --fit-target (default: 0)
   -rpc, --rpc <rpc_servers>                 register RPC devices (comma separated)
 
 test parameters:
@@ -62,6 +62,9 @@ test parameters:
   --poll <0...100>                          (default: 50)
   -ngl, --n-gpu-layers <n>                  (default: -1)
   -ncmoe, --n-cpu-moe <n>                   (default: 0)
+  -ecs, --expert-cache-slots <n>            (default: 0)
+  -eca, --expert-cache-admit-window <n>     (default: 0)
+  -ecw, --expert-cache-workers <n>          (default: 1)
   -sm, --split-mode <none|layer|row|tensor> (default: layer)
   -mg, --main-gpu <i>                       (default: 0)
   -nkvo, --no-kv-offload <0|1>              (default: 0)
@@ -96,6 +99,8 @@ Each test is repeated the number of times given by `-r`, and the results are ave
 Using the `-d <n>` option, each test can be run at a specified context depth, prefilling the KV cache with `<n>` tokens.
 
 For a description of the other options, see the [completion example](../completion/README.md).
+
+`--expert-cache-slots N` keeps routed experts in system memory and uses a GPU cache with N slots per MoE layer. Ready hits run on the GPU while misses run on the CPU; background workers admit missing experts. Native and repacked weights use the same policy. This option cannot be combined with `--n-cpu-moe`. Compare runs with the same slot count, admission window, worker count, and context depth; cache warmup and route history affect throughput.
 
 > [!NOTE]
 > The measurements with `llama-bench` do not include the times for tokenization and for sampling.

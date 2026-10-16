@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-moe-cache.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -17,6 +18,7 @@
 
 struct llama_model;
 class llama_batch_allocr;
+class llama_moe_cache;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -110,6 +112,8 @@ struct llama_context {
             ggml_threadpool_t threadpool_batch);
 
     void detach_threadpool();
+
+    void attach_moe_cache(const llama_context & ctx_target);
 
     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
 
@@ -271,8 +275,14 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
-    // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID
+    // create a new backend scheduler for a graph of the specified size and register the callbacks below
+    void sched_new(size_t max_nodes, bool parallel);
+
+    // ggml_backend_sched copy callback for cache activations and selected expert uploads
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
+
+    // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
+    static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -360,6 +370,10 @@ private:
 
     bool sched_need_reserve = true;
 
+    // whether the reserve graph has a logits tensor, set in sched_reserve()
+    // true until then, because the first output_reserve() runs before any graph is reserved
+    bool graph_has_logits = true;
+
     // state of sched_copy_experts, reset before each graph compute
     struct copy_experts_info {
         const ggml_tensor *  ids = nullptr;
@@ -375,8 +389,14 @@ private:
 
     copy_experts_info copy_experts;
 
+    // graph reallocations during inference where the backend assignments did not change, split by whether the
+    // graph size is the same as the previously scheduled one (unexpected) or different
+    int32_t n_reallocs_same = 0;
+    int32_t n_reallocs_diff = 0;
+
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+    llama_moe_cache_ptr moe_cache;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
@@ -410,6 +430,9 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // true after the prism.hadamard coverage check passes on a reserved graph
+    bool hadamard_verified = false;
 
     // perf
     mutable int64_t t_start_us  = 0;
