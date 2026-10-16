@@ -50,6 +50,10 @@ static __device__ __forceinline__ int znq_pack4_cuda(const uint8_t * block, int 
         if constexpr (bits == 4) {
             // Selectors 0, 4, 1, 5 put the four nibble codes in separate bytes.
             indices = __builtin_amdgcn_perm(codes >> 4, codes, 0x05010400) & 0x0f0f0f0f;
+        } else if constexpr (bits == 3) {
+            // Spread four 3-bit codes into separate byte selectors.
+            indices = (codes | (codes << 10)) & 0x003f003f;
+            indices = (indices | (indices << 5)) & 0x07070707;
         } else {
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
