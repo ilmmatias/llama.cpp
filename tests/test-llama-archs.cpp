@@ -10,6 +10,7 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-model.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -17,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <memory>
 #include <random>
 #include <regex>
 #include <stdexcept>
@@ -595,6 +597,64 @@ static std::vector<float> get_logits(
     return ret;
 }
 
+static bool check_fused_qkv(
+        gguf_context * metadata, const llama_model * reference,
+        const std::vector<ggml_backend_dev_t> & devs,
+        const std::vector<llama_token> & tokens, const std::vector<float> & logits_reference) {
+    gguf_context_ptr fused_metadata(gguf_init_empty());
+    gguf_set_kv(fused_metadata.get(), metadata);
+    const std::regex separate_projection(R"(blk\.[0-9]+\.attn_[qkv]\.(weight|scale|input_scale))");
+    for (const auto & entry : reference->tensors_by_name) {
+        if (!std::regex_match(entry.first, separate_projection)) {
+            gguf_add_tensor(fused_metadata.get(), entry.second);
+        }
+    }
+
+    ggml_context_ptr weights(ggml_init({ reference->layers.size()*ggml_tensor_overhead(), nullptr, true }));
+    std::vector<std::vector<float>> fused_data;
+    for (size_t il = 0; il < reference->layers.size(); ++il) {
+        const auto & layer = reference->layers[il];
+        if (!layer.wq) {
+            continue;
+        }
+
+        ggml_tensor * qkv = ggml_new_tensor_2d(weights.get(), GGML_TYPE_F32, layer.wq->ne[0],
+                layer.wq->ne[1] + layer.wk->ne[1] + layer.wv->ne[1]);
+        ggml_format_name(qkv, "blk.%zu.attn_qkv.weight", il);
+        fused_data.emplace_back(ggml_nelements(qkv));
+        qkv->data = fused_data.back().data();
+        const ggml_tensor * projections[] = { layer.wq, layer.wk, layer.wv };
+        const ggml_tensor * scales[] = { layer.wq_s, layer.wk_s, layer.wv_s };
+        size_t offset = 0;
+        for (size_t i = 0; i < 3; ++i) {
+            const ggml_tensor * projection = projections[i];
+            GGML_ASSERT(projection->type == GGML_TYPE_F32);
+            ggml_backend_tensor_get(projection, fused_data.back().data() + offset, 0, ggml_nbytes(projection));
+
+            // The synthetic model has separate projection scales; fold them into the fused weights.
+            float scale = 1.0f;
+            if (scales[i]) {
+                ggml_backend_tensor_get(scales[i], &scale, 0, sizeof(scale));
+            }
+            for (int64_t j = 0; j < ggml_nelements(projection); ++j) {
+                fused_data.back()[offset + j] *= scale;
+            }
+            offset += ggml_nelements(projection);
+        }
+        gguf_add_tensor(fused_metadata.get(), qkv);
+    }
+
+    std::unique_ptr<FILE, int (*)(FILE *)> file(tmpfile(), fclose);
+    if (!file || !gguf_write_to_file_ptr(fused_metadata.get(), file.get(), false)) {
+        throw std::runtime_error("failed to write fused QKV model");
+    }
+    rewind(file.get());
+
+    auto model_and_ctx = get_model_and_ctx(nullptr, file.get(), 0, 0.0f, devs);
+    const double error = nmse(logits_reference, get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens));
+    return std::isfinite(error) && error < 1e-4;
+}
+
 // entries [n/4, n/2) are embd rows, decoded either as token/embd/token chunks or as one mixed batch
 // returns the llama_process() error code
 static int32_t get_logits_mixed(
@@ -1120,6 +1180,11 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                                 status_roundtrip = "\033[1;31mFAIL\033[0m";
                                 break;
                             }
+                        }
+                        if (arch == LLM_ARCH_QWEN4EXP && !check_fused_qkv(
+                                gguf_ctx.get(), model_and_ctx_cpu.first.get(), dc.devs, tokens, logits_cpu)) {
+                            test_ok = false;
+                            status_roundtrip = "\033[1;31mFAIL\033[0m (fused QKV)";
                         }
                     }
                 }
