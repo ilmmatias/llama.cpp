@@ -383,17 +383,28 @@ if (TARGET gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
 
+if (GGML_CPU_FUSION_LLVM AND TARGET ggml-cpu)
+    find_package(Threads REQUIRED)
+
+    add_executable(test-cpu-fusion test-cpu-fusion.cpp)
+    target_include_directories(test-cpu-fusion PRIVATE ../ggml/src)
+    target_link_libraries(test-cpu-fusion PRIVATE ggml-cpu ggml-base Threads::Threads)
+    llama_test(test-cpu-fusion)
+endif()
+
+if ((GGML_HIP AND GGML_HIP_RTC) OR GGML_CPU_FUSION_LLVM)
+    add_executable(test-fusion-ir test-fusion-ir.cpp)
+    target_include_directories(test-fusion-ir PRIVATE ../ggml/src)
+    target_link_libraries(test-fusion-ir PRIVATE ggml-base)
+    llama_test(test-fusion-ir)
+endif()
+
 if (GGML_HIP AND GGML_HIP_RTC)
     find_package(hip REQUIRED CONFIG HINTS /opt/rocm)
     find_package(hiprtc QUIET CONFIG HINTS /opt/rocm)
     if (CMAKE_HIP_COMPILER)
         enable_language(HIP)
     endif()
-
-    add_executable(test-fusion-ir test-fusion-ir.cpp ../ggml/src/ggml-fusion.cpp)
-    target_include_directories(test-fusion-ir PRIVATE ../ggml/src)
-    target_link_libraries(test-fusion-ir PRIVATE ggml-base)
-    llama_test(test-fusion-ir)
 
     add_executable(test-hiprtc-fusion test-hiprtc-fusion.cpp)
     set_property(TARGET test-hiprtc-fusion PROPERTY LINKER_LANGUAGE CXX)

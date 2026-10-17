@@ -18,6 +18,10 @@
 #include "iqp.h"
 #include "expert-cache.h"
 
+#ifdef GGML_USE_CPU_FUSION_LLVM
+#include "fusion.h"
+#endif
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
 #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
@@ -504,6 +508,9 @@ struct ggml_threadpool {
 
     struct ggml_cgraph * cgraph;
     struct ggml_cplan  * cplan;
+#ifdef GGML_USE_CPU_FUSION_LLVM
+    struct ggml_cpu_fusion_plan * fusion_plan;
+#endif
 
     // synchronization primitives
     atomic_int n_graph;       // updated when there is work to be done (i.e each graph) holds graph and active thread counts.
@@ -3253,7 +3260,11 @@ static int ggml_cpu_try_fuse_ops(
         }
     }
 
+#ifdef GGML_USE_CPU_FUSION_LLVM
+    return ggml_cpu_fusion_compute(params->threadpool->fusion_plan, node_n, params->ith, params->nth);
+#else
     return 0;
+#endif
 }
 
 static thread_ret_t ggml_graph_compute_thread(void * data) {
@@ -3480,6 +3491,9 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     {
         threadpool->cgraph           = cgraph;
         threadpool->cplan            = cplan;
+#ifdef GGML_USE_CPU_FUSION_LLVM
+        threadpool->fusion_plan      = NULL;
+#endif
         threadpool->n_graph          = 0;
         threadpool->n_barrier        = 0;
         threadpool->n_barrier_passed = 0;
@@ -3575,6 +3589,10 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
+#ifdef GGML_USE_CPU_FUSION_LLVM
+    threadpool->fusion_plan = !ggml_cpu_disable_fusion && !cplan->use_ref && !cplan->abort_callback ? ggml_cpu_fusion_plan_create(cgraph) : NULL;
+#endif
+
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
@@ -3616,6 +3634,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     clear_numa_thread_affinity();
 
     enum ggml_status ret = threadpool->ec;
+
+#ifdef GGML_USE_CPU_FUSION_LLVM
+    ggml_cpu_fusion_plan_free(threadpool->fusion_plan);
+    threadpool->fusion_plan = NULL;
+#endif
 
     if (disposable_threadpool) {
         ggml_threadpool_free(threadpool);
