@@ -93,6 +93,14 @@ cmake --build build --config Release
   - **Fedora / RHEL / Rocky / Alma:** `sudo dnf install openssl-devel`
   - **Arch / Manjaro:** `sudo pacman -S openssl`
 
+### Experimental LLVM CPU fusion
+
+Add `-DGGML_CPU_FUSION_LLVM=ON` to enable runtime fusion of supported contiguous F32 pointwise operations. This requires LLVM 14 or newer; set `LLVM_DIR` if CMake cannot find its package configuration.
+
+Compiled objects are cached across processes in the platform cache directory under `llama.cpp/cpu-fusion`. Set `GGML_CPU_FUSION_CACHE_DIR` to choose another directory, or set it to `0` to disable disk caching. The in-memory cache remains available. Use a directory that only trusted users can write to, since cached objects contain executable code.
+
+Cache keys include the generated IR, target CPU and features, data layout, target triple, and LLVM version. Tensor pointers, scalar values, and flat tensor sizes are bound at runtime. Missing or damaged cache entries are recompiled; an unavailable cache directory does not prevent fusion. Files are published atomically so processes can share the directory. Old entries can be removed by deleting the directory.
+
 ## BLAS Build
 
 Building the program with BLAS support may lead to some performance improvements in prompt processing using batch sizes higher than 32 (the default is 512). Using BLAS doesn't affect the generation performance. There are currently several different BLAS implementations available for build and use:

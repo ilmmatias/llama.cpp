@@ -390,6 +390,10 @@ if (GGML_CPU_FUSION_LLVM AND TARGET ggml-cpu)
     target_include_directories(test-cpu-fusion PRIVATE ../ggml/src)
     target_link_libraries(test-cpu-fusion PRIVATE ggml-cpu ggml-base Threads::Threads)
     llama_test(test-cpu-fusion)
+    llama_test_cmd(${CMAKE_COMMAND} NAME test-cpu-fusion-cache ARGS
+            "-DTEST_EXECUTABLE=$<TARGET_FILE:test-cpu-fusion>"
+            "-DCACHE_DIR=${CMAKE_CURRENT_BINARY_DIR}/cpu-fusion-cache"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/test-cpu-fusion-cache.cmake")
 endif()
 
 if ((GGML_HIP AND GGML_HIP_RTC) OR GGML_CPU_FUSION_LLVM)

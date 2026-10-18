@@ -326,6 +326,28 @@ static void benchmark() {
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 3 && std::strcmp(argv[1], "cache") == 0) {
+        int hits = 0;
+        ggml_log_set([](ggml_log_level, const char * text, void * data) {
+            if (std::strstr(text, "CPU fusion: loaded object ")) {
+                ++*static_cast<int *>(data);
+            }
+        }, &hits);
+
+        const bool warm = std::strcmp(argv[2], "warm") == 0;
+        if (warm) {
+            test_arithmetic_and_abort();
+            test_chain(513, 4);
+        } else {
+            test_chain(31, 1);
+            test_arithmetic_and_abort();
+        }
+
+        REQUIRE(hits == (warm ? 2 : 0));
+        ggml_log_set(nullptr, nullptr);
+        return 0;
+    }
+
     if (argc == 2 && std::strcmp(argv[1], "bench") == 0) {
         benchmark();
         return 0;

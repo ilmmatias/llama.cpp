@@ -3,16 +3,24 @@
 #include "ggml-impl.h"
 
 #include <llvm/Config/llvm-config.h>
+#include <llvm/ExecutionEngine/ObjectCache.h>
+#include <llvm/ExecutionEngine/Orc/CompileUtils.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/MD5.h>
+#include <llvm/Support/Path.h>
 #include <llvm/Support/TargetSelect.h>
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <memory>
@@ -266,10 +274,102 @@ std::unique_ptr<llvm::Module> fusion_module(const ggml_fusion_program & program,
     return module;
 }
 
+std::string fusion_digest(llvm::StringRef bytes) {
+    llvm::MD5 hash;
+    llvm::MD5::MD5Result result;
+    llvm::SmallString<32> text;
+
+    hash.update(bytes);
+    hash.final(result);
+    llvm::MD5::stringifyResult(result, text);
+    return text.str().str();
+}
+
+class fusion_object_cache : public llvm::ObjectCache {
+    static constexpr size_t max_bytes = 1024 * 1024;
+    llvm::SmallString<256> directory;
+
+    std::string path(const llvm::Module * module) const {
+        auto result = directory;
+        llvm::sys::path::append(result, module->getModuleIdentifier() + ".o");
+        return result.str().str();
+    }
+
+public:
+    fusion_object_cache() {
+        const char * value = std::getenv("GGML_CPU_FUSION_CACHE_DIR");
+        if (value && std::string(value) == "0") {
+            return;
+        }
+
+        if (value && *value) {
+            directory = value;
+        } else if (llvm::sys::path::cache_directory(directory)) {
+            llvm::sys::path::append(directory, "llama.cpp", "cpu-fusion");
+        }
+
+        if (!directory.empty() && llvm::sys::fs::create_directories(directory, true, llvm::sys::fs::owner_all)) {
+            GGML_LOG_WARN("CPU fusion: cannot create cache directory %s\n", directory.c_str());
+            directory.clear();
+        }
+    }
+
+    std::unique_ptr<llvm::MemoryBuffer> getObject(const llvm::Module * module) override {
+        if (directory.empty()) {
+            return nullptr;
+        }
+
+        std::ifstream file(std::filesystem::u8path(path(module)), std::ios::binary | std::ios::ate);
+        const std::string header = module->getModuleIdentifier() + "\n";
+        const auto size = file.tellg();
+        if (!file || size <= std::streamoff(header.size() + 32) || size > std::streamoff(max_bytes)) {
+            return nullptr;
+        }
+
+        std::string bytes(size_t(size), '\0');
+        file.seekg(0);
+        if (!file.read(&bytes[0], size)) {
+            return nullptr;
+        }
+
+        llvm::StringRef code(bytes.data() + header.size() + 32, bytes.size() - header.size() - 32);
+        if (bytes.compare(0, header.size(), header) != 0 || bytes.compare(header.size(), 32, fusion_digest(code)) != 0) {
+            return nullptr;
+        }
+
+        GGML_LOG_DEBUG("CPU fusion: loaded object %s\n", module->getModuleIdentifier().c_str());
+        return llvm::MemoryBuffer::getMemBufferCopy(code, module->getModuleIdentifier());
+    }
+
+    void notifyObjectCompiled(const llvm::Module * module, llvm::MemoryBufferRef object) override {
+        const std::string header = module->getModuleIdentifier() + "\n" + fusion_digest(object.getBuffer());
+        if (directory.empty() || object.getBufferSize() > max_bytes - header.size()) {
+            return;
+        }
+
+        const std::string destination = path(module);
+        llvm::SmallString<256> temporary;
+        int fd;
+        if (llvm::sys::fs::createUniqueFile(destination + ".tmp-%%%%%%", fd, temporary, llvm::sys::fs::OF_None, llvm::sys::fs::owner_read | llvm::sys::fs::owner_write)) {
+            return;
+        }
+
+        llvm::raw_fd_ostream file(fd, true);
+        file << header << object.getBuffer();
+        file.close();
+        if (file.has_error() || llvm::sys::fs::rename(temporary, destination)) {
+            file.clear_error();
+            llvm::sys::fs::remove(temporary);
+        }
+    }
+};
+
 class fusion_cache {
     std::mutex                           mutex;
+    fusion_object_cache                  objects;
     std::unique_ptr<llvm::orc::LLJIT>    jit;
     std::map<std::string, fusion_kernel> kernels;
+    std::string                          target;
 
 public:
     fusion_cache() {
@@ -277,7 +377,24 @@ public:
             return;
         }
 
-        auto result = llvm::orc::LLJITBuilder().create();
+        auto machine = llvm::orc::JITTargetMachineBuilder::detectHost();
+        if (!machine) {
+            GGML_LOG_WARN("CPU fusion: %s\n", llvm::toString(machine.takeError()).c_str());
+            return;
+        }
+
+        target = std::string(LLVM_VERSION_STRING) + "\n" + machine->getCPU() + "\n" + machine->getFeatures().getString();
+
+        auto result = llvm::orc::LLJITBuilder()
+            .setJITTargetMachineBuilder(std::move(*machine))
+            .setCompileFunctionCreator([this](llvm::orc::JITTargetMachineBuilder machine) -> llvm::Expected<std::unique_ptr<llvm::orc::IRCompileLayer::IRCompiler>> {
+                auto target = machine.createTargetMachine();
+                if (!target) {
+                    return target.takeError();
+                }
+
+                return std::make_unique<llvm::orc::TMOwningSimpleCompiler>(std::move(*target), &objects);
+            }).create();
         if (result) {
             jit = std::move(*result);
         } else {
@@ -308,33 +425,54 @@ public:
             return nullptr;
         }
 
-        const std::string name = "ggml_cpu_fusion_" + std::to_string(kernels.size());
         auto inserted = kernels.emplace(std::move(bytes), nullptr).first;
         auto context  = std::make_unique<llvm::LLVMContext>();
-        auto module   = fusion_module(program, *context, jit->getDataLayout(), name);
+        auto module   = fusion_module(program, *context, jit->getDataLayout(), "ggml_cpu_fusion");
+#if LLVM_VERSION_MAJOR >= 21
+        module->setTargetTriple(jit->getTargetTriple());
+#else
+        module->setTargetTriple(jit->getTargetTriple().str());
+#endif
 
-        if (llvm::verifyModule(*module, &llvm::errs())) {
-            return nullptr;
-        }
+        // Hash unoptimized IR. Bump the namespace when the ABI or compiler options change.
+        std::string ir;
+        llvm::raw_string_ostream stream(ir);
+        module->print(stream, nullptr);
+        stream.flush();
 
-        llvm::LoopAnalysisManager     loops;
-        llvm::FunctionAnalysisManager functions;
-        llvm::CGSCCAnalysisManager    cgscc;
-        llvm::ModuleAnalysisManager   modules;
-        llvm::PassBuilder             passes;
+        const std::string name = "ggml_cpu_fusion_" + fusion_digest("cpu-fusion-v1\n" + target + "\n" + inserted->first + "\n" + ir);
+        module->getFunction("ggml_cpu_fusion")->setName(name);
+        module->setModuleIdentifier(name);
 
-        passes.registerModuleAnalyses(modules);
-        passes.registerCGSCCAnalyses(cgscc);
-        passes.registerFunctionAnalyses(functions);
-        passes.registerLoopAnalyses(loops);
-        passes.crossRegisterProxies(loops, functions, cgscc, modules);
+        if (auto object = objects.getObject(module.get())) {
+            if (auto error = jit->addObjectFile(std::move(object))) {
+                GGML_LOG_WARN("CPU fusion: %s\n", llvm::toString(std::move(error)).c_str());
+                return nullptr;
+            }
+        } else {
+            if (llvm::verifyModule(*module, &llvm::errs())) {
+                return nullptr;
+            }
 
-        auto pipeline = passes.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
-        pipeline.run(*module, modules);
+            llvm::LoopAnalysisManager     loops;
+            llvm::FunctionAnalysisManager functions;
+            llvm::CGSCCAnalysisManager    cgscc;
+            llvm::ModuleAnalysisManager   modules;
+            llvm::PassBuilder             passes;
 
-        if (auto error = jit->addIRModule(llvm::orc::ThreadSafeModule(std::move(module), std::move(context)))) {
-            GGML_LOG_WARN("CPU fusion: %s\n", llvm::toString(std::move(error)).c_str());
-            return nullptr;
+            passes.registerModuleAnalyses(modules);
+            passes.registerCGSCCAnalyses(cgscc);
+            passes.registerFunctionAnalyses(functions);
+            passes.registerLoopAnalyses(loops);
+            passes.crossRegisterProxies(loops, functions, cgscc, modules);
+
+            auto pipeline = passes.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
+            pipeline.run(*module, modules);
+
+            if (auto error = jit->addIRModule(llvm::orc::ThreadSafeModule(std::move(module), std::move(context)))) {
+                GGML_LOG_WARN("CPU fusion: %s\n", llvm::toString(std::move(error)).c_str());
+                return nullptr;
+            }
         }
 
         auto symbol = jit->lookup(name);
