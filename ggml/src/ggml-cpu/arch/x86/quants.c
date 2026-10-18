@@ -4022,7 +4022,7 @@ void ggml_vec_dot_iq1_m_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 #endif
 }
 
-static inline float znq4_x86_ufp8_to_fp32(uint8_t code) {
+static inline float znq4_m_x86_ufp8_to_fp32(uint8_t code) {
     const uint32_t e = code >> 3;
     const uint32_t m = code & 7u;
     if (e == 0) {
@@ -4034,21 +4034,21 @@ static inline float znq4_x86_ufp8_to_fp32(uint8_t code) {
     return f;
 }
 
-static inline __m128i znq4_x86_codes_lo(__m128i packed) {
+static inline __m128i znq4_m_x86_codes_lo(__m128i packed) {
     const __m128i m4 = _mm_set1_epi8(0x0f);
     const __m128i lo = _mm_and_si128(packed, m4);
     const __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), m4);
     return _mm_unpacklo_epi8(lo, hi);
 }
 
-static inline __m128i znq4_x86_codes_hi(__m128i packed) {
+static inline __m128i znq4_m_x86_codes_hi(__m128i packed) {
     const __m128i m4 = _mm_set1_epi8(0x0f);
     const __m128i lo = _mm_and_si128(packed, m4);
     const __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), m4);
     return _mm_unpackhi_epi8(lo, hi);
 }
 
-void ggml_vec_dot_znq4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+void ggml_vec_dot_znq4_m_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
         size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);
@@ -4058,7 +4058,7 @@ void ggml_vec_dot_znq4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     assert(n % QK_ZNQ == 0);
     static_assert(QK_ZNQ == QK8_0, "QK_ZNQ and QK8_0 must be the same");
 
-    const block_znq4 * GGML_RESTRICT x = vx;
+    const block_znq4_m * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
     const int nb = n / QK_ZNQ;
 
@@ -4080,10 +4080,10 @@ void ggml_vec_dot_znq4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
         const __m128i packed0 = _mm_loadu_si128((const __m128i *) x[ib + 0].qs);
         const __m128i packed1 = _mm_loadu_si128((const __m128i *) x[ib + 1].qs);
 
-        const __m128i c00 = znq4_x86_codes_lo(packed0);
-        const __m128i c01 = znq4_x86_codes_hi(packed0);
-        const __m128i c10 = znq4_x86_codes_lo(packed1);
-        const __m128i c11 = znq4_x86_codes_hi(packed1);
+        const __m128i c00 = znq4_m_x86_codes_lo(packed0);
+        const __m128i c01 = znq4_m_x86_codes_hi(packed0);
+        const __m128i c10 = znq4_m_x86_codes_lo(packed1);
+        const __m128i c11 = znq4_m_x86_codes_hi(packed1);
 
         __m512i indices = _mm512_castsi128_si512(c00);
         indices = _mm512_inserti32x4(indices, c01, 1);
@@ -4097,13 +4097,13 @@ void ggml_vec_dot_znq4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
         const uint8_t b11 = x[ib + 1].books >> 4;
 
         __m512i table = _mm512_castsi128_si512(
-                _mm_loadu_si128((const __m128i *) (kvalues_znq4 + 16*b00)));
+                _mm_loadu_si128((const __m128i *) (kvalues_znq4_m + 16*b00)));
         table = _mm512_inserti32x4(table,
-                _mm_loadu_si128((const __m128i *) (kvalues_znq4 + 16*b01)), 1);
+                _mm_loadu_si128((const __m128i *) (kvalues_znq4_m + 16*b01)), 1);
         table = _mm512_inserti32x4(table,
-                _mm_loadu_si128((const __m128i *) (kvalues_znq4 + 16*b10)), 2);
+                _mm_loadu_si128((const __m128i *) (kvalues_znq4_m + 16*b10)), 2);
         table = _mm512_inserti32x4(table,
-                _mm_loadu_si128((const __m128i *) (kvalues_znq4 + 16*b11)), 3);
+                _mm_loadu_si128((const __m128i *) (kvalues_znq4_m + 16*b11)), 3);
 
         const __m512i weights = _mm512_permutexvar_epi8(indices, table);
 
@@ -4120,8 +4120,8 @@ void ggml_vec_dot_znq4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
         const __m512i correction = _mm512_dpbusd_epi32(_mm512_setzero_si512(), bias, q8);
         const __m512i sumi = _mm512_sub_epi32(dot, correction);
 
-        const float d0 = znq4_x86_ufp8_to_fp32(x[ib + 0].d) * GGML_CPU_FP16_TO_FP32(y[ib + 0].d);
-        const float d1 = znq4_x86_ufp8_to_fp32(x[ib + 1].d) * GGML_CPU_FP16_TO_FP32(y[ib + 1].d);
+        const float d0 = znq4_m_x86_ufp8_to_fp32(x[ib + 0].d) * GGML_CPU_FP16_TO_FP32(y[ib + 0].d);
+        const float d1 = znq4_m_x86_ufp8_to_fp32(x[ib + 1].d) * GGML_CPU_FP16_TO_FP32(y[ib + 1].d);
         const __m512 scales = _mm512_mask_blend_ps(0xff00, _mm512_set1_ps(d0), _mm512_set1_ps(d1));
         accum = _mm512_fmadd_ps(scales, _mm512_cvtepi32_ps(sumi), accum);
     }
@@ -4139,28 +4139,28 @@ void ggml_vec_dot_znq4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
         const __m128i packed1 = _mm_loadu_si128((const __m128i *) x[ib + 1].qs);
 
         const __m128i b00 = _mm_loadu_si128((const __m128i *)
-                (kvalues_znq4 + 16*(x[ib + 0].books & 0x0f)));
+                (kvalues_znq4_m + 16*(x[ib + 0].books & 0x0f)));
         const __m128i b01 = _mm_loadu_si128((const __m128i *)
-                (kvalues_znq4 + 16*(x[ib + 0].books >> 4)));
+                (kvalues_znq4_m + 16*(x[ib + 0].books >> 4)));
         const __m128i b10 = _mm_loadu_si128((const __m128i *)
-                (kvalues_znq4 + 16*(x[ib + 1].books & 0x0f)));
+                (kvalues_znq4_m + 16*(x[ib + 1].books & 0x0f)));
         const __m128i b11 = _mm_loadu_si128((const __m128i *)
-                (kvalues_znq4 + 16*(x[ib + 1].books >> 4)));
+                (kvalues_znq4_m + 16*(x[ib + 1].books >> 4)));
 
         const __m256i w0 = MM256_SET_M128I(
-                _mm_shuffle_epi8(b01, znq4_x86_codes_hi(packed0)),
-                _mm_shuffle_epi8(b00, znq4_x86_codes_lo(packed0)));
+                _mm_shuffle_epi8(b01, znq4_m_x86_codes_hi(packed0)),
+                _mm_shuffle_epi8(b00, znq4_m_x86_codes_lo(packed0)));
         const __m256i w1 = MM256_SET_M128I(
-                _mm_shuffle_epi8(b11, znq4_x86_codes_hi(packed1)),
-                _mm_shuffle_epi8(b10, znq4_x86_codes_lo(packed1)));
+                _mm_shuffle_epi8(b11, znq4_m_x86_codes_hi(packed1)),
+                _mm_shuffle_epi8(b10, znq4_m_x86_codes_lo(packed1)));
 
         const __m256 p0 = mul_sum_i8_pairs_float(w0,
                 _mm256_loadu_si256((const __m256i *) y[ib + 0].qs));
         const __m256 p1 = mul_sum_i8_pairs_float(w1,
                 _mm256_loadu_si256((const __m256i *) y[ib + 1].qs));
 
-        const float d0 = znq4_x86_ufp8_to_fp32(x[ib + 0].d) * GGML_CPU_FP16_TO_FP32(y[ib + 0].d);
-        const float d1 = znq4_x86_ufp8_to_fp32(x[ib + 1].d) * GGML_CPU_FP16_TO_FP32(y[ib + 1].d);
+        const float d0 = znq4_m_x86_ufp8_to_fp32(x[ib + 0].d) * GGML_CPU_FP16_TO_FP32(y[ib + 0].d);
+        const float d1 = znq4_m_x86_ufp8_to_fp32(x[ib + 1].d) * GGML_CPU_FP16_TO_FP32(y[ib + 1].d);
         accum0 = _mm256_fmadd_ps(_mm256_set1_ps(d0), p0, accum0);
         accum1 = _mm256_fmadd_ps(_mm256_set1_ps(d1), p1, accum1);
     }
@@ -4175,9 +4175,9 @@ void ggml_vec_dot_znq4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
         for (int j = 0; j < QK_ZNQ; ++j) {
             const int book = (x[ib].books >> (4*(j/16))) & 0x0f;
             const int code = (x[ib].qs[j/2] >> (4*(j & 1))) & 0x0f;
-            sumi += kvalues_znq4[16*book + code] * y[ib].qs[j];
+            sumi += kvalues_znq4_m[16*book + code] * y[ib].qs[j];
         }
-        sumf += znq4_x86_ufp8_to_fp32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d) * sumi;
+        sumf += znq4_m_x86_ufp8_to_fp32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d) * sumi;
     }
 
     *s = sumf;

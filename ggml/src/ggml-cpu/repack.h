@@ -120,31 +120,59 @@ struct block_iq4_nlx8 {
 
 static_assert(sizeof(block_iq4_nlx8) == 8 * sizeof(ggml_half) + QK4_NL * 4, "wrong iq4_nlx8 block size/padding");
 
-struct block_znq2x8 {
+struct block_znq2_mx8 {
     uint8_t d[8];
     uint8_t books[8];
     // Packed 2-bit codes interleaved by 4-weight group across eight rows.
     uint8_t qs[QK_ZNQ / 4][8];
 };
 
-static_assert(sizeof(block_znq2x8) == 8 * sizeof(block_znq2), "wrong znq2x8 block size/padding");
+static_assert(sizeof(block_znq2_mx8) == 8 * sizeof(block_znq2_m), "wrong znq2_mx8 block size/padding");
 
-struct block_znq3x8 {
+struct block_znq2_lx8 {
+    uint8_t header[24];
+    uint8_t qs[8][8];
+};
+
+static_assert(sizeof(block_znq2_lx8) == 8 * sizeof(block_znq2_l), "wrong znq2_lx8 size");
+
+struct block_znq3_sx8 {
+    uint8_t header[32];
+    uint8_t qs[8][8];
+};
+
+static_assert(sizeof(block_znq3_sx8) == 8 * sizeof(block_znq3_s), "wrong znq3_sx8 size");
+
+struct block_znq3_mx8 {
     uint8_t d[8];
     uint8_t books[8];
     // Three bitplanes per 4-weight group, interleaved across eight rows.
     uint32_t planes[QK_ZNQ / 4][3];
 };
 
-static_assert(sizeof(block_znq3x8) == 8 * sizeof(block_znq3), "wrong znq3x8 block size/padding");
+static_assert(sizeof(block_znq3_mx8) == 8 * sizeof(block_znq3_m), "wrong znq3_mx8 block size/padding");
 
-struct block_znq4x8 {
+struct block_znq3_lx8 {
+    uint8_t header[24];
+    uint32_t planes[8][3];
+};
+
+static_assert(sizeof(block_znq3_lx8) == 8 * sizeof(block_znq3_l), "wrong znq3_lx8 size");
+
+struct block_znq4_sx8 {
+    uint8_t header[32];
+    uint32_t planes[8][3];
+};
+
+static_assert(sizeof(block_znq4_sx8) == 8 * sizeof(block_znq4_s), "wrong znq4_sx8 size");
+
+struct block_znq4_mx8 {
     uint8_t d[8];
     uint8_t books[8];
     uint8_t qs[QK_ZNQ * 4];  // 8 rows x 16 packed-nibble bytes, interleaved in 4-weight groups
 };
 
-static_assert(sizeof(block_znq4x8) == 8 * sizeof(block_znq4), "wrong znq4x8 block size/padding");
+static_assert(sizeof(block_znq4_mx8) == 8 * sizeof(block_znq4_m), "wrong znq4_mx8 block size/padding");
 
 struct block_iq4_nlx16 {
     ggml_half d[16];            // deltas for 16 iq4_nl blocks
@@ -198,7 +226,31 @@ static_assert(sizeof(block_iqp_x8) == 8 * sizeof(float) + 8 * sizeof(int32_t) + 
 #endif
 
 #if defined(__cplusplus)
+struct alignas(64) ggml_znq_gemm_panel {
+    uint8_t weights[2][8][64];
+    float scale[2][16];
+};
+static_assert(sizeof(ggml_znq_gemm_panel) == 1152, "wrong ZNQ shared panel size");
+
 extern "C" {
+void ggml_gemm_znq_panel(const ggml_znq_gemm_panel * panel, const void * activations, const int32_t * sums,
+        int sum_stride, int count, bool accumulate, int width, float * out0, float * out1, float * out2, float * out3);
+bool ggml_gemm_znq_prepared(int n, float * s, size_t bs, const void * vx, const void * vy,
+        int nr, int nc, ggml_type type, const int32_t * sums);
+// Optional corrections are row-major [nr][n/QK_ZNQ], with 128 times each Q8 block sum.
+void ggml_gemv_znq_local(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc, int group,
+        const int32_t * prepared_sums = nullptr, int index_bits = 2);
+void ggml_gemm_znq_local(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc,
+        int group, const int32_t * map, size_t bs1, size_t bs2, const int32_t * prepared_sums = nullptr, int index_bits = 2);
+void ggml_znq_local_prepare_sums(int n, int nr, bool packed, const void * vy, int32_t * sums);
+
+void ggml_gemm_znq_panel_generic(const ggml_znq_gemm_panel * panel, const void * activations, const int32_t * sums,
+        int sum_stride, int count, bool accumulate, int width, float * out0, float * out1, float * out2, float * out3);
+void ggml_gemv_znq_local_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc, int group,
+        const int32_t * prepared_sums, int index_bits);
+void ggml_gemm_znq_local_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc,
+        int group, const int32_t * map, size_t bs1, size_t bs2, const int32_t * prepared_sums, int index_bits);
+
 #endif
 
 void ggml_quantize_mat_q8_0_4x4(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
@@ -219,33 +271,33 @@ void ggml_gemv_q6_K_8x4_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 void ggml_gemv_q6_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemv_iq4_nl_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemv_iq4_nl_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
-void ggml_gemv_znq2_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
-void ggml_gemm_znq2_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
-void ggml_gemv_znq3_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
-void ggml_gemm_znq3_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_znq2_m_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_znq2_m_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_znq3_m_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_znq3_m_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
 void ggml_repack_q8_0_4x8(const void * const vx[4], void * vy, int64_t k);
 // Quantize four non-contiguous routed activation rows directly into the 4x8
 // Q8_0 interleave consumed by the ZNQ GEMM kernels.
-void ggml_quantize_mat_znq4_q8_0_4x8(const float * x0, const float * x1,
+void ggml_quantize_mat_znq4_m_q8_0_4x8(const float * x0, const float * x1,
         const float * x2, const float * x3, void * vy, int64_t k);
 // Direct-scatter MoE GEMM entry points. row_map is a packed {route, token}
 // int32 pair per activation row; destination strides are in float elements.
-void ggml_gemm_znq2_8x8_q8_0_moe(
+void ggml_gemm_znq2_m_8x8_q8_0_moe(
         int n, float * GGML_RESTRICT s, size_t dst_bs1, size_t dst_bs2, const int32_t * row_map,
         const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 // GEMV tails read shared Q8_0 input rows by token and scatter through row_map.
-void ggml_gemv_znq3_8x8_q8_0_moe(
+void ggml_gemv_znq3_m_8x8_q8_0_moe(
         int n, float * GGML_RESTRICT s, size_t dst_bs1, size_t dst_bs2, const int32_t * row_map,
         const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
-void ggml_gemm_znq3_8x8_q8_0_moe(
+void ggml_gemm_znq3_m_8x8_q8_0_moe(
         int n, float * GGML_RESTRICT s, size_t dst_bs1, size_t dst_bs2, const int32_t * row_map,
         const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
-void ggml_gemm_znq4_8x8_q8_0_moe(
+void ggml_gemm_znq4_m_8x8_q8_0_moe(
         int n, float * GGML_RESTRICT s, size_t dst_bs1, size_t dst_bs2, const int32_t * row_map,
         const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 #endif
-void ggml_gemv_znq4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_znq4_m_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemv_mxfp4_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemv_mxfp4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemv_q8_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
@@ -264,7 +316,7 @@ void ggml_gemm_q6_K_8x4_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 void ggml_gemm_q6_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_iq4_nl_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_iq4_nl_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
-void ggml_gemm_znq4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_znq4_m_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_mxfp4_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_mxfp4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_q8_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);

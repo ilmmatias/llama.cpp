@@ -15,6 +15,7 @@
 #include <cassert>
 #include <cstdlib> // for qsort
 #include <cstdio>  // for GGML_ASSERT
+#include <type_traits>
 
 #define GGML_CPU_CLANG_WORKAROUND
 #include "../../repack.h"
@@ -6620,7 +6621,7 @@ void ggml_gemm_iqp_8x8_q8_K_p4(int n, float * GGML_RESTRICT s, size_t bs, const 
     ggml_gemm_iqp_8x8_q8_K_p4_generic(n, s, bs, vx, vy, nc);
 }
 
-static inline float znq4x8_ufp8_to_fp32(uint8_t code) {
+static inline float znq4_mx8_ufp8_to_fp32(uint8_t code) {
     const uint32_t e = code >> 3;
     const uint32_t m = code & 7u;
     if (e == 0) {
@@ -6632,12 +6633,9 @@ static inline float znq4x8_ufp8_to_fp32(uint8_t code) {
     return f;
 }
 
-// Q8_0 activation packing for MUL_MAT_ID. The generic repack path normally
-// quantizes each routed row independently and ZNQ4 0034 then re-reads those
-// blocks in every worker to build block_q8_0x4. Do the final layout directly
-// instead, once, after rows have been grouped by expert.
+// Pack Q8_0 activations into the four-row layout once after grouping rows by expert.
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__)
-static inline __m256i znq4_moe_quantize_q8_0_block(const float * x, ggml_half * d_out) {
+static inline __m256i znq4_m_moe_quantize_q8_0_block(const float * x, ggml_half * d_out) {
     __m512 v0 = _mm512_loadu_ps(x +  0);
     __m512 v1 = _mm512_loadu_ps(x + 16);
 
@@ -6658,7 +6656,7 @@ static inline __m256i znq4_moe_quantize_q8_0_block(const float * x, ggml_half * 
     return _mm256_inserti128_si256(_mm256_castsi128_si256(q0), q1, 1);
 }
 #elif defined(__AVX2__)
-static inline __m256i znq4_moe_quantize_q8_0_block(const float * x, ggml_half * d_out) {
+static inline __m256i znq4_m_moe_quantize_q8_0_block(const float * x, ggml_half * d_out) {
     __m256 v0 = _mm256_loadu_ps(x +  0);
     __m256 v1 = _mm256_loadu_ps(x +  8);
     __m256 v2 = _mm256_loadu_ps(x + 16);
@@ -6743,7 +6741,7 @@ void ggml_repack_q8_0_4x8(const void * const vx[4], void * vy, int64_t k) {
     }
 }
 
-void ggml_quantize_mat_znq4_q8_0_4x8(const float * x0, const float * x1,
+void ggml_quantize_mat_znq4_m_q8_0_4x8(const float * x0, const float * x1,
         const float * x2, const float * x3, void * vy, int64_t k) {
     assert(QK8_0 == 32);
     assert(k % QK8_0 == 0);
@@ -6752,10 +6750,10 @@ void ggml_quantize_mat_znq4_q8_0_4x8(const float * x0, const float * x1,
 
 #if (defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__)) || defined(__AVX2__)
     for (int ib = 0; ib < nb; ++ib) {
-        const __m256i q0 = znq4_moe_quantize_q8_0_block(x0 + ib*QK8_0, &y[ib].d[0]);
-        const __m256i q1 = znq4_moe_quantize_q8_0_block(x1 + ib*QK8_0, &y[ib].d[1]);
-        const __m256i q2 = znq4_moe_quantize_q8_0_block(x2 + ib*QK8_0, &y[ib].d[2]);
-        const __m256i q3 = znq4_moe_quantize_q8_0_block(x3 + ib*QK8_0, &y[ib].d[3]);
+        const __m256i q0 = znq4_m_moe_quantize_q8_0_block(x0 + ib*QK8_0, &y[ib].d[0]);
+        const __m256i q1 = znq4_m_moe_quantize_q8_0_block(x1 + ib*QK8_0, &y[ib].d[1]);
+        const __m256i q2 = znq4_m_moe_quantize_q8_0_block(x2 + ib*QK8_0, &y[ib].d[2]);
+        const __m256i q3 = znq4_m_moe_quantize_q8_0_block(x3 + ib*QK8_0, &y[ib].d[3]);
 
         interleave_q8_0_4x8(q0, q1, q2, q3, y[ib].qs);
     }
@@ -6785,7 +6783,7 @@ void ggml_quantize_mat_znq4_q8_0_4x8(const float * x0, const float * x1,
 }
 
 #if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
-static inline __m256 znq4x8_ufp8x8_to_fp32(const uint8_t * p) {
+static inline __m256 znq4_mx8_ufp8x8_to_fp32(const uint8_t * p) {
     const __m128i c8 = _mm_loadl_epi64((const __m128i *) p);
     const __m256i c = _mm256_cvtepu8_epi32(c8);
     const __m256i e = _mm256_srli_epi32(c, 3);
@@ -6799,7 +6797,7 @@ static inline __m256 znq4x8_ufp8x8_to_fp32(const uint8_t * p) {
     return _mm256_blendv_ps(normal, subnormal, is_subnormal);
 }
 
-static inline __m256i znq4x8_book_repeat4(const uint8_t * p, bool high) {
+static inline __m256i znq4_mx8_book_repeat4(const uint8_t * p, bool high) {
     __m128i books = _mm_loadl_epi64((const __m128i *) p);
     if (high) {
         books = _mm_srli_epi16(books, 4);
@@ -6809,7 +6807,7 @@ static inline __m256i znq4x8_book_repeat4(const uint8_t * p, bool high) {
     return _mm256_mullo_epi32(dwords, _mm256_set1_epi32(0x01010101));
 }
 
-static inline __m512i znq4x16_book_repeat4(const uint8_t * p0, const uint8_t * p1, bool high) {
+static inline __m512i znq4_mx16_book_repeat4(const uint8_t * p0, const uint8_t * p1, bool high) {
     const __m128i lo = _mm_loadl_epi64((const __m128i *) p0);
     const __m128i hi = _mm_loadl_epi64((const __m128i *) p1);
     __m128i books = _mm_unpacklo_epi64(lo, hi);
@@ -6822,14 +6820,14 @@ static inline __m512i znq4x16_book_repeat4(const uint8_t * p0, const uint8_t * p
     return _mm512_mullo_epi32(dwords, _mm512_set1_epi32(0x01010101));
 }
 
-static inline __m256i znq4x8_unpack_group(const uint8_t * p) {
+static inline __m256i znq4_mx8_unpack_group(const uint8_t * p) {
     // Each dword contains eight nibbles in output order.
     const __m256i packed = _mm256_cvtepu32_epi64(_mm_loadu_si128((const __m128i *) p));
     const __m256i shifts = _mm256_set1_epi64x(0x1c1814100c080400);
     return _mm256_and_si256(_mm256_multishift_epi64_epi8(shifts, packed), _mm256_set1_epi8(15));
 }
 
-static inline __m256i znq4x8_lookup_group(
+static inline __m256i znq4_mx8_lookup_group(
         __m256i codes, __m256i books,
         __m512i table03, __m512i table47, __m512i table8b, __m512i tablecf) {
     // Bit 7 selects the table pair; VPERMI2B uses only the low seven bits.
@@ -6840,7 +6838,7 @@ static inline __m256i znq4x8_lookup_group(
     return _mm512_castsi512_si256(_mm512_mask_blend_epi8(_mm512_movepi8_mask(indices), a, b));
 }
 
-static inline __m512i znq4x16_unpack_group(const uint8_t * p0, const uint8_t * p1) {
+static inline __m512i znq4_mx16_unpack_group(const uint8_t * p0, const uint8_t * p1) {
     const __m256i packed32 = _mm256_inserti128_si256(
             _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *) p0)),
             _mm_loadu_si128((const __m128i *) p1), 1);
@@ -6849,7 +6847,7 @@ static inline __m512i znq4x16_unpack_group(const uint8_t * p0, const uint8_t * p
     return _mm512_and_si512(_mm512_multishift_epi64_epi8(shifts, packed), _mm512_set1_epi8(15));
 }
 
-static inline __m512i znq4x16_lookup_group(
+static inline __m512i znq4_mx16_lookup_group(
         __m512i codes, __m512i books,
         __m512i table03, __m512i table47, __m512i table8b, __m512i tablecf) {
     const __m512i indices = _mm512_add_epi8(codes, _mm512_slli_epi16(books, 4));
@@ -6858,13 +6856,13 @@ static inline __m512i znq4x16_lookup_group(
     return _mm512_mask_blend_epi8(_mm512_movepi8_mask(indices), lo, hi);
 }
 
-static inline uint32_t znq4x8_load_u32(const void * p) {
+static inline uint32_t znq4_mx8_load_u32(const void * p) {
     uint32_t v;
     memcpy(&v, p, sizeof(v));
     return v;
 }
 
-static inline __m512 znq4x8_ufp8x16_to_fp32(const uint8_t * p0, const uint8_t * p1) {
+static inline __m512 znq4_mx8_ufp8x16_to_fp32(const uint8_t * p0, const uint8_t * p1) {
     const __m128i lo = _mm_loadl_epi64((const __m128i *) p0);
     const __m128i hi = _mm_loadl_epi64((const __m128i *) p1);
     const __m512i c = _mm512_cvtepu8_epi32(_mm_unpacklo_epi64(lo, hi));
@@ -6905,49 +6903,49 @@ struct znq_panel_scratch {
 
 static thread_local znq_panel_scratch znq_scratch;
 
-struct znq4x32_panel_block {
+struct znq4_mx32_panel_block {
     int8_t  weights[2][QK_ZNQ / 4][64];
     int32_t correction[2][16];
     float   weight_scale[2][16];
 };
 
-static_assert(sizeof(znq4x32_panel_block) == 1280, "wrong ZNQ4 x32 panel size/padding");
+static_assert(sizeof(znq4_mx32_panel_block) == 1280, "wrong ZNQ4_M x32 panel size/padding");
 #endif
 
-void ggml_gemv_znq4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+void ggml_gemv_znq4_m_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
         const void * GGML_RESTRICT vy, int nr, int nc) {
     assert(n % QK_ZNQ == 0);
     assert(nc % 8 == 0);
 
     const int nb = n / QK_ZNQ;
-    const block_znq4x8 * b_ptr_start = (const block_znq4x8 *) vx;
+    const block_znq4_mx8 * b_ptr_start = (const block_znq4_mx8 *) vx;
     const block_q8_0 * a_ptr_start = (const block_q8_0 *) vy;
 
 #if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
-    const __m512i table03 = _mm512_loadu_si512((const void *) (kvalues_znq4 +   0));
-    const __m512i table47 = _mm512_loadu_si512((const void *) (kvalues_znq4 +  64));
-    const __m512i table8b = _mm512_loadu_si512((const void *) (kvalues_znq4 + 128));
-    const __m512i tablecf = _mm512_loadu_si512((const void *) (kvalues_znq4 + 192));
+    const __m512i table03 = _mm512_loadu_si512((const void *) (kvalues_znq4_m +   0));
+    const __m512i table47 = _mm512_loadu_si512((const void *) (kvalues_znq4_m +  64));
+    const __m512i table8b = _mm512_loadu_si512((const void *) (kvalues_znq4_m + 128));
+    const __m512i tablecf = _mm512_loadu_si512((const void *) (kvalues_znq4_m + 192));
 
     for (int y = 0; y < nr; ++y) {
         const block_q8_0 * a_ptr = a_ptr_start + y * nb;
         int x = 0;
         for (; x + 1 < nc / 8; x += 2) {
-            const block_znq4x8 * b0 = b_ptr_start + x * nb;
-            const block_znq4x8 * b1 = b0 + nb;
+            const block_znq4_mx8 * b0 = b_ptr_start + x * nb;
+            const block_znq4_mx8 * b1 = b0 + nb;
             __m512 acc = _mm512_setzero_ps();
 
             for (int ib = 0; ib < nb; ++ib) {
-                const __m512i books_lo = znq4x16_book_repeat4(b0[ib].books, b1[ib].books, false);
-                const __m512i books_hi = znq4x16_book_repeat4(b0[ib].books, b1[ib].books, true);
+                const __m512i books_lo = znq4_mx16_book_repeat4(b0[ib].books, b1[ib].books, false);
+                const __m512i books_hi = znq4_mx16_book_repeat4(b0[ib].books, b1[ib].books, true);
                 __m512i dot = _mm512_setzero_si512();
                 __m512i sumw = _mm512_setzero_si512();
 
                 for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                    const __m512i weights = znq4x16_lookup_group(
-                            znq4x16_unpack_group(b0[ib].qs + 16 * g, b1[ib].qs + 16 * g),
+                    const __m512i weights = znq4_mx16_lookup_group(
+                            znq4_mx16_unpack_group(b0[ib].qs + 16 * g, b1[ib].qs + 16 * g),
                             g < 4 ? books_lo : books_hi, table03, table47, table8b, tablecf);
-                    const uint32_t q = znq4x8_load_u32(a_ptr[ib].qs + 4 * g) ^ 0x80808080u;
+                    const uint32_t q = znq4_mx8_load_u32(a_ptr[ib].qs + 4 * g) ^ 0x80808080u;
                     dot = _mm512_dpbusd_epi32(dot, _mm512_set1_epi32((int) q), weights);
                     sumw = _mm512_dpbusd_epi32(sumw, _mm512_set1_epi8(1), weights);
                 }
@@ -6955,7 +6953,7 @@ void ggml_gemv_znq4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                 // Remove the unsigned activation bias before the block scale.
                 dot = _mm512_sub_epi32(dot, _mm512_slli_epi32(sumw, 7));
                 const __m512 scales = _mm512_mul_ps(
-                        znq4x8_ufp8x16_to_fp32(b0[ib].d, b1[ib].d),
+                        znq4_mx8_ufp8x16_to_fp32(b0[ib].d, b1[ib].d),
                         _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[ib].d)));
                 acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dot), scales, acc);
             }
@@ -6963,24 +6961,24 @@ void ggml_gemv_znq4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
             _mm512_storeu_ps(s + y * bs + x * 8, acc);
         }
         for (; x < nc / 8; ++x) {
-            const block_znq4x8 * b_ptr = b_ptr_start + x * nb;
+            const block_znq4_mx8 * b_ptr = b_ptr_start + x * nb;
             __m256 acc = _mm256_setzero_ps();
 
             for (int ib = 0; ib < nb; ++ib) {
-                const __m256i books_lo = znq4x8_book_repeat4(b_ptr[ib].books, false);
-                const __m256i books_hi = znq4x8_book_repeat4(b_ptr[ib].books, true);
+                const __m256i books_lo = znq4_mx8_book_repeat4(b_ptr[ib].books, false);
+                const __m256i books_hi = znq4_mx8_book_repeat4(b_ptr[ib].books, true);
                 __m256i iacc = _mm256_setzero_si256();
 
                 for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                    const __m256i weights = znq4x8_lookup_group(
-                            znq4x8_unpack_group(b_ptr[ib].qs + 16 * g),
+                    const __m256i weights = znq4_mx8_lookup_group(
+                            znq4_mx8_unpack_group(b_ptr[ib].qs + 16 * g),
                             g < 4 ? books_lo : books_hi, table03, table47, table8b, tablecf);
-                    const __m256i act = _mm256_set1_epi32((int) znq4x8_load_u32(a_ptr[ib].qs + 4 * g));
+                    const __m256i act = _mm256_set1_epi32((int) znq4_mx8_load_u32(a_ptr[ib].qs + 4 * g));
                     iacc = mul_sum_i8_pairs_acc_int32x8(iacc, weights, act);
                 }
 
                 const __m256 scales = _mm256_mul_ps(
-                        znq4x8_ufp8x8_to_fp32(b_ptr[ib].d),
+                        znq4_mx8_ufp8x8_to_fp32(b_ptr[ib].d),
                         _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[ib].d)));
                 acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc), scales, acc);
             }
@@ -6995,7 +6993,7 @@ void ggml_gemv_znq4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     for (int y = 0; y < nr; ++y) {
         const block_q8_0 * a_ptr = a_ptr_start + y * nb;
         for (int x = 0; x < nc / 8; ++x) {
-            const block_znq4x8 * b_ptr = b_ptr_start + x * nb;
+            const block_znq4_mx8 * b_ptr = b_ptr_start + x * nb;
             float out[8] = {};
             for (int ib = 0; ib < nb; ++ib) {
                 const float da = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d);
@@ -7007,9 +7005,9 @@ void ggml_gemv_znq4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                         const uint8_t packed = b_ptr[ib].qs[g * 16 + r * 2 + jb / 2];
                         const int code = (packed >> (4 * (jb & 1))) & 0x0f;
                         const int book = (b_ptr[ib].books[r] >> (4 * (j / 16))) & 0x0f;
-                        dot += kvalues_znq4[16 * book + code] * a_ptr[ib].qs[j];
+                        dot += kvalues_znq4_m[16 * book + code] * a_ptr[ib].qs[j];
                     }
-                    out[r] += znq4x8_ufp8_to_fp32(b_ptr[ib].d[r]) * da * dot;
+                    out[r] += znq4_mx8_ufp8_to_fp32(b_ptr[ib].d[r]) * da * dot;
                 }
             }
             memcpy(s + y * bs + x * 8, out, sizeof(out));
@@ -7017,7 +7015,7 @@ void ggml_gemv_znq4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     }
 }
 
-static inline float * znq4x8_gemm_dst_row(
+static inline float * znq4_mx8_gemm_dst_row(
         float * s, size_t bs, const int32_t * row_map, size_t dst_bs1, size_t dst_bs2, int row) {
     if (row_map != nullptr) {
         return s + (size_t) row_map[2 * row + 0] * dst_bs1 + (size_t) row_map[2 * row + 1] * dst_bs2;
@@ -7025,7 +7023,7 @@ static inline float * znq4x8_gemm_dst_row(
     return s + (size_t) row * bs;
 }
 
-static void ggml_gemm_znq4_8x8_q8_0_impl(
+static void ggml_gemm_znq4_m_8x8_q8_0_impl(
         int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
         const void * GGML_RESTRICT vy, int nr, int nc,
         const int32_t * row_map, size_t dst_bs1, size_t dst_bs2) {
@@ -7034,14 +7032,14 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
     assert(nc % 8 == 0);
 
     const int nb = n / QK_ZNQ;
-    const block_znq4x8 * b_ptr_start = (const block_znq4x8 *) vx;
+    const block_znq4_mx8 * b_ptr_start = (const block_znq4_mx8 *) vx;
     const block_q8_0x4 * a_ptr_start = (const block_q8_0x4 *) vy;
 
 #if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
-    const __m512i table03 = _mm512_loadu_si512((const void *) (kvalues_znq4 +   0));
-    const __m512i table47 = _mm512_loadu_si512((const void *) (kvalues_znq4 +  64));
-    const __m512i table8b = _mm512_loadu_si512((const void *) (kvalues_znq4 + 128));
-    const __m512i tablecf = _mm512_loadu_si512((const void *) (kvalues_znq4 + 192));
+    const __m512i table03 = _mm512_loadu_si512((const void *) (kvalues_znq4_m +   0));
+    const __m512i table47 = _mm512_loadu_si512((const void *) (kvalues_znq4_m +  64));
+    const __m512i table8b = _mm512_loadu_si512((const void *) (kvalues_znq4_m + 128));
+    const __m512i tablecf = _mm512_loadu_si512((const void *) (kvalues_znq4_m + 192));
 
     // Large-prompt fast path: decode two adjacent x8 repack pairs (32 output
     // rows) once into an int8 panel, then reuse it over every activation row.
@@ -7059,14 +7057,14 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
     // Keep the direct 16-row tile; use a panel before repeating decode for its tail.
     if (nr >= 20 && nc >= 32) {
         const int panel_blocks = std::min(nb, ZNQ_PANEL_BLOCKS);
-        const size_t panel_size = (size_t) panel_blocks * sizeof(znq4x32_panel_block);
-        auto * panel = (znq4x32_panel_block *) znq_scratch.get(panel_size);
+        const size_t panel_size = (size_t) panel_blocks * sizeof(znq4_mx32_panel_block);
+        auto * panel = (znq4_mx32_panel_block *) znq_scratch.get(panel_size);
 
         if (panel != nullptr) {
             const __m512i ones = _mm512_set1_epi8(1);
 
             for (int x32 = 0; x32 < nc / 32; ++x32) {
-                const block_znq4x8 * b_ptrs[4] = {
+                const block_znq4_mx8 * b_ptrs[4] = {
                     b_ptr_start + (4 * x32 + 0) * nb,
                     b_ptr_start + (4 * x32 + 1) * nb,
                     b_ptr_start + (4 * x32 + 2) * nb,
@@ -7077,22 +7075,22 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
                     const int ib_end = std::min(nb, ib0 + panel_blocks);
                     for (int ib = ib0; ib < ib_end; ++ib) {
                         for (int h = 0; h < 2; ++h) {
-                            const block_znq4x8 & b0 = b_ptrs[2 * h + 0][ib];
-                            const block_znq4x8 & b1 = b_ptrs[2 * h + 1][ib];
-                            const __m512i books_lo = znq4x16_book_repeat4(b0.books, b1.books, false);
-                            const __m512i books_hi = znq4x16_book_repeat4(b0.books, b1.books, true);
+                            const block_znq4_mx8 & b0 = b_ptrs[2 * h + 0][ib];
+                            const block_znq4_mx8 & b1 = b_ptrs[2 * h + 1][ib];
+                            const __m512i books_lo = znq4_mx16_book_repeat4(b0.books, b1.books, false);
+                            const __m512i books_hi = znq4_mx16_book_repeat4(b0.books, b1.books, true);
                             __m512i sumw = _mm512_setzero_si512();
 
                             for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                                const __m512i weights = znq4x16_lookup_group(
-                                        znq4x16_unpack_group(b0.qs + 16 * g, b1.qs + 16 * g),
+                                const __m512i weights = znq4_mx16_lookup_group(
+                                        znq4_mx16_unpack_group(b0.qs + 16 * g, b1.qs + 16 * g),
                                         g < 4 ? books_lo : books_hi, table03, table47, table8b, tablecf);
                                 _mm512_storeu_si512((void *) panel[ib - ib0].weights[h][g], weights);
                                 sumw = _mm512_dpbusd_epi32(sumw, ones, weights);
                             }
 
                             _mm512_storeu_si512((void *) panel[ib - ib0].correction[h], _mm512_slli_epi32(sumw, 7));
-                            _mm512_storeu_ps(panel[ib - ib0].weight_scale[h], znq4x8_ufp8x16_to_fp32(b0.d, b1.d));
+                            _mm512_storeu_ps(panel[ib - ib0].weight_scale[h], znq4_mx8_ufp8x16_to_fp32(b0.d, b1.d));
                         }
                     }
 
@@ -7100,10 +7098,10 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
                         const block_q8_0x4 * a_ptr = a_ptr_start + y4 * nb;
 
                         const int row = 4 * y4;
-                        float * d0 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 0) + 32 * x32;
-                        float * d1 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 1) + 32 * x32;
-                        float * d2 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 2) + 32 * x32;
-                        float * d3 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 3) + 32 * x32;
+                        float * d0 = znq4_mx8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 0) + 32 * x32;
+                        float * d1 = znq4_mx8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 1) + 32 * x32;
+                        float * d2 = znq4_mx8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 2) + 32 * x32;
+                        float * d3 = znq4_mx8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 3) + 32 * x32;
 
                         __m512 a0 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d0);
                         __m512 b0 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d0 + 16);
@@ -7135,10 +7133,10 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
                                 const int within = (g & 1) * 4;
                                 const int off = chunk * 32 + within;
 
-                                const __m512i q0 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  0) ^ 0x80808080u));
-                                const __m512i q1 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  8) ^ 0x80808080u));
-                                const __m512i q2 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 16) ^ 0x80808080u));
-                                const __m512i q3 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 24) ^ 0x80808080u));
+                                const __m512i q0 = _mm512_set1_epi32((int) (znq4_mx8_load_u32(qbase + off +  0) ^ 0x80808080u));
+                                const __m512i q1 = _mm512_set1_epi32((int) (znq4_mx8_load_u32(qbase + off +  8) ^ 0x80808080u));
+                                const __m512i q2 = _mm512_set1_epi32((int) (znq4_mx8_load_u32(qbase + off + 16) ^ 0x80808080u));
+                                const __m512i q3 = _mm512_set1_epi32((int) (znq4_mx8_load_u32(qbase + off + 24) ^ 0x80808080u));
 
                                 d00 = _mm512_dpbusd_epi32(d00, q0, w0); d10 = _mm512_dpbusd_epi32(d10, q0, w1);
                                 d01 = _mm512_dpbusd_epi32(d01, q1, w0); d11 = _mm512_dpbusd_epi32(d11, q1, w1);
@@ -7180,7 +7178,7 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
             // instead of forcing all 24 columns through the 4x8 fallback.
             int done = nc32;
             if (nc - done >= 16) {
-                ggml_gemm_znq4_8x8_q8_0_impl(
+                ggml_gemm_znq4_m_8x8_q8_0_impl(
                         n, s + done, bs,
                         b_ptr_start + (done / 8) * nb,
                         vy, nr, 16, row_map, dst_bs1, dst_bs2);
@@ -7188,7 +7186,7 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
             }
             if (done < nc) {
                 GGML_ASSERT(nc - done == 8);
-                ggml_gemm_znq4_8x8_q8_0_impl(
+                ggml_gemm_znq4_m_8x8_q8_0_impl(
                         n, s + done, bs,
                         b_ptr_start + (done / 8) * nb,
                         vy, nr, 8, row_map, dst_bs1, dst_bs2);
@@ -7218,27 +7216,27 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
             };
 
             for (int x16 = 0; x16 < nc / 16; ++x16) {
-                const block_znq4x8 * b_ptr_0 = b_ptr_start + (2 * x16 + 0) * nb;
-                const block_znq4x8 * b_ptr_1 = b_ptr_start + (2 * x16 + 1) * nb;
+                const block_znq4_mx8 * b_ptr_0 = b_ptr_start + (2 * x16 + 0) * nb;
+                const block_znq4_mx8 * b_ptr_1 = b_ptr_start + (2 * x16 + 1) * nb;
                 __m512 acc[16];
                 for (int r = 0; r < 16; ++r) {
                     acc[r] = _mm512_setzero_ps();
                 }
 
                 for (int ib = 0; ib < nb; ++ib) {
-                    const __m512i books_lo = znq4x16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, false);
-                    const __m512i books_hi = znq4x16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, true);
+                    const __m512i books_lo = znq4_mx16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, false);
+                    const __m512i books_hi = znq4_mx16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, true);
 
                     __m512i weights[QK_ZNQ / 4];
                     __m512i sumw = _mm512_setzero_si512();
                     for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                        weights[g] = znq4x16_lookup_group(
-                                znq4x16_unpack_group(b_ptr_0[ib].qs + 16 * g, b_ptr_1[ib].qs + 16 * g),
+                        weights[g] = znq4_mx16_lookup_group(
+                                znq4_mx16_unpack_group(b_ptr_0[ib].qs + 16 * g, b_ptr_1[ib].qs + 16 * g),
                                 g < 4 ? books_lo : books_hi, table03, table47, table8b, tablecf);
                         sumw = _mm512_dpbusd_epi32(sumw, ones, weights[g]);
                     }
                     const __m512i correction = _mm512_slli_epi32(sumw, 7);
-                    const __m512 wd = znq4x8_ufp8x16_to_fp32(b_ptr_0[ib].d, b_ptr_1[ib].d);
+                    const __m512 wd = znq4_mx8_ufp8x16_to_fp32(b_ptr_0[ib].d, b_ptr_1[ib].d);
 
                     for (int p = 0; p < 4; ++p) {
                         for (int r = 0; r < 4; ++r) {
@@ -7247,7 +7245,7 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
                             for (int g = 0; g < QK_ZNQ / 4; ++g) {
                                 const int chunk = g >> 1;
                                 const int within = (g & 1) * 4;
-                                const uint32_t q = znq4x8_load_u32(
+                                const uint32_t q = znq4_mx8_load_u32(
                                         a_ptrs[p][ib].qs + chunk * 32 + r * 8 + within) ^ 0x80808080u;
                                 dot = _mm512_dpbusd_epi32(
                                         dot, _mm512_set1_epi32((int) q), weights[g]);
@@ -7261,7 +7259,7 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
                 }
 
                 for (int r = 0; r < 16; ++r) {
-                    float * dst_row = znq4x8_gemm_dst_row(
+                    float * dst_row = znq4_mx8_gemm_dst_row(
                             s, bs, row_map, dst_bs1, dst_bs2, 4 * y4 + r);
                     _mm512_storeu_ps(dst_row + 16 * x16, acc[r]);
                 }
@@ -7278,16 +7276,16 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
             };
 
             for (int x16 = 0; x16 < nc / 16; ++x16) {
-                const block_znq4x8 * b_ptr_0 = b_ptr_start + (2 * x16 + 0) * nb;
-                const block_znq4x8 * b_ptr_1 = b_ptr_start + (2 * x16 + 1) * nb;
+                const block_znq4_mx8 * b_ptr_0 = b_ptr_start + (2 * x16 + 0) * nb;
+                const block_znq4_mx8 * b_ptr_1 = b_ptr_start + (2 * x16 + 1) * nb;
                 __m512 acc[8];
                 for (int r = 0; r < 8; ++r) {
                     acc[r] = _mm512_setzero_ps();
                 }
 
                 for (int ib = 0; ib < nb; ++ib) {
-                    const __m512i books_lo = znq4x16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, false);
-                    const __m512i books_hi = znq4x16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, true);
+                    const __m512i books_lo = znq4_mx16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, false);
+                    const __m512i books_hi = znq4_mx16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, true);
                     __m512i dot[8];
                     for (int r = 0; r < 8; ++r) {
                         dot[r] = _mm512_setzero_si512();
@@ -7295,8 +7293,8 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
                     __m512i sumw = _mm512_setzero_si512();
 
                     for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                        const __m512i weights = znq4x16_lookup_group(
-                                znq4x16_unpack_group(b_ptr_0[ib].qs + 16 * g, b_ptr_1[ib].qs + 16 * g),
+                        const __m512i weights = znq4_mx16_lookup_group(
+                                znq4_mx16_unpack_group(b_ptr_0[ib].qs + 16 * g, b_ptr_1[ib].qs + 16 * g),
                                 g < 4 ? books_lo : books_hi, table03, table47, table8b, tablecf);
                         sumw = _mm512_dpbusd_epi32(sumw, ones, weights);
 
@@ -7305,7 +7303,7 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
                         for (int p = 0; p < 2; ++p) {
                             for (int r = 0; r < 4; ++r) {
                                 const int rr = 4 * p + r;
-                                const uint32_t q = znq4x8_load_u32(
+                                const uint32_t q = znq4_mx8_load_u32(
                                         a_ptrs[p][ib].qs + chunk * 32 + r * 8 + within) ^ 0x80808080u;
                                 dot[rr] = _mm512_dpbusd_epi32(
                                         dot[rr], _mm512_set1_epi32((int) q), weights);
@@ -7314,7 +7312,7 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
                     }
 
                     const __m512i correction = _mm512_slli_epi32(sumw, 7);
-                    const __m512 wd = znq4x8_ufp8x16_to_fp32(b_ptr_0[ib].d, b_ptr_1[ib].d);
+                    const __m512 wd = znq4_mx8_ufp8x16_to_fp32(b_ptr_0[ib].d, b_ptr_1[ib].d);
                     for (int p = 0; p < 2; ++p) {
                         for (int r = 0; r < 4; ++r) {
                             const int rr = 4 * p + r;
@@ -7328,7 +7326,7 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
                 }
 
                 for (int r = 0; r < 8; ++r) {
-                    float * dst_row = znq4x8_gemm_dst_row(
+                    float * dst_row = znq4_mx8_gemm_dst_row(
                             s, bs, row_map, dst_bs1, dst_bs2, 4 * y4 + r);
                     _mm512_storeu_ps(dst_row + 16 * x16, acc[r]);
                 }
@@ -7341,33 +7339,33 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
     for (int y = y4; y < nr / 4; ++y) {
         const block_q8_0x4 * a_ptr = a_ptr_start + y * nb;
         for (int x = 0; x < nc / 8; ++x) {
-            const block_znq4x8 * b_ptr = b_ptr_start + x * nb;
+            const block_znq4_mx8 * b_ptr = b_ptr_start + x * nb;
             __m256 acc[4] = {
                 _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
             };
 
             for (int ib = 0; ib < nb; ++ib) {
-                const __m256i books_lo = znq4x8_book_repeat4(b_ptr[ib].books, false);
-                const __m256i books_hi = znq4x8_book_repeat4(b_ptr[ib].books, true);
+                const __m256i books_lo = znq4_mx8_book_repeat4(b_ptr[ib].books, false);
+                const __m256i books_hi = znq4_mx8_book_repeat4(b_ptr[ib].books, true);
                 __m256i iacc[4] = {
                     _mm256_setzero_si256(), _mm256_setzero_si256(),
                     _mm256_setzero_si256(), _mm256_setzero_si256(),
                 };
 
                 for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                    const __m256i weights = znq4x8_lookup_group(
-                            znq4x8_unpack_group(b_ptr[ib].qs + 16 * g),
+                    const __m256i weights = znq4_mx8_lookup_group(
+                            znq4_mx8_unpack_group(b_ptr[ib].qs + 16 * g),
                             g < 4 ? books_lo : books_hi, table03, table47, table8b, tablecf);
                     const int chunk = g >> 1;
                     const int within = (g & 1) * 4;
                     for (int r = 0; r < 4; ++r) {
-                        const uint32_t q = znq4x8_load_u32(a_ptr[ib].qs + chunk * 32 + r * 8 + within);
+                        const uint32_t q = znq4_mx8_load_u32(a_ptr[ib].qs + chunk * 32 + r * 8 + within);
                         iacc[r] = mul_sum_i8_pairs_acc_int32x8(
                                 iacc[r], weights, _mm256_set1_epi32((int) q));
                     }
                 }
 
-                const __m256 wd = znq4x8_ufp8x8_to_fp32(b_ptr[ib].d);
+                const __m256 wd = znq4_mx8_ufp8x8_to_fp32(b_ptr[ib].d);
                 for (int r = 0; r < 4; ++r) {
                     const __m256 scales = _mm256_mul_ps(
                             wd, _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[r])));
@@ -7376,7 +7374,7 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
             }
 
             for (int r = 0; r < 4; ++r) {
-                float * dst_row = znq4x8_gemm_dst_row(
+                float * dst_row = znq4_mx8_gemm_dst_row(
                         s, bs, row_map, dst_bs1, dst_bs2, y * 4 + r);
                 _mm256_storeu_ps(dst_row + x * 8, acc[r]);
             }
@@ -7388,7 +7386,7 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
     for (int y = 0; y < nr / 4; ++y) {
         const block_q8_0x4 * a_ptr = a_ptr_start + y * nb;
         for (int x = 0; x < nc / 8; ++x) {
-            const block_znq4x8 * b_ptr = b_ptr_start + x * nb;
+            const block_znq4_mx8 * b_ptr = b_ptr_start + x * nb;
             float out[4][8] = {};
             for (int ib = 0; ib < nb; ++ib) {
                 for (int r = 0; r < 4; ++r) {
@@ -7404,14 +7402,14 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
                             const int chunk = j / 8;
                             const int offset = j & 7;
                             const int8_t act = a_ptr[ib].qs[chunk * 32 + r * 8 + offset];
-                            dot += kvalues_znq4[16 * book + code] * act;
+                            dot += kvalues_znq4_m[16 * book + code] * act;
                         }
-                        out[r][wr] += znq4x8_ufp8_to_fp32(b_ptr[ib].d[wr]) * da * dot;
+                        out[r][wr] += znq4_mx8_ufp8_to_fp32(b_ptr[ib].d[wr]) * da * dot;
                     }
                 }
             }
             for (int r = 0; r < 4; ++r) {
-                float * dst_row = znq4x8_gemm_dst_row(
+                float * dst_row = znq4_mx8_gemm_dst_row(
                         s, bs, row_map, dst_bs1, dst_bs2, y * 4 + r);
                 memcpy(dst_row + x * 8, out[r], sizeof(out[r]));
             }
@@ -7419,13 +7417,13 @@ static void ggml_gemm_znq4_8x8_q8_0_impl(
     }
 }
 
-void ggml_gemm_znq4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+void ggml_gemm_znq4_m_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
         const void * GGML_RESTRICT vy, int nr, int nc) {
-    ggml_gemm_znq4_8x8_q8_0_impl(n, s, bs, vx, vy, nr, nc, nullptr, 0, 0);
+    ggml_gemm_znq4_m_8x8_q8_0_impl(n, s, bs, vx, vy, nr, nc, nullptr, 0, 0);
 }
 
 #if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
-static inline __m256i znq2x8_unpack_group(const uint8_t qs[8]) {
+static inline __m256i znq2_mx8_unpack_group(const uint8_t qs[8]) {
     // Broadcast the eight packed row bytes to all four qword lanes. Each lane
     // then extracts two rows (8 output bytes) with fixed 2-bit shift counts:
     // [row0 w0..w3, row1 w0..w3, ..., row7 w0..w3].
@@ -7441,15 +7439,15 @@ static inline __m256i znq2x8_unpack_group(const uint8_t qs[8]) {
             _mm256_set1_epi8(3));
 }
 
-static inline __m256i znq2x8_lookup_group(__m256i codes, __m256i books, __m512i table) {
+static inline __m256i znq2_mx8_lookup_group(__m256i codes, __m256i books, __m512i table) {
     // 16 books x 4 entries = exactly 64 bytes. book*4 + code is a direct
-    // VPERMB index, so ZNQ2 needs one table register and one permutation.
+    // VPERMB index, so ZNQ2_M needs one table register and one permutation.
     const __m256i indices256 = _mm256_add_epi8(codes, _mm256_slli_epi16(books, 2));
     const __m512i indices = _mm512_inserti64x4(_mm512_setzero_si512(), indices256, 0);
     return _mm512_castsi512_si256(_mm512_permutexvar_epi8(indices, table));
 }
 
-static inline __m512i znq2x16_unpack_group(const uint8_t qs0[8], const uint8_t qs1[8]) {
+static inline __m512i znq2_mx16_unpack_group(const uint8_t qs0[8], const uint8_t qs1[8]) {
     const __m128i lo = _mm_loadl_epi64((const __m128i *) qs0);
     const __m128i hi = _mm_loadl_epi64((const __m128i *) qs1);
     const __m512i packed = _mm512_cvtepu16_epi64(_mm_unpacklo_epi64(lo, hi));
@@ -7457,60 +7455,60 @@ static inline __m512i znq2x16_unpack_group(const uint8_t qs0[8], const uint8_t q
     return _mm512_and_si512(_mm512_multishift_epi64_epi8(shifts, packed), _mm512_set1_epi8(3));
 }
 
-static inline __m512i znq2x16_lookup_group(__m512i codes, __m512i books, __m512i table) {
+static inline __m512i znq2_mx16_lookup_group(__m512i codes, __m512i books, __m512i table) {
     const __m512i indices = _mm512_add_epi8(codes, _mm512_slli_epi16(books, 2));
     return _mm512_permutexvar_epi8(indices, table);
 }
 
-// Same post-decode layout as ZNQ3/ZNQ4. The panel deliberately expands only
+// Same post-decode layout as ZNQ3_M/ZNQ4_M. The panel deliberately expands only
 // transient prompt-processing weights; model storage remains exactly 2.5 bpw.
-struct znq2x32_panel_block {
+struct znq2_mx32_panel_block {
     int8_t  weights[2][QK_ZNQ / 4][64];
     int32_t correction[2][16];
     float   weight_scale[2][16];
 };
 
-static_assert(sizeof(znq2x32_panel_block) == 1280, "wrong ZNQ2 x32 panel size/padding");
+static_assert(sizeof(znq2_mx32_panel_block) == 1280, "wrong ZNQ2_M x32 panel size/padding");
 #endif
 
-void ggml_gemv_znq2_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+void ggml_gemv_znq2_m_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
         const void * GGML_RESTRICT vy, int nr, int nc) {
     assert(n % QK_ZNQ == 0);
     assert(nc % 8 == 0);
 
     const int nb = n / QK_ZNQ;
-    const block_znq2x8 * b_ptr_start = (const block_znq2x8 *) vx;
+    const block_znq2_mx8 * b_ptr_start = (const block_znq2_mx8 *) vx;
     const block_q8_0 * a_ptr_start = (const block_q8_0 *) vy;
 
 #if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
-    const __m512i table = _mm512_loadu_si512((const void *) kvalues_znq2);
+    const __m512i table = _mm512_loadu_si512((const void *) kvalues_znq2_m);
 
     for (int y = 0; y < nr; ++y) {
         const block_q8_0 * a_ptr = a_ptr_start + y * nb;
         int x = 0;
         for (; x + 1 < nc / 8; x += 2) {
-            const block_znq2x8 * b0 = b_ptr_start + x * nb;
-            const block_znq2x8 * b1 = b0 + nb;
+            const block_znq2_mx8 * b0 = b_ptr_start + x * nb;
+            const block_znq2_mx8 * b1 = b0 + nb;
             __m512 acc = _mm512_setzero_ps();
 
             for (int ib = 0; ib < nb; ++ib) {
-                const __m512i books_lo = znq4x16_book_repeat4(b0[ib].books, b1[ib].books, false);
-                const __m512i books_hi = znq4x16_book_repeat4(b0[ib].books, b1[ib].books, true);
+                const __m512i books_lo = znq4_mx16_book_repeat4(b0[ib].books, b1[ib].books, false);
+                const __m512i books_hi = znq4_mx16_book_repeat4(b0[ib].books, b1[ib].books, true);
                 __m512i dot = _mm512_setzero_si512();
                 __m512i sumw = _mm512_setzero_si512();
 
                 for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                    const __m512i weights = znq2x16_lookup_group(
-                            znq2x16_unpack_group(b0[ib].qs[g], b1[ib].qs[g]),
+                    const __m512i weights = znq2_mx16_lookup_group(
+                            znq2_mx16_unpack_group(b0[ib].qs[g], b1[ib].qs[g]),
                             g < 4 ? books_lo : books_hi, table);
-                    const uint32_t q = znq4x8_load_u32(a_ptr[ib].qs + 4 * g) ^ 0x80808080u;
+                    const uint32_t q = znq4_mx8_load_u32(a_ptr[ib].qs + 4 * g) ^ 0x80808080u;
                     dot = _mm512_dpbusd_epi32(dot, _mm512_set1_epi32((int) q), weights);
                     sumw = _mm512_dpbusd_epi32(sumw, _mm512_set1_epi8(1), weights);
                 }
 
                 dot = _mm512_sub_epi32(dot, _mm512_slli_epi32(sumw, 7));
                 const __m512 scales = _mm512_mul_ps(
-                        znq4x8_ufp8x16_to_fp32(b0[ib].d, b1[ib].d),
+                        znq4_mx8_ufp8x16_to_fp32(b0[ib].d, b1[ib].d),
                         _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[ib].d)));
                 acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dot), scales, acc);
             }
@@ -7518,24 +7516,24 @@ void ggml_gemv_znq2_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
             _mm512_storeu_ps(s + y * bs + x * 8, acc);
         }
         for (; x < nc / 8; ++x) {
-            const block_znq2x8 * b_ptr = b_ptr_start + x * nb;
+            const block_znq2_mx8 * b_ptr = b_ptr_start + x * nb;
             __m256 acc = _mm256_setzero_ps();
 
             for (int ib = 0; ib < nb; ++ib) {
-                const __m256i books_lo = znq4x8_book_repeat4(b_ptr[ib].books, false);
-                const __m256i books_hi = znq4x8_book_repeat4(b_ptr[ib].books, true);
+                const __m256i books_lo = znq4_mx8_book_repeat4(b_ptr[ib].books, false);
+                const __m256i books_hi = znq4_mx8_book_repeat4(b_ptr[ib].books, true);
                 __m256i iacc = _mm256_setzero_si256();
 
                 for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                    const __m256i weights = znq2x8_lookup_group(
-                            znq2x8_unpack_group(b_ptr[ib].qs[g]),
+                    const __m256i weights = znq2_mx8_lookup_group(
+                            znq2_mx8_unpack_group(b_ptr[ib].qs[g]),
                             g < 4 ? books_lo : books_hi, table);
-                    const __m256i act = _mm256_set1_epi32((int) znq4x8_load_u32(a_ptr[ib].qs + 4 * g));
+                    const __m256i act = _mm256_set1_epi32((int) znq4_mx8_load_u32(a_ptr[ib].qs + 4 * g));
                     iacc = mul_sum_i8_pairs_acc_int32x8(iacc, weights, act);
                 }
 
                 const __m256 scales = _mm256_mul_ps(
-                        znq4x8_ufp8x8_to_fp32(b_ptr[ib].d),
+                        znq4_mx8_ufp8x8_to_fp32(b_ptr[ib].d),
                         _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[ib].d)));
                 acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc), scales, acc);
             }
@@ -7549,7 +7547,7 @@ void ggml_gemv_znq2_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     for (int y = 0; y < nr; ++y) {
         const block_q8_0 * a_ptr = a_ptr_start + y * nb;
         for (int x = 0; x < nc / 8; ++x) {
-            const block_znq2x8 * b_ptr = b_ptr_start + x * nb;
+            const block_znq2_mx8 * b_ptr = b_ptr_start + x * nb;
             float out[8] = {};
             for (int ib = 0; ib < nb; ++ib) {
                 const float da = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d);
@@ -7559,9 +7557,9 @@ void ggml_gemv_znq2_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                         const int g = j / 4;
                         const int code = (b_ptr[ib].qs[g][r] >> (2 * (j & 3))) & 3u;
                         const int book = (b_ptr[ib].books[r] >> (4 * (j / 16))) & 0x0f;
-                        dot += kvalues_znq2[4 * book + code] * a_ptr[ib].qs[j];
+                        dot += kvalues_znq2_m[4 * book + code] * a_ptr[ib].qs[j];
                     }
-                    out[r] += znq4x8_ufp8_to_fp32(b_ptr[ib].d[r]) * da * dot;
+                    out[r] += znq4_mx8_ufp8_to_fp32(b_ptr[ib].d[r]) * da * dot;
                 }
             }
             memcpy(s + y * bs + x * 8, out, sizeof(out));
@@ -7569,7 +7567,7 @@ void ggml_gemv_znq2_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     }
 }
 
-static void ggml_gemm_znq2_8x8_q8_0_impl(
+static void ggml_gemm_znq2_m_8x8_q8_0_impl(
         int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
         const void * GGML_RESTRICT vy, int nr, int nc,
         const int32_t * row_map, size_t dst_bs1, size_t dst_bs2) {
@@ -7578,26 +7576,26 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
     assert(nc % 8 == 0);
 
     const int nb = n / QK_ZNQ;
-    const block_znq2x8 * b_ptr_start = (const block_znq2x8 *) vx;
+    const block_znq2_mx8 * b_ptr_start = (const block_znq2_mx8 *) vx;
     const block_q8_0x4 * a_ptr_start = (const block_q8_0x4 *) vy;
 
 #if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
-    const __m512i table = _mm512_loadu_si512((const void *) kvalues_znq2);
+    const __m512i table = _mm512_loadu_si512((const void *) kvalues_znq2_m);
 
     // Decode 32 output rows across K once, then reuse the expanded int8 panel
     // across every four-row activation tile. After decode this is the same
-    // register-balanced Zen5 VNNI engine used by ZNQ3 and ZNQ4.
+    // register-balanced Zen5 VNNI engine used by ZNQ3_M and ZNQ4_M.
     // Keep the direct 16-row tile; use a panel before repeating decode for its tail.
     if (nr >= 20 && nc >= 32) {
         const int panel_blocks = std::min(nb, ZNQ_PANEL_BLOCKS);
-        const size_t panel_size = (size_t) panel_blocks * sizeof(znq2x32_panel_block);
-        auto * panel = (znq2x32_panel_block *) znq_scratch.get(panel_size);
+        const size_t panel_size = (size_t) panel_blocks * sizeof(znq2_mx32_panel_block);
+        auto * panel = (znq2_mx32_panel_block *) znq_scratch.get(panel_size);
 
         if (panel != nullptr) {
             const __m512i ones = _mm512_set1_epi8(1);
 
             for (int x32 = 0; x32 < nc / 32; ++x32) {
-                const block_znq2x8 * b_ptrs[4] = {
+                const block_znq2_mx8 * b_ptrs[4] = {
                     b_ptr_start + (4 * x32 + 0) * nb,
                     b_ptr_start + (4 * x32 + 1) * nb,
                     b_ptr_start + (4 * x32 + 2) * nb,
@@ -7608,22 +7606,22 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
                     const int ib_end = std::min(nb, ib0 + panel_blocks);
                     for (int ib = ib0; ib < ib_end; ++ib) {
                         for (int h = 0; h < 2; ++h) {
-                            const block_znq2x8 & b0 = b_ptrs[2 * h + 0][ib];
-                            const block_znq2x8 & b1 = b_ptrs[2 * h + 1][ib];
-                            const __m512i books_lo = znq4x16_book_repeat4(b0.books, b1.books, false);
-                            const __m512i books_hi = znq4x16_book_repeat4(b0.books, b1.books, true);
+                            const block_znq2_mx8 & b0 = b_ptrs[2 * h + 0][ib];
+                            const block_znq2_mx8 & b1 = b_ptrs[2 * h + 1][ib];
+                            const __m512i books_lo = znq4_mx16_book_repeat4(b0.books, b1.books, false);
+                            const __m512i books_hi = znq4_mx16_book_repeat4(b0.books, b1.books, true);
                             __m512i sumw = _mm512_setzero_si512();
 
                             for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                                const __m512i weights = znq2x16_lookup_group(
-                                        znq2x16_unpack_group(b0.qs[g], b1.qs[g]),
+                                const __m512i weights = znq2_mx16_lookup_group(
+                                        znq2_mx16_unpack_group(b0.qs[g], b1.qs[g]),
                                         g < 4 ? books_lo : books_hi, table);
                                 _mm512_storeu_si512((void *) panel[ib - ib0].weights[h][g], weights);
                                 sumw = _mm512_dpbusd_epi32(sumw, ones, weights);
                             }
 
                             _mm512_storeu_si512((void *) panel[ib - ib0].correction[h], _mm512_slli_epi32(sumw, 7));
-                            _mm512_storeu_ps(panel[ib - ib0].weight_scale[h], znq4x8_ufp8x16_to_fp32(b0.d, b1.d));
+                            _mm512_storeu_ps(panel[ib - ib0].weight_scale[h], znq4_mx8_ufp8x16_to_fp32(b0.d, b1.d));
                         }
                     }
 
@@ -7631,10 +7629,10 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
                         const block_q8_0x4 * a_ptr = a_ptr_start + y4 * nb;
 
                         const int row = 4 * y4;
-                        float * d0 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 0) + 32 * x32;
-                        float * d1 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 1) + 32 * x32;
-                        float * d2 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 2) + 32 * x32;
-                        float * d3 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 3) + 32 * x32;
+                        float * d0 = znq4_mx8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 0) + 32 * x32;
+                        float * d1 = znq4_mx8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 1) + 32 * x32;
+                        float * d2 = znq4_mx8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 2) + 32 * x32;
+                        float * d3 = znq4_mx8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 3) + 32 * x32;
 
                         __m512 a0 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d0);
                         __m512 b0 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d0 + 16);
@@ -7664,10 +7662,10 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
                                 const int within = (g & 1) * 4;
                                 const int off = chunk * 32 + within;
 
-                                const __m512i q0 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  0) ^ 0x80808080u));
-                                const __m512i q1 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  8) ^ 0x80808080u));
-                                const __m512i q2 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 16) ^ 0x80808080u));
-                                const __m512i q3 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 24) ^ 0x80808080u));
+                                const __m512i q0 = _mm512_set1_epi32((int) (znq4_mx8_load_u32(qbase + off +  0) ^ 0x80808080u));
+                                const __m512i q1 = _mm512_set1_epi32((int) (znq4_mx8_load_u32(qbase + off +  8) ^ 0x80808080u));
+                                const __m512i q2 = _mm512_set1_epi32((int) (znq4_mx8_load_u32(qbase + off + 16) ^ 0x80808080u));
+                                const __m512i q3 = _mm512_set1_epi32((int) (znq4_mx8_load_u32(qbase + off + 24) ^ 0x80808080u));
 
                                 d00 = _mm512_dpbusd_epi32(d00, q0, w0); d10 = _mm512_dpbusd_epi32(d10, q0, w1);
                                 d01 = _mm512_dpbusd_epi32(d01, q1, w0); d11 = _mm512_dpbusd_epi32(d11, q1, w1);
@@ -7706,7 +7704,7 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
 
             int done = nc32;
             if (nc - done >= 16) {
-                ggml_gemm_znq2_8x8_q8_0_impl(
+                ggml_gemm_znq2_m_8x8_q8_0_impl(
                         n, s + done, bs,
                         b_ptr_start + (done / 8) * nb,
                         vy, nr, 16, row_map, dst_bs1, dst_bs2);
@@ -7714,7 +7712,7 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
             }
             if (done < nc) {
                 GGML_ASSERT(nc - done == 8);
-                ggml_gemm_znq2_8x8_q8_0_impl(
+                ggml_gemm_znq2_m_8x8_q8_0_impl(
                         n, s + done, bs,
                         b_ptr_start + (done / 8) * nb,
                         vy, nr, 8, row_map, dst_bs1, dst_bs2);
@@ -7737,27 +7735,27 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
             };
 
             for (int x16 = 0; x16 < nc / 16; ++x16) {
-                const block_znq2x8 * b_ptr_0 = b_ptr_start + (2 * x16 + 0) * nb;
-                const block_znq2x8 * b_ptr_1 = b_ptr_start + (2 * x16 + 1) * nb;
+                const block_znq2_mx8 * b_ptr_0 = b_ptr_start + (2 * x16 + 0) * nb;
+                const block_znq2_mx8 * b_ptr_1 = b_ptr_start + (2 * x16 + 1) * nb;
                 __m512 acc[16];
                 for (int r = 0; r < 16; ++r) {
                     acc[r] = _mm512_setzero_ps();
                 }
 
                 for (int ib = 0; ib < nb; ++ib) {
-                    const __m512i books_lo = znq4x16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, false);
-                    const __m512i books_hi = znq4x16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, true);
+                    const __m512i books_lo = znq4_mx16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, false);
+                    const __m512i books_hi = znq4_mx16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, true);
 
                     __m512i weights[QK_ZNQ / 4];
                     __m512i sumw = _mm512_setzero_si512();
                     for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                        weights[g] = znq2x16_lookup_group(
-                                znq2x16_unpack_group(b_ptr_0[ib].qs[g], b_ptr_1[ib].qs[g]),
+                        weights[g] = znq2_mx16_lookup_group(
+                                znq2_mx16_unpack_group(b_ptr_0[ib].qs[g], b_ptr_1[ib].qs[g]),
                                 g < 4 ? books_lo : books_hi, table);
                         sumw = _mm512_dpbusd_epi32(sumw, ones, weights[g]);
                     }
                     const __m512i correction = _mm512_slli_epi32(sumw, 7);
-                    const __m512 wd = znq4x8_ufp8x16_to_fp32(b_ptr_0[ib].d, b_ptr_1[ib].d);
+                    const __m512 wd = znq4_mx8_ufp8x16_to_fp32(b_ptr_0[ib].d, b_ptr_1[ib].d);
 
                     for (int p = 0; p < 4; ++p) {
                         for (int r = 0; r < 4; ++r) {
@@ -7766,7 +7764,7 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
                             for (int g = 0; g < QK_ZNQ / 4; ++g) {
                                 const int chunk = g >> 1;
                                 const int within = (g & 1) * 4;
-                                const uint32_t q = znq4x8_load_u32(
+                                const uint32_t q = znq4_mx8_load_u32(
                                         a_ptrs[p][ib].qs + chunk * 32 + r * 8 + within) ^ 0x80808080u;
                                 dot = _mm512_dpbusd_epi32(
                                         dot, _mm512_set1_epi32((int) q), weights[g]);
@@ -7780,7 +7778,7 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
                 }
 
                 for (int r = 0; r < 16; ++r) {
-                    float * dst_row = znq4x8_gemm_dst_row(
+                    float * dst_row = znq4_mx8_gemm_dst_row(
                             s, bs, row_map, dst_bs1, dst_bs2, 4 * y4 + r);
                     _mm512_storeu_ps(dst_row + 16 * x16, acc[r]);
                 }
@@ -7797,16 +7795,16 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
             };
 
             for (int x16 = 0; x16 < nc / 16; ++x16) {
-                const block_znq2x8 * b_ptr_0 = b_ptr_start + (2 * x16 + 0) * nb;
-                const block_znq2x8 * b_ptr_1 = b_ptr_start + (2 * x16 + 1) * nb;
+                const block_znq2_mx8 * b_ptr_0 = b_ptr_start + (2 * x16 + 0) * nb;
+                const block_znq2_mx8 * b_ptr_1 = b_ptr_start + (2 * x16 + 1) * nb;
                 __m512 acc[8];
                 for (int r = 0; r < 8; ++r) {
                     acc[r] = _mm512_setzero_ps();
                 }
 
                 for (int ib = 0; ib < nb; ++ib) {
-                    const __m512i books_lo = znq4x16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, false);
-                    const __m512i books_hi = znq4x16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, true);
+                    const __m512i books_lo = znq4_mx16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, false);
+                    const __m512i books_hi = znq4_mx16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, true);
                     __m512i dot[8];
                     for (int r = 0; r < 8; ++r) {
                         dot[r] = _mm512_setzero_si512();
@@ -7814,8 +7812,8 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
                     __m512i sumw = _mm512_setzero_si512();
 
                     for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                        const __m512i weights = znq2x16_lookup_group(
-                                znq2x16_unpack_group(b_ptr_0[ib].qs[g], b_ptr_1[ib].qs[g]),
+                        const __m512i weights = znq2_mx16_lookup_group(
+                                znq2_mx16_unpack_group(b_ptr_0[ib].qs[g], b_ptr_1[ib].qs[g]),
                                 g < 4 ? books_lo : books_hi, table);
                         sumw = _mm512_dpbusd_epi32(sumw, ones, weights);
 
@@ -7824,7 +7822,7 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
                         for (int p = 0; p < 2; ++p) {
                             for (int r = 0; r < 4; ++r) {
                                 const int rr = 4 * p + r;
-                                const uint32_t q = znq4x8_load_u32(
+                                const uint32_t q = znq4_mx8_load_u32(
                                         a_ptrs[p][ib].qs + chunk * 32 + r * 8 + within) ^ 0x80808080u;
                                 dot[rr] = _mm512_dpbusd_epi32(
                                         dot[rr], _mm512_set1_epi32((int) q), weights);
@@ -7833,7 +7831,7 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
                     }
 
                     const __m512i correction = _mm512_slli_epi32(sumw, 7);
-                    const __m512 wd = znq4x8_ufp8x16_to_fp32(b_ptr_0[ib].d, b_ptr_1[ib].d);
+                    const __m512 wd = znq4_mx8_ufp8x16_to_fp32(b_ptr_0[ib].d, b_ptr_1[ib].d);
                     for (int p = 0; p < 2; ++p) {
                         for (int r = 0; r < 4; ++r) {
                             const int rr = 4 * p + r;
@@ -7847,7 +7845,7 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
                 }
 
                 for (int r = 0; r < 8; ++r) {
-                    float * dst_row = znq4x8_gemm_dst_row(
+                    float * dst_row = znq4_mx8_gemm_dst_row(
                             s, bs, row_map, dst_bs1, dst_bs2, 4 * y4 + r);
                     _mm512_storeu_ps(dst_row + 16 * x16, acc[r]);
                 }
@@ -7860,34 +7858,34 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
     for (int y = y4; y < nr / 4; ++y) {
         const block_q8_0x4 * a_ptr = a_ptr_start + y * nb;
         for (int x = 0; x < nc / 8; ++x) {
-            const block_znq2x8 * b_ptr = b_ptr_start + x * nb;
+            const block_znq2_mx8 * b_ptr = b_ptr_start + x * nb;
             __m256 acc[4] = {
                 _mm256_setzero_ps(), _mm256_setzero_ps(),
                 _mm256_setzero_ps(), _mm256_setzero_ps(),
             };
 
             for (int ib = 0; ib < nb; ++ib) {
-                const __m256i books_lo = znq4x8_book_repeat4(b_ptr[ib].books, false);
-                const __m256i books_hi = znq4x8_book_repeat4(b_ptr[ib].books, true);
+                const __m256i books_lo = znq4_mx8_book_repeat4(b_ptr[ib].books, false);
+                const __m256i books_hi = znq4_mx8_book_repeat4(b_ptr[ib].books, true);
                 __m256i iacc[4] = {
                     _mm256_setzero_si256(), _mm256_setzero_si256(),
                     _mm256_setzero_si256(), _mm256_setzero_si256(),
                 };
 
                 for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                    const __m256i weights = znq2x8_lookup_group(
-                            znq2x8_unpack_group(b_ptr[ib].qs[g]),
+                    const __m256i weights = znq2_mx8_lookup_group(
+                            znq2_mx8_unpack_group(b_ptr[ib].qs[g]),
                             g < 4 ? books_lo : books_hi, table);
                     const int chunk = g >> 1;
                     const int within = (g & 1) * 4;
                     for (int r = 0; r < 4; ++r) {
-                        const uint32_t q = znq4x8_load_u32(a_ptr[ib].qs + chunk * 32 + r * 8 + within);
+                        const uint32_t q = znq4_mx8_load_u32(a_ptr[ib].qs + chunk * 32 + r * 8 + within);
                         iacc[r] = mul_sum_i8_pairs_acc_int32x8(
                                 iacc[r], weights, _mm256_set1_epi32((int) q));
                     }
                 }
 
-                const __m256 wd = znq4x8_ufp8x8_to_fp32(b_ptr[ib].d);
+                const __m256 wd = znq4_mx8_ufp8x8_to_fp32(b_ptr[ib].d);
                 for (int r = 0; r < 4; ++r) {
                     const __m256 scales = _mm256_mul_ps(
                             wd, _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[r])));
@@ -7896,7 +7894,7 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
             }
 
             for (int r = 0; r < 4; ++r) {
-                float * dst_row = znq4x8_gemm_dst_row(
+                float * dst_row = znq4_mx8_gemm_dst_row(
                         s, bs, row_map, dst_bs1, dst_bs2, y * 4 + r);
                 _mm256_storeu_ps(dst_row + x * 8, acc[r]);
             }
@@ -7908,7 +7906,7 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
     for (int y = 0; y < nr / 4; ++y) {
         const block_q8_0x4 * a_ptr = a_ptr_start + y * nb;
         for (int x = 0; x < nc / 8; ++x) {
-            const block_znq2x8 * b_ptr = b_ptr_start + x * nb;
+            const block_znq2_mx8 * b_ptr = b_ptr_start + x * nb;
             float out[4][8] = {};
             for (int ib = 0; ib < nb; ++ib) {
                 for (int r = 0; r < 4; ++r) {
@@ -7922,14 +7920,14 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
                             const int chunk = j / 8;
                             const int offset = j & 7;
                             const int8_t act = a_ptr[ib].qs[chunk * 32 + r * 8 + offset];
-                            dot += kvalues_znq2[4 * book + code] * act;
+                            dot += kvalues_znq2_m[4 * book + code] * act;
                         }
-                        out[r][wr] += znq4x8_ufp8_to_fp32(b_ptr[ib].d[wr]) * da * dot;
+                        out[r][wr] += znq4_mx8_ufp8_to_fp32(b_ptr[ib].d[wr]) * da * dot;
                     }
                 }
             }
             for (int r = 0; r < 4; ++r) {
-                float * dst_row = znq4x8_gemm_dst_row(
+                float * dst_row = znq4_mx8_gemm_dst_row(
                         s, bs, row_map, dst_bs1, dst_bs2, y * 4 + r);
                 memcpy(dst_row + x * 8, out[r], sizeof(out[r]));
             }
@@ -7937,27 +7935,27 @@ static void ggml_gemm_znq2_8x8_q8_0_impl(
     }
 }
 
-void ggml_gemm_znq2_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+void ggml_gemm_znq2_m_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
         const void * GGML_RESTRICT vy, int nr, int nc) {
-    ggml_gemm_znq2_8x8_q8_0_impl(n, s, bs, vx, vy, nr, nc, nullptr, 0, 0);
+    ggml_gemm_znq2_m_8x8_q8_0_impl(n, s, bs, vx, vy, nr, nc, nullptr, 0, 0);
 }
 
-void ggml_gemm_znq2_8x8_q8_0_moe(
+void ggml_gemm_znq2_m_8x8_q8_0_moe(
         int n, float * GGML_RESTRICT s, size_t dst_bs1, size_t dst_bs2, const int32_t * row_map,
         const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     GGML_ASSERT(row_map != nullptr);
-    ggml_gemm_znq2_8x8_q8_0_impl(n, s, 0, vx, vy, nr, nc, row_map, dst_bs1, dst_bs2);
+    ggml_gemm_znq2_m_8x8_q8_0_impl(n, s, 0, vx, vy, nr, nc, row_map, dst_bs1, dst_bs2);
 }
 
 #if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
-static inline __m256i znq3x8_unpack_group(const uint32_t planes[3]) {
+static inline __m256i znq3_mx8_unpack_group(const uint32_t planes[3]) {
     const __m256i b0 = _mm256_maskz_set1_epi8((__mmask32) planes[0], 1);
     const __m256i b1 = _mm256_maskz_set1_epi8((__mmask32) planes[1], 2);
     const __m256i b2 = _mm256_maskz_set1_epi8((__mmask32) planes[2], 4);
     return _mm256_ternarylogic_epi32(b0, b1, b2, 0xfe);
 }
 
-static inline __m256i znq3x8_lookup_group(
+static inline __m256i znq3_mx8_lookup_group(
         __m256i codes, __m256i books, __m512i table07, __m512i table8f) {
     // 16 books x 8 entries = 128 bytes. A single VPERMI2B can address the
     // whole table: low six index bits select a byte, bit 6 selects table8f.
@@ -7968,7 +7966,7 @@ static inline __m256i znq3x8_lookup_group(
     return _mm512_castsi512_si256(_mm512_permutex2var_epi8(table07, indices, table8f));
 }
 
-static inline __m512i znq3x16_unpack_group(const uint32_t planes0[3], const uint32_t planes1[3]) {
+static inline __m512i znq3_mx16_unpack_group(const uint32_t planes0[3], const uint32_t planes1[3]) {
     const __mmask64 m0 = (__mmask64) planes0[0] | ((__mmask64) planes1[0] << 32);
     const __mmask64 m1 = (__mmask64) planes0[1] | ((__mmask64) planes1[1] << 32);
     const __mmask64 m2 = (__mmask64) planes0[2] | ((__mmask64) planes1[2] << 32);
@@ -7979,38 +7977,38 @@ static inline __m512i znq3x16_unpack_group(const uint32_t planes0[3], const uint
     return _mm512_ternarylogic_epi32(b0, b1, b2, 0xfe);
 }
 
-static inline __m512i znq3x16_lookup_group(
+static inline __m512i znq3_mx16_lookup_group(
         __m512i codes, __m512i books, __m512i table07, __m512i table8f) {
     const __m512i indices = _mm512_add_epi8(codes, _mm512_slli_epi16(books, 3));
     return _mm512_permutex2var_epi8(table07, indices, table8f);
 }
 
-// Transient decoded panel for 32 ZNQ3 output rows. This deliberately has the
-// same post-decode layout as the ZNQ4 panel: once 3-bit codes have been
+// Transient decoded panel for 32 ZNQ3_M output rows. This deliberately has the
+// same post-decode layout as the ZNQ4_M panel: once 3-bit codes have been
 // expanded to int8 weights, both formats share the exact same Zen5 VNNI core.
-struct znq3x32_panel_block {
+struct znq3_mx32_panel_block {
     int8_t  weights[2][QK_ZNQ / 4][64];
     int32_t correction[2][16];
     float   weight_scale[2][16];
 };
 
-static_assert(sizeof(znq3x32_panel_block) == 1280, "wrong ZNQ3 x32 panel size/padding");
+static_assert(sizeof(znq3_mx32_panel_block) == 1280, "wrong ZNQ3_M x32 panel size/padding");
 #endif
 
 template <int nrows>
-static void ggml_gemv_znq3_8x8_q8_0_impl(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+static void ggml_gemv_znq3_m_8x8_q8_0_impl(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
         const void * GGML_RESTRICT vy, int nr, int nc,
         const int32_t * row_map, size_t dst_bs1, size_t dst_bs2) {
     assert(n % QK_ZNQ == 0);
     assert(nc % 8 == 0);
 
     const int nb = n / QK_ZNQ;
-    const block_znq3x8 * b_ptr_start = (const block_znq3x8 *) vx;
+    const block_znq3_mx8 * b_ptr_start = (const block_znq3_mx8 *) vx;
     const block_q8_0 * a_ptr_start = (const block_q8_0 *) vy;
 
 #if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
-    const __m512i table07 = _mm512_loadu_si512((const void *) (kvalues_znq3 +  0));
-    const __m512i table8f = _mm512_loadu_si512((const void *) (kvalues_znq3 + 64));
+    const __m512i table07 = _mm512_loadu_si512((const void *) (kvalues_znq3_m +  0));
+    const __m512i table8f = _mm512_loadu_si512((const void *) (kvalues_znq3_m + 64));
 
     for (int y = 0; y < nr; y += nrows) {
         const block_q8_0 * a_rows[nrows];
@@ -8019,21 +8017,21 @@ static void ggml_gemv_znq3_8x8_q8_0_impl(int n, float * GGML_RESTRICT s, size_t 
             const int row = y + r;
             const int input_row = row_map != nullptr ? row_map[2*row + 1] : row;
             a_rows[r] = a_ptr_start + (size_t) input_row * nb;
-            dst_rows[r] = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row);
+            dst_rows[r] = znq4_mx8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row);
         }
 
         int x = 0;
         for (; x + 1 < nc / 8; x += 2) {
-            const block_znq3x8 * b0 = b_ptr_start + x * nb;
-            const block_znq3x8 * b1 = b0 + nb;
+            const block_znq3_mx8 * b0 = b_ptr_start + x * nb;
+            const block_znq3_mx8 * b1 = b0 + nb;
             __m512 acc[nrows];
             for (int r = 0; r < nrows; ++r) {
                 acc[r] = _mm512_setzero_ps();
             }
 
             for (int ib = 0; ib < nb; ++ib) {
-                const __m512i books_lo = znq4x16_book_repeat4(b0[ib].books, b1[ib].books, false);
-                const __m512i books_hi = znq4x16_book_repeat4(b0[ib].books, b1[ib].books, true);
+                const __m512i books_lo = znq4_mx16_book_repeat4(b0[ib].books, b1[ib].books, false);
+                const __m512i books_hi = znq4_mx16_book_repeat4(b0[ib].books, b1[ib].books, true);
                 __m512i dot[nrows];
                 for (int r = 0; r < nrows; ++r) {
                     dot[r] = _mm512_setzero_si512();
@@ -8041,18 +8039,18 @@ static void ggml_gemv_znq3_8x8_q8_0_impl(int n, float * GGML_RESTRICT s, size_t 
                 __m512i sumw = _mm512_setzero_si512();
 
                 for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                    const __m512i weights = znq3x16_lookup_group(
-                            znq3x16_unpack_group(b0[ib].planes[g], b1[ib].planes[g]),
+                    const __m512i weights = znq3_mx16_lookup_group(
+                            znq3_mx16_unpack_group(b0[ib].planes[g], b1[ib].planes[g]),
                             g < 4 ? books_lo : books_hi, table07, table8f);
                     for (int r = 0; r < nrows; ++r) {
-                        const uint32_t q = znq4x8_load_u32(a_rows[r][ib].qs + 4 * g) ^ 0x80808080u;
+                        const uint32_t q = znq4_mx8_load_u32(a_rows[r][ib].qs + 4 * g) ^ 0x80808080u;
                         dot[r] = _mm512_dpbusd_epi32(dot[r], _mm512_set1_epi32((int) q), weights);
                     }
                     sumw = _mm512_dpbusd_epi32(sumw, _mm512_set1_epi8(1), weights);
                 }
 
                 const __m512i correction = _mm512_slli_epi32(sumw, 7);
-                const __m512 wd = znq4x8_ufp8x16_to_fp32(b0[ib].d, b1[ib].d);
+                const __m512 wd = znq4_mx8_ufp8x16_to_fp32(b0[ib].d, b1[ib].d);
                 for (int r = 0; r < nrows; ++r) {
                     dot[r] = _mm512_sub_epi32(dot[r], correction);
                     const __m512 scales = _mm512_mul_ps(wd, _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a_rows[r][ib].d)));
@@ -8066,24 +8064,24 @@ static void ggml_gemv_znq3_8x8_q8_0_impl(int n, float * GGML_RESTRICT s, size_t 
         }
         for (int r = 0; r < nrows; ++r) {
             for (int xt = x; xt < nc / 8; ++xt) {
-                const block_znq3x8 * b_ptr = b_ptr_start + xt * nb;
+                const block_znq3_mx8 * b_ptr = b_ptr_start + xt * nb;
                 __m256 acc = _mm256_setzero_ps();
 
                 for (int ib = 0; ib < nb; ++ib) {
-                    const __m256i books_lo = znq4x8_book_repeat4(b_ptr[ib].books, false);
-                    const __m256i books_hi = znq4x8_book_repeat4(b_ptr[ib].books, true);
+                    const __m256i books_lo = znq4_mx8_book_repeat4(b_ptr[ib].books, false);
+                    const __m256i books_hi = znq4_mx8_book_repeat4(b_ptr[ib].books, true);
                     __m256i iacc = _mm256_setzero_si256();
 
                     for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                        const __m256i weights = znq3x8_lookup_group(
-                                znq3x8_unpack_group(b_ptr[ib].planes[g]),
+                        const __m256i weights = znq3_mx8_lookup_group(
+                                znq3_mx8_unpack_group(b_ptr[ib].planes[g]),
                                 g < 4 ? books_lo : books_hi, table07, table8f);
-                        const __m256i act = _mm256_set1_epi32((int) znq4x8_load_u32(a_rows[r][ib].qs + 4 * g));
+                        const __m256i act = _mm256_set1_epi32((int) znq4_mx8_load_u32(a_rows[r][ib].qs + 4 * g));
                         iacc = mul_sum_i8_pairs_acc_int32x8(iacc, weights, act);
                     }
 
                     const __m256 scales = _mm256_mul_ps(
-                            znq4x8_ufp8x8_to_fp32(b_ptr[ib].d),
+                            znq4_mx8_ufp8x8_to_fp32(b_ptr[ib].d),
                             _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_rows[r][ib].d)));
                     acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc), scales, acc);
                 }
@@ -8098,9 +8096,9 @@ static void ggml_gemv_znq3_8x8_q8_0_impl(int n, float * GGML_RESTRICT s, size_t 
     for (int y = 0; y < nr; ++y) {
         const int input_row = row_map != nullptr ? row_map[2*y + 1] : y;
         const block_q8_0 * a_ptr = a_ptr_start + (size_t) input_row * nb;
-        float * dst_row = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, y);
+        float * dst_row = znq4_mx8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, y);
         for (int x = 0; x < nc / 8; ++x) {
-            const block_znq3x8 * b_ptr = b_ptr_start + x * nb;
+            const block_znq3_mx8 * b_ptr = b_ptr_start + x * nb;
             float out[8] = {};
             for (int ib = 0; ib < nb; ++ib) {
                 const float da = GGML_CPU_FP16_TO_FP32(a_ptr[ib].d);
@@ -8115,9 +8113,9 @@ static void ggml_gemv_znq3_8x8_q8_0_impl(int n, float * GGML_RESTRICT s, size_t 
                             (((b_ptr[ib].planes[g][1] >> pos) & 1u) << 1) |
                             (((b_ptr[ib].planes[g][2] >> pos) & 1u) << 2);
                         const int book = (b_ptr[ib].books[r] >> (4 * (j / 16))) & 0x0f;
-                        dot += kvalues_znq3[8 * book + code] * a_ptr[ib].qs[j];
+                        dot += kvalues_znq3_m[8 * book + code] * a_ptr[ib].qs[j];
                     }
-                    out[r] += znq4x8_ufp8_to_fp32(b_ptr[ib].d[r]) * da * dot;
+                    out[r] += znq4_mx8_ufp8_to_fp32(b_ptr[ib].d[r]) * da * dot;
                 }
             }
             memcpy(dst_row + x * 8, out, sizeof(out));
@@ -8125,27 +8123,27 @@ static void ggml_gemv_znq3_8x8_q8_0_impl(int n, float * GGML_RESTRICT s, size_t 
     }
 }
 
-void ggml_gemv_znq3_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+void ggml_gemv_znq3_m_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
         const void * GGML_RESTRICT vy, int nr, int nc) {
     switch (nr) {
-        case 2: ggml_gemv_znq3_8x8_q8_0_impl<2>(n, s, bs, vx, vy, nr, nc, nullptr, 0, 0); break;
-        case 3: ggml_gemv_znq3_8x8_q8_0_impl<3>(n, s, bs, vx, vy, nr, nc, nullptr, 0, 0); break;
-        default: ggml_gemv_znq3_8x8_q8_0_impl<1>(n, s, bs, vx, vy, nr, nc, nullptr, 0, 0); break;
+        case 2: ggml_gemv_znq3_m_8x8_q8_0_impl<2>(n, s, bs, vx, vy, nr, nc, nullptr, 0, 0); break;
+        case 3: ggml_gemv_znq3_m_8x8_q8_0_impl<3>(n, s, bs, vx, vy, nr, nc, nullptr, 0, 0); break;
+        default: ggml_gemv_znq3_m_8x8_q8_0_impl<1>(n, s, bs, vx, vy, nr, nc, nullptr, 0, 0); break;
     }
 }
 
-void ggml_gemv_znq3_8x8_q8_0_moe(
+void ggml_gemv_znq3_m_8x8_q8_0_moe(
         int n, float * GGML_RESTRICT s, size_t dst_bs1, size_t dst_bs2, const int32_t * row_map,
         const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     GGML_ASSERT(row_map != nullptr && nr >= 1 && nr <= 3);
     switch (nr) {
-        case 1: ggml_gemv_znq3_8x8_q8_0_impl<1>(n, s, 0, vx, vy, nr, nc, row_map, dst_bs1, dst_bs2); break;
-        case 2: ggml_gemv_znq3_8x8_q8_0_impl<2>(n, s, 0, vx, vy, nr, nc, row_map, dst_bs1, dst_bs2); break;
-        case 3: ggml_gemv_znq3_8x8_q8_0_impl<3>(n, s, 0, vx, vy, nr, nc, row_map, dst_bs1, dst_bs2); break;
+        case 1: ggml_gemv_znq3_m_8x8_q8_0_impl<1>(n, s, 0, vx, vy, nr, nc, row_map, dst_bs1, dst_bs2); break;
+        case 2: ggml_gemv_znq3_m_8x8_q8_0_impl<2>(n, s, 0, vx, vy, nr, nc, row_map, dst_bs1, dst_bs2); break;
+        case 3: ggml_gemv_znq3_m_8x8_q8_0_impl<3>(n, s, 0, vx, vy, nr, nc, row_map, dst_bs1, dst_bs2); break;
     }
 }
 
-static void ggml_gemm_znq3_8x8_q8_0_impl(
+static void ggml_gemm_znq3_m_8x8_q8_0_impl(
         int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
         const void * GGML_RESTRICT vy, int nr, int nc,
         const int32_t * row_map, size_t dst_bs1, size_t dst_bs2) {
@@ -8154,28 +8152,28 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
     assert(nc % 8 == 0);
 
     const int nb = n / QK_ZNQ;
-    const block_znq3x8 * b_ptr_start = (const block_znq3x8 *) vx;
+    const block_znq3_mx8 * b_ptr_start = (const block_znq3_mx8 *) vx;
     const block_q8_0x4 * a_ptr_start = (const block_q8_0x4 *) vy;
 
 #if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
-    const __m512i table07 = _mm512_loadu_si512((const void *) (kvalues_znq3 +  0));
-    const __m512i table8f = _mm512_loadu_si512((const void *) (kvalues_znq3 + 64));
+    const __m512i table07 = _mm512_loadu_si512((const void *) (kvalues_znq3_m +  0));
+    const __m512i table8f = _mm512_loadu_si512((const void *) (kvalues_znq3_m + 64));
 
     // Large-prompt path. Decode 32 output rows across K once, then reuse the
-    // expanded int8 panel for every 4-row activation tile. ZNQ3's compressed
-    // decode is cheaper than ZNQ4 after unpack: all 16x8 book entries fit in
+    // expanded int8 panel for every 4-row activation tile. ZNQ3_M's compressed
+    // decode is cheaper than ZNQ4_M after unpack: all 16x8 book entries fit in
     // two ZMM tables and require just one VPERMI2B per x16 group.
     // Keep the direct 16-row tile; use a panel before repeating decode for its tail.
     if (nr >= 20 && nc >= 32) {
         const int panel_blocks = std::min(nb, ZNQ_PANEL_BLOCKS);
-        const size_t panel_size = (size_t) panel_blocks * sizeof(znq3x32_panel_block);
-        auto * panel = (znq3x32_panel_block *) znq_scratch.get(panel_size);
+        const size_t panel_size = (size_t) panel_blocks * sizeof(znq3_mx32_panel_block);
+        auto * panel = (znq3_mx32_panel_block *) znq_scratch.get(panel_size);
 
         if (panel != nullptr) {
             const __m512i ones = _mm512_set1_epi8(1);
 
             for (int x32 = 0; x32 < nc / 32; ++x32) {
-                const block_znq3x8 * b_ptrs[4] = {
+                const block_znq3_mx8 * b_ptrs[4] = {
                     b_ptr_start + (4 * x32 + 0) * nb,
                     b_ptr_start + (4 * x32 + 1) * nb,
                     b_ptr_start + (4 * x32 + 2) * nb,
@@ -8186,22 +8184,22 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
                     const int ib_end = std::min(nb, ib0 + panel_blocks);
                     for (int ib = ib0; ib < ib_end; ++ib) {
                         for (int h = 0; h < 2; ++h) {
-                            const block_znq3x8 & b0 = b_ptrs[2 * h + 0][ib];
-                            const block_znq3x8 & b1 = b_ptrs[2 * h + 1][ib];
-                            const __m512i books_lo = znq4x16_book_repeat4(b0.books, b1.books, false);
-                            const __m512i books_hi = znq4x16_book_repeat4(b0.books, b1.books, true);
+                            const block_znq3_mx8 & b0 = b_ptrs[2 * h + 0][ib];
+                            const block_znq3_mx8 & b1 = b_ptrs[2 * h + 1][ib];
+                            const __m512i books_lo = znq4_mx16_book_repeat4(b0.books, b1.books, false);
+                            const __m512i books_hi = znq4_mx16_book_repeat4(b0.books, b1.books, true);
                             __m512i sumw = _mm512_setzero_si512();
 
                             for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                                const __m512i weights = znq3x16_lookup_group(
-                                        znq3x16_unpack_group(b0.planes[g], b1.planes[g]),
+                                const __m512i weights = znq3_mx16_lookup_group(
+                                        znq3_mx16_unpack_group(b0.planes[g], b1.planes[g]),
                                         g < 4 ? books_lo : books_hi, table07, table8f);
                                 _mm512_storeu_si512((void *) panel[ib - ib0].weights[h][g], weights);
                                 sumw = _mm512_dpbusd_epi32(sumw, ones, weights);
                             }
 
                             _mm512_storeu_si512((void *) panel[ib - ib0].correction[h], _mm512_slli_epi32(sumw, 7));
-                            _mm512_storeu_ps(panel[ib - ib0].weight_scale[h], znq4x8_ufp8x16_to_fp32(b0.d, b1.d));
+                            _mm512_storeu_ps(panel[ib - ib0].weight_scale[h], znq4_mx8_ufp8x16_to_fp32(b0.d, b1.d));
                         }
                     }
 
@@ -8209,10 +8207,10 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
                         const block_q8_0x4 * a_ptr = a_ptr_start + y4 * nb;
 
                         const int row = 4 * y4;
-                        float * d0 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 0) + 32 * x32;
-                        float * d1 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 1) + 32 * x32;
-                        float * d2 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 2) + 32 * x32;
-                        float * d3 = znq4x8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 3) + 32 * x32;
+                        float * d0 = znq4_mx8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 0) + 32 * x32;
+                        float * d1 = znq4_mx8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 1) + 32 * x32;
+                        float * d2 = znq4_mx8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 2) + 32 * x32;
+                        float * d3 = znq4_mx8_gemm_dst_row(s, bs, row_map, dst_bs1, dst_bs2, row + 3) + 32 * x32;
 
                         __m512 a0 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d0);
                         __m512 b0 = ib0 == 0 ? _mm512_setzero_ps() : _mm512_loadu_ps(d0 + 16);
@@ -8242,10 +8240,10 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
                                 const int within = (g & 1) * 4;
                                 const int off = chunk * 32 + within;
 
-                                const __m512i q0 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  0) ^ 0x80808080u));
-                                const __m512i q1 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off +  8) ^ 0x80808080u));
-                                const __m512i q2 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 16) ^ 0x80808080u));
-                                const __m512i q3 = _mm512_set1_epi32((int) (znq4x8_load_u32(qbase + off + 24) ^ 0x80808080u));
+                                const __m512i q0 = _mm512_set1_epi32((int) (znq4_mx8_load_u32(qbase + off +  0) ^ 0x80808080u));
+                                const __m512i q1 = _mm512_set1_epi32((int) (znq4_mx8_load_u32(qbase + off +  8) ^ 0x80808080u));
+                                const __m512i q2 = _mm512_set1_epi32((int) (znq4_mx8_load_u32(qbase + off + 16) ^ 0x80808080u));
+                                const __m512i q3 = _mm512_set1_epi32((int) (znq4_mx8_load_u32(qbase + off + 24) ^ 0x80808080u));
 
                                 d00 = _mm512_dpbusd_epi32(d00, q0, w0); d10 = _mm512_dpbusd_epi32(d10, q0, w1);
                                 d01 = _mm512_dpbusd_epi32(d01, q1, w0); d11 = _mm512_dpbusd_epi32(d11, q1, w1);
@@ -8284,7 +8282,7 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
 
             int done = nc32;
             if (nc - done >= 16) {
-                ggml_gemm_znq3_8x8_q8_0_impl(
+                ggml_gemm_znq3_m_8x8_q8_0_impl(
                         n, s + done, bs,
                         b_ptr_start + (done / 8) * nb,
                         vy, nr, 16, row_map, dst_bs1, dst_bs2);
@@ -8292,7 +8290,7 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
             }
             if (done < nc) {
                 GGML_ASSERT(nc - done == 8);
-                ggml_gemm_znq3_8x8_q8_0_impl(
+                ggml_gemm_znq3_m_8x8_q8_0_impl(
                         n, s + done, bs,
                         b_ptr_start + (done / 8) * nb,
                         vy, nr, 8, row_map, dst_bs1, dst_bs2);
@@ -8316,27 +8314,27 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
             };
 
             for (int x16 = 0; x16 < nc / 16; ++x16) {
-                const block_znq3x8 * b_ptr_0 = b_ptr_start + (2 * x16 + 0) * nb;
-                const block_znq3x8 * b_ptr_1 = b_ptr_start + (2 * x16 + 1) * nb;
+                const block_znq3_mx8 * b_ptr_0 = b_ptr_start + (2 * x16 + 0) * nb;
+                const block_znq3_mx8 * b_ptr_1 = b_ptr_start + (2 * x16 + 1) * nb;
                 __m512 acc[16];
                 for (int r = 0; r < 16; ++r) {
                     acc[r] = _mm512_setzero_ps();
                 }
 
                 for (int ib = 0; ib < nb; ++ib) {
-                    const __m512i books_lo = znq4x16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, false);
-                    const __m512i books_hi = znq4x16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, true);
+                    const __m512i books_lo = znq4_mx16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, false);
+                    const __m512i books_hi = znq4_mx16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, true);
 
                     __m512i weights[QK_ZNQ / 4];
                     __m512i sumw = _mm512_setzero_si512();
                     for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                        weights[g] = znq3x16_lookup_group(
-                                znq3x16_unpack_group(b_ptr_0[ib].planes[g], b_ptr_1[ib].planes[g]),
+                        weights[g] = znq3_mx16_lookup_group(
+                                znq3_mx16_unpack_group(b_ptr_0[ib].planes[g], b_ptr_1[ib].planes[g]),
                                 g < 4 ? books_lo : books_hi, table07, table8f);
                         sumw = _mm512_dpbusd_epi32(sumw, ones, weights[g]);
                     }
                     const __m512i correction = _mm512_slli_epi32(sumw, 7);
-                    const __m512 wd = znq4x8_ufp8x16_to_fp32(b_ptr_0[ib].d, b_ptr_1[ib].d);
+                    const __m512 wd = znq4_mx8_ufp8x16_to_fp32(b_ptr_0[ib].d, b_ptr_1[ib].d);
 
                     for (int p = 0; p < 4; ++p) {
                         for (int r = 0; r < 4; ++r) {
@@ -8345,7 +8343,7 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
                             for (int g = 0; g < QK_ZNQ / 4; ++g) {
                                 const int chunk = g >> 1;
                                 const int within = (g & 1) * 4;
-                                const uint32_t q = znq4x8_load_u32(
+                                const uint32_t q = znq4_mx8_load_u32(
                                         a_ptrs[p][ib].qs + chunk * 32 + r * 8 + within) ^ 0x80808080u;
                                 dot = _mm512_dpbusd_epi32(
                                         dot, _mm512_set1_epi32((int) q), weights[g]);
@@ -8359,7 +8357,7 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
                 }
 
                 for (int r = 0; r < 16; ++r) {
-                    float * dst_row = znq4x8_gemm_dst_row(
+                    float * dst_row = znq4_mx8_gemm_dst_row(
                             s, bs, row_map, dst_bs1, dst_bs2, 4 * y4 + r);
                     _mm512_storeu_ps(dst_row + 16 * x16, acc[r]);
                 }
@@ -8376,16 +8374,16 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
             };
 
             for (int x16 = 0; x16 < nc / 16; ++x16) {
-                const block_znq3x8 * b_ptr_0 = b_ptr_start + (2 * x16 + 0) * nb;
-                const block_znq3x8 * b_ptr_1 = b_ptr_start + (2 * x16 + 1) * nb;
+                const block_znq3_mx8 * b_ptr_0 = b_ptr_start + (2 * x16 + 0) * nb;
+                const block_znq3_mx8 * b_ptr_1 = b_ptr_start + (2 * x16 + 1) * nb;
                 __m512 acc[8];
                 for (int r = 0; r < 8; ++r) {
                     acc[r] = _mm512_setzero_ps();
                 }
 
                 for (int ib = 0; ib < nb; ++ib) {
-                    const __m512i books_lo = znq4x16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, false);
-                    const __m512i books_hi = znq4x16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, true);
+                    const __m512i books_lo = znq4_mx16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, false);
+                    const __m512i books_hi = znq4_mx16_book_repeat4(b_ptr_0[ib].books, b_ptr_1[ib].books, true);
                     __m512i dot[8];
                     for (int r = 0; r < 8; ++r) {
                         dot[r] = _mm512_setzero_si512();
@@ -8393,8 +8391,8 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
                     __m512i sumw = _mm512_setzero_si512();
 
                     for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                        const __m512i weights = znq3x16_lookup_group(
-                                znq3x16_unpack_group(b_ptr_0[ib].planes[g], b_ptr_1[ib].planes[g]),
+                        const __m512i weights = znq3_mx16_lookup_group(
+                                znq3_mx16_unpack_group(b_ptr_0[ib].planes[g], b_ptr_1[ib].planes[g]),
                                 g < 4 ? books_lo : books_hi, table07, table8f);
                         sumw = _mm512_dpbusd_epi32(sumw, ones, weights);
 
@@ -8403,7 +8401,7 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
                         for (int p = 0; p < 2; ++p) {
                             for (int r = 0; r < 4; ++r) {
                                 const int rr = 4 * p + r;
-                                const uint32_t q = znq4x8_load_u32(
+                                const uint32_t q = znq4_mx8_load_u32(
                                         a_ptrs[p][ib].qs + chunk * 32 + r * 8 + within) ^ 0x80808080u;
                                 dot[rr] = _mm512_dpbusd_epi32(
                                         dot[rr], _mm512_set1_epi32((int) q), weights);
@@ -8412,7 +8410,7 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
                     }
 
                     const __m512i correction = _mm512_slli_epi32(sumw, 7);
-                    const __m512 wd = znq4x8_ufp8x16_to_fp32(b_ptr_0[ib].d, b_ptr_1[ib].d);
+                    const __m512 wd = znq4_mx8_ufp8x16_to_fp32(b_ptr_0[ib].d, b_ptr_1[ib].d);
                     for (int p = 0; p < 2; ++p) {
                         for (int r = 0; r < 4; ++r) {
                             const int rr = 4 * p + r;
@@ -8426,7 +8424,7 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
                 }
 
                 for (int r = 0; r < 8; ++r) {
-                    float * dst_row = znq4x8_gemm_dst_row(
+                    float * dst_row = znq4_mx8_gemm_dst_row(
                             s, bs, row_map, dst_bs1, dst_bs2, 4 * y4 + r);
                     _mm512_storeu_ps(dst_row + 16 * x16, acc[r]);
                 }
@@ -8439,34 +8437,34 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
     for (int y = y4; y < nr / 4; ++y) {
         const block_q8_0x4 * a_ptr = a_ptr_start + y * nb;
         for (int x = 0; x < nc / 8; ++x) {
-            const block_znq3x8 * b_ptr = b_ptr_start + x * nb;
+            const block_znq3_mx8 * b_ptr = b_ptr_start + x * nb;
             __m256 acc[4] = {
                 _mm256_setzero_ps(), _mm256_setzero_ps(),
                 _mm256_setzero_ps(), _mm256_setzero_ps(),
             };
 
             for (int ib = 0; ib < nb; ++ib) {
-                const __m256i books_lo = znq4x8_book_repeat4(b_ptr[ib].books, false);
-                const __m256i books_hi = znq4x8_book_repeat4(b_ptr[ib].books, true);
+                const __m256i books_lo = znq4_mx8_book_repeat4(b_ptr[ib].books, false);
+                const __m256i books_hi = znq4_mx8_book_repeat4(b_ptr[ib].books, true);
                 __m256i iacc[4] = {
                     _mm256_setzero_si256(), _mm256_setzero_si256(),
                     _mm256_setzero_si256(), _mm256_setzero_si256(),
                 };
 
                 for (int g = 0; g < QK_ZNQ / 4; ++g) {
-                    const __m256i weights = znq3x8_lookup_group(
-                            znq3x8_unpack_group(b_ptr[ib].planes[g]),
+                    const __m256i weights = znq3_mx8_lookup_group(
+                            znq3_mx8_unpack_group(b_ptr[ib].planes[g]),
                             g < 4 ? books_lo : books_hi, table07, table8f);
                     const int chunk = g >> 1;
                     const int within = (g & 1) * 4;
                     for (int r = 0; r < 4; ++r) {
-                        const uint32_t q = znq4x8_load_u32(a_ptr[ib].qs + chunk * 32 + r * 8 + within);
+                        const uint32_t q = znq4_mx8_load_u32(a_ptr[ib].qs + chunk * 32 + r * 8 + within);
                         iacc[r] = mul_sum_i8_pairs_acc_int32x8(
                                 iacc[r], weights, _mm256_set1_epi32((int) q));
                     }
                 }
 
-                const __m256 wd = znq4x8_ufp8x8_to_fp32(b_ptr[ib].d);
+                const __m256 wd = znq4_mx8_ufp8x8_to_fp32(b_ptr[ib].d);
                 for (int r = 0; r < 4; ++r) {
                     const __m256 scales = _mm256_mul_ps(
                             wd, _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[ib].d[r])));
@@ -8475,7 +8473,7 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
             }
 
             for (int r = 0; r < 4; ++r) {
-                float * dst_row = znq4x8_gemm_dst_row(
+                float * dst_row = znq4_mx8_gemm_dst_row(
                         s, bs, row_map, dst_bs1, dst_bs2, y * 4 + r);
                 _mm256_storeu_ps(dst_row + x * 8, acc[r]);
             }
@@ -8487,7 +8485,7 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
     for (int y = 0; y < nr / 4; ++y) {
         const block_q8_0x4 * a_ptr = a_ptr_start + y * nb;
         for (int x = 0; x < nc / 8; ++x) {
-            const block_znq3x8 * b_ptr = b_ptr_start + x * nb;
+            const block_znq3_mx8 * b_ptr = b_ptr_start + x * nb;
             float out[4][8] = {};
             for (int ib = 0; ib < nb; ++ib) {
                 for (int r = 0; r < 4; ++r) {
@@ -8506,14 +8504,14 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
                             const int chunk = j / 8;
                             const int offset = j & 7;
                             const int8_t act = a_ptr[ib].qs[chunk * 32 + r * 8 + offset];
-                            dot += kvalues_znq3[8 * book + code] * act;
+                            dot += kvalues_znq3_m[8 * book + code] * act;
                         }
-                        out[r][wr] += znq4x8_ufp8_to_fp32(b_ptr[ib].d[wr]) * da * dot;
+                        out[r][wr] += znq4_mx8_ufp8_to_fp32(b_ptr[ib].d[wr]) * da * dot;
                     }
                 }
             }
             for (int r = 0; r < 4; ++r) {
-                float * dst_row = znq4x8_gemm_dst_row(
+                float * dst_row = znq4_mx8_gemm_dst_row(
                         s, bs, row_map, dst_bs1, dst_bs2, y * 4 + r);
                 memcpy(dst_row + x * 8, out[r], sizeof(out[r]));
             }
@@ -8521,21 +8519,430 @@ static void ggml_gemm_znq3_8x8_q8_0_impl(
     }
 }
 
-void ggml_gemm_znq3_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+void ggml_gemm_znq3_m_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
         const void * GGML_RESTRICT vy, int nr, int nc) {
-    ggml_gemm_znq3_8x8_q8_0_impl(n, s, bs, vx, vy, nr, nc, nullptr, 0, 0);
+    ggml_gemm_znq3_m_8x8_q8_0_impl(n, s, bs, vx, vy, nr, nc, nullptr, 0, 0);
 }
 
-void ggml_gemm_znq3_8x8_q8_0_moe(
+void ggml_gemm_znq3_m_8x8_q8_0_moe(
         int n, float * GGML_RESTRICT s, size_t dst_bs1, size_t dst_bs2, const int32_t * row_map,
         const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     GGML_ASSERT(row_map != nullptr);
-    ggml_gemm_znq3_8x8_q8_0_impl(n, s, 0, vx, vy, nr, nc, row_map, dst_bs1, dst_bs2);
+    ggml_gemm_znq3_m_8x8_q8_0_impl(n, s, 0, vx, vy, nr, nc, row_map, dst_bs1, dst_bs2);
 }
 
-void ggml_gemm_znq4_8x8_q8_0_moe(
+void ggml_gemm_znq4_m_8x8_q8_0_moe(
         int n, float * GGML_RESTRICT s, size_t dst_bs1, size_t dst_bs2, const int32_t * row_map,
         const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     GGML_ASSERT(row_map != nullptr);
-    ggml_gemm_znq4_8x8_q8_0_impl(n, s, 0, vx, vy, nr, nc, row_map, dst_bs1, dst_bs2);
+    ggml_gemm_znq4_m_8x8_q8_0_impl(n, s, 0, vx, vy, nr, nc, row_map, dst_bs1, dst_bs2);
+}
+
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
+static float * znq_local_dst(float * s, size_t bs, const int32_t * map, size_t bs1, size_t bs2, int row) {
+    return map ? s + size_t(map[2*row])*bs1 + size_t(map[2*row + 1])*bs2 : s + size_t(row)*bs;
+}
+
+static inline __m128i znq_local_load16(const uint8_t * a, const uint8_t * b) {
+    return _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *) a), _mm_loadl_epi64((const __m128i *) b));
+}
+
+template<int group>
+static inline __m512i znq_local_header(const uint8_t * a, const uint8_t * b) {
+    if constexpr (group == 4) {
+        return _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) a)),
+                                  _mm256_loadu_si256((const __m256i *) b), 1);
+    } else {
+        const __m512i lo = _mm512_cvtepu8_epi32(znq_local_load16(a + 8, b + 8));
+        const __m512i hi = _mm512_cvtepu8_epi32(znq_local_load16(a + 16, b + 16));
+        return _mm512_slli_epi32(_mm512_or_si512(lo, _mm512_slli_epi32(hi, 8)), 8);
+    }
+}
+
+template<int group>
+static inline __m512 znq_local_scales(const uint8_t * a, const uint8_t * b, __m512i header) {
+    const __m512i code = group == 4 ? _mm512_and_si512(header, _mm512_set1_epi32(255)) :
+                                     _mm512_cvtepu8_epi32(znq_local_load16(a, b));
+    const __m512i e = _mm512_srli_epi32(code, 3);
+    const __m512i m = _mm512_and_si512(code, _mm512_set1_epi32(7));
+    const __m512 normal = _mm512_castsi512_ps(_mm512_or_si512(_mm512_slli_epi32(_mm512_add_epi32(e, _mm512_set1_epi32(112)), 23), _mm512_slli_epi32(m, 20)));
+    const __m512 subnormal = _mm512_mul_ps(_mm512_cvtepi32_ps(m), _mm512_set1_ps(0x1p-17f));
+    return _mm512_mask_blend_ps(_mm512_cmpeq_epi32_mask(e, _mm512_setzero_si512()), normal, subnormal);
+}
+
+template<int group, int index_bits = 2>
+static inline __m512i znq_local_book_indices(__m512i header, int q) {
+    constexpr int bits = group == 4 ? 3 : 4;
+    const __m512i book = _mm512_and_si512(_mm512_srlv_epi32(header, _mm512_set1_epi32(8 + bits * (q / (group / 4)))), _mm512_set1_epi32((1 << bits) - 1));
+    return _mm512_mullo_epi32(book, _mm512_set1_epi32((1 << index_bits)*0x01010101));
+}
+
+template<int group, int index_bits = 2>
+static inline __m512i znq_local_weights(const uint8_t * a, const uint8_t * b, int q, __m512i indices, __m512i table, __m512i table1) {
+    constexpr int h = group == 4 ? 4 : 3;
+    __m512i codes;
+    if constexpr (index_bits == 2) {
+        const __m512i packed = _mm512_cvtepu16_epi64(znq_local_load16(a + 8*(h + q), b + 8*(h + q)));
+        codes = _mm512_and_si512(_mm512_multishift_epi64_epi8(_mm512_set1_epi64(0x0e0c0a0806040200), packed), _mm512_set1_epi8(3));
+    } else {
+        const uint8_t * p0 = a + 8*h + 12*q;
+        const uint8_t * p1 = b + 8*h + 12*q;
+        const __mmask64 m0 = znq4_mx8_load_u32(p0) | (uint64_t(znq4_mx8_load_u32(p1)) << 32);
+        const __mmask64 m1 = znq4_mx8_load_u32(p0+4) | (uint64_t(znq4_mx8_load_u32(p1+4)) << 32);
+        const __mmask64 m2 = znq4_mx8_load_u32(p0+8) | (uint64_t(znq4_mx8_load_u32(p1+8)) << 32);
+        codes = _mm512_ternarylogic_epi32(_mm512_maskz_set1_epi8(m0, 1), _mm512_maskz_set1_epi8(m1, 2), _mm512_maskz_set1_epi8(m2, 4), 0xfe);
+    }
+
+    const __m512i lookup = _mm512_add_epi8(indices, codes);
+    if constexpr (index_bits == 3 && group == 8) {
+        return _mm512_permutex2var_epi8(table, lookup, table1);
+    } else {
+        return _mm512_permutexvar_epi8(lookup, table);
+    }
+}
+
+template<int group, int index_bits = 2>
+static void znq_local_gemv(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc, const int32_t * prepared_sums) {
+    const int nb = n / QK_ZNQ;
+    constexpr int stride = 8 * (4*index_bits + (group == 4 ? 4 : 3));
+    const auto * x = (const uint8_t *) vx;
+    const auto * y = (const block_q8_0 *) vy;
+    const int8_t * values = index_bits == 2 ? (group == 4 ? kvalues_znq3_s : kvalues_znq2_l) :
+                                               (group == 4 ? kvalues_znq4_s : kvalues_znq3_l);
+    const __m512i table = _mm512_xor_si512(_mm512_loadu_si512(values), _mm512_set1_epi8(char(0x80)));
+    __m512i table1 = _mm512_setzero_si512();
+    if constexpr (index_bits == 3 && group == 8) {
+        table1 = _mm512_xor_si512(_mm512_loadu_si512(values+64), _mm512_set1_epi8(char(0x80)));
+    }
+
+    int32_t * fallback_sums = nullptr;
+    if (!prepared_sums) {
+        fallback_sums = (int32_t *) znq_scratch.get(size_t(nb)*sizeof(int32_t));
+        if (!fallback_sums) {
+            ggml_gemv_znq_local_generic(n, s, bs, vx, vy, nr, nc, group, nullptr, index_bits);
+            return;
+        }
+    }
+
+    for (int row = 0; row < nr; ++row) {
+        const block_q8_0 * yr = y + size_t(row)*nb;
+        if (!prepared_sums) {
+            ggml_znq_local_prepare_sums(n, 1, false, yr, fallback_sums);
+        }
+        const int32_t * sums = prepared_sums ? prepared_sums + size_t(row)*nb : fallback_sums;
+        for (int col = 0; col < nc; col += 16) {
+            const int width = std::min(16, nc - col);
+            const uint8_t * a0 = x + size_t(col / 8)*nb*stride;
+            const uint8_t * b0 = width == 16 ? a0 + size_t(nb)*stride : a0;
+            __m512 acc = _mm512_setzero_ps();
+            for (int ib = 0; ib < nb; ++ib) {
+                const uint8_t * a = a0 + ib*stride;
+                const uint8_t * b = b0 + ib*stride;
+                const __m512i header = znq_local_header<group>(a, b);
+                __m512i dot = _mm512_setzero_si512();
+                __m512i books = _mm512_setzero_si512();
+                for (int q = 0; q < 8; ++q) {
+                    if (q % (group / 4) == 0) {
+                        books = znq_local_book_indices<group, index_bits>(header, q);
+                    }
+                    const __m512i w = znq_local_weights<group, index_bits>(a, b, q, books, table, table1);
+                    dot = _mm512_dpbusd_epi32(dot, w, _mm512_set1_epi32((int) znq4_mx8_load_u32(yr[ib].qs + q*4)));
+                }
+
+                dot = _mm512_sub_epi32(dot, _mm512_set1_epi32(sums[ib]));
+                const __m512 d = _mm512_mul_ps(znq_local_scales<group>(a, b, header), _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(yr[ib].d)));
+                acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dot), d, acc);
+            }
+
+            _mm512_mask_storeu_ps(s + size_t(row)*bs + col, width == 16 ? 0xffff : 0xff, acc);
+        }
+    }
+}
+
+// Fixed halves keep the dot products and float accumulators in registers.
+template<bool two_tiles>
+static void znq_gemm_tile(const ggml_znq_gemm_panel * panel, const block_q8_0x4 * a,
+        const int32_t * sums, int sum_stride, int count, bool accumulate, int width,
+        float * out0, float * out1, float * out2, float * out3) {
+    const __mmask16 mask0 = width >= 16 ? 0xffff : 0xff;
+    const __mmask16 mask1 = width == 32 ? 0xffff : 0xff;
+    __m512 l0 = accumulate ? _mm512_maskz_loadu_ps(mask0, out0) : _mm512_setzero_ps();
+    __m512 l1 = accumulate ? _mm512_maskz_loadu_ps(mask0, out1) : _mm512_setzero_ps();
+    __m512 l2 = accumulate ? _mm512_maskz_loadu_ps(mask0, out2) : _mm512_setzero_ps();
+    __m512 l3 = accumulate ? _mm512_maskz_loadu_ps(mask0, out3) : _mm512_setzero_ps();
+    __m512 r0, r1, r2, r3;
+    if constexpr (two_tiles) {
+        r0 = accumulate ? _mm512_maskz_loadu_ps(mask1, out0 + 16) : _mm512_setzero_ps();
+        r1 = accumulate ? _mm512_maskz_loadu_ps(mask1, out1 + 16) : _mm512_setzero_ps();
+        r2 = accumulate ? _mm512_maskz_loadu_ps(mask1, out2 + 16) : _mm512_setzero_ps();
+        r3 = accumulate ? _mm512_maskz_loadu_ps(mask1, out3 + 16) : _mm512_setzero_ps();
+    }
+
+    for (int ib = 0; ib < count; ++ib) {
+        __m512i dl0 = _mm512_setzero_si512(), dl1 = _mm512_setzero_si512();
+        __m512i dl2 = _mm512_setzero_si512(), dl3 = _mm512_setzero_si512();
+        __m512i dr0 = _mm512_setzero_si512(), dr1 = _mm512_setzero_si512();
+        __m512i dr2 = _mm512_setzero_si512(), dr3 = _mm512_setzero_si512();
+        for (int q = 0; q < 8; ++q) {
+            const __m512i w0 = _mm512_loadu_si512(panel[ib].weights[0][q]);
+            const int offset = (q/2)*32 + (q%2)*4;
+            const __m512i q0 = _mm512_set1_epi32((int) znq4_mx8_load_u32(a[ib].qs + offset));
+            const __m512i q1 = _mm512_set1_epi32((int) znq4_mx8_load_u32(a[ib].qs + offset + 8));
+            const __m512i q2 = _mm512_set1_epi32((int) znq4_mx8_load_u32(a[ib].qs + offset + 16));
+            const __m512i q3 = _mm512_set1_epi32((int) znq4_mx8_load_u32(a[ib].qs + offset + 24));
+            dl0 = _mm512_dpbusd_epi32(dl0, w0, q0);
+            dl1 = _mm512_dpbusd_epi32(dl1, w0, q1);
+            dl2 = _mm512_dpbusd_epi32(dl2, w0, q2);
+            dl3 = _mm512_dpbusd_epi32(dl3, w0, q3);
+            if constexpr (two_tiles) {
+                const __m512i w1 = _mm512_loadu_si512(panel[ib].weights[1][q]);
+                dr0 = _mm512_dpbusd_epi32(dr0, w1, q0);
+                dr1 = _mm512_dpbusd_epi32(dr1, w1, q1);
+                dr2 = _mm512_dpbusd_epi32(dr2, w1, q2);
+                dr3 = _mm512_dpbusd_epi32(dr3, w1, q3);
+            }
+        }
+
+        const __m512i c0 = _mm512_set1_epi32(sums[ib]);
+        const __m512i c1 = _mm512_set1_epi32(sums[sum_stride + ib]);
+        const __m512i c2 = _mm512_set1_epi32(sums[2*sum_stride + ib]);
+        const __m512i c3 = _mm512_set1_epi32(sums[3*sum_stride + ib]);
+        const __m512 ad0 = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a[ib].d[0]));
+        const __m512 ad1 = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a[ib].d[1]));
+        const __m512 ad2 = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a[ib].d[2]));
+        const __m512 ad3 = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a[ib].d[3]));
+        const __m512 wd0 = _mm512_loadu_ps(panel[ib].scale[0]);
+        l0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(dl0, c0)), _mm512_mul_ps(wd0, ad0), l0);
+        l1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(dl1, c1)), _mm512_mul_ps(wd0, ad1), l1);
+        l2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(dl2, c2)), _mm512_mul_ps(wd0, ad2), l2);
+        l3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(dl3, c3)), _mm512_mul_ps(wd0, ad3), l3);
+        if constexpr (two_tiles) {
+            const __m512 wd1 = _mm512_loadu_ps(panel[ib].scale[1]);
+            r0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(dr0, c0)), _mm512_mul_ps(wd1, ad0), r0);
+            r1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(dr1, c1)), _mm512_mul_ps(wd1, ad1), r1);
+            r2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(dr2, c2)), _mm512_mul_ps(wd1, ad2), r2);
+            r3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(dr3, c3)), _mm512_mul_ps(wd1, ad3), r3);
+        }
+    }
+    _mm512_mask_storeu_ps(out0, mask0, l0);
+    _mm512_mask_storeu_ps(out1, mask0, l1);
+    _mm512_mask_storeu_ps(out2, mask0, l2);
+    _mm512_mask_storeu_ps(out3, mask0, l3);
+    if constexpr (two_tiles) {
+        _mm512_mask_storeu_ps(out0 + 16, mask1, r0);
+        _mm512_mask_storeu_ps(out1 + 16, mask1, r1);
+        _mm512_mask_storeu_ps(out2 + 16, mask1, r2);
+        _mm512_mask_storeu_ps(out3 + 16, mask1, r3);
+    }
+}
+
+template<int group, int index_bits = 2>
+static void znq_local_gemm(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc,
+        const int32_t * map, size_t bs1, size_t bs2, const int32_t * prepared_sums) {
+    const int nb = n / QK_ZNQ;
+    constexpr int stride = 8 * (4*index_bits + (group == 4 ? 4 : 3));
+    const auto * x = (const uint8_t *) vx;
+    const auto * y = (const block_q8_0x4 *) vy;
+    const int8_t * values = index_bits == 2 ? (group == 4 ? kvalues_znq3_s : kvalues_znq2_l) :
+                                               (group == 4 ? kvalues_znq4_s : kvalues_znq3_l);
+    const __m512i table = _mm512_xor_si512(_mm512_loadu_si512(values), _mm512_set1_epi8(char(0x80)));
+    __m512i table1 = _mm512_setzero_si512();
+    if constexpr (index_bits == 3 && group == 8) {
+        table1 = _mm512_xor_si512(_mm512_loadu_si512(values+64), _mm512_set1_epi8(char(0x80)));
+    }
+
+    const int blocks = std::min(nb, ZNQ_PANEL_BLOCKS);
+    const size_t panel_size = size_t(blocks)*sizeof(ggml_znq_gemm_panel);
+    const size_t sums_size = prepared_sums ? 0 : size_t(nr)*nb*sizeof(int32_t);
+    void * storage = znq_scratch.get(panel_size + sums_size + 63);
+    if (!storage) {
+        ggml_gemm_znq_local_generic(n, s, bs, vx, vy, nr, nc, group, map, bs1, bs2, prepared_sums, index_bits);
+        return;
+    }
+
+    auto * panel = (ggml_znq_gemm_panel *) ((uintptr_t(storage) + 63) & ~uintptr_t(63));
+    if (!prepared_sums) {
+        auto * sums = (int32_t *) (panel + blocks);
+        ggml_znq_local_prepare_sums(n, nr, true, vy, sums);
+        prepared_sums = sums;
+    }
+
+    for (int col = 0; col < nc; col += 32) {
+        const int width = std::min(32, nc - col);
+        const int halves = width > 16 ? 2 : 1;
+        for (int start = 0; start < nb; start += blocks) {
+            const int count = std::min(blocks, nb - start);
+
+            for (int ib = 0; ib < count; ++ib) {
+                for (int h = 0; h < halves; ++h) {
+                    const int hw = std::min(16, width - h*16);
+                    const uint8_t * a = x + (size_t((col + h*16)/8)*nb + start + ib)*stride;
+                    const uint8_t * b = hw == 16 ? a + size_t(nb)*stride : a;
+                    const __m512i header = znq_local_header<group>(a, b);
+                    _mm512_storeu_ps(panel[ib].scale[h], znq_local_scales<group>(a, b, header));
+                    __m512i books = _mm512_setzero_si512();
+                    for (int q = 0; q < 8; ++q) {
+                        if (q % (group / 4) == 0) {
+                            books = znq_local_book_indices<group, index_bits>(header, q);
+                        }
+                        _mm512_storeu_si512(panel[ib].weights[h][q], znq_local_weights<group, index_bits>(a, b, q, books, table, table1));
+                    }
+                }
+            }
+
+            for (int row = 0; row < nr; row += 4) {
+                float * out0 = znq_local_dst(s, bs, map, bs1, bs2, row + 0) + col;
+                float * out1 = znq_local_dst(s, bs, map, bs1, bs2, row + 1) + col;
+                float * out2 = znq_local_dst(s, bs, map, bs1, bs2, row + 2) + col;
+                float * out3 = znq_local_dst(s, bs, map, bs1, bs2, row + 3) + col;
+                const auto * a = y + size_t(row/4)*nb + start;
+                const auto * sum = prepared_sums + size_t(row)*nb + start;
+                if (halves == 2) {
+                    znq_gemm_tile<true>(panel, a, sum, nb, count, start != 0, width, out0, out1, out2, out3);
+                } else {
+                    znq_gemm_tile<false>(panel, a, sum, nb, count, start != 0, width, out0, out1, out2, out3);
+                }
+            }
+        }
+    }
+}
+#endif
+
+void ggml_gemm_znq_panel(const ggml_znq_gemm_panel * panel, const void * activations,
+        const int32_t * sums, int sum_stride, int count, bool accumulate, int width,
+        float * out0, float * out1, float * out2, float * out3) {
+    GGML_ASSERT(width >= 8 && width <= 32 && width % 8 == 0);
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
+    if (width > 16) {
+        znq_gemm_tile<true>(panel, (const block_q8_0x4 *) activations, sums, sum_stride, count, accumulate, width, out0, out1, out2, out3);
+    } else {
+        znq_gemm_tile<false>(panel, (const block_q8_0x4 *) activations, sums, sum_stride, count, accumulate, width, out0, out1, out2, out3);
+    }
+#else
+    ggml_gemm_znq_panel_generic(panel, activations, sums, sum_stride, count, accumulate, width, out0, out1, out2, out3);
+#endif
+}
+
+void ggml_gemv_znq_local(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc, int group, const int32_t * prepared_sums, int index_bits) {
+    GGML_ASSERT(n % QK_ZNQ == 0 && nc % 8 == 0 && (group == 4 || group == 8) && (index_bits == 2 || index_bits == 3));
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
+    if (index_bits == 3) {
+        if (group == 4) {
+            znq_local_gemv<4, 3>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+        } else {
+            znq_local_gemv<8, 3>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+        }
+    } else {
+        if (group == 4) {
+            znq_local_gemv<4>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+        } else {
+            znq_local_gemv<8>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+        }
+    }
+#else
+    ggml_gemv_znq_local_generic(n, s, bs, vx, vy, nr, nc, group, prepared_sums, index_bits);
+#endif
+}
+
+void ggml_gemm_znq_local(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc,
+        int group, const int32_t * map, size_t bs1, size_t bs2, const int32_t * prepared_sums, int index_bits) {
+    GGML_ASSERT(n % QK_ZNQ == 0 && nc % 8 == 0 && nr % 4 == 0 && (group == 4 || group == 8) && (index_bits == 2 || index_bits == 3));
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
+    if (index_bits == 3) {
+        if (group == 4) {
+            znq_local_gemm<4, 3>(n, s, bs, vx, vy, nr, nc, map, bs1, bs2, prepared_sums);
+        } else {
+            znq_local_gemm<8, 3>(n, s, bs, vx, vy, nr, nc, map, bs1, bs2, prepared_sums);
+        }
+    } else {
+        if (group == 4) {
+            znq_local_gemm<4>(n, s, bs, vx, vy, nr, nc, map, bs1, bs2, prepared_sums);
+        } else {
+            znq_local_gemm<8>(n, s, bs, vx, vy, nr, nc, map, bs1, bs2, prepared_sums);
+        }
+    }
+#else
+    ggml_gemm_znq_local_generic(n, s, bs, vx, vy, nr, nc, group, map, bs1, bs2, prepared_sums, index_bits);
+#endif
+}
+
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
+// Bias the decoded weights once, then reuse signed activations across output tiles.
+template<ggml_type type>
+static bool znq_prepared_gemm(int n, float * s, size_t bs, const void * vx, const void * vy,
+        int nr, int nc, const int32_t * sums) {
+    using block_type = std::conditional_t<type == GGML_TYPE_ZNQ2_M, block_znq2_mx8,
+                       std::conditional_t<type == GGML_TYPE_ZNQ3_M, block_znq3_mx8, block_znq4_mx8>>;
+    const int nb = n / QK_ZNQ;
+    const int blocks = std::min(nb, ZNQ_PANEL_BLOCKS);
+    void * storage = znq_scratch.get(size_t(blocks)*sizeof(ggml_znq_gemm_panel) + 63);
+    if (!storage) {
+        return false;
+    }
+    auto * panel = (ggml_znq_gemm_panel *) ((uintptr_t(storage) + 63) & ~uintptr_t(63));
+    const auto * x = (const block_type *) vx;
+    const auto * y = (const block_q8_0x4 *) vy;
+    const int8_t * values = type == GGML_TYPE_ZNQ2_M ? kvalues_znq2_m :
+                           type == GGML_TYPE_ZNQ3_M ? kvalues_znq3_m : kvalues_znq4_m;
+    const __m512i table0 = _mm512_loadu_si512(values);
+    __m512i table1, table2, table3;
+    if constexpr (type != GGML_TYPE_ZNQ2_M) {
+        table1 = _mm512_loadu_si512(values + 64);
+    }
+    if constexpr (type == GGML_TYPE_ZNQ4_M) {
+        table2 = _mm512_loadu_si512(values + 128);
+        table3 = _mm512_loadu_si512(values + 192);
+    }
+    const __m512i bias = _mm512_set1_epi8(char(0x80));
+    for (int col = 0; col < nc; col += 32) {
+        const int width = std::min(32, nc - col);
+        for (int start = 0; start < nb; start += blocks) {
+            const int count = std::min(blocks, nb - start);
+            for (int ib = 0; ib < count; ++ib) {
+                for (int h = 0; h < (width + 15)/16; ++h) {
+                    const auto & b0 = x[size_t((col + 16*h)/8)*nb + start + ib];
+                    const auto & b1 = width - 16*h >= 16 ? *(&b0 + nb) : b0;
+                    const __m512i lo = znq4_mx16_book_repeat4(b0.books, b1.books, false);
+                    const __m512i hi = znq4_mx16_book_repeat4(b0.books, b1.books, true);
+                    for (int g = 0; g < QK_ZNQ/4; ++g) {
+                        const __m512i book = g < 4 ? lo : hi;
+                        __m512i w;
+                        if constexpr (type == GGML_TYPE_ZNQ2_M) {
+                            w = znq2_mx16_lookup_group(znq2_mx16_unpack_group(b0.qs[g], b1.qs[g]), book, table0);
+                        } else if constexpr (type == GGML_TYPE_ZNQ3_M) {
+                            w = znq3_mx16_lookup_group(znq3_mx16_unpack_group(b0.planes[g], b1.planes[g]), book, table0, table1);
+                        } else {
+                            w = znq4_mx16_lookup_group(znq4_mx16_unpack_group(b0.qs + 16*g, b1.qs + 16*g), book, table0, table1, table2, table3);
+                        }
+                        _mm512_storeu_si512(panel[ib].weights[h][g], _mm512_xor_si512(w, bias));
+                    }
+                    _mm512_storeu_ps(panel[ib].scale[h], znq4_mx8_ufp8x16_to_fp32(b0.d, b1.d));
+                }
+            }
+            for (int row = 0; row < nr; row += 4) {
+                float * out = s + size_t(row)*bs + col;
+                ggml_gemm_znq_panel(panel, y + size_t(row/4)*nb + start, sums + size_t(row)*nb + start,
+                                    nb, count, start != 0, width, out, out + bs, out + 2*bs, out + 3*bs);
+            }
+        }
+    }
+    return true;
+}
+#endif
+
+bool ggml_gemm_znq_prepared(int n, float * s, size_t bs, const void * vx, const void * vy,
+        int nr, int nc, enum ggml_type type, const int32_t * sums) {
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
+    GGML_ASSERT(n > 0 && n % QK_ZNQ == 0 && nr % 4 == 0 && nc % 8 == 0 && sums);
+    switch (type) {
+        case GGML_TYPE_ZNQ2_M: return znq_prepared_gemm<GGML_TYPE_ZNQ2_M>(n, s, bs, vx, vy, nr, nc, sums);
+        case GGML_TYPE_ZNQ3_M: return znq_prepared_gemm<GGML_TYPE_ZNQ3_M>(n, s, bs, vx, vy, nr, nc, sums);
+        case GGML_TYPE_ZNQ4_M: return znq_prepared_gemm<GGML_TYPE_ZNQ4_M>(n, s, bs, vx, vy, nr, nc, sums);
+        default: return false;
+    }
+#else
+    GGML_UNUSED(n); GGML_UNUSED(s); GGML_UNUSED(bs); GGML_UNUSED(vx); GGML_UNUSED(vy);
+    GGML_UNUSED(nr); GGML_UNUSED(nc); GGML_UNUSED(type); GGML_UNUSED(sums);
+    return false;
+#endif
 }

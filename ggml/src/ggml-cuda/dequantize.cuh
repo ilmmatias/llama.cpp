@@ -2,12 +2,12 @@
 #include "convert.cuh"
 #include "znq.cuh"
 
-template <int bits>
+template <int bits, int group = 16>
 static __device__ __forceinline__ void dequantize_znq(const void * vx, const int64_t ib, const int iqs, float2 & v) {
-    const uint8_t * block = (const uint8_t *) vx + ib*(2 + 4*bits);
+    const uint8_t * block = (const uint8_t *) vx + ib*(znq_header_cuda<bits, group>() + 4*bits);
     const float d = znq_scale_cuda(block[0]);
-    v.x = d * znq_value_cuda<bits>(block, iqs);
-    v.y = d * znq_value_cuda<bits>(block, iqs + 1);
+    v.x = d * znq_value_cuda<bits, group>(block, iqs);
+    v.y = d * znq_value_cuda<bits, group>(block, iqs + 1);
 }
 
 

@@ -92,9 +92,13 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
         case GGML_TYPE_IQ1_S:
             return MMQ_Q8_1_DS_LAYOUT_DS4;
         case GGML_TYPE_IQ4_XS:
-        case GGML_TYPE_ZNQ2:
-        case GGML_TYPE_ZNQ3:
-        case GGML_TYPE_ZNQ4:
+        case GGML_TYPE_ZNQ2_M:
+        case GGML_TYPE_ZNQ2_L:
+        case GGML_TYPE_ZNQ3_S:
+        case GGML_TYPE_ZNQ3_M:
+        case GGML_TYPE_ZNQ3_L:
+        case GGML_TYPE_ZNQ4_S:
+        case GGML_TYPE_ZNQ4_M:
         case GGML_TYPE_IQ4_NL:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         default:
@@ -206,7 +210,7 @@ struct ggml_cuda_mmq_config {
 };
 
 #define CASE(type_, nthreads_, occupancy_, I_, J_, sram_layout_, K_vram_, stream_k_, fallback_)                                           \
-    if ((type == (type_) || ((type == GGML_TYPE_ZNQ2 || type == GGML_TYPE_ZNQ3 || type == GGML_TYPE_ZNQ4) && (type_) == GGML_TYPE_IQ4_NL)) && J == (J_) && fallback == (fallback_)) {                                                                        \
+    if ((type == (type_) || ((type == GGML_TYPE_ZNQ2_M || type == GGML_TYPE_ZNQ2_L || type == GGML_TYPE_ZNQ3_S || type == GGML_TYPE_ZNQ3_M || type == GGML_TYPE_ZNQ3_L || type == GGML_TYPE_ZNQ4_S || type == GGML_TYPE_ZNQ4_M) && (type_) == GGML_TYPE_IQ4_NL)) && J == (J_) && fallback == (fallback_)) {                                                                        \
         static_assert((nthreads_) %  32 == 0 && (nthreads_)       <= 512, "bad nthreads");                                                \
         static_assert(                          (occupancy_)      <=   8, "bad occupancy");                                               \
         static_assert((I_)        %  32 == 0,                             "bad I");                                                       \
@@ -413,9 +417,13 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_IQ3_S:   return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ1_S:   return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ4_XS:  return MMQ_DP4A_TXS_Q8_0;
-        case GGML_TYPE_ZNQ2:    return MMQ_DP4A_TXS_Q8_0;
-        case GGML_TYPE_ZNQ3:    return MMQ_DP4A_TXS_Q8_0;
-        case GGML_TYPE_ZNQ4:    return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_ZNQ2_M:  return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_ZNQ2_L:  return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_ZNQ3_S:  return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_ZNQ3_M:
+        case GGML_TYPE_ZNQ3_L:
+        case GGML_TYPE_ZNQ4_S:  return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_ZNQ4_M:  return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ4_NL:  return MMQ_DP4A_TXS_Q8_0;
         default:                return tile_x_sizes{0, 0, 0};
     }
@@ -659,19 +667,23 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     ggml_cuda_mmq_load_tiles_iq4_xs<type, J, fallback>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
-            case GGML_TYPE_ZNQ2:
+            case GGML_TYPE_ZNQ2_M:
+            case GGML_TYPE_ZNQ2_L:
+            case GGML_TYPE_ZNQ3_S:
                 return ggml_cuda_mmq_util_funcs(
                     4,
                     ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 2>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
-            case GGML_TYPE_ZNQ3:
+            case GGML_TYPE_ZNQ3_M:
+            case GGML_TYPE_ZNQ3_L:
+            case GGML_TYPE_ZNQ4_S:
                 return ggml_cuda_mmq_util_funcs(
                     4,
                     ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 3>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
-            case GGML_TYPE_ZNQ4:
+            case GGML_TYPE_ZNQ4_M:
                 return ggml_cuda_mmq_util_funcs(
                     4,
                     ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 4>,
@@ -847,19 +859,23 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 ggml_cuda_mmq_load_tiles_iq4_xs<type, J, fallback>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>);
-        case GGML_TYPE_ZNQ2:
+        case GGML_TYPE_ZNQ2_M:
+        case GGML_TYPE_ZNQ2_L:
+        case GGML_TYPE_ZNQ3_S:
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 2>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>);
-        case GGML_TYPE_ZNQ3:
+        case GGML_TYPE_ZNQ3_M:
+        case GGML_TYPE_ZNQ3_L:
+        case GGML_TYPE_ZNQ4_S:
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 3>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>);
-        case GGML_TYPE_ZNQ4:
+        case GGML_TYPE_ZNQ4_M:
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 4>,
@@ -1706,9 +1722,13 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ2_XS);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ2_S);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ3_XXS);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ3_S);
-extern DECL_MMQ_CASE(GGML_TYPE_ZNQ2);
-extern DECL_MMQ_CASE(GGML_TYPE_ZNQ3);
-extern DECL_MMQ_CASE(GGML_TYPE_ZNQ4);
+extern DECL_MMQ_CASE(GGML_TYPE_ZNQ2_M);
+extern DECL_MMQ_CASE(GGML_TYPE_ZNQ2_L);
+extern DECL_MMQ_CASE(GGML_TYPE_ZNQ3_S);
+extern DECL_MMQ_CASE(GGML_TYPE_ZNQ3_M);
+extern DECL_MMQ_CASE(GGML_TYPE_ZNQ3_L);
+extern DECL_MMQ_CASE(GGML_TYPE_ZNQ4_S);
+extern DECL_MMQ_CASE(GGML_TYPE_ZNQ4_M);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ4_NL);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
 // -----------------------------------------

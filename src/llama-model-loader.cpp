@@ -71,9 +71,13 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:    name = LLAMA_FTYPE_PREFIX "IQ4_XS - 4.25 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ3_S:     name = LLAMA_FTYPE_PREFIX "IQ3_S - 3.4375 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ3_M:     name = LLAMA_FTYPE_PREFIX "IQ3_S mix - 3.66 bpw"; break;
-        case LLAMA_FTYPE_MOSTLY_ZNQ2:      name = LLAMA_FTYPE_PREFIX "ZNQ2 - 2.5 bpw"; break;
-        case LLAMA_FTYPE_MOSTLY_ZNQ3:      name = LLAMA_FTYPE_PREFIX "ZNQ3 - 3.5 bpw"; break;
-        case LLAMA_FTYPE_MOSTLY_ZNQ4:      name = LLAMA_FTYPE_PREFIX "ZNQ4 - 4.5 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_ZNQ2_M:    name = LLAMA_FTYPE_PREFIX "ZNQ2_M - 2.5 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_ZNQ2_L:    name = LLAMA_FTYPE_PREFIX "ZNQ2_L - 2.75 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_ZNQ3_S:    name = LLAMA_FTYPE_PREFIX "ZNQ3_S - 3.00 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_ZNQ3_M:    name = LLAMA_FTYPE_PREFIX "ZNQ3_M - 3.5 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_ZNQ3_L:    name = LLAMA_FTYPE_PREFIX "ZNQ3_L - 3.75 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_ZNQ4_S:    name = LLAMA_FTYPE_PREFIX "ZNQ4_S - 4.00 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_ZNQ4_M:    name = LLAMA_FTYPE_PREFIX "ZNQ4_M - 4.5 bpw"; break;
         default:                           name = LLAMA_FTYPE_PREFIX "unknown, may not work"; break;
     }
     return (ftype & LLAMA_FTYPE_GUESSED) ? name : name + guessed_prefix_len;
@@ -783,9 +787,13 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
             case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
             case GGML_TYPE_Q2_0:    ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;
-            case GGML_TYPE_ZNQ2:    ftype = LLAMA_FTYPE_MOSTLY_ZNQ2;    break;
-            case GGML_TYPE_ZNQ3:    ftype = LLAMA_FTYPE_MOSTLY_ZNQ3;    break;
-            case GGML_TYPE_ZNQ4:    ftype = LLAMA_FTYPE_MOSTLY_ZNQ4;    break;
+            case GGML_TYPE_ZNQ2_M:  ftype = LLAMA_FTYPE_MOSTLY_ZNQ2_M;  break;
+            case GGML_TYPE_ZNQ2_L:  ftype = LLAMA_FTYPE_MOSTLY_ZNQ2_L;  break;
+            case GGML_TYPE_ZNQ3_S:  ftype = LLAMA_FTYPE_MOSTLY_ZNQ3_S;  break;
+            case GGML_TYPE_ZNQ3_M:  ftype = LLAMA_FTYPE_MOSTLY_ZNQ3_M;  break;
+            case GGML_TYPE_ZNQ3_L:  ftype = LLAMA_FTYPE_MOSTLY_ZNQ3_L;  break;
+            case GGML_TYPE_ZNQ4_S:  ftype = LLAMA_FTYPE_MOSTLY_ZNQ4_S;  break;
+            case GGML_TYPE_ZNQ4_M:  ftype = LLAMA_FTYPE_MOSTLY_ZNQ4_M;  break;
             default:
                 {
                     LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));
@@ -1073,7 +1081,7 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 // find the first buffer type in the list that can use the tensor
 static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list, bool expert_cache) {
     GGML_ASSERT(!buft_list->empty());
-    const bool is_znq = tensor->type == GGML_TYPE_ZNQ2 || tensor->type == GGML_TYPE_ZNQ3 || tensor->type == GGML_TYPE_ZNQ4;
+    const bool is_znq = (tensor->type == GGML_TYPE_ZNQ2_M || tensor->type == GGML_TYPE_ZNQ2_L || tensor->type == GGML_TYPE_ZNQ3_S || tensor->type == GGML_TYPE_ZNQ3_M || tensor->type == GGML_TYPE_ZNQ3_L || tensor->type == GGML_TYPE_ZNQ4_S || tensor->type == GGML_TYPE_ZNQ4_M);
     for (const auto & cur : *buft_list) {
         ggml_backend_dev_t cur_dev = cur.first;
         ggml_backend_buffer_type_t cur_buft = cur.second;
@@ -1286,7 +1294,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                             const auto dev = ggml_backend_buft_get_device(buft);
                             if (ggml_backend_buft_is_host(buft) ||
                                     (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU)) {
-                                const bool is_znq = t_meta->type == GGML_TYPE_ZNQ2 || t_meta->type == GGML_TYPE_ZNQ3 || t_meta->type == GGML_TYPE_ZNQ4;
+                                const bool is_znq = (t_meta->type == GGML_TYPE_ZNQ2_M || t_meta->type == GGML_TYPE_ZNQ2_L || t_meta->type == GGML_TYPE_ZNQ3_S || t_meta->type == GGML_TYPE_ZNQ3_M || t_meta->type == GGML_TYPE_ZNQ3_L || t_meta->type == GGML_TYPE_ZNQ4_S || t_meta->type == GGML_TYPE_ZNQ4_M);
                                 if (!is_znq || strcmp(ggml_backend_buft_name(buft), "CPU_REPACK") != 0 ||
                                         dev == nullptr || !weight_buft_supported(hparams, t_meta, op, buft, dev)) {
                                     buft = ggml_backend_cpu_buffer_type();

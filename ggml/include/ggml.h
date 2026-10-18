@@ -431,10 +431,14 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         // 43 and 44 are intentionally left free for IQ2_NL / IQ3_NL from upstream PR #27983.
-        GGML_TYPE_ZNQ2    = 45,
-        GGML_TYPE_ZNQ3    = 46,
-        GGML_TYPE_ZNQ4    = 47,
-        GGML_TYPE_COUNT   = 48,
+        GGML_TYPE_ZNQ2_M  = 45,
+        GGML_TYPE_ZNQ2_L  = 48,
+        GGML_TYPE_ZNQ3_S  = 49,
+        GGML_TYPE_ZNQ3_M  = 46,
+        GGML_TYPE_ZNQ3_L  = 50,
+        GGML_TYPE_ZNQ4_S  = 51,
+        GGML_TYPE_ZNQ4_M  = 47,
+        GGML_TYPE_COUNT   = 52,
     };
 
     // [TAG_GGML_PREC]

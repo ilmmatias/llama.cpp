@@ -59,9 +59,13 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q3_K_L",   LLAMA_FTYPE_MOSTLY_Q3_K_L,   " 4.03G, +0.5562 ppl @ Llama-3-8B",  },
     { "IQ4_NL",   LLAMA_FTYPE_MOSTLY_IQ4_NL,   " 4.50 bpw non-linear quantization", },
     { "IQ4_XS",   LLAMA_FTYPE_MOSTLY_IQ4_XS,   " 4.25 bpw non-linear quantization", },
-    { "ZNQ2",     LLAMA_FTYPE_MOSTLY_ZNQ2,     " 2.50 bpw nonlinear book quantization", },
-    { "ZNQ3",     LLAMA_FTYPE_MOSTLY_ZNQ3,     " 3.50 bpw nonlinear book quantization", },
-    { "ZNQ4",     LLAMA_FTYPE_MOSTLY_ZNQ4,     " 4.50 bpw nonlinear book quantization", },
+    { "ZNQ2_M",   LLAMA_FTYPE_MOSTLY_ZNQ2_M,   " 2.50 bpw non-linear book quantization", },
+    { "ZNQ2_L",   LLAMA_FTYPE_MOSTLY_ZNQ2_L,   " 2.75 bpw non-linear book quantization", },
+    { "ZNQ3_S",   LLAMA_FTYPE_MOSTLY_ZNQ3_S,   " 3.00 bpw non-linear book quantization", },
+    { "ZNQ3_M",   LLAMA_FTYPE_MOSTLY_ZNQ3_M,   " 3.50 bpw non-linear book quantization", },
+    { "ZNQ3_L",   LLAMA_FTYPE_MOSTLY_ZNQ3_L,   " 3.75 bpw non-linear book quantization", },
+    { "ZNQ4_S",   LLAMA_FTYPE_MOSTLY_ZNQ4_S,   " 4.00 bpw non-linear book quantization", },
+    { "ZNQ4_M",   LLAMA_FTYPE_MOSTLY_ZNQ4_M,   " 4.50 bpw non-linear book quantization", },
     { "Q4_K",     LLAMA_FTYPE_MOSTLY_Q4_K_M,   "alias for Q4_K_M",                  },
     { "Q4_K_S",   LLAMA_FTYPE_MOSTLY_Q4_K_S,   " 4.37G, +0.2689 ppl @ Llama-3-8B",  },
     { "Q4_K_M",   LLAMA_FTYPE_MOSTLY_Q4_K_M,   " 4.58G, +0.1754 ppl @ Llama-3-8B",  },
@@ -92,12 +96,37 @@ static bool striequals(const char * a, const char * b) {
     return *a == *b;
 }
 
-static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftype, std::string & ftype_str_out) {
-    std::string ftype_str;
-
-    for (auto ch : ftype_str_in) {
-        ftype_str.push_back(std::toupper(ch));
+static std::string normalize_quant_type_name(const std::string & name) {
+    std::string upper;
+    for (unsigned char ch : name) {
+        upper.push_back(std::toupper(ch));
     }
+
+    const struct {
+        const char * previous;
+        const char * current;
+    } aliases[] = {
+        { "ZNQ2",    "ZNQ2_M" },
+        { "ZNQ2_G8", "ZNQ2_L" },
+        { "ZNQ2_G4", "ZNQ3_S" },
+        { "ZNQ3",    "ZNQ3_M" },
+        { "ZNQ3_G8", "ZNQ3_L" },
+        { "ZNQ3_G4", "ZNQ4_S" },
+        { "ZNQ4",    "ZNQ4_M" },
+    };
+
+    for (const auto & alias : aliases) {
+        if (upper == alias.previous) {
+            return alias.current;
+        }
+    }
+
+    return upper;
+}
+
+static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftype, std::string & ftype_str_out) {
+    const std::string ftype_str = normalize_quant_type_name(ftype_str_in);
+
     for (const auto & it : QUANT_OPTIONS) {
         if (striequals(it.name.c_str(), ftype_str.c_str())) {
             ftype = it.ftype;
@@ -314,10 +343,11 @@ static int prepare_imatrix(const std::string & imatrix_file,
 }
 
 static ggml_type parse_ggml_type(const char * arg) {
+    const std::string normalized = normalize_quant_type_name(arg);
     for (int i = 0; i < GGML_TYPE_COUNT; ++i) {
         auto type = (ggml_type)i;
         const auto * name = ggml_type_name(type);
-        if (name && striequals(name, arg)) {
+        if (name && striequals(name, normalized.c_str())) {
             return type;
         }
     }

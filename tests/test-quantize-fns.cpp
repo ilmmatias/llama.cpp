@@ -27,7 +27,7 @@ constexpr float MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS = 0.0050f;
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_FP4 = 0.0030f;
 constexpr float MAX_DOT_PRODUCT_ERROR = 0.02f;
 constexpr float MAX_DOT_PRODUCT_ERROR_LOWBIT = 0.04f;
-constexpr float MAX_DOT_PRODUCT_ERROR_ZNQ2 = 0.06f;
+constexpr float MAX_DOT_PRODUCT_ERROR_ZNQ2_M = 0.06f;
 constexpr float MAX_DOT_PRODUCT_ERROR_FP4 = 0.03f;
 constexpr float MAX_DOT_PRODUCT_ERROR_BINARY = 0.40f;
 constexpr float MAX_DOT_PRODUCT_ERROR_TERNARY = 0.15f;
@@ -196,10 +196,10 @@ static int test_vec_dot_q(bool verbose) {
                 type == GGML_TYPE_Q2_0    ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_Q2_K    ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_IQ2_S   ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
-                type == GGML_TYPE_ZNQ2    ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
+                (type == GGML_TYPE_ZNQ2_M || type == GGML_TYPE_ZNQ2_L || type == GGML_TYPE_ZNQ3_S) ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_S   ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
-                type == GGML_TYPE_ZNQ3    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
+                (type == GGML_TYPE_ZNQ3_M || type == GGML_TYPE_ZNQ3_L || type == GGML_TYPE_ZNQ4_S) ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_XXS ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS :
                 type == GGML_TYPE_NVFP4   ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 : MAX_QUANTIZATION_TOTAL_ERROR;
             bool failed = !(total_error < max_quantization_error);
@@ -217,7 +217,7 @@ static int test_vec_dot_q(bool verbose) {
 
             const float vec_dot_error = dot_product_error(qfns_cpu, type, test_size, test_data.data(), test_data2.data(), nullptr, nullptr, 1);
             const float max_allowed_error = type == GGML_TYPE_Q2_K || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_XXS ||
-                type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_ZNQ3
+                type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_ZNQ3_M || type == GGML_TYPE_ZNQ3_L || type == GGML_TYPE_ZNQ4_S
                 ? MAX_DOT_PRODUCT_ERROR_LOWBIT
                 : type == GGML_TYPE_Q1_0
                 ? MAX_DOT_PRODUCT_ERROR_BINARY
@@ -225,8 +225,8 @@ static int test_vec_dot_q(bool verbose) {
                 ? MAX_DOT_PRODUCT_ERROR_TERNARY
                 : type == GGML_TYPE_NVFP4
                 ? MAX_DOT_PRODUCT_ERROR_FP4
-                : type == GGML_TYPE_ZNQ2
-                ? MAX_DOT_PRODUCT_ERROR_ZNQ2
+                : (type == GGML_TYPE_ZNQ2_M || type == GGML_TYPE_ZNQ2_L || type == GGML_TYPE_ZNQ3_S)
+                ? MAX_DOT_PRODUCT_ERROR_ZNQ2_M
                 : MAX_DOT_PRODUCT_ERROR;
             failed = !(vec_dot_error < max_allowed_error);
             num_failed += failed;
@@ -249,7 +249,7 @@ static int test_vec_dot_q(bool verbose) {
     return num_failed;
 }
 
-static int test_repack(bool verbose, ggml_type weight_type, ggml_type input_type, bool dense = false) {
+static int test_repack(bool verbose, ggml_type weight_type, ggml_type input_type, bool dense = false, int dense_planes = 1) {
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     assert(backend);
     auto * dev = ggml_backend_get_device(backend.get());
@@ -271,12 +271,17 @@ static int test_repack(bool verbose, ggml_type weight_type, ggml_type input_type
     int num_failed = 0;
     // Short batches, GEMM tails, output tiles, and shared gate/up inputs.
     const int shapes[][4] = {
-        {32, 56, 2, 2}, {256, 280, 3, 2}, {256, 56, 6, 2}, {4128, 56, 7, 2},
+        {32, 56, 2, 2}, {640, 24, 7, 2}, {256, 280, 3, 2}, {256, 56, 6, 2}, {4128, 56, 7, 2},
         {32, 56, 1, 4}, {256, 24, 2, 4}, {256, 56, 3, 4},
         {256, 280, 4, 8}, {256, 280, 6, 8}, {4128, 56, 7, 8},
+        {32, 8, 20, 2}, {640, 24, 25, 2}, {640, 40, 20, 2}, {4128, 56, 25, 2}, {256, 280, 64, 2},
     };
     for (const auto & shape : shapes) {
         const int k = shape[0], m = shape[1], n = shape[2];
+        if (n >= 20 && (!dense || (weight_type != GGML_TYPE_ZNQ2_M && weight_type != GGML_TYPE_ZNQ2_L &&
+            weight_type != GGML_TYPE_ZNQ3_S && weight_type != GGML_TYPE_ZNQ3_M && weight_type != GGML_TYPE_ZNQ3_L && weight_type != GGML_TYPE_ZNQ4_S && weight_type != GGML_TYPE_ZNQ4_M))) {
+            continue;
+        }
         if (dense && std::any_of(shapes, &shape, [&](const auto & previous) {
                 return previous[0] == k && previous[1] == m && previous[2] == n;
             })) {
@@ -304,7 +309,7 @@ static int test_repack(bool verbose, ggml_type weight_type, ggml_type input_type
             }
             ggml_context_ptr ctx(ggml_init(params));
             const int slots = dense ? n : (broadcast ? 1 : n_used);
-            const int planes = dense ? 1 : n;
+            const int planes = dense ? dense_planes : n;
             const size_t row_size = ggml_row_size(input_type, k);
             const int stride = input_type == GGML_TYPE_F32 ? 1 : 2;
             auto * storage = ggml_new_tensor_3d(ctx.get(), input_type, k, stride*slots, planes);
@@ -340,16 +345,19 @@ static int test_repack(bool verbose, ggml_type weight_type, ggml_type input_type
             }
             data.resize(ggml_nelements(storage));
             generate_data(1.0f, data.size(), data.data());
-            if (input_type == GGML_TYPE_F32) {
-                ggml_backend_tensor_set(storage, data.data(), 0, ggml_nbytes(storage));
-            } else {
-                quantized.resize(ggml_nbytes(storage));
-                const auto from_float = ggml_get_type_traits_cpu(input_type)->from_float;
-                for (int row = 0; row < stride*slots*planes; ++row) {
-                    from_float(data.data() + row*k, quantized.data() + row*row_size, k);
+            auto set_input = [&] {
+                if (input_type == GGML_TYPE_F32) {
+                    ggml_backend_tensor_set(storage, data.data(), 0, ggml_nbytes(storage));
+                } else {
+                    quantized.resize(ggml_nbytes(storage));
+                    const auto from_float = ggml_get_type_traits_cpu(input_type)->from_float;
+                    for (int row = 0; row < stride*slots*planes; ++row) {
+                        from_float(data.data() + row*k, quantized.data() + row*row_size, k);
+                    }
+                    ggml_backend_tensor_set(storage, quantized.data(), 0, quantized.size());
                 }
-                ggml_backend_tensor_set(storage, quantized.data(), 0, quantized.size());
-            }
+            };
+            set_input();
             std::vector<int32_t> routes(n*n_used);
             for (int t = 0; t < n; ++t) {
                 for (int r = 0; r < n_used; ++r) {
@@ -362,6 +370,10 @@ static int test_repack(bool verbose, ggml_type weight_type, ggml_type input_type
             std::vector<float> expected(ggml_nelements(out[0])), actual(expected.size());
             for (int threads : { 1, 3, 8 }) {
                 ggml_backend_cpu_set_n_threads(backend.get(), threads);
+                if (dense && dense_planes > 1) {
+                    for (float & value : data) value = -0.9f*value + 0.001f;
+                    set_input();
+                }
                 for (auto & route : routes) {
                     route = (route + 1) % n_expert;
                 }
@@ -380,7 +392,7 @@ static int test_repack(bool verbose, ggml_type weight_type, ggml_type input_type
                 const bool failed = !(error <= 1e-6 * std::max(norm, 1e-20));
                 num_failed += failed;
                 if (failed || verbose) {
-                    printf("%s repack input=%s dense=%d k=%d m=%d n=%d used=%d broadcast=%d threads=%d: %s\n", ggml_type_name(weight_type), ggml_type_name(input_type), dense, k, m, n, n_used, broadcast, threads, RESULT_STR[failed]);
+                    printf("%s repack input=%s dense=%d k=%d m=%d n=%d planes=%d used=%d broadcast=%d threads=%d: %s\n", ggml_type_name(weight_type), ggml_type_name(input_type), dense, k, m, n, planes, n_used, broadcast, threads, RESULT_STR[failed]);
                 }
             }
         }
@@ -398,7 +410,7 @@ static int test_quantize_imatrix_degenerate(bool verbose) {
     int num_failed = 0;
 
     printf("Testing degenerate imatrix:\n");
-    for (ggml_type type : {GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_1, GGML_TYPE_Q5_1}) {
+    for (ggml_type type : {GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_1, GGML_TYPE_Q5_1}) {
         const int64_t group = type == GGML_TYPE_Q2_K ? 16 : 32;
         for (int64_t i = 0; i < n; ++i) {
             const int64_t g = i / group;
@@ -445,12 +457,23 @@ int main(int argc, char * argv[]) {
 
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_vec_dot_q(verbose);
-    num_failed += test_repack(verbose, GGML_TYPE_ZNQ3, GGML_TYPE_F32);
-    for (ggml_type type : {GGML_TYPE_ZNQ2, GGML_TYPE_ZNQ3, GGML_TYPE_ZNQ4, GGML_TYPE_Q4_0,
+    num_failed += test_repack(verbose, GGML_TYPE_ZNQ3_M, GGML_TYPE_F32);
+    for (ggml_type type : {GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S}) {
+        num_failed += test_repack(verbose, type, GGML_TYPE_F32);
+        num_failed += test_repack(verbose, type, GGML_TYPE_F32, true);
+        // Shared sums must cover every plane, including Q8 tails and strided input rows.
+        num_failed += test_repack(verbose, type, GGML_TYPE_F32, true, 3);
+        num_failed += test_repack(verbose, type, GGML_TYPE_Q8_0, true, 3);
+    }
+    for (ggml_type type : {GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M, GGML_TYPE_Q4_0,
                            GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
         const ggml_type input_type = ggml_get_type_traits_cpu(type)->vec_dot_type;
         num_failed += test_repack(verbose, type, input_type);
         num_failed += test_repack(verbose, type, input_type, true);
+    }
+    for (ggml_type type : {GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ4_M}) {
+        num_failed += test_repack(verbose, type, GGML_TYPE_F32, true, 3);
+        num_failed += test_repack(verbose, type, GGML_TYPE_Q8_0, true, 3);
     }
     num_failed += test_quantize_imatrix_degenerate(verbose);
 

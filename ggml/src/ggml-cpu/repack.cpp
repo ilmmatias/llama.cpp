@@ -3156,6 +3156,136 @@ void ggml_gemm_iqp_8x8_q8_K_p4_generic(int n, float * GGML_RESTRICT s, size_t bs
     iqp_gemm_tile_4_generic(nb, s, bs, (const block_iqp_x8 *) vx, a_ptr, nc);
 }
 
+static uint32_t znq_local_load32(const void * p) {
+    uint32_t value;
+    memcpy(&value, p, sizeof(value));
+    return value;
+}
+
+static float znq_local_scale(uint8_t code) {
+    return code < 8 ? float(code) * 0x1p-17f : std::ldexp(1.0f + float(code & 7) * 0.125f, (code >> 3) - 15);
+}
+
+static float * znq_local_dst(float * s, size_t bs, const int32_t * map, size_t bs1, size_t bs2, int row) {
+    return map ? s + size_t(map[2*row])*bs1 + size_t(map[2*row + 1])*bs2 : s + size_t(row)*bs;
+}
+
+void ggml_znq_local_prepare_sums(int n, int nr, bool packed, const void * vy, int32_t * sums) {
+    GGML_ASSERT(n % QK_ZNQ == 0 && (!packed || nr % 4 == 0));
+    const int nb = n / QK_ZNQ;
+    const auto * y = (const block_q8_0 *) vy;
+    const auto * y4 = (const block_q8_0x4 *) vy;
+
+    if (packed) {
+        for (int r4 = 0; r4 < nr / 4; ++r4) {
+            for (int ib = 0; ib < nb; ++ib) {
+                const auto & a = y4[size_t(r4)*nb + ib];
+                for (int t = 0; t < 4; ++t) {
+                    int sum = 0;
+                    for (int chunk = 0; chunk < 4; ++chunk) {
+                        for (int j = 0; j < 8; ++j) {
+                            sum += a.qs[chunk*32 + t*8 + j];
+                        }
+                    }
+                    sums[size_t(r4*4 + t)*nb + ib] = 128 * sum;
+                }
+            }
+        }
+    } else {
+        for (int row = 0; row < nr; ++row) {
+            for (int ib = 0; ib < nb; ++ib) {
+                int sum = 0;
+                const auto & a = y[size_t(row)*nb + ib];
+                for (int j = 0; j < QK_ZNQ; ++j) {
+                    sum += a.qs[j];
+                }
+                sums[size_t(row)*nb + ib] = 128 * sum;
+            }
+        }
+    }
+}
+
+static void znq_local_scalar(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc,
+        int group, bool packed, const int32_t * map, size_t bs1, size_t bs2, int index_bits) {
+    const int nb = n / QK_ZNQ;
+    const int header = group == 4 ? 4 : 3;
+    const int stride = 8*(header + 4*index_bits);
+    const auto * x = (const uint8_t *) vx;
+    const auto * y = (const block_q8_0 *) vy;
+    const auto * y4 = (const block_q8_0x4 *) vy;
+    const int8_t * values = index_bits == 2 ? (group == 4 ? kvalues_znq3_s : kvalues_znq2_l) :
+                                               (group == 4 ? kvalues_znq4_s : kvalues_znq3_l);
+
+    for (int row = 0; row < nr; ++row) {
+        for (int col = 0; col < nc; ++col) {
+            float acc = 0;
+            for (int ib = 0; ib < nb; ++ib) {
+                const uint8_t * p = x + (size_t(col/8)*nb + ib)*stride;
+                const int r = col%8;
+                uint32_t selectors = 0;
+                for (int b = 1; b < header; ++b) {
+                    selectors |= uint32_t(p[group == 4 ? r*4 + b : b*8 + r]) << (8*(b - 1));
+                }
+                int dot = 0;
+                for (int j = 0; j < QK_ZNQ; ++j) {
+                    const int book = (selectors >> ((group == 4 ? 3 : 4)*(j/group))) & (group == 4 ? 7 : 15);
+                    int code;
+                    if (index_bits == 2) {
+                        code = (p[(header + j/4)*8 + r] >> (2*(j%4))) & 3;
+                    } else {
+                        code = 0;
+                        for (int b = 0; b < 3; ++b) {
+                            code |= ((znq_local_load32(p + 8*header + 12*(j/4) + 4*b) >> (4*r + j%4)) & 1) << b;
+                        }
+                    }
+                    const int a = packed ? y4[size_t(row/4)*nb + ib].qs[(j/8)*32 + (row%4)*8 + j%8] : y[size_t(row)*nb + ib].qs[j];
+                    dot += values[(1 << index_bits)*book + code] * a;
+                }
+                const float ad = GGML_CPU_FP16_TO_FP32(packed ? y4[size_t(row/4)*nb + ib].d[row%4] : y[size_t(row)*nb + ib].d);
+                acc += dot * znq_local_scale(p[group == 4 ? r*4 : r]) * ad;
+            }
+            znq_local_dst(s, bs, map, bs1, bs2, row)[col] = acc;
+        }
+    }
+}
+
+void ggml_gemm_znq_panel_generic(const ggml_znq_gemm_panel * panel, const void * activations,
+        const int32_t * sums, int sum_stride, int count, bool accumulate, int width,
+        float * out0, float * out1, float * out2, float * out3) {
+    GGML_ASSERT(width >= 8 && width <= 32 && width % 8 == 0);
+    const auto * a = (const block_q8_0x4 *) activations;
+    float * out[4] = {out0, out1, out2, out3};
+    for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < width; ++col) {
+            float acc = accumulate ? out[row][col] : 0;
+
+            for (int ib = 0; ib < count; ++ib) {
+                int dot = -sums[row*sum_stride + ib];
+                for (int j = 0; j < QK_ZNQ; ++j) {
+                    dot += panel[ib].weights[col/16][j/4][4*(col%16) + j%4] *
+                        a[ib].qs[(j/8)*32 + row*8 + j%8];
+                }
+                const float d = panel[ib].scale[col/16][col%16] * GGML_CPU_FP16_TO_FP32(a[ib].d[row]);
+                acc += dot*d;
+            }
+            out[row][col] = acc;
+        }
+    }
+}
+
+void ggml_gemv_znq_local_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc, int group, const int32_t * prepared_sums, int index_bits) {
+    GGML_ASSERT(n % QK_ZNQ == 0 && nc % 8 == 0 && (group == 4 || group == 8) && (index_bits == 2 || index_bits == 3));
+    GGML_UNUSED(prepared_sums);
+    znq_local_scalar(n, s, bs, vx, vy, nr, nc, group, false, nullptr, 0, 0, index_bits);
+}
+
+void ggml_gemm_znq_local_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc,
+        int group, const int32_t * map, size_t bs1, size_t bs2, const int32_t * prepared_sums, int index_bits) {
+    GGML_ASSERT(n % QK_ZNQ == 0 && nc % 8 == 0 && nr % 4 == 0 && (group == 4 || group == 8) && (index_bits == 2 || index_bits == 3));
+    GGML_UNUSED(prepared_sums);
+    znq_local_scalar(n, s, bs, vx, vy, nr, nc, group, true, map, bs1, bs2, index_bits);
+}
+
 } // extern "C"
 
 static block_q8_0x4 make_block_q8_0x4(block_q8_0 * in, unsigned int blck_size_interleave) {
@@ -4258,17 +4388,15 @@ static void repack_znq_8_bl_parallel(
     }
 }
 
-static block_znq2x8 make_block_znq2x8(const block_znq2 * in) {
-    block_znq2x8 out = {};
+static block_znq2_mx8 make_block_znq2_mx8(const block_znq2_m * in) {
+    block_znq2_mx8 out = {};
 
     for (int r = 0; r < 8; ++r) {
         out.d[r] = in[r].d;
         out.books[r] = in[r].books;
     }
 
-    // Each source byte already contains the four 2-bit codes for one
-    // 4-weight group. Transpose only at byte granularity so runtime can load
-    // all eight rows with one qword broadcast before VPMULTISHIFTQB.
+    // Interleave four-weight groups so one qword broadcast loads all eight rows.
     for (int g = 0; g < QK_ZNQ / 4; ++g) {
         for (int r = 0; r < 8; ++r) {
             out.qs[g][r] = in[r].qs[g];
@@ -4278,28 +4406,78 @@ static block_znq2x8 make_block_znq2x8(const block_znq2 * in) {
     return out;
 }
 
-static int repack_znq2_to_znq2_8_bl(struct ggml_tensor * t, const void * GGML_RESTRICT data, size_t data_size) {
-    GGML_ASSERT(t->type == GGML_TYPE_ZNQ2);
+static int repack_znq2_m_to_znq2_m_8_bl(ggml_tensor * t, const void * GGML_RESTRICT data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_ZNQ2_M);
 
-    const block_znq2 * src = (const block_znq2 *) data;
-          block_znq2x8 * dst = (block_znq2x8 *) t->data;
+    const block_znq2_m * src = (const block_znq2_m *) data;
+          block_znq2_mx8 * dst = (block_znq2_mx8 *) t->data;
 
     const int nrow = ggml_nrows(t);
     const int nblocks = t->ne[0] / QK_ZNQ;
 
     GGML_ASSERT(t->ne[0] % QK_ZNQ == 0);
-    GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(block_znq2));
+    GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(block_znq2_m));
 
     if (t->ne[1] % 8 != 0) {
         return -1;
     }
 
-    repack_znq_8_bl_parallel(src, dst, nrow, nblocks, data_size, make_block_znq2x8);
+    repack_znq_8_bl_parallel(src, dst, nrow, nblocks, data_size, make_block_znq2_mx8);
 
     return 0;
 }
 
-static inline uint8_t znq3_repack_code(const uint8_t * qs, int j) {
+static block_znq2_lx8 make_block_znq2_lx8(const block_znq2_l * in) {
+    block_znq2_lx8 out = {};
+    for (int r = 0; r < 8; ++r) {
+        const uint8_t * src = (const uint8_t *) &in[r];
+        for (int b = 0; b < 3; ++b) {
+            out.header[b*8 + r] = src[b];
+        }
+        for (int q = 0; q < 8; ++q) {
+            out.qs[q][r] = in[r].qs[q];
+        }
+    }
+    return out;
+}
+
+static int repack_znq2_l_8(ggml_tensor * t, const void * data, size_t size) {
+    GGML_ASSERT(t->type == GGML_TYPE_ZNQ2_L && t->ne[0] % QK_ZNQ == 0);
+    if (t->ne[1] % 8) {
+        return -1;
+    }
+    GGML_ASSERT(size == ggml_nbytes(t));
+    repack_znq_8_bl_parallel((const block_znq2_l *) data, (block_znq2_lx8 *) t->data,
+                            ggml_nrows(t), t->ne[0] / QK_ZNQ, size, make_block_znq2_lx8);
+    return 0;
+}
+
+static block_znq3_sx8 make_block_znq3_sx8(const block_znq3_s * in) {
+    block_znq3_sx8 out = {};
+    for (int r = 0; r < 8; ++r) {
+        const uint8_t * src = (const uint8_t *) &in[r];
+        for (int b = 0; b < 4; ++b) {
+            out.header[r*4 + b] = src[b];
+        }
+        for (int q = 0; q < 8; ++q) {
+            out.qs[q][r] = in[r].qs[q];
+        }
+    }
+    return out;
+}
+
+static int repack_znq3_s_8(ggml_tensor * t, const void * data, size_t size) {
+    GGML_ASSERT(t->type == GGML_TYPE_ZNQ3_S && t->ne[0] % QK_ZNQ == 0);
+    if (t->ne[1] % 8) {
+        return -1;
+    }
+    GGML_ASSERT(size == ggml_nbytes(t));
+    repack_znq_8_bl_parallel((const block_znq3_s *) data, (block_znq3_sx8 *) t->data,
+                            ggml_nrows(t), t->ne[0] / QK_ZNQ, size, make_block_znq3_sx8);
+    return 0;
+}
+
+static inline uint8_t znq3_m_repack_code(const uint8_t * qs, int j) {
     const int bit = 3*j;
     const int byte = bit >> 3;
     const int shift = bit & 7;
@@ -4310,8 +4488,8 @@ static inline uint8_t znq3_repack_code(const uint8_t * qs, int j) {
     return (uint8_t) (v & 7u);
 }
 
-static block_znq3x8 make_block_znq3x8(const block_znq3 * in) {
-    block_znq3x8 out = {};
+static block_znq3_mx8 make_block_znq3_mx8(const block_znq3_m * in) {
+    block_znq3_mx8 out = {};
 
     for (int r = 0; r < 8; ++r) {
         out.d[r] = in[r].d;
@@ -4324,7 +4502,7 @@ static block_znq3x8 make_block_znq3x8(const block_znq3 * in) {
         uint32_t p2 = 0;
         for (int r = 0; r < 8; ++r) {
             for (int j = 0; j < 4; ++j) {
-                const uint8_t code = znq3_repack_code(in[r].qs, 4*g + j);
+                const uint8_t code = znq3_m_repack_code(in[r].qs, 4*g + j);
                 const int pos = 4*r + j;
                 p0 |= (uint32_t) ((code >> 0) & 1u) << pos;
                 p1 |= (uint32_t) ((code >> 1) & 1u) << pos;
@@ -4339,29 +4517,90 @@ static block_znq3x8 make_block_znq3x8(const block_znq3 * in) {
     return out;
 }
 
-static int repack_znq3_to_znq3_8_bl(struct ggml_tensor * t, const void * GGML_RESTRICT data, size_t data_size) {
-    GGML_ASSERT(t->type == GGML_TYPE_ZNQ3);
+static int repack_znq3_m_to_znq3_m_8_bl(ggml_tensor * t, const void * GGML_RESTRICT data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_ZNQ3_M);
 
-    const block_znq3 * src = (const block_znq3 *) data;
-          block_znq3x8 * dst = (block_znq3x8 *) t->data;
+    const block_znq3_m * src = (const block_znq3_m *) data;
+          block_znq3_mx8 * dst = (block_znq3_mx8 *) t->data;
 
     const int nrow = ggml_nrows(t);
     const int nblocks = t->ne[0] / QK_ZNQ;
 
     GGML_ASSERT(t->ne[0] % QK_ZNQ == 0);
-    GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(block_znq3));
+    GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(block_znq3_m));
 
     if (t->ne[1] % 8 != 0) {
         return -1;
     }
 
-    repack_znq_8_bl_parallel(src, dst, nrow, nblocks, data_size, make_block_znq3x8);
+    repack_znq_8_bl_parallel(src, dst, nrow, nblocks, data_size, make_block_znq3_mx8);
 
     return 0;
 }
 
-static block_znq4x8 make_block_znq4x8(const block_znq4 * in) {
-    block_znq4x8 out = {};
+static block_znq3_lx8 make_block_znq3_lx8(const block_znq3_l * in) {
+    block_znq3_lx8 out = {};
+    for (int r = 0; r < 8; ++r) {
+        out.header[r] = in[r].d;
+        out.header[8+r] = in[r].books[0];
+        out.header[16+r] = in[r].books[1];
+        for (int j = 0; j < QK_ZNQ; ++j) {
+            const int bit = 3*j;
+            unsigned code = in[r].qs[bit/8] >> (bit%8);
+            if (bit%8 > 5) {
+                code |= unsigned(in[r].qs[bit/8+1]) << (8-bit%8);
+            }
+            for (int b = 0; b < 3; ++b) {
+                out.planes[j/4][b] |= ((code >> b)&1u) << (4*r+j%4);
+            }
+        }
+    }
+    return out;
+}
+
+static int repack_znq3_l_8(ggml_tensor * t, const void * data, size_t size) {
+    GGML_ASSERT(t->type == GGML_TYPE_ZNQ3_L && t->ne[0] % QK_ZNQ == 0);
+    GGML_ASSERT(size == ggml_nbytes(t));
+    if (t->ne[1] % 8) {
+        return -1;
+    }
+    repack_znq_8_bl_parallel((const block_znq3_l *) data, (block_znq3_lx8 *) t->data,
+                            ggml_nrows(t), t->ne[0]/QK_ZNQ, size, make_block_znq3_lx8);
+    return 0;
+}
+
+static block_znq4_sx8 make_block_znq4_sx8(const block_znq4_s * in) {
+    block_znq4_sx8 out = {};
+    for (int r = 0; r < 8; ++r) {
+        out.header[4*r] = in[r].d;
+        memcpy(out.header + 4*r + 1, in[r].books, 3);
+        for (int j = 0; j < QK_ZNQ; ++j) {
+            const int bit = 3*j;
+            unsigned code = in[r].qs[bit/8] >> (bit%8);
+            if (bit%8 > 5) {
+                code |= unsigned(in[r].qs[bit/8+1]) << (8-bit%8);
+            }
+            for (int b = 0; b < 3; ++b) {
+                out.planes[j/4][b] |= ((code >> b)&1u) << (4*r+j%4);
+            }
+        }
+    }
+    return out;
+}
+
+static int repack_znq4_s_8(ggml_tensor * t, const void * data, size_t size) {
+    GGML_ASSERT(t->type == GGML_TYPE_ZNQ4_S && t->ne[0] % QK_ZNQ == 0);
+    GGML_ASSERT(size == ggml_nbytes(t));
+    if (t->ne[1] % 8) {
+        return -1;
+    }
+    repack_znq_8_bl_parallel((const block_znq4_s *) data, (block_znq4_sx8 *) t->data,
+                            ggml_nrows(t), t->ne[0]/QK_ZNQ, size, make_block_znq4_sx8);
+    return 0;
+}
+
+static block_znq4_mx8 make_block_znq4_mx8(const block_znq4_m * in) {
+    block_znq4_mx8 out = {};
 
     for (int r = 0; r < 8; ++r) {
         out.d[r] = in[r].d;
@@ -4379,23 +4618,23 @@ static block_znq4x8 make_block_znq4x8(const block_znq4 * in) {
     return out;
 }
 
-static int repack_znq4_to_znq4_8_bl(struct ggml_tensor * t, const void * GGML_RESTRICT data, size_t data_size) {
-    GGML_ASSERT(t->type == GGML_TYPE_ZNQ4);
+static int repack_znq4_m_to_znq4_m_8_bl(ggml_tensor * t, const void * GGML_RESTRICT data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_ZNQ4_M);
 
-    const block_znq4 * src = (const block_znq4 *) data;
-          block_znq4x8 * dst = (block_znq4x8 *) t->data;
+    const block_znq4_m * src = (const block_znq4_m *) data;
+          block_znq4_mx8 * dst = (block_znq4_mx8 *) t->data;
 
     const int nrow = ggml_nrows(t);
     const int nblocks = t->ne[0] / QK_ZNQ;
 
     GGML_ASSERT(t->ne[0] % QK_ZNQ == 0);
-    GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(block_znq4));
+    GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(block_znq4_m));
 
     if (t->ne[1] % 8 != 0) {
         return -1;
     }
 
-    repack_znq_8_bl_parallel(src, dst, nrow, nblocks, data_size, make_block_znq4x8);
+    repack_znq_8_bl_parallel(src, dst, nrow, nblocks, data_size, make_block_znq4_mx8);
 
     return 0;
 }
@@ -4639,16 +4878,32 @@ template <> int repack<block_iq4_nl, 8, 8>(struct ggml_tensor * t, const void * 
 }
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
-template <> int repack<block_znq2, 8, 8>(struct ggml_tensor * t, const void * data, size_t data_size) {
-    return repack_znq2_to_znq2_8_bl(t, data, data_size);
+template <> int repack<block_znq2_m, 8, 8>(ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_znq2_m_to_znq2_m_8_bl(t, data, data_size);
 }
 
-template <> int repack<block_znq3, 8, 8>(struct ggml_tensor * t, const void * data, size_t data_size) {
-    return repack_znq3_to_znq3_8_bl(t, data, data_size);
+template <> int repack<block_znq2_l, 8, 8>(ggml_tensor * t, const void * data, size_t size) {
+    return repack_znq2_l_8(t, data, size);
 }
 
-template <> int repack<block_znq4, 8, 8>(struct ggml_tensor * t, const void * data, size_t data_size) {
-    return repack_znq4_to_znq4_8_bl(t, data, data_size);
+template <> int repack<block_znq3_s, 8, 8>(ggml_tensor * t, const void * data, size_t size) {
+    return repack_znq3_s_8(t, data, size);
+}
+
+template <> int repack<block_znq3_m, 8, 8>(ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_znq3_m_to_znq3_m_8_bl(t, data, data_size);
+}
+
+template <> int repack<block_znq3_l, 8, 8>(ggml_tensor * t, const void * data, size_t size) {
+    return repack_znq3_l_8(t, data, size);
+}
+
+template <> int repack<block_znq4_s, 8, 8>(ggml_tensor * t, const void * data, size_t size) {
+    return repack_znq4_s_8(t, data, size);
+}
+
+template <> int repack<block_znq4_m, 8, 8>(ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_znq4_m_to_znq4_m_8_bl(t, data, data_size);
 }
 #endif
 
@@ -4758,16 +5013,32 @@ template <> void gemv<block_iq4_nl, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size
 }
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
-template <> void gemv<block_znq2, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
-    ggml_gemv_znq2_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
+template <> void gemv<block_znq2_m, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_znq2_m_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
-template <> void gemv<block_znq3, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
-    ggml_gemv_znq3_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
+template <> void gemv<block_znq2_l, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_znq_local(n, s, bs, vx, vy, nr, nc, 8);
 }
 
-template <> void gemv<block_znq4, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
-    ggml_gemv_znq4_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
+template <> void gemv<block_znq3_s, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_znq_local(n, s, bs, vx, vy, nr, nc, 4);
+}
+
+template <> void gemv<block_znq3_m, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_znq3_m_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemv<block_znq3_l, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_znq_local(n, s, bs, vx, vy, nr, nc, 8, nullptr, 3);
+}
+
+template <> void gemv<block_znq4_s, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_znq_local(n, s, bs, vx, vy, nr, nc, 4, nullptr, 3);
+}
+
+template <> void gemv<block_znq4_m, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_znq4_m_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 #endif
 
@@ -4877,16 +5148,32 @@ template <> void gemm<block_iq4_nl, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size
 }
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
-template <> void gemm<block_znq2, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
-    ggml_gemm_znq2_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
+template <> void gemm<block_znq2_m, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_znq2_m_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
-template <> void gemm<block_znq3, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
-    ggml_gemm_znq3_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
+template <> void gemm<block_znq2_l, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_znq_local(n, s, bs, vx, vy, nr, nc, 8, nullptr, 0, 0);
 }
 
-template <> void gemm<block_znq4, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
-    ggml_gemm_znq4_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
+template <> void gemm<block_znq3_s, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_znq_local(n, s, bs, vx, vy, nr, nc, 4, nullptr, 0, 0);
+}
+
+template <> void gemm<block_znq3_m, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_znq3_m_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemm<block_znq3_l, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_znq_local(n, s, bs, vx, vy, nr, nc, 8, nullptr, 0, 0, nullptr, 3);
+}
+
+template <> void gemm<block_znq4_s, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_znq_local(n, s, bs, vx, vy, nr, nc, 4, nullptr, 0, 0, nullptr, 3);
+}
+
+template <> void gemm<block_znq4_m, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_znq4_m_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 #endif
 
@@ -4957,6 +5244,18 @@ static void repack_activation_rows(const void * const rows[4], void * dst, int64
 }
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
+    static constexpr bool local_znq = std::is_same_v<BLOC_TYPE, block_znq2_l> || std::is_same_v<BLOC_TYPE, block_znq3_s> ||
+        std::is_same_v<BLOC_TYPE, block_znq3_l> || std::is_same_v<BLOC_TYPE, block_znq4_s>;
+    static constexpr int local_group = (std::is_same_v<BLOC_TYPE, block_znq3_s> || std::is_same_v<BLOC_TYPE, block_znq4_s>) ? 4 : 8;
+    static constexpr int local_bits = (std::is_same_v<BLOC_TYPE, block_znq3_l> || std::is_same_v<BLOC_TYPE, block_znq4_s>) ? 3 : 2;
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
+    static constexpr bool group16_znq = std::is_same_v<BLOC_TYPE, block_znq2_m> || std::is_same_v<BLOC_TYPE, block_znq3_m> || std::is_same_v<BLOC_TYPE, block_znq4_m>;
+#else
+    static constexpr bool group16_znq = false;
+#endif
+    static bool prepare_sums(const ggml_tensor * input) {
+        return local_znq || (group16_znq && input->ne[1] >= 20);
+    }
 
     bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
         // not realy a GGML_TYPE_Q8_0 but same size.
@@ -4966,6 +5265,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     const auto * input = op->src[1];
                     const int64_t rows = input->type == PARAM_TYPE ? input->ne[1] - input->ne[1] % 4 : input->ne[1];
                     size = ggml_row_size(PARAM_TYPE, input->ne[0]) * rows * input->ne[2];
+                    if (prepare_sums(input)) {
+                        size = GGML_PAD(size, sizeof(int32_t)) + sizeof(int32_t) *
+                            (input->ne[0] / QK_ZNQ) * input->ne[1] * input->ne[2];
+                    }
                     return true;
                 }
             case GGML_OP_MUL_MAT_ID:
@@ -4980,14 +5283,14 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
                     if constexpr (PARAM_TYPE == GGML_TYPE_Q8_0 && INTER_SIZE == 8 && NB_COLS == 8) {
                         const ggml_type src0_type = op->src[0]->type;
-                        if ((src0_type == GGML_TYPE_ZNQ2 ||
-                             src0_type == GGML_TYPE_ZNQ3 ||
-                             src0_type == GGML_TYPE_ZNQ4) && ne12 > 1) {
+                        if ((src0_type == GGML_TYPE_ZNQ2_M || src0_type == GGML_TYPE_ZNQ2_L || src0_type == GGML_TYPE_ZNQ3_S || src0_type == GGML_TYPE_ZNQ3_M || src0_type == GGML_TYPE_ZNQ3_L ||
+                             src0_type == GGML_TYPE_ZNQ4_S ||
+                             src0_type == GGML_TYPE_ZNQ4_M) && ne12 > 1) {
                             const int64_t n_ids = op->src[2]->ne[0];
                             const size_t row_size = ggml_row_size(PARAM_TYPE, op->src[1]->ne[0]);
                             const size_t routed_size = row_size * (size_t) n_ids * (size_t) ne12;
                             activation_size = MAX(activation_size, routed_size);
-                            if (src0_type == GGML_TYPE_ZNQ3 && op->src[1]->type == GGML_TYPE_F32 && op->src[1]->ne[1] == 1 && n_ids >= 4) {
+                            if (src0_type == GGML_TYPE_ZNQ3_M && op->src[1]->type == GGML_TYPE_F32 && op->src[1]->ne[1] == 1 && n_ids >= 4) {
                                 activation_size += row_size * (size_t) ne12;
                             }
                         }
@@ -5060,20 +5363,45 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int64_t nrows = src1_end - src1_start;
         const int64_t ncols = src0_end - src0_start;
 
+        const int32_t * sums = nullptr;
+        if (prepare_sums(src1)) {
+            const size_t offset = GGML_PAD(src1_col_stride * packed_rows * ne12, sizeof(int32_t));
+            sums = (const int32_t *) ((const char *) params->wdata + offset) + (i12*ne11 + i11)*(ne10/QK_ZNQ);
+        }
+
         // If there are more than three rows in src1, use gemm; otherwise, use gemv.
         if (nrows > 3) {
             GGML_ASSERT(src1_ptr + src1_col_stride * (nrows - nrows % 4) <= (const char *) params->wdata + params->wsize);
-            gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst_ptr) + src0_start, nb1 / nb0,
-                                                             src0_ptr + src0_start * nb01, src1_ptr,
-                                                             nrows - (nrows % 4), ncols);
+            if constexpr (local_znq) {
+                ggml_gemm_znq_local(ne00, (float *) dst_ptr + src0_start, nb1 / nb0,
+                                    src0_ptr + src0_start * nb01, src1_ptr, nrows - nrows % 4, ncols,
+                                    local_group, nullptr, 0, 0, sums, local_bits);
+            } else {
+                bool done = false;
+                if constexpr (group16_znq) {
+                    if (sums) {
+                        done = ggml_gemm_znq_prepared(ne00, (float *) dst_ptr + src0_start, nb1 / nb0,
+                            src0_ptr + src0_start*nb01, src1_ptr, nrows - nrows % 4, ncols, src0->type, sums);
+                    }
+                }
+                if (!done) {
+                    gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) dst_ptr + src0_start, nb1 / nb0,
+                        src0_ptr + src0_start*nb01, src1_ptr, nrows - nrows % 4, ncols);
+                }
+            }
         }
         for (int iter = nrows - (nrows % 4); iter < nrows; iter++) {
             const void * row = src1->type == PARAM_TYPE
                 ? (const char *) src1->data + (i11 + iter)*nb11 + i12*nb12
                 : src1_ptr + src1_col_stride*iter;
-            gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst_ptr + (iter * nb1)) + src0_start,
-                                                             ne01, src0_ptr + src0_start * nb01,
-                                                             row, 1 /* nrows */, ncols);
+            if constexpr (local_znq) {
+                ggml_gemv_znq_local(ne00, (float *) (dst_ptr + iter*nb1) + src0_start, ne01,
+                                    src0_ptr + src0_start * nb01, row, 1, ncols, local_group, sums + iter*(ne10/QK_ZNQ), local_bits);
+            } else {
+                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst_ptr + (iter * nb1)) + src0_start,
+                                                                 ne01, src0_ptr + src0_start * nb01,
+                                                                 row, 1 /* nrows */, ncols);
+            }
         }
     }
 
@@ -5116,6 +5444,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         assert(params->wsize >= nbw2 * ne12);
 
+        int32_t * sums = nullptr;
+        if (prepare_sums(src1)) {
+            const size_t offset = GGML_PAD(nbw2 * ne12, sizeof(int32_t));
+            GGML_ASSERT(params->wsize >= offset + sizeof(int32_t)*(ne10/QK_ZNQ)*ne11*ne12);
+            sums = (int32_t *) (wdata + offset);
+        }
+
         const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
 
         // INFO: Quantization is done in planes to avoid extra complexity in chunking.
@@ -5136,12 +5471,19 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>((float *) (data_ptr + i11 * nb11),
                                                               (void *) (wdata_ptr + i11 * nbw1), 4, ne10);
                 }
+                if (prepare_sums(src1)) {
+                    ggml_znq_local_prepare_sums(ne10, 4, true, wdata_ptr + i11*nbw1, sums + (i12*ne11 + i11)*(ne10/QK_ZNQ));
+                }
             }
 
             const int64_t i11_processed = ne11 - ne11 % 4;
             for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
                 if (src1->type == GGML_TYPE_F32) {
                     from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
+                }
+                if (prepare_sums(src1)) {
+                    const void * row = src1->type == PARAM_TYPE ? data_ptr + i11*nb11 : wdata_ptr + i11*nbw1;
+                    ggml_znq_local_prepare_sums(ne10, 1, false, row, sums + (i12*ne11 + i11)*(ne10/QK_ZNQ));
                 }
             }
         }
@@ -5273,9 +5615,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         bool use_znq_moe = false;
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
         if constexpr (PARAM_TYPE == GGML_TYPE_Q8_0 && INTER_SIZE == 8 && NB_COLS == 8) {
-            use_znq_moe = (src0->type == GGML_TYPE_ZNQ2 ||
-                            src0->type == GGML_TYPE_ZNQ3 ||
-                            src0->type == GGML_TYPE_ZNQ4) && ne12 > 1;
+            use_znq_moe = (src0->type == GGML_TYPE_ZNQ2_M || src0->type == GGML_TYPE_ZNQ2_L || src0->type == GGML_TYPE_ZNQ3_S || src0->type == GGML_TYPE_ZNQ3_M || src0->type == GGML_TYPE_ZNQ3_L ||
+                            src0->type == GGML_TYPE_ZNQ4_S ||
+                            src0->type == GGML_TYPE_ZNQ4_M) && ne12 > 1;
         }
 #endif
 
@@ -5291,11 +5633,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         // Reserve the expert-grouped activation stream separately from the row map.
         const size_t routed_q8_size = nbw1 * (size_t) n_ids * (size_t) ne12;
-        const bool reuse_znq3_input = use_znq_moe && src1->type == GGML_TYPE_F32 &&
-                                     src0->type == GGML_TYPE_ZNQ3 && ne11 == 1 && n_ids >= 4;
+        const bool reuse_znq3_m_input = use_znq_moe && src1->type == GGML_TYPE_F32 &&
+                                     src0->type == GGML_TYPE_ZNQ3_M && ne11 == 1 && n_ids >= 4;
         const size_t activation_size = (use_znq_moe ? MAX(nbw3, routed_q8_size) :
                                        src1->type == PARAM_TYPE ? 0 : nbw3) +
-                                      (reuse_znq3_input ? nbw3 : 0);
+                                      (reuse_znq3_m_input ? nbw3 : 0);
 
         GGML_ASSERT(params->wsize >=
                 (GGML_PAD(activation_size, sizeof(int64_t)) +
@@ -5312,8 +5654,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         auto * active_experts = (int32_t *) (matrix_rows + n_as*ne12); // [n_as], followed by count
 
         // Broadcast gate/up inputs are shared by all selected experts.
-        char * shared_q8 = reuse_znq3_input ? wdata + routed_q8_size : nullptr;
-        if (reuse_znq3_input) {
+        char * shared_q8 = reuse_znq3_m_input ? wdata + routed_q8_size : nullptr;
+        if (reuse_znq3_m_input) {
             for (int64_t i12 = ith; i12 < ne12; i12 += nth) {
                 from_float((const float *) ((const char *) src1->data + i12*nb12),
                            shared_q8 + i12*nbw1, ne10);
@@ -5395,7 +5737,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                         continue;
                     }
 
-                    if (reuse_znq3_input) {
+                    if (reuse_znq3_m_input) {
                         const void * rows[4];
                         for (int r = 0; r < 4; ++r) {
                             const mmid_row_mapping row = MMID_MATRIX_ROW(cur_a, ir1 + r);
@@ -5422,12 +5764,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                         const int64_t i12 = row.i2;
                         xr[r] = (const float *) ((const char *) src1->data + i12*nb12 + i11*nb11);
                     }
-                    ggml_quantize_mat_znq4_q8_0_4x8(
+                    ggml_quantize_mat_znq4_m_q8_0_4x8(
                         xr[0], xr[1], xr[2], xr[3],
                         wdata + (expert_row_base + ir1)*nbw1, ne10);
                 }
                 // Shared-input tails are read directly by GEMV.
-                for (; !reuse_znq3_input && ir1 < cne1; ++ir1) {
+                for (; !reuse_znq3_m_input && ir1 < cne1; ++ir1) {
                     const int64_t task = qtask++;
                     if (task % nth != ith) {
                         continue;
@@ -5456,14 +5798,26 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                                 const int32_t * row_map, const void * weights,
                                 const void * activations, int nr, int nc) {
             switch (src0->type) {
-                case GGML_TYPE_ZNQ2:
-                    ggml_gemm_znq2_8x8_q8_0_moe(n, out, dst_bs1, dst_bs2, row_map, weights, activations, nr, nc);
+                case GGML_TYPE_ZNQ2_M:
+                    ggml_gemm_znq2_m_8x8_q8_0_moe(n, out, dst_bs1, dst_bs2, row_map, weights, activations, nr, nc);
                     break;
-                case GGML_TYPE_ZNQ3:
-                    ggml_gemm_znq3_8x8_q8_0_moe(n, out, dst_bs1, dst_bs2, row_map, weights, activations, nr, nc);
+                case GGML_TYPE_ZNQ2_L:
+                    ggml_gemm_znq_local(n, out, 0, weights, activations, nr, nc, 8, row_map, dst_bs1, dst_bs2);
                     break;
-                case GGML_TYPE_ZNQ4:
-                    ggml_gemm_znq4_8x8_q8_0_moe(n, out, dst_bs1, dst_bs2, row_map, weights, activations, nr, nc);
+                case GGML_TYPE_ZNQ3_S:
+                    ggml_gemm_znq_local(n, out, 0, weights, activations, nr, nc, 4, row_map, dst_bs1, dst_bs2);
+                    break;
+                case GGML_TYPE_ZNQ3_M:
+                    ggml_gemm_znq3_m_8x8_q8_0_moe(n, out, dst_bs1, dst_bs2, row_map, weights, activations, nr, nc);
+                    break;
+                case GGML_TYPE_ZNQ3_L:
+                    ggml_gemm_znq_local(n, out, 0, weights, activations, nr, nc, 8, row_map, dst_bs1, dst_bs2, nullptr, 3);
+                    break;
+                case GGML_TYPE_ZNQ4_S:
+                    ggml_gemm_znq_local(n, out, 0, weights, activations, nr, nc, 4, row_map, dst_bs1, dst_bs2, nullptr, 3);
+                    break;
+                case GGML_TYPE_ZNQ4_M:
+                    ggml_gemm_znq4_m_8x8_q8_0_moe(n, out, dst_bs1, dst_bs2, row_map, weights, activations, nr, nc);
                     break;
                 default:
                     GGML_ABORT("invalid ZNQ MoE type");
@@ -5535,19 +5889,19 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                             src0_cur + col*nb01, expert_q8, (int) gemm_rows, tile);
                     }
 
-                    // Reuse ZNQ3 weight decode across the unpacked two/three-row tail.
+                    // Reuse ZNQ3_M weight decode across the unpacked two/three-row tail.
                     int64_t ir1 = gemm_rows;
-                    if (reuse_znq3_input && ir1 < nr1) {
+                    if (reuse_znq3_m_input && ir1 < nr1) {
                         const int32_t * row_map =
                             reinterpret_cast<const int32_t *>(&MMID_MATRIX_ROW(cur_a, ir1));
-                        ggml_gemv_znq3_8x8_q8_0_moe(
+                        ggml_gemv_znq3_m_8x8_q8_0_moe(
                             ne00, (float *) dst->data + col, dst_bs1, dst_bs2, row_map,
                             src0_cur + col*nb01, shared_q8, (int) (nr1 - ir1), tile);
                         ir1 = nr1;
-                    } else if (src0->type == GGML_TYPE_ZNQ3 && nr1 - ir1 > 1 && tile >= 16) {
+                    } else if (src0->type == GGML_TYPE_ZNQ3_M && nr1 - ir1 > 1 && tile >= 16) {
                         float tail[3 * znq_moe_task_cols];
                         const int tail_rows = (int) (nr1 - ir1);
-                        ggml_gemv_znq3_8x8_q8_0(
+                        ggml_gemv_znq3_m_8x8_q8_0(
                             ne00, tail, tile, src0_cur + col*nb01, expert_q8 + ir1*nbw1, tail_rows, tile);
                         for (int r = 0; r < tail_rows; ++r) {
                             const mmid_row_mapping row = MMID_MATRIX_ROW(cur_a, ir1 + r);
@@ -5710,9 +6064,13 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     static const ggml::cpu::repack::tensor_traits<block_iq4_nl, 8, 8, GGML_TYPE_Q8_0> iq4_nl_8x8_q8_0;
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
-    static const ggml::cpu::repack::tensor_traits<block_znq2, 8, 8, GGML_TYPE_Q8_0> znq2_8x8_q8_0;
-    static const ggml::cpu::repack::tensor_traits<block_znq3, 8, 8, GGML_TYPE_Q8_0> znq3_8x8_q8_0;
-    static const ggml::cpu::repack::tensor_traits<block_znq4, 8, 8, GGML_TYPE_Q8_0> znq4_8x8_q8_0;
+    static const ggml::cpu::repack::tensor_traits<block_znq2_m, 8, 8, GGML_TYPE_Q8_0> znq2_m_8x8_q8_0;
+    static const ggml::cpu::repack::tensor_traits<block_znq2_l, 8, 8, GGML_TYPE_Q8_0> znq2_l_8x8_q8_0;
+    static const ggml::cpu::repack::tensor_traits<block_znq3_s, 8, 8, GGML_TYPE_Q8_0> znq3_s_8x8_q8_0;
+    static const ggml::cpu::repack::tensor_traits<block_znq3_m, 8, 8, GGML_TYPE_Q8_0> znq3_m_8x8_q8_0;
+    static const ggml::cpu::repack::tensor_traits<block_znq3_l, 8, 8, GGML_TYPE_Q8_0> znq3_l_8x8_q8_0;
+    static const ggml::cpu::repack::tensor_traits<block_znq4_s, 8, 8, GGML_TYPE_Q8_0> znq4_s_8x8_q8_0;
+    static const ggml::cpu::repack::tensor_traits<block_znq4_m, 8, 8, GGML_TYPE_Q8_0> znq4_m_8x8_q8_0;
 #endif
 
     // instance for MXFP4
@@ -5856,22 +6214,34 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
             #endif
         }
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
-    } else if (cur->type == GGML_TYPE_ZNQ2) {
+    } else if (cur->type == GGML_TYPE_ZNQ2_M || cur->type == GGML_TYPE_ZNQ2_L || cur->type == GGML_TYPE_ZNQ3_S || cur->type == GGML_TYPE_ZNQ3_L || cur->type == GGML_TYPE_ZNQ4_S) {
         if (ggml_cpu_has_avx512_vbmi() && ggml_cpu_has_avx512_vnni()) {
             if (cur->ne[1] % 8 == 0) {
-                return &znq2_8x8_q8_0;
+                if (cur->type == GGML_TYPE_ZNQ2_L) {
+                    return &znq2_l_8x8_q8_0;
+                }
+                if (cur->type == GGML_TYPE_ZNQ3_L) {
+                    return &znq3_l_8x8_q8_0;
+                }
+                if (cur->type == GGML_TYPE_ZNQ3_S) {
+                    return &znq3_s_8x8_q8_0;
+                }
+                if (cur->type == GGML_TYPE_ZNQ4_S) {
+                    return &znq4_s_8x8_q8_0;
+                }
+                return &znq2_m_8x8_q8_0;
             }
         }
-    } else if (cur->type == GGML_TYPE_ZNQ3) {
+    } else if (cur->type == GGML_TYPE_ZNQ3_M) {
         if (ggml_cpu_has_avx512_vbmi() && ggml_cpu_has_avx512_vnni()) {
             if (cur->ne[1] % 8 == 0) {
-                return &znq3_8x8_q8_0;
+                return &znq3_m_8x8_q8_0;
             }
         }
-    } else if (cur->type == GGML_TYPE_ZNQ4) {
+    } else if (cur->type == GGML_TYPE_ZNQ4_M) {
         if (ggml_cpu_has_avx512_vbmi() && ggml_cpu_has_avx512_vnni()) {
             if (cur->ne[1] % 8 == 0) {
-                return &znq4_8x8_q8_0;
+                return &znq4_m_8x8_q8_0;
             }
         }
 #endif

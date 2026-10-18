@@ -465,7 +465,7 @@ static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel, ggml_
     auto memory = (ggml_backend_cpu_expert_cache_memory_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_expert_cache_memory");
     auto hits = (ggml_backend_cpu_expert_cache_hits_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_expert_cache_hits");
     GGML_ASSERT(create && free_cache && add_device && register_weights && set_cache && prepare && copy && cache_device && offload_device && memory && hits);
-    const bool repacked = type == GGML_TYPE_ZNQ2 || type == GGML_TYPE_ZNQ3 || type == GGML_TYPE_ZNQ4;
+    const bool repacked = type == GGML_TYPE_ZNQ2_M || type == GGML_TYPE_ZNQ2_L || type == GGML_TYPE_ZNQ3_S || type == GGML_TYPE_ZNQ3_M || type == GGML_TYPE_ZNQ3_L || type == GGML_TYPE_ZNQ4_S || type == GGML_TYPE_ZNQ4_M;
     auto buft = ggml_backend_cpu_buffer_type();
     if (repacked) {
         buft = nullptr;
@@ -524,7 +524,7 @@ static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel, ggml_
     auto start_cache = [&](ggml_backend_t backend) {
         auto cache = create();
         GGML_ASSERT(cache);
-        GGML_ASSERT(add_device(cache, 2, 0, type == GGML_TYPE_ZNQ3 ? 2 : 1, dev));
+        GGML_ASSERT(add_device(cache, 2, 0, type == GGML_TYPE_ZNQ3_M ? 2 : 1, dev));
         for (int layer = 0; layer < layers; ++layer) {
             for (int part = first_part; part < 3; ++part) {
                 register_weights(cache, dev, w[layer][part]);
@@ -779,7 +779,7 @@ int main() {
             for (ggml_type type : {
                     GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16,
                     GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
-                    GGML_TYPE_ZNQ2, GGML_TYPE_ZNQ3, GGML_TYPE_ZNQ4 }) {
+                    GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M }) {
                 test_expert_cache_reuse(dev, parallel, type, false);
                 test_expert_cache_reuse(dev, parallel, type, true);
             }

@@ -159,9 +159,13 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
         // 42 and 43 are intentionally left free for IQ2_NL / IQ3_NL from upstream PR #27983.
-        LLAMA_FTYPE_MOSTLY_ZNQ2          = 44, // except 1d tensors
-        LLAMA_FTYPE_MOSTLY_ZNQ3          = 45, // except 1d tensors
-        LLAMA_FTYPE_MOSTLY_ZNQ4          = 46, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_ZNQ2_M        = 44, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_ZNQ2_L        = 47, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_ZNQ3_S        = 48, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_ZNQ3_M        = 45, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_ZNQ3_L        = 49, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_ZNQ4_S        = 50, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_ZNQ4_M        = 46, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
