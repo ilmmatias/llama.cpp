@@ -1533,6 +1533,13 @@ bool llama_quant_tensor_allows_quantization(
     return tensor_allows_quantization(qs->params, qs->model.arch, tensor);
 }
 
+bool llama_quant_tensor_allows_quantization(
+        const char * architecture,
+        const llama_model_quantize_params * params,
+        const ggml_tensor * tensor) {
+    return tensor_allows_quantization(params, llm_arch_from_string(architecture), tensor);
+}
+
 void llama_quant_compute_types(
         quantize_state_impl * qs,
         llama_ftype ftype,

@@ -50,6 +50,12 @@ LLAMA_API bool llama_quant_tensor_allows_quantization(
         const quantize_state_impl * qs,
         const ggml_tensor * tensor);
 
+// Check eligibility from GGUF metadata without constructing a model.
+LLAMA_API bool llama_quant_tensor_allows_quantization(
+        const char * architecture,
+        const llama_model_quantize_params * params,
+        const ggml_tensor * tensor);
+
 // Compute quantization type assignments for a list of tensors.
 // All tensors should be quantizable (use llama_quant_tensor_allows_quantization to filter).
 // result_types: caller-allocated array of n_tensors elements, filled with assigned types.
