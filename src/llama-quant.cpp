@@ -900,6 +900,8 @@ static bool tensor_requires_imatrix(const char * tensor_name, const ggml_type ds
         case GGML_TYPE_ZNQ5_M:
         case GGML_TYPE_ZNQ5_L:
         case GGML_TYPE_ZNQ6_S:
+        case GGML_TYPE_ZNQ6_M:
+        case GGML_TYPE_ZNQ6_L:
             return true;
         case GGML_TYPE_Q2_K:
             // as a general rule, the k-type quantizations don't require imatrix data.
@@ -967,6 +969,8 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_ZNQ5_M: return GGML_TYPE_ZNQ5_M;
         case LLAMA_FTYPE_MOSTLY_ZNQ5_L: return GGML_TYPE_ZNQ5_L;
         case LLAMA_FTYPE_MOSTLY_ZNQ6_S: return GGML_TYPE_ZNQ6_S;
+        case LLAMA_FTYPE_MOSTLY_ZNQ6_M: return GGML_TYPE_ZNQ6_M;
+        case LLAMA_FTYPE_MOSTLY_ZNQ6_L: return GGML_TYPE_ZNQ6_L;
         default: return GGML_TYPE_COUNT;
     }
 }

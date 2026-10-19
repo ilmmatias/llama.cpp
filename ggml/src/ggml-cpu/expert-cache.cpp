@@ -689,6 +689,88 @@ static bool unpack_repacked_znq_expert(const ggml_tensor * tensor, int32_t exper
 
             return true;
         }
+        case GGML_TYPE_ZNQ6_M: {
+            if (dst_size != (size_t) tensor->ne[1] * (size_t) nblocks * sizeof(block_znq6_m)) {
+                return false;
+            }
+
+            const auto * src = (const block_znq6_mx8 *) src_base;
+            auto * out = (block_znq6_m *) dst;
+
+            for (int64_t rg = 0; rg < row_groups; ++rg) {
+                for (int64_t ib = 0; ib < nblocks; ++ib) {
+                    const auto & in = src[rg * nblocks + ib];
+
+                    for (int r = 0; r < 8; ++r) {
+                        auto & b = out[(rg * 8 + r) * nblocks + ib];
+                        uint8_t * header = (uint8_t *) &b;
+
+                        for (int j = 0; j < 2; ++j) {
+                            header[j] = in.header[j * 8 + r];
+                        }
+
+                        memset(b.qs, 0, sizeof(b.qs));
+
+                        for (int j = 0; j < QK_ZNQ; ++j) {
+                            const uint8_t * quad = in.qs[j / 4];
+                            uint32_t high;
+                            memcpy(&high, quad + 16, sizeof(high));
+                            uint32_t high1;
+                            memcpy(&high1, quad + 20, sizeof(high1));
+                            const unsigned code = ((quad[2 * r + (j % 4) / 2] >> (4 * (j % 2))) & 15) | (((high >> (4 * r + j % 4)) & 1) << 4) | (((high1 >> (4 * r + j % 4)) & 1) << 5);
+                            const int bit = 6 * j;
+                            b.qs[bit / 8] |= code << (bit % 8);
+                            if (bit % 8 > 2) {
+                                b.qs[bit / 8 + 1] |= code >> (8 - bit % 8);
+                            }
+                        }
+                    }
+                }
+            }
+
+            return true;
+        }
+        case GGML_TYPE_ZNQ6_L: {
+            if (dst_size != (size_t) tensor->ne[1] * (size_t) nblocks * sizeof(block_znq6_l)) {
+                return false;
+            }
+
+            const auto * src = (const block_znq6_lx8 *) src_base;
+            auto * out = (block_znq6_l *) dst;
+
+            for (int64_t rg = 0; rg < row_groups; ++rg) {
+                for (int64_t ib = 0; ib < nblocks; ++ib) {
+                    const auto & in = src[rg * nblocks + ib];
+
+                    for (int r = 0; r < 8; ++r) {
+                        auto & b = out[(rg * 8 + r) * nblocks + ib];
+                        uint8_t * header = (uint8_t *) &b;
+
+                        for (int j = 0; j < 3; ++j) {
+                            header[j] = in.header[j * 8 + r];
+                        }
+
+                        memset(b.qs, 0, sizeof(b.qs));
+
+                        for (int j = 0; j < QK_ZNQ; ++j) {
+                            const uint8_t * quad = in.qs[j / 4];
+                            uint32_t high;
+                            memcpy(&high, quad + 16, sizeof(high));
+                            uint32_t high1;
+                            memcpy(&high1, quad + 20, sizeof(high1));
+                            const unsigned code = ((quad[2 * r + (j % 4) / 2] >> (4 * (j % 2))) & 15) | (((high >> (4 * r + j % 4)) & 1) << 4) | (((high1 >> (4 * r + j % 4)) & 1) << 5);
+                            const int bit = 6 * j;
+                            b.qs[bit / 8] |= code << (bit % 8);
+                            if (bit % 8 > 2) {
+                                b.qs[bit / 8 + 1] |= code >> (8 - bit % 8);
+                            }
+                        }
+                    }
+                }
+            }
+
+            return true;
+        }
         default:
             return false;
     }
@@ -1208,7 +1290,7 @@ private:
                 return false;
             }
             if (is_cpu_repack_tensor(tensor) &&
-                tensor->type != GGML_TYPE_ZNQ2_M && tensor->type != GGML_TYPE_ZNQ2_L && tensor->type != GGML_TYPE_ZNQ3_S && tensor->type != GGML_TYPE_ZNQ3_M && tensor->type != GGML_TYPE_ZNQ3_L && tensor->type != GGML_TYPE_ZNQ4_S && tensor->type != GGML_TYPE_ZNQ4_M && tensor->type != GGML_TYPE_ZNQ4_L && tensor->type != GGML_TYPE_ZNQ5_S && tensor->type != GGML_TYPE_ZNQ5_M && tensor->type != GGML_TYPE_ZNQ5_L && tensor->type != GGML_TYPE_ZNQ6_S) {
+                tensor->type != GGML_TYPE_ZNQ2_M && tensor->type != GGML_TYPE_ZNQ2_L && tensor->type != GGML_TYPE_ZNQ3_S && tensor->type != GGML_TYPE_ZNQ3_M && tensor->type != GGML_TYPE_ZNQ3_L && tensor->type != GGML_TYPE_ZNQ4_S && tensor->type != GGML_TYPE_ZNQ4_M && tensor->type != GGML_TYPE_ZNQ4_L && tensor->type != GGML_TYPE_ZNQ5_S && tensor->type != GGML_TYPE_ZNQ5_M && tensor->type != GGML_TYPE_ZNQ5_L && tensor->type != GGML_TYPE_ZNQ6_S && tensor->type != GGML_TYPE_ZNQ6_M && tensor->type != GGML_TYPE_ZNQ6_L) {
                 fprintf(stderr, "expert_cache: layer %d CPU_REPACK type %s is not convertible to native GPU layout\n",
                         layer_id, ggml_type_name(tensor->type));
                 layer.disabled = true;
@@ -1499,7 +1581,7 @@ private:
 
         // Native Q8_1 skips the input conversion.
         const auto input_type = layer.gate_up ? layer.gate_up->type : layer.gate->type;
-        t->input_q8 = (input_type == GGML_TYPE_ZNQ2_M || input_type == GGML_TYPE_ZNQ2_L || input_type == GGML_TYPE_ZNQ3_S || input_type == GGML_TYPE_ZNQ3_M || input_type == GGML_TYPE_ZNQ3_L || input_type == GGML_TYPE_ZNQ4_S || input_type == GGML_TYPE_ZNQ4_M || input_type == GGML_TYPE_ZNQ4_L || input_type == GGML_TYPE_ZNQ5_S || input_type == GGML_TYPE_ZNQ5_M || input_type == GGML_TYPE_ZNQ5_L || input_type == GGML_TYPE_ZNQ6_S) &&
+        t->input_q8 = (input_type == GGML_TYPE_ZNQ2_M || input_type == GGML_TYPE_ZNQ2_L || input_type == GGML_TYPE_ZNQ3_S || input_type == GGML_TYPE_ZNQ3_M || input_type == GGML_TYPE_ZNQ3_L || input_type == GGML_TYPE_ZNQ4_S || input_type == GGML_TYPE_ZNQ4_M || input_type == GGML_TYPE_ZNQ4_L || input_type == GGML_TYPE_ZNQ5_S || input_type == GGML_TYPE_ZNQ5_M || input_type == GGML_TYPE_ZNQ5_L || input_type == GGML_TYPE_ZNQ6_S || input_type == GGML_TYPE_ZNQ6_M || input_type == GGML_TYPE_ZNQ6_L) &&
             layer.input_dim % ggml_blck_size(GGML_TYPE_Q8_1) == 0;
         t->input = ggml_new_tensor_3d(t->ctx, t->input_q8 ? GGML_TYPE_Q8_1 : GGML_TYPE_F32, layer.input_dim, 1, batch_size);
         t->ids = ggml_new_tensor_2d(t->ctx, GGML_TYPE_I32, hit_count, batch_size);

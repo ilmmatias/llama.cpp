@@ -71,6 +71,8 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "ZNQ5_M",   LLAMA_FTYPE_MOSTLY_ZNQ5_M,   " 5.50 bpw non-linear book quantization", },
     { "ZNQ5_L",   LLAMA_FTYPE_MOSTLY_ZNQ5_L,   " 5.75 bpw non-linear book quantization", },
     { "ZNQ6_S",   LLAMA_FTYPE_MOSTLY_ZNQ6_S,   " 6.00 bpw non-linear book quantization", },
+    { "ZNQ6_M",   LLAMA_FTYPE_MOSTLY_ZNQ6_M,   " 6.50 bpw non-linear book quantization", },
+    { "ZNQ6_L",   LLAMA_FTYPE_MOSTLY_ZNQ6_L,   " 6.75 bpw non-linear book quantization", },
     { "Q4_K",     LLAMA_FTYPE_MOSTLY_Q4_K_M,   "alias for Q4_K_M",                  },
     { "Q4_K_S",   LLAMA_FTYPE_MOSTLY_Q4_K_S,   " 4.37G, +0.2689 ppl @ Llama-3-8B",  },
     { "Q4_K_M",   LLAMA_FTYPE_MOSTLY_Q4_K_M,   " 4.58G, +0.1754 ppl @ Llama-3-8B",  },

@@ -5204,7 +5204,7 @@ static void znq_pack_codes(int bits, const uint8_t * codes, uint8_t * dst) {
         for (int j = 0; j < QK_ZNQ; ++j) {
             dst[j/4] |= (codes[j] & 3u) << (2*(j & 3));
         }
-    } else if (bits == 3 || bits == 5) {
+    } else if (bits == 3 || bits == 5 || bits == 6) {
         for (int j = 0; j < QK_ZNQ; ++j) {
             const int bit = bits*j;
             const int byte = bit >> 3;
@@ -5225,7 +5225,7 @@ static inline uint8_t znq_unpack_code(const uint8_t * qs, int bits, int j) {
     if (bits == 2) {
         return (qs[j/4] >> (2*(j & 3))) & 3u;
     }
-    if (bits == 3 || bits == 5) {
+    if (bits == 3 || bits == 5 || bits == 6) {
         const int bit = bits*j;
         const int byte = bit >> 3;
         const int shift = bit & 7;
@@ -5558,7 +5558,8 @@ static void quantize_row_znq_local(const float * x, void * vy, int64_t k, int gr
     const int8_t * values = bits == 2 ? (group == 4 ? kvalues_znq3_s : kvalues_znq2_l) :
                            bits == 3 ? (group == 4 ? kvalues_znq4_s : kvalues_znq3_l) :
                            bits == 4 ? (group == 4 ? kvalues_znq5_s : kvalues_znq4_l) :
-                           (group == 16 ? kvalues_znq5_m : group == 8 ? kvalues_znq5_l : kvalues_znq6_s);
+                           bits == 5 ? (group == 16 ? kvalues_znq5_m : group == 8 ? kvalues_znq5_l : kvalues_znq6_s) :
+                           (group == 16 ? kvalues_znq6_m : kvalues_znq6_l);
     const int nlevels = 1 << bits;
     const int nbooks = group == 4 ? 8 : 16;
     uint8_t * y = (uint8_t *) vy;
@@ -5639,7 +5640,8 @@ static void dequantize_row_znq_local(const void * vx, float * y, int64_t k, int 
     const int8_t * values = bits == 2 ? (group == 4 ? kvalues_znq3_s : kvalues_znq2_l) :
                            bits == 3 ? (group == 4 ? kvalues_znq4_s : kvalues_znq3_l) :
                            bits == 4 ? (group == 4 ? kvalues_znq5_s : kvalues_znq4_l) :
-                           (group == 16 ? kvalues_znq5_m : group == 8 ? kvalues_znq5_l : kvalues_znq6_s);
+                           bits == 5 ? (group == 16 ? kvalues_znq5_m : group == 8 ? kvalues_znq5_l : kvalues_znq6_s) :
+                           (group == 16 ? kvalues_znq6_m : kvalues_znq6_l);
     const int nlevels = 1 << bits;
     const uint8_t * x = (const uint8_t *) vx;
 
@@ -5822,6 +5824,32 @@ void dequantize_row_znq6_s(const block_znq6_s * GGML_RESTRICT x, float * GGML_RE
 size_t quantize_znq6_s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
         int64_t nrow, int64_t n_per_row, const float * imatrix) {
     return quantize_znq_local(src, dst, nrow, n_per_row, 4, 5, imatrix);
+}
+
+void quantize_row_znq6_m_ref(const float * GGML_RESTRICT x, block_znq6_m * GGML_RESTRICT y, int64_t k) {
+    quantize_row_znq_local(x, y, k, 16, 6, NULL);
+}
+
+void dequantize_row_znq6_m(const block_znq6_m * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_znq_local(x, y, k, 16, 6);
+}
+
+size_t quantize_znq6_m(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+        int64_t nrow, int64_t n_per_row, const float * imatrix) {
+    return quantize_znq_local(src, dst, nrow, n_per_row, 16, 6, imatrix);
+}
+
+void quantize_row_znq6_l_ref(const float * GGML_RESTRICT x, block_znq6_l * GGML_RESTRICT y, int64_t k) {
+    quantize_row_znq_local(x, y, k, 8, 6, NULL);
+}
+
+void dequantize_row_znq6_l(const block_znq6_l * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_znq_local(x, y, k, 8, 6);
+}
+
+size_t quantize_znq6_l(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+        int64_t nrow, int64_t n_per_row, const float * imatrix) {
+    return quantize_znq_local(src, dst, nrow, n_per_row, 8, 6, imatrix);
 }
 
 // ============================ 4-bit non-linear quants
@@ -6529,6 +6557,13 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_ZNQ5_M:
         case GGML_TYPE_ZNQ5_L:
         case GGML_TYPE_ZNQ6_S:
+            {
+                // All 256 UFP8 scale-byte encodings are finite and valid.
+                GGML_UNUSED(data); GGML_UNUSED(nb);
+            } break;
+
+        case GGML_TYPE_ZNQ6_M:
+        case GGML_TYPE_ZNQ6_L:
             {
                 // All 256 UFP8 scale-byte encodings are finite and valid.
                 GGML_UNUSED(data); GGML_UNUSED(nb);

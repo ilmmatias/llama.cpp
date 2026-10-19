@@ -6188,6 +6188,8 @@ class GGMLQuantizationType(IntEnum):
     ZNQ5_M  = 54
     ZNQ5_L  = 55
     ZNQ6_S  = 56
+    ZNQ6_M  = 57
+    ZNQ6_L  = 58
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6256,6 +6258,8 @@ class LlamaFileType(IntEnum):
     MOSTLY_ZNQ5_M        = 53  # except 1d tensors
     MOSTLY_ZNQ5_L        = 54  # except 1d tensors
     MOSTLY_ZNQ6_S        = 55  # except 1d tensors
+    MOSTLY_ZNQ6_M        = 56  # except 1d tensors
+    MOSTLY_ZNQ6_L        = 57  # except 1d tensors
     GUESSED              = 1024  # not specified in the model file
 
 
@@ -6427,6 +6431,8 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.ZNQ5_M:  (32, 22),
     GGMLQuantizationType.ZNQ5_L:  (32, 23),
     GGMLQuantizationType.ZNQ6_S:  (32, 24),
+    GGMLQuantizationType.ZNQ6_M:  (32, 26),
+    GGMLQuantizationType.ZNQ6_L:  (32, 27),
 }
 
 

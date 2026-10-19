@@ -19,13 +19,13 @@ static __device__ __forceinline__ const int8_t * znq_values_cuda() {
     if constexpr (group == 4) {
         return bits == 2 ? kvalues_znq3_s : bits == 3 ? kvalues_znq4_s : bits == 4 ? kvalues_znq5_s : kvalues_znq6_s;
     } else if constexpr (group == 8) {
-        return bits == 2 ? kvalues_znq2_l : bits == 3 ? kvalues_znq3_l : bits == 4 ? kvalues_znq4_l : kvalues_znq5_l;
+        return bits == 2 ? kvalues_znq2_l : bits == 3 ? kvalues_znq3_l : bits == 4 ? kvalues_znq4_l : bits == 5 ? kvalues_znq5_l : kvalues_znq6_l;
     } else if constexpr (bits == 2) {
         return kvalues_znq2_m;
     } else if constexpr (bits == 3) {
         return kvalues_znq3_m;
     } else {
-        return bits == 4 ? kvalues_znq4_m : kvalues_znq5_m;
+        return bits == 4 ? kvalues_znq4_m : bits == 5 ? kvalues_znq5_m : kvalues_znq6_m;
     }
 }
 
@@ -49,7 +49,7 @@ static __device__ __forceinline__ int znq_value_cuda(const uint8_t * block, int 
     const int offset = bits * j;
     const int shift = offset % 8;
     unsigned code = block[znq_header_cuda<bits, group>() + offset / 8] >> shift;
-    if constexpr (bits == 3 || bits == 5) {
+    if constexpr (bits == 3 || bits >= 5) {
         if (shift + bits > 8) {
             code |= unsigned(block[znq_header_cuda<bits, group>() + 1 + offset / 8]) << (8 - shift);
         }
@@ -75,8 +75,8 @@ static __device__ __forceinline__ int znq_pack4_cuda(const uint8_t * block, int 
     } else if constexpr (bits == 3) {
         const int offset = 3 * j;
         codes = (uint32_t(block[znq_header_cuda<bits, group>() + offset / 8]) | (uint32_t(block[znq_header_cuda<bits, group>() + 1 + offset / 8]) << 8)) >> (offset % 8);
-    } else if constexpr (bits == 5) {
-        const int offset = 5 * j;
+    } else if constexpr (bits >= 5) {
+        const int offset = bits * j;
         const uint8_t * qs = block + znq_header_cuda<bits, group>() + offset / 8;
         codes = (uint32_t(qs[0]) | (uint32_t(qs[1]) << 8) | (uint32_t(qs[2]) << 16)) >> (offset % 8);
     } else {
@@ -87,7 +87,7 @@ static __device__ __forceinline__ int znq_pack4_cuda(const uint8_t * block, int 
 
 #if defined(GGML_USE_HIP)
     // Larger books pay off when one lane decodes several quads from the same book.
-    if constexpr (bits == 2 || (reuse_book && (bits != 5 || group != 4))) {
+    if constexpr (bits == 2 || (reuse_book && bits < 6 && (bits != 5 || group != 4))) {
         uint32_t indices = 0;
         if constexpr (bits == 4) {
             // Selectors 0, 4, 1, 5 put the four nibble codes in separate bytes.

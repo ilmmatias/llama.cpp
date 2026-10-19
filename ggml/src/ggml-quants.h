@@ -48,6 +48,8 @@ GGML_API void quantize_row_znq5_s_ref(const float * GGML_RESTRICT x, block_znq5_
 GGML_API void quantize_row_znq5_m_ref(const float * GGML_RESTRICT x, block_znq5_m * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_znq5_l_ref(const float * GGML_RESTRICT x, block_znq5_l * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_znq6_s_ref(const float * GGML_RESTRICT x, block_znq6_s * GGML_RESTRICT y, int64_t k);
+GGML_API void quantize_row_znq6_m_ref(const float * GGML_RESTRICT x, block_znq6_m * GGML_RESTRICT y, int64_t k);
+GGML_API void quantize_row_znq6_l_ref(const float * GGML_RESTRICT x, block_znq6_l * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_iq3_xxs_ref(const float * GGML_RESTRICT x, block_iq3_xxs * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_iq4_nl_ref (const float * GGML_RESTRICT x, block_iq4_nl  * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_iq4_xs_ref (const float * GGML_RESTRICT x, block_iq4_xs  * GGML_RESTRICT y, int64_t k);
@@ -89,6 +91,8 @@ GGML_API void dequantize_row_znq5_s(const block_znq5_s * GGML_RESTRICT x, float 
 GGML_API void dequantize_row_znq5_m(const block_znq5_m * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_znq5_l(const block_znq5_l * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_znq6_s(const block_znq6_s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_znq6_m(const block_znq6_m * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_znq6_l(const block_znq6_l * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_iq2_xs (const block_iq2_xs  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_iq2_s  (const block_iq2_s   * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
@@ -125,6 +129,8 @@ GGML_API size_t quantize_znq5_s(const float * GGML_RESTRICT src, void * GGML_RES
 GGML_API size_t quantize_znq5_m(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 GGML_API size_t quantize_znq5_l(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 GGML_API size_t quantize_znq6_s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+GGML_API size_t quantize_znq6_m(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+GGML_API size_t quantize_znq6_l(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 
 GGML_API size_t quantize_q2_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 GGML_API size_t quantize_q3_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);

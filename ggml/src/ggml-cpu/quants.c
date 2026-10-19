@@ -768,6 +768,84 @@ void ggml_vec_dot_znq6_s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     *s = sum;
 }
 
+void ggml_vec_dot_znq6_m_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(n % QK_ZNQ == 0 && nrc == 1);
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(nrc);
+
+    const block_znq6_m * x = (const block_znq6_m *) vx;
+    const block_q8_0 * y = (const block_q8_0 *) vy;
+    float sum = 0.0f;
+
+    for (int ib = 0; ib < n / QK_ZNQ; ++ib) {
+        uint32_t books = 0;
+
+        for (int b = 0; b < 1; ++b) {
+            books |= (uint32_t) x[ib].books[b] << (8 * b);
+        }
+
+        int dot = 0;
+
+        for (int j = 0; j < QK_ZNQ; ++j) {
+            const int book = (books >> (4 * (j / 16))) & 15;
+            const int bit = 6 * j;
+            unsigned code = x[ib].qs[bit / 8] >> (bit % 8);
+            if (bit % 8 > 2) {
+                code |= (unsigned) x[ib].qs[bit / 8 + 1] << (8 - bit % 8);
+            }
+
+            code &= 63;
+            dot += kvalues_znq6_m[64 * book + code] * y[ib].qs[j];
+        }
+
+        sum += znq_cpu_ufp8_to_fp32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d) * dot;
+    }
+
+    *s = sum;
+}
+
+void ggml_vec_dot_znq6_l_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(n % QK_ZNQ == 0 && nrc == 1);
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(nrc);
+
+    const block_znq6_l * x = (const block_znq6_l *) vx;
+    const block_q8_0 * y = (const block_q8_0 *) vy;
+    float sum = 0.0f;
+
+    for (int ib = 0; ib < n / QK_ZNQ; ++ib) {
+        uint32_t books = 0;
+
+        for (int b = 0; b < 2; ++b) {
+            books |= (uint32_t) x[ib].books[b] << (8 * b);
+        }
+
+        int dot = 0;
+
+        for (int j = 0; j < QK_ZNQ; ++j) {
+            const int book = (books >> (4 * (j / 8))) & 15;
+            const int bit = 6 * j;
+            unsigned code = x[ib].qs[bit / 8] >> (bit % 8);
+            if (bit % 8 > 2) {
+                code |= (unsigned) x[ib].qs[bit / 8 + 1] << (8 - bit % 8);
+            }
+
+            code &= 63;
+            dot += kvalues_znq6_l[64 * book + code] * y[ib].qs[j];
+        }
+
+        sum += znq_cpu_ufp8_to_fp32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d) * dot;
+    }
+
+    *s = sum;
+}
+
 void ggml_vec_dot_q5_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
@@ -1780,6 +1858,14 @@ void quantize_row_znq5_l(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
 
 void quantize_row_znq6_s(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_znq6_s_ref(x, y, k);
+}
+
+void quantize_row_znq6_m(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_znq6_m_ref(x, y, k);
+}
+
+void quantize_row_znq6_l(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_znq6_l_ref(x, y, k);
 }
 
 void quantize_row_iq4_nl(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {

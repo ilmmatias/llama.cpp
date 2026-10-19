@@ -1016,6 +1016,22 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_znq6_s,
         .from_float_ref           = (ggml_from_float_t) quantize_row_znq6_s_ref,
     },
+    [GGML_TYPE_ZNQ6_M] = {
+        .type_name                = "znq6_m",
+        .blck_size                = QK_ZNQ,
+        .type_size                = sizeof(block_znq6_m),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_znq6_m,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_znq6_m_ref,
+    },
+    [GGML_TYPE_ZNQ6_L] = {
+        .type_name                = "znq6_l",
+        .blck_size                = QK_ZNQ,
+        .type_size                = sizeof(block_znq6_l),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_znq6_l,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_znq6_l_ref,
+    },
     [GGML_TYPE_IQ4_XS] = {
         .type_name                = "iq4_xs",
         .blck_size                = QK_K,
@@ -8484,6 +8500,8 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_ZNQ5_M:    result = quantize_znq5_m   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_ZNQ5_L: result = quantize_znq5_l(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_ZNQ6_S: result = quantize_znq6_s(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_ZNQ6_M:    result = quantize_znq6_m   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_ZNQ6_L:    result = quantize_znq6_l   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_F16:
             {
                 size_t elemsize = sizeof(ggml_fp16_t);
