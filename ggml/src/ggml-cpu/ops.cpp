@@ -5588,6 +5588,8 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_ZNQ3_L:
         case GGML_TYPE_ZNQ4_S:
         case GGML_TYPE_ZNQ4_M:
+        case GGML_TYPE_ZNQ4_L:
+        case GGML_TYPE_ZNQ5_S:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -6396,6 +6398,8 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_ZNQ3_L:
         case GGML_TYPE_ZNQ4_S:
         case GGML_TYPE_ZNQ4_M:
+        case GGML_TYPE_ZNQ4_L:
+        case GGML_TYPE_ZNQ5_S:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:

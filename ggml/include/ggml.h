@@ -438,7 +438,9 @@ extern "C" {
         GGML_TYPE_ZNQ3_L  = 50,
         GGML_TYPE_ZNQ4_S  = 51,
         GGML_TYPE_ZNQ4_M  = 47,
-        GGML_TYPE_COUNT   = 52,
+        GGML_TYPE_ZNQ4_L  = 52,
+        GGML_TYPE_ZNQ5_S  = 53,
+        GGML_TYPE_COUNT   = 54,
     };
 
     // [TAG_GGML_PREC]

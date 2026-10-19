@@ -174,6 +174,21 @@ struct block_znq4_mx8 {
 
 static_assert(sizeof(block_znq4_mx8) == 8 * sizeof(block_znq4_m), "wrong znq4_mx8 block size/padding");
 
+struct block_znq4_lx8 {
+    uint8_t header[24];
+    uint8_t qs[8][16];
+};
+
+static_assert(sizeof(block_znq4_lx8) == 8 * sizeof(block_znq4_l), "wrong znq4_lx8 size");
+
+struct block_znq5_sx8 {
+    uint8_t header[32];
+    uint8_t qs[8][16];
+};
+
+static_assert(sizeof(block_znq5_sx8) == 8 * sizeof(block_znq5_s), "wrong znq5_sx8 size");
+
+
 struct block_iq4_nlx16 {
     ggml_half d[16];            // deltas for 16 iq4_nl blocks
     uint8_t   qs[QK4_NL * 8];  // nibbles / quants for 16 iq4_nl blocks

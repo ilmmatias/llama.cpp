@@ -5480,7 +5480,8 @@ static void quantize_row_znq_local(const float * x, void * vy, int64_t k, int gr
     const int header = 1 + (32 / group) * sbits / 8;
     const int stride = header + 4*bits;
     const int8_t * values = bits == 2 ? (group == 4 ? kvalues_znq3_s : kvalues_znq2_l) :
-                                         (group == 4 ? kvalues_znq4_s : kvalues_znq3_l);
+                           bits == 3 ? (group == 4 ? kvalues_znq4_s : kvalues_znq3_l) :
+                                             (group == 4 ? kvalues_znq5_s : kvalues_znq4_l);
     const int nlevels = 1 << bits;
     const int nbooks = group == 4 ? 8 : 16;
     uint8_t * y = (uint8_t *) vy;
@@ -5509,7 +5510,16 @@ static void quantize_row_znq_local(const float * x, void * vy, int64_t k, int gr
         const uint8_t sc = znq_local_scale(xb, weight, group, nbooks, nlevels, values, initial, seed);
         uint8_t selectors[8], codes[QK_ZNQ];
         int8_t q[QK_ZNQ];
-        znq_local_assign(xb, weight, group, nbooks, nlevels, values, sc, q, selectors, codes);
+        const double error = znq_local_assign(xb, weight, group, nbooks, nlevels, values, sc, q, selectors, codes);
+        if (bits == 4) {
+            double zero_error = 0.0;
+            for (int j = 0; j < QK_ZNQ; ++j) {
+                zero_error += (double) weight[j] * (double) xb[j] * (double) xb[j];
+            }
+            if (zero_error <= error) {
+                continue;
+            }
+        }
 
         out[0] = sc;
         for (int g = 0; g < QK_ZNQ / group; ++g) {
@@ -5529,7 +5539,8 @@ static void dequantize_row_znq_local(const void * vx, float * y, int64_t k, int 
     const int sbits = group == 4 ? 3 : 4;
     const int header = 1 + (32 / group) * sbits / 8;
     const int8_t * values = bits == 2 ? (group == 4 ? kvalues_znq3_s : kvalues_znq2_l) :
-                                         (group == 4 ? kvalues_znq4_s : kvalues_znq3_l);
+                           bits == 3 ? (group == 4 ? kvalues_znq4_s : kvalues_znq3_l) :
+                                             (group == 4 ? kvalues_znq5_s : kvalues_znq4_l);
     const int nlevels = 1 << bits;
     const uint8_t * x = (const uint8_t *) vx;
 
@@ -5643,6 +5654,32 @@ void dequantize_row_znq4_m(const block_znq4_m * GGML_RESTRICT x, float * GGML_RE
 
 size_t quantize_znq4_m(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * imatrix) {
     return quantize_znq_impl(src, dst, nrow, n_per_row, 4, imatrix);
+}
+
+void quantize_row_znq4_l_ref(const float * GGML_RESTRICT x, block_znq4_l * GGML_RESTRICT y, int64_t k) {
+    quantize_row_znq_local(x, y, k, 8, 4, NULL);
+}
+
+void dequantize_row_znq4_l(const block_znq4_l * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_znq_local(x, y, k, 8, 4);
+}
+
+size_t quantize_znq4_l(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+        int64_t nrow, int64_t n_per_row, const float * imatrix) {
+    return quantize_znq_local(src, dst, nrow, n_per_row, 8, 4, imatrix);
+}
+
+void quantize_row_znq5_s_ref(const float * GGML_RESTRICT x, block_znq5_s * GGML_RESTRICT y, int64_t k) {
+    quantize_row_znq_local(x, y, k, 4, 4, NULL);
+}
+
+void dequantize_row_znq5_s(const block_znq5_s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_znq_local(x, y, k, 4, 4);
+}
+
+size_t quantize_znq5_s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+        int64_t nrow, int64_t n_per_row, const float * imatrix) {
+    return quantize_znq_local(src, dst, nrow, n_per_row, 4, 4, imatrix);
 }
 
 // ============================ 4-bit non-linear quants
@@ -6340,6 +6377,8 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_ZNQ3_L:
         case GGML_TYPE_ZNQ4_S:
         case GGML_TYPE_ZNQ4_M:
+        case GGML_TYPE_ZNQ4_L:
+        case GGML_TYPE_ZNQ5_S:
             {
                 // All 256 UFP8 scale-byte encodings are finite and valid.
                 GGML_UNUSED(data); GGML_UNUSED(nb);

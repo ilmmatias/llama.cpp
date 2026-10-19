@@ -14,9 +14,9 @@ static __host__ __device__ constexpr int znq_header_cuda() { return group == 16 
 template <int bits, int group>
 static __device__ __forceinline__ const int8_t * znq_values_cuda() {
     if constexpr (group == 4) {
-        return bits == 2 ? kvalues_znq3_s : kvalues_znq4_s;
+        return bits == 2 ? kvalues_znq3_s : bits == 3 ? kvalues_znq4_s : kvalues_znq5_s;
     } else if constexpr (group == 8) {
-        return bits == 2 ? kvalues_znq2_l : kvalues_znq3_l;
+        return bits == 2 ? kvalues_znq2_l : bits == 3 ? kvalues_znq3_l : kvalues_znq4_l;
     } else if constexpr (bits == 2) {
         return kvalues_znq2_m;
     } else if constexpr (bits == 3) {
@@ -57,7 +57,7 @@ static __device__ __forceinline__ int znq_value_cuda(const uint8_t * block, int 
     } else if constexpr (bits == 3) {
         return znq_values_cuda<bits, group>()[book*8 + code];
     } else {
-        return kvalues_znq4_m[book*16 + code];
+        return znq_values_cuda<bits, group>()[book*16 + code];
     }
 }
 
@@ -99,7 +99,7 @@ static __device__ __forceinline__ int znq_pack4_cuda(const uint8_t * block, int 
             const uint32_t * table = (const uint32_t *) (znq_values_cuda<bits, group>() + 8*book);
             return __builtin_amdgcn_perm(table[1], table[0], indices);
         } else {
-            const uint32_t * table = (const uint32_t *) (kvalues_znq4_m + 16*book);
+            const uint32_t * table = (const uint32_t *) (znq_values_cuda<bits, group>() + 16*book);
             const uint32_t lo = __builtin_amdgcn_perm(table[1], table[0], indices & 0x07070707);
             const uint32_t hi = __builtin_amdgcn_perm(table[3], table[2], indices & 0x07070707);
             return __builtin_amdgcn_perm(hi, lo, 0x03020100 | ((indices & 0x08080808) >> 1));
@@ -115,7 +115,7 @@ static __device__ __forceinline__ int znq_pack4_cuda(const uint8_t * block, int 
         } else if constexpr (bits == 3) {
             packed |= uint32_t(uint8_t(znq_values_cuda<bits, group>()[book*8 + code])) << (8*k);
         } else {
-            packed |= uint32_t(uint8_t(kvalues_znq4_m[book*16 + code])) << (8*k);
+            packed |= uint32_t(uint8_t(znq_values_cuda<bits, group>()[book*16 + code])) << (8*k);
         }
     }
     return int(packed);

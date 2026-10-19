@@ -279,7 +279,7 @@ static int test_repack(bool verbose, ggml_type weight_type, ggml_type input_type
     for (const auto & shape : shapes) {
         const int k = shape[0], m = shape[1], n = shape[2];
         if (n >= 20 && (!dense || (weight_type != GGML_TYPE_ZNQ2_M && weight_type != GGML_TYPE_ZNQ2_L &&
-            weight_type != GGML_TYPE_ZNQ3_S && weight_type != GGML_TYPE_ZNQ3_M && weight_type != GGML_TYPE_ZNQ3_L && weight_type != GGML_TYPE_ZNQ4_S && weight_type != GGML_TYPE_ZNQ4_M))) {
+            weight_type != GGML_TYPE_ZNQ3_S && weight_type != GGML_TYPE_ZNQ3_M && weight_type != GGML_TYPE_ZNQ3_L && weight_type != GGML_TYPE_ZNQ4_S && weight_type != GGML_TYPE_ZNQ4_M && weight_type != GGML_TYPE_ZNQ4_L && weight_type != GGML_TYPE_ZNQ5_S))) {
             continue;
         }
         if (dense && std::any_of(shapes, &shape, [&](const auto & previous) {
@@ -410,7 +410,7 @@ static int test_quantize_imatrix_degenerate(bool verbose) {
     int num_failed = 0;
 
     printf("Testing degenerate imatrix:\n");
-    for (ggml_type type : {GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_1, GGML_TYPE_Q5_1}) {
+    for (ggml_type type : {GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_1, GGML_TYPE_Q5_1}) {
         const int64_t group = type == GGML_TYPE_Q2_K ? 16 : 32;
         for (int64_t i = 0; i < n; ++i) {
             const int64_t g = i / group;
@@ -458,14 +458,14 @@ int main(int argc, char * argv[]) {
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_vec_dot_q(verbose);
     num_failed += test_repack(verbose, GGML_TYPE_ZNQ3_M, GGML_TYPE_F32);
-    for (ggml_type type : {GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S}) {
+    for (ggml_type type : {GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S}) {
         num_failed += test_repack(verbose, type, GGML_TYPE_F32);
         num_failed += test_repack(verbose, type, GGML_TYPE_F32, true);
         // Shared sums must cover every plane, including Q8 tails and strided input rows.
         num_failed += test_repack(verbose, type, GGML_TYPE_F32, true, 3);
         num_failed += test_repack(verbose, type, GGML_TYPE_Q8_0, true, 3);
     }
-    for (ggml_type type : {GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M, GGML_TYPE_Q4_0,
+    for (ggml_type type : {GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_Q4_0,
                            GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
         const ggml_type input_type = ggml_get_type_traits_cpu(type)->vec_dot_type;
         num_failed += test_repack(verbose, type, input_type);
