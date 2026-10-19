@@ -11374,7 +11374,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
-    GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S,
+    GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_S,
 };
 
 static const ggml_type base_types[] = {
@@ -11403,7 +11403,7 @@ static const ggml_type other_types[] = {
     GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
-    GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S,
+    GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_S,
     GGML_TYPE_BF16,
 };
 
@@ -12418,7 +12418,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_shared_mul_add(127, 7, false, false, true));
     test_cases.emplace_back(new test_swiglu_mmq(false, 1, 1, 2048, 32, 512));
     test_cases.emplace_back(new test_swiglu_mmq(true, 16, 8, 2048, 32, 512));
-    for (ggml_type type : {GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_Q6_K}) {
+    for (ggml_type type : {GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_S, GGML_TYPE_Q6_K}) {
         test_cases.emplace_back(new test_swiglu_mmq(false, 1, 1, 128, 17, 768, type, true));
         test_cases.emplace_back(new test_swiglu_mmq(true, 8, 3, 64, 9, 256, type, true));
     }
@@ -12592,7 +12592,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
     // QK32 local books: odd output sizes, K=640, and a partial final K panel.
-    for (ggml_type type : {GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S}) {
+    for (ggml_type type : {GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_S}) {
         for (int64_t m : {21, 24, 40}) {
             for (int64_t n : {1, 7, 25}) {
                 test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, 640, {1, 1}, {1, 1}));
@@ -14021,7 +14021,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // multi-token dense fusion: epilogue only
-    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_NVFP4}) {
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_S, GGML_TYPE_NVFP4}) {
         for (int64_t n_tokens : {2, 3, 4, 5, 8}) {
             for (bool with_bias : {false, true}) {
                 for (bool with_lane_scale : {false, true}) {
@@ -14041,7 +14041,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             false, 1, 1, false, /*with_bias =*/ true, /*with_gate =*/ false, false, {1, 1},
             /*full_bias_shape =*/ true, /*strided_bias =*/ false, /*bias_type =*/ GGML_TYPE_F16));
     }
-    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_NVFP4}) {
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_S, GGML_TYPE_NVFP4}) {
         for (int64_t n_tokens : {2, 3, 4, 5}) {
             test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n_tokens, 33, 4096,
                     false, 1, 1, false, true, false, type == GGML_TYPE_NVFP4, {3, 2}, true));

@@ -3813,7 +3813,7 @@ bool llama_model_expert_cache_is_host_weight(const ggml_tensor * tensor) {
     if (ggml_backend_buffer_is_host(tensor->buffer)) {
         return true;
     }
-    const bool is_znq = (tensor->type == GGML_TYPE_ZNQ2_M || tensor->type == GGML_TYPE_ZNQ2_L || tensor->type == GGML_TYPE_ZNQ3_S || tensor->type == GGML_TYPE_ZNQ3_M || tensor->type == GGML_TYPE_ZNQ3_L || tensor->type == GGML_TYPE_ZNQ4_S || tensor->type == GGML_TYPE_ZNQ4_M || tensor->type == GGML_TYPE_ZNQ4_L || tensor->type == GGML_TYPE_ZNQ5_S);
+    const bool is_znq = (tensor->type == GGML_TYPE_ZNQ2_M || tensor->type == GGML_TYPE_ZNQ2_L || tensor->type == GGML_TYPE_ZNQ3_S || tensor->type == GGML_TYPE_ZNQ3_M || tensor->type == GGML_TYPE_ZNQ3_L || tensor->type == GGML_TYPE_ZNQ4_S || tensor->type == GGML_TYPE_ZNQ4_M || tensor->type == GGML_TYPE_ZNQ4_L || tensor->type == GGML_TYPE_ZNQ5_S || tensor->type == GGML_TYPE_ZNQ5_M || tensor->type == GGML_TYPE_ZNQ5_L || tensor->type == GGML_TYPE_ZNQ6_S);
     return is_znq && strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(tensor->buffer)), "CPU_REPACK") == 0;
 }
 

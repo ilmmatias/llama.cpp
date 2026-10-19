@@ -405,6 +405,18 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_q<QK_ZNQ, 1, dequantize_znq<4, 4>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+        case GGML_TYPE_ZNQ5_M:
+            get_rows_cuda_q<QK_ZNQ, 1, dequantize_znq<5>>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_ZNQ5_L:
+            get_rows_cuda_q<QK_ZNQ, 1, dequantize_znq<5, 8>>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_ZNQ6_S:
+            get_rows_cuda_q<QK_ZNQ, 1, dequantize_znq<5, 4>>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
         case GGML_TYPE_Q1_0:
             get_rows_cuda_q<QK1_0, QR1_0, dequantize_q1_0>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);

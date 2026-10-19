@@ -313,35 +313,59 @@ static bool unpack_repacked_znq_expert(const ggml_tensor * tensor, int32_t exper
             return true;
         }
         case GGML_TYPE_ZNQ2_L: {
-            if (dst_size != (size_t) tensor->ne[1] * (size_t) nblocks * 11) return false;
+            if (dst_size != (size_t) tensor->ne[1] * (size_t) nblocks * 11) {
+                return false;
+            }
+
             const auto * src = (const block_znq2_lx8 *) src_base;
             auto * out = (uint8_t *) dst;
+
             for (int64_t rg = 0; rg < row_groups; ++rg) {
                 for (int64_t ib = 0; ib < nblocks; ++ib) {
-                    const auto & in = src[rg*nblocks + ib];
+                    const auto & in = src[rg * nblocks + ib];
+
                     for (int r = 0; r < 8; ++r) {
-                        uint8_t * b = out + ((rg*8 + r)*nblocks + ib)*11;
-                        for (int j = 0; j < 3; ++j) b[j] = in.header[j*8 + r];
-                        for (int q = 0; q < 8; ++q) b[3 + q] = in.qs[q][r];
+                        uint8_t * b = out + ((rg * 8 + r) * nblocks + ib) * 11;
+
+                        for (int j = 0; j < 3; ++j) {
+                            b[j] = in.header[j * 8 + r];
+                        }
+
+                        for (int q = 0; q < 8; ++q) {
+                            b[3 + q] = in.qs[q][r];
+                        }
                     }
                 }
             }
+
             return true;
         }
         case GGML_TYPE_ZNQ3_S: {
-            if (dst_size != (size_t) tensor->ne[1] * (size_t) nblocks * 12) return false;
+            if (dst_size != (size_t) tensor->ne[1] * (size_t) nblocks * 12) {
+                return false;
+            }
+
             const auto * src = (const block_znq3_sx8 *) src_base;
             auto * out = (uint8_t *) dst;
+
             for (int64_t rg = 0; rg < row_groups; ++rg) {
                 for (int64_t ib = 0; ib < nblocks; ++ib) {
-                    const auto & in = src[rg*nblocks + ib];
+                    const auto & in = src[rg * nblocks + ib];
+
                     for (int r = 0; r < 8; ++r) {
-                        uint8_t * b = out + ((rg*8 + r)*nblocks + ib)*12;
-                        for (int j = 0; j < 4; ++j) b[j] = in.header[r*4 + j];
-                        for (int q = 0; q < 8; ++q) b[4 + q] = in.qs[q][r];
+                        uint8_t * b = out + ((rg * 8 + r) * nblocks + ib) * 12;
+
+                        for (int j = 0; j < 4; ++j) {
+                            b[j] = in.header[r * 4 + j];
+                        }
+
+                        for (int q = 0; q < 8; ++q) {
+                            b[4 + q] = in.qs[q][r];
+                        }
                     }
                 }
             }
+
             return true;
         }
         case GGML_TYPE_ZNQ3_M: {
@@ -398,53 +422,75 @@ static bool unpack_repacked_znq_expert(const ggml_tensor * tensor, int32_t exper
             return true;
         }
         case GGML_TYPE_ZNQ3_L: {
-            if (dst_size != (size_t) tensor->ne[1] * (size_t) nblocks * 15) return false;
+            if (dst_size != (size_t) tensor->ne[1] * (size_t) nblocks * 15) {
+                return false;
+            }
+
             const auto * src = (const block_znq3_lx8 *) src_base;
             auto * out = (uint8_t *) dst;
+
             for (int64_t rg = 0; rg < row_groups; ++rg) {
                 for (int64_t ib = 0; ib < nblocks; ++ib) {
-                    const auto & in = src[rg*nblocks + ib];
+                    const auto & in = src[rg * nblocks + ib];
+
                     for (int r = 0; r < 8; ++r) {
-                        uint8_t * b = out + ((rg*8 + r)*nblocks + ib)*15;
-                        for (int j = 0; j < 3; ++j) b[j] = in.header[j*8 + r];
+                        uint8_t * b = out + ((rg * 8 + r) * nblocks + ib) * 15;
+
+                        for (int j = 0; j < 3; ++j) {
+                            b[j] = in.header[j * 8 + r];
+                        }
+
                         memset(b + 3, 0, 12);
+
                         for (int q = 0; q < 8; ++q) {
-                            const unsigned p0 = (in.planes[q][0] >> (4*r)) & 15;
-                            const unsigned p1 = (in.planes[q][1] >> (4*r)) & 15;
-                            const unsigned p2 = (in.planes[q][2] >> (4*r)) & 15;
+                            const unsigned p0 = (in.planes[q][0] >> (4 * r)) & 15;
+                            const unsigned p1 = (in.planes[q][1] >> (4 * r)) & 15;
+                            const unsigned p2 = (in.planes[q][2] >> (4 * r)) & 15;
                             const unsigned codes = znq3_m_spread4_table[p0] | (znq3_m_spread4_table[p1] << 1) | (znq3_m_spread4_table[p2] << 2);
-                            const int offset = 12*q;
-                            b[3 + offset/8] |= uint8_t(codes << (offset%8));
-                            b[3 + offset/8 + 1] |= uint8_t(codes >> (8-offset%8));
+                            const int offset = 12 * q;
+                            b[3 + offset / 8] |= uint8_t(codes << (offset % 8));
+                            b[3 + offset / 8 + 1] |= uint8_t(codes >> (8 - offset % 8));
                         }
                     }
                 }
             }
+
             return true;
         }
         case GGML_TYPE_ZNQ4_S: {
-            if (dst_size != (size_t) tensor->ne[1] * (size_t) nblocks * 16) return false;
+            if (dst_size != (size_t) tensor->ne[1] * (size_t) nblocks * 16) {
+                return false;
+            }
+
             const auto * src = (const block_znq4_sx8 *) src_base;
             auto * out = (uint8_t *) dst;
+
             for (int64_t rg = 0; rg < row_groups; ++rg) {
                 for (int64_t ib = 0; ib < nblocks; ++ib) {
-                    const auto & in = src[rg*nblocks + ib];
+                    const auto & in = src[rg * nblocks + ib];
+
                     for (int r = 0; r < 8; ++r) {
-                        uint8_t * b = out + ((rg*8 + r)*nblocks + ib)*16;
-                        for (int j = 0; j < 4; ++j) b[j] = in.header[r*4 + j];
+                        uint8_t * b = out + ((rg * 8 + r) * nblocks + ib) * 16;
+
+                        for (int j = 0; j < 4; ++j) {
+                            b[j] = in.header[r * 4 + j];
+                        }
+
                         memset(b + 4, 0, 12);
+
                         for (int q = 0; q < 8; ++q) {
-                            const unsigned p0 = (in.planes[q][0] >> (4*r)) & 15;
-                            const unsigned p1 = (in.planes[q][1] >> (4*r)) & 15;
-                            const unsigned p2 = (in.planes[q][2] >> (4*r)) & 15;
+                            const unsigned p0 = (in.planes[q][0] >> (4 * r)) & 15;
+                            const unsigned p1 = (in.planes[q][1] >> (4 * r)) & 15;
+                            const unsigned p2 = (in.planes[q][2] >> (4 * r)) & 15;
                             const unsigned codes = znq3_m_spread4_table[p0] | (znq3_m_spread4_table[p1] << 1) | (znq3_m_spread4_table[p2] << 2);
-                            const int offset = 12*q;
-                            b[4 + offset/8] |= uint8_t(codes << (offset%8));
-                            b[4 + offset/8 + 1] |= uint8_t(codes >> (8-offset%8));
+                            const int offset = 12 * q;
+                            b[4 + offset / 8] |= uint8_t(codes << (offset % 8));
+                            b[4 + offset / 8 + 1] |= uint8_t(codes >> (8 - offset % 8));
                         }
                     }
                 }
             }
+
             return true;
         }
         case GGML_TYPE_ZNQ4_M: {
@@ -472,46 +518,175 @@ static bool unpack_repacked_znq_expert(const ggml_tensor * tensor, int32_t exper
             if (dst_size != (size_t) tensor->ne[1] * (size_t) nblocks * sizeof(block_znq4_l)) {
                 return false;
             }
+
             const auto * src = (const block_znq4_lx8 *) src_base;
             auto * out = (block_znq4_l *) dst;
+
             for (int64_t rg = 0; rg < row_groups; ++rg) {
                 for (int64_t ib = 0; ib < nblocks; ++ib) {
-                    const auto & in = src[rg*nblocks + ib];
+                    const auto & in = src[rg * nblocks + ib];
+
                     for (int r = 0; r < 8; ++r) {
-                        auto & b = out[(rg*8 + r)*nblocks + ib];
+                        auto & b = out[(rg * 8 + r) * nblocks + ib];
                         uint8_t * header = (uint8_t *) &b;
+
                         for (int j = 0; j < 3; ++j) {
-                            header[j] = in.header[j*8 + r];
+                            header[j] = in.header[j * 8 + r];
                         }
+
                         for (int q = 0; q < 8; ++q) {
-                            memcpy(b.qs + 2*q, in.qs[q] + 2*r, 2);
+                            memcpy(b.qs + 2 * q, in.qs[q] + 2 * r, 2);
                         }
                     }
                 }
             }
+
             return true;
         }
         case GGML_TYPE_ZNQ5_S: {
             if (dst_size != (size_t) tensor->ne[1] * (size_t) nblocks * sizeof(block_znq5_s)) {
                 return false;
             }
+
             const auto * src = (const block_znq5_sx8 *) src_base;
             auto * out = (block_znq5_s *) dst;
+
             for (int64_t rg = 0; rg < row_groups; ++rg) {
                 for (int64_t ib = 0; ib < nblocks; ++ib) {
-                    const auto & in = src[rg*nblocks + ib];
+                    const auto & in = src[rg * nblocks + ib];
+
                     for (int r = 0; r < 8; ++r) {
-                        auto & b = out[(rg*8 + r)*nblocks + ib];
+                        auto & b = out[(rg * 8 + r) * nblocks + ib];
                         uint8_t * header = (uint8_t *) &b;
+
                         for (int j = 0; j < 4; ++j) {
-                            header[j] = in.header[r*4 + j];
+                            header[j] = in.header[r * 4 + j];
                         }
+
                         for (int q = 0; q < 8; ++q) {
-                            memcpy(b.qs + 2*q, in.qs[q] + 2*r, 2);
+                            memcpy(b.qs + 2 * q, in.qs[q] + 2 * r, 2);
                         }
                     }
                 }
             }
+
+            return true;
+        }
+        case GGML_TYPE_ZNQ5_M: {
+            if (dst_size != (size_t) tensor->ne[1] * (size_t) nblocks * sizeof(block_znq5_m)) {
+                return false;
+            }
+
+            const auto * src = (const block_znq5_mx8 *) src_base;
+            auto * out = (block_znq5_m *) dst;
+
+            for (int64_t rg = 0; rg < row_groups; ++rg) {
+                for (int64_t ib = 0; ib < nblocks; ++ib) {
+                    const auto & in = src[rg * nblocks + ib];
+
+                    for (int r = 0; r < 8; ++r) {
+                        auto & b = out[(rg * 8 + r) * nblocks + ib];
+                        uint8_t * header = (uint8_t *) &b;
+
+                        for (int j = 0; j < 2; ++j) {
+                            header[j] = in.header[j * 8 + r];
+                        }
+
+                        memset(b.qs, 0, sizeof(b.qs));
+
+                        for (int j = 0; j < QK_ZNQ; ++j) {
+                            const uint8_t * quad = in.qs[j / 4];
+                            uint32_t high;
+                            memcpy(&high, quad + 16, sizeof(high));
+                            const unsigned code = ((quad[2 * r + (j % 4) / 2] >> (4 * (j % 2))) & 15) | (((high >> (4 * r + j % 4)) & 1) << 4);
+                            const int bit = 5 * j;
+                            b.qs[bit / 8] |= code << (bit % 8);
+                            if (bit % 8 > 3) {
+                                b.qs[bit / 8 + 1] |= code >> (8 - bit % 8);
+                            }
+                        }
+                    }
+                }
+            }
+
+            return true;
+        }
+        case GGML_TYPE_ZNQ5_L: {
+            if (dst_size != (size_t) tensor->ne[1] * (size_t) nblocks * sizeof(block_znq5_l)) {
+                return false;
+            }
+
+            const auto * src = (const block_znq5_lx8 *) src_base;
+            auto * out = (block_znq5_l *) dst;
+
+            for (int64_t rg = 0; rg < row_groups; ++rg) {
+                for (int64_t ib = 0; ib < nblocks; ++ib) {
+                    const auto & in = src[rg * nblocks + ib];
+
+                    for (int r = 0; r < 8; ++r) {
+                        auto & b = out[(rg * 8 + r) * nblocks + ib];
+                        uint8_t * header = (uint8_t *) &b;
+
+                        for (int j = 0; j < 3; ++j) {
+                            header[j] = in.header[j * 8 + r];
+                        }
+
+                        memset(b.qs, 0, sizeof(b.qs));
+
+                        for (int j = 0; j < QK_ZNQ; ++j) {
+                            const uint8_t * quad = in.qs[j / 4];
+                            uint32_t high;
+                            memcpy(&high, quad + 16, sizeof(high));
+                            const unsigned code = ((quad[2 * r + (j % 4) / 2] >> (4 * (j % 2))) & 15) | (((high >> (4 * r + j % 4)) & 1) << 4);
+                            const int bit = 5 * j;
+                            b.qs[bit / 8] |= code << (bit % 8);
+                            if (bit % 8 > 3) {
+                                b.qs[bit / 8 + 1] |= code >> (8 - bit % 8);
+                            }
+                        }
+                    }
+                }
+            }
+
+            return true;
+        }
+        case GGML_TYPE_ZNQ6_S: {
+            if (dst_size != (size_t) tensor->ne[1] * (size_t) nblocks * sizeof(block_znq6_s)) {
+                return false;
+            }
+
+            const auto * src = (const block_znq6_sx8 *) src_base;
+            auto * out = (block_znq6_s *) dst;
+
+            for (int64_t rg = 0; rg < row_groups; ++rg) {
+                for (int64_t ib = 0; ib < nblocks; ++ib) {
+                    const auto & in = src[rg * nblocks + ib];
+
+                    for (int r = 0; r < 8; ++r) {
+                        auto & b = out[(rg * 8 + r) * nblocks + ib];
+                        uint8_t * header = (uint8_t *) &b;
+
+                        for (int j = 0; j < 4; ++j) {
+                            header[j] = in.header[r * 4 + j];
+                        }
+
+                        memset(b.qs, 0, sizeof(b.qs));
+
+                        for (int j = 0; j < QK_ZNQ; ++j) {
+                            const uint8_t * quad = in.qs[j / 4];
+                            uint32_t high;
+                            memcpy(&high, quad + 16, sizeof(high));
+                            const unsigned code = ((quad[2 * r + (j % 4) / 2] >> (4 * (j % 2))) & 15) | (((high >> (4 * r + j % 4)) & 1) << 4);
+                            const int bit = 5 * j;
+                            b.qs[bit / 8] |= code << (bit % 8);
+                            if (bit % 8 > 3) {
+                                b.qs[bit / 8 + 1] |= code >> (8 - bit % 8);
+                            }
+                        }
+                    }
+                }
+            }
+
             return true;
         }
         default:
@@ -1033,7 +1208,7 @@ private:
                 return false;
             }
             if (is_cpu_repack_tensor(tensor) &&
-                tensor->type != GGML_TYPE_ZNQ2_M && tensor->type != GGML_TYPE_ZNQ2_L && tensor->type != GGML_TYPE_ZNQ3_S && tensor->type != GGML_TYPE_ZNQ3_M && tensor->type != GGML_TYPE_ZNQ3_L && tensor->type != GGML_TYPE_ZNQ4_S && tensor->type != GGML_TYPE_ZNQ4_M && tensor->type != GGML_TYPE_ZNQ4_L && tensor->type != GGML_TYPE_ZNQ5_S) {
+                tensor->type != GGML_TYPE_ZNQ2_M && tensor->type != GGML_TYPE_ZNQ2_L && tensor->type != GGML_TYPE_ZNQ3_S && tensor->type != GGML_TYPE_ZNQ3_M && tensor->type != GGML_TYPE_ZNQ3_L && tensor->type != GGML_TYPE_ZNQ4_S && tensor->type != GGML_TYPE_ZNQ4_M && tensor->type != GGML_TYPE_ZNQ4_L && tensor->type != GGML_TYPE_ZNQ5_S && tensor->type != GGML_TYPE_ZNQ5_M && tensor->type != GGML_TYPE_ZNQ5_L && tensor->type != GGML_TYPE_ZNQ6_S) {
                 fprintf(stderr, "expert_cache: layer %d CPU_REPACK type %s is not convertible to native GPU layout\n",
                         layer_id, ggml_type_name(tensor->type));
                 layer.disabled = true;
@@ -1324,7 +1499,7 @@ private:
 
         // Native Q8_1 skips the input conversion.
         const auto input_type = layer.gate_up ? layer.gate_up->type : layer.gate->type;
-        t->input_q8 = (input_type == GGML_TYPE_ZNQ2_M || input_type == GGML_TYPE_ZNQ2_L || input_type == GGML_TYPE_ZNQ3_S || input_type == GGML_TYPE_ZNQ3_M || input_type == GGML_TYPE_ZNQ3_L || input_type == GGML_TYPE_ZNQ4_S || input_type == GGML_TYPE_ZNQ4_M || input_type == GGML_TYPE_ZNQ4_L || input_type == GGML_TYPE_ZNQ5_S) &&
+        t->input_q8 = (input_type == GGML_TYPE_ZNQ2_M || input_type == GGML_TYPE_ZNQ2_L || input_type == GGML_TYPE_ZNQ3_S || input_type == GGML_TYPE_ZNQ3_M || input_type == GGML_TYPE_ZNQ3_L || input_type == GGML_TYPE_ZNQ4_S || input_type == GGML_TYPE_ZNQ4_M || input_type == GGML_TYPE_ZNQ4_L || input_type == GGML_TYPE_ZNQ5_S || input_type == GGML_TYPE_ZNQ5_M || input_type == GGML_TYPE_ZNQ5_L || input_type == GGML_TYPE_ZNQ6_S) &&
             layer.input_dim % ggml_blck_size(GGML_TYPE_Q8_1) == 0;
         t->input = ggml_new_tensor_3d(t->ctx, t->input_q8 ? GGML_TYPE_Q8_1 : GGML_TYPE_F32, layer.input_dim, 1, batch_size);
         t->ids = ggml_new_tensor_2d(t->ctx, GGML_TYPE_I32, hit_count, batch_size);

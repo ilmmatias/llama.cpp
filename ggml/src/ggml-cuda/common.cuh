@@ -1269,6 +1269,30 @@ struct ggml_cuda_type_traits<GGML_TYPE_ZNQ5_S> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_ZNQ5_M> {
+    static constexpr int qk = QK_ZNQ;
+    static constexpr int qr = 1;
+    static constexpr int qi = QK_ZNQ/4;
+    static constexpr int bs = sizeof(block_znq5_m);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_ZNQ5_L> {
+    static constexpr int qk = QK_ZNQ;
+    static constexpr int qr = 1;
+    static constexpr int qi = QK_ZNQ/4;
+    static constexpr int bs = sizeof(block_znq5_l);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_ZNQ6_S> {
+    static constexpr int qk = QK_ZNQ;
+    static constexpr int qr = 1;
+    static constexpr int qi = QK_ZNQ/4;
+    static constexpr int bs = sizeof(block_znq6_s);
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_IQ4_NL> {
     static constexpr int qk = QK4_NL;
     static constexpr int qr = QR4_NL;

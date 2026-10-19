@@ -8540,7 +8540,7 @@ void ggml_gemm_znq4_m_8x8_q8_0_moe(
 
 #if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
 static float * znq_local_dst(float * s, size_t bs, const int32_t * map, size_t bs1, size_t bs2, int row) {
-    return map ? s + size_t(map[2*row])*bs1 + size_t(map[2*row + 1])*bs2 : s + size_t(row)*bs;
+    return map ? s + size_t(map[2 * row]) * bs1 + size_t(map[2 * row + 1]) * bs2 : s + size_t(row) * bs;
 }
 
 static inline __m128i znq_local_load16(const uint8_t * a, const uint8_t * b) {
@@ -8552,9 +8552,12 @@ static inline __m512i znq_local_header(const uint8_t * a, const uint8_t * b) {
     if constexpr (group == 4) {
         return _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) a)),
                                   _mm256_loadu_si256((const __m256i *) b), 1);
+    } else if constexpr (group == 16) {
+        return _mm512_slli_epi32(_mm512_cvtepu8_epi32(znq_local_load16(a + 8, b + 8)), 8);
     } else {
         const __m512i lo = _mm512_cvtepu8_epi32(znq_local_load16(a + 8, b + 8));
         const __m512i hi = _mm512_cvtepu8_epi32(znq_local_load16(a + 16, b + 16));
+
         return _mm512_slli_epi32(_mm512_or_si512(lo, _mm512_slli_epi32(hi, 8)), 8);
     }
 }
@@ -8567,38 +8570,68 @@ static inline __m512 znq_local_scales(const uint8_t * a, const uint8_t * b, __m5
     const __m512i m = _mm512_and_si512(code, _mm512_set1_epi32(7));
     const __m512 normal = _mm512_castsi512_ps(_mm512_or_si512(_mm512_slli_epi32(_mm512_add_epi32(e, _mm512_set1_epi32(112)), 23), _mm512_slli_epi32(m, 20)));
     const __m512 subnormal = _mm512_mul_ps(_mm512_cvtepi32_ps(m), _mm512_set1_ps(0x1p-17f));
+
     return _mm512_mask_blend_ps(_mm512_cmpeq_epi32_mask(e, _mm512_setzero_si512()), normal, subnormal);
 }
 
 template<int group, int index_bits = 2>
-static inline __m512i znq_local_book_indices(__m512i header, int q) {
+static inline __m512i znq_local_book_indices(__m512i header, int q, __mmask64 & high) {
     constexpr int bits = group == 4 ? 3 : 4;
     const __m512i book = _mm512_and_si512(_mm512_srlv_epi32(header, _mm512_set1_epi32(8 + bits * (q / (group / 4)))), _mm512_set1_epi32((1 << bits) - 1));
-    return _mm512_mullo_epi32(book, _mm512_set1_epi32((1 << index_bits)*0x01010101));
+    if constexpr (index_bits == 5 && group != 4) {
+        high = _mm512_movepi8_mask(_mm512_mullo_epi32(book, _mm512_set1_epi32(0x10101010)));
+
+        return _mm512_mullo_epi32(_mm512_and_si512(book, _mm512_set1_epi32(7)), _mm512_set1_epi32(0x20202020));
+    } else {
+        GGML_UNUSED(high);
+
+        return _mm512_mullo_epi32(book, _mm512_set1_epi32((1 << index_bits) * 0x01010101));
+    }
 }
 
 template<int group, int index_bits = 2>
-static inline __m512i znq_local_weights(const uint8_t * a, const uint8_t * b, int q, __m512i indices, __m512i table, __m512i table1, __m512i table2, __m512i table3) {
-    constexpr int h = group == 4 ? 4 : 3;
+static inline __m512i znq_local_weights(const uint8_t * a, const uint8_t * b, int q, __m512i indices, __mmask64 high, __m512i table, __m512i table1, __m512i table2, __m512i table3,
+        __m512i table4, __m512i table5, __m512i table6, __m512i table7) {
+    constexpr int h = group == 16 ? 2 : group == 8 ? 3 : 4;
     __m512i codes;
     if constexpr (index_bits == 2) {
-        const __m512i packed = _mm512_cvtepu16_epi64(znq_local_load16(a + 8*(h + q), b + 8*(h + q)));
+        const __m512i packed = _mm512_cvtepu16_epi64(znq_local_load16(a + 8 * (h + q), b + 8 * (h + q)));
         codes = _mm512_and_si512(_mm512_multishift_epi64_epi8(_mm512_set1_epi64(0x0e0c0a0806040200), packed), _mm512_set1_epi8(3));
     } else if constexpr (index_bits == 4) {
-        codes = znq4_mx16_unpack_group(a + 8*h + 16*q, b + 8*h + 16*q);
+        codes = znq4_mx16_unpack_group(a + 8 * h + 16 * q, b + 8 * h + 16 * q);
+    } else if constexpr (index_bits == 5) {
+        const uint8_t * p0 = a + 8 * h + 20 * q;
+        const uint8_t * p1 = b + 8 * h + 20 * q;
+        const __mmask64 mask = znq4_mx8_load_u32(p0 + 16) | (uint64_t(znq4_mx8_load_u32(p1 + 16)) << 32);
+        codes = _mm512_or_si512(znq4_mx16_unpack_group(p0, p1), _mm512_maskz_set1_epi8(mask, 16));
     } else {
-        const uint8_t * p0 = a + 8*h + 12*q;
-        const uint8_t * p1 = b + 8*h + 12*q;
+        const uint8_t * p0 = a + 8 * h + 12 * q;
+        const uint8_t * p1 = b + 8 * h + 12 * q;
         const __mmask64 m0 = znq4_mx8_load_u32(p0) | (uint64_t(znq4_mx8_load_u32(p1)) << 32);
-        const __mmask64 m1 = znq4_mx8_load_u32(p0+4) | (uint64_t(znq4_mx8_load_u32(p1+4)) << 32);
-        const __mmask64 m2 = znq4_mx8_load_u32(p0+8) | (uint64_t(znq4_mx8_load_u32(p1+8)) << 32);
+        const __mmask64 m1 = znq4_mx8_load_u32(p0 + 4) | (uint64_t(znq4_mx8_load_u32(p1 + 4)) << 32);
+        const __mmask64 m2 = znq4_mx8_load_u32(p0 + 8) | (uint64_t(znq4_mx8_load_u32(p1 + 8)) << 32);
         codes = _mm512_ternarylogic_epi32(_mm512_maskz_set1_epi8(m0, 1), _mm512_maskz_set1_epi8(m1, 2), _mm512_maskz_set1_epi8(m2, 4), 0xfe);
     }
 
     const __m512i lookup = _mm512_add_epi8(indices, codes);
-    if constexpr (index_bits == 4 && group == 8) {
+    if constexpr (index_bits == 5) {
+        const __m512i lo0 = _mm512_permutex2var_epi8(table, lookup, table1);
+        const __m512i lo1 = _mm512_permutex2var_epi8(table2, lookup, table3);
+        const __mmask64 upper = _mm512_movepi8_mask(lookup);
+        const __m512i lo = _mm512_mask_blend_epi8(upper, lo0, lo1);
+        if constexpr (group != 4) {
+            const __m512i hi0 = _mm512_permutex2var_epi8(table4, lookup, table5);
+            const __m512i hi1 = _mm512_permutex2var_epi8(table6, lookup, table7);
+            const __m512i hi = _mm512_mask_blend_epi8(upper, hi0, hi1);
+
+            return _mm512_mask_blend_epi8(high, lo, hi);
+        } else {
+            return lo;
+        }
+    } else if constexpr (index_bits == 4 && group == 8) {
         const __m512i lo = _mm512_permutex2var_epi8(table, lookup, table1);
         const __m512i hi = _mm512_permutex2var_epi8(table2, lookup, table3);
+
         return _mm512_mask_blend_epi8(_mm512_movepi8_mask(lookup), lo, hi);
     } else if constexpr ((index_bits == 3 && group == 8) || index_bits == 4) {
         return _mm512_permutex2var_epi8(table, lookup, table1);
@@ -8610,27 +8643,40 @@ static inline __m512i znq_local_weights(const uint8_t * a, const uint8_t * b, in
 template<int group, int index_bits = 2>
 static void znq_local_gemv(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc, const int32_t * prepared_sums) {
     const int nb = n / QK_ZNQ;
-    constexpr int stride = 8 * (4*index_bits + (group == 4 ? 4 : 3));
+    constexpr int stride = 8 * (4 * index_bits + (group == 16 ? 2 : group == 8 ? 3 : 4));
     const auto * x = (const uint8_t *) vx;
     const auto * y = (const block_q8_0 *) vy;
     const int8_t * values = index_bits == 2 ? (group == 4 ? kvalues_znq3_s : kvalues_znq2_l) :
                            index_bits == 3 ? (group == 4 ? kvalues_znq4_s : kvalues_znq3_l) :
-                                             (group == 4 ? kvalues_znq5_s : kvalues_znq4_l);
+                           index_bits == 4 ? (group == 4 ? kvalues_znq5_s : kvalues_znq4_l) :
+                           (group == 16 ? kvalues_znq5_m : group == 8 ? kvalues_znq5_l : kvalues_znq6_s);
     const __m512i table = _mm512_xor_si512(_mm512_loadu_si512(values), _mm512_set1_epi8(char(0x80)));
     __m512i table1 = _mm512_setzero_si512();
-    if constexpr ((index_bits == 3 && group == 8) || index_bits == 4) {
-        table1 = _mm512_xor_si512(_mm512_loadu_si512(values+64), _mm512_set1_epi8(char(0x80)));
+    if constexpr ((index_bits == 3 && group == 8) || index_bits >= 4) {
+        table1 = _mm512_xor_si512(_mm512_loadu_si512(values + 64), _mm512_set1_epi8(char(0x80)));
     }
+
     __m512i table2 = _mm512_setzero_si512();
     __m512i table3 = _mm512_setzero_si512();
-    if constexpr (index_bits == 4 && group == 8) {
+    if constexpr ((index_bits == 4 && group == 8) || index_bits == 5) {
         table2 = _mm512_xor_si512(_mm512_loadu_si512(values + 128), _mm512_set1_epi8(char(0x80)));
         table3 = _mm512_xor_si512(_mm512_loadu_si512(values + 192), _mm512_set1_epi8(char(0x80)));
     }
 
+    __m512i table4 = _mm512_setzero_si512();
+    __m512i table5 = _mm512_setzero_si512();
+    __m512i table6 = _mm512_setzero_si512();
+    __m512i table7 = _mm512_setzero_si512();
+    if constexpr (index_bits == 5 && group != 4) {
+        table4 = _mm512_xor_si512(_mm512_loadu_si512(values + 256), _mm512_set1_epi8(char(0x80)));
+        table5 = _mm512_xor_si512(_mm512_loadu_si512(values + 320), _mm512_set1_epi8(char(0x80)));
+        table6 = _mm512_xor_si512(_mm512_loadu_si512(values + 384), _mm512_set1_epi8(char(0x80)));
+        table7 = _mm512_xor_si512(_mm512_loadu_si512(values + 448), _mm512_set1_epi8(char(0x80)));
+    }
+
     int32_t * fallback_sums = nullptr;
     if (!prepared_sums) {
-        fallback_sums = (int32_t *) znq_scratch.get(size_t(nb)*sizeof(int32_t));
+        fallback_sums = (int32_t *) znq_scratch.get(size_t(nb) * sizeof(int32_t));
         if (!fallback_sums) {
             ggml_gemv_znq_local_generic(n, s, bs, vx, vy, nr, nc, group, nullptr, index_bits);
             return;
@@ -8638,28 +8684,34 @@ static void znq_local_gemv(int n, float * s, size_t bs, const void * vx, const v
     }
 
     for (int row = 0; row < nr; ++row) {
-        const block_q8_0 * yr = y + size_t(row)*nb;
+        const block_q8_0 * yr = y + size_t(row) * nb;
         if (!prepared_sums) {
             ggml_znq_local_prepare_sums(n, 1, false, yr, fallback_sums);
         }
-        const int32_t * sums = prepared_sums ? prepared_sums + size_t(row)*nb : fallback_sums;
+
+        const int32_t * sums = prepared_sums ? prepared_sums + size_t(row) * nb : fallback_sums;
+
         for (int col = 0; col < nc; col += 16) {
             const int width = std::min(16, nc - col);
-            const uint8_t * a0 = x + size_t(col / 8)*nb*stride;
-            const uint8_t * b0 = width == 16 ? a0 + size_t(nb)*stride : a0;
+            const uint8_t * a0 = x + size_t(col / 8) * nb * stride;
+            const uint8_t * b0 = width == 16 ? a0 + size_t(nb) * stride : a0;
             __m512 acc = _mm512_setzero_ps();
+
             for (int ib = 0; ib < nb; ++ib) {
-                const uint8_t * a = a0 + ib*stride;
-                const uint8_t * b = b0 + ib*stride;
+                const uint8_t * a = a0 + ib * stride;
+                const uint8_t * b = b0 + ib * stride;
                 const __m512i header = znq_local_header<group>(a, b);
                 __m512i dot = _mm512_setzero_si512();
                 __m512i books = _mm512_setzero_si512();
+                __mmask64 high = 0;
+
                 for (int q = 0; q < 8; ++q) {
                     if (q % (group / 4) == 0) {
-                        books = znq_local_book_indices<group, index_bits>(header, q);
+                        books = znq_local_book_indices<group, index_bits>(header, q, high);
                     }
-                    const __m512i w = znq_local_weights<group, index_bits>(a, b, q, books, table, table1, table2, table3);
-                    dot = _mm512_dpbusd_epi32(dot, w, _mm512_set1_epi32((int) znq4_mx8_load_u32(yr[ib].qs + q*4)));
+
+                    const __m512i w = znq_local_weights<group, index_bits>(a, b, q, books, high, table, table1, table2, table3, table4, table5, table6, table7);
+                    dot = _mm512_dpbusd_epi32(dot, w, _mm512_set1_epi32((int) znq4_mx8_load_u32(yr[ib].qs + q * 4)));
                 }
 
                 dot = _mm512_sub_epi32(dot, _mm512_set1_epi32(sums[ib]));
@@ -8667,7 +8719,7 @@ static void znq_local_gemv(int n, float * s, size_t bs, const void * vx, const v
                 acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dot), d, acc);
             }
 
-            _mm512_mask_storeu_ps(s + size_t(row)*bs + col, width == 16 ? 0xffff : 0xff, acc);
+            _mm512_mask_storeu_ps(s + size_t(row) * bs + col, width == 16 ? 0xffff : 0xff, acc);
         }
     }
 }
@@ -8696,9 +8748,10 @@ static void znq_gemm_tile(const ggml_znq_gemm_panel * panel, const block_q8_0x4 
         __m512i dl2 = _mm512_setzero_si512(), dl3 = _mm512_setzero_si512();
         __m512i dr0 = _mm512_setzero_si512(), dr1 = _mm512_setzero_si512();
         __m512i dr2 = _mm512_setzero_si512(), dr3 = _mm512_setzero_si512();
+
         for (int q = 0; q < 8; ++q) {
             const __m512i w0 = _mm512_loadu_si512(panel[ib].weights[0][q]);
-            const int offset = (q/2)*32 + (q%2)*4;
+            const int offset = (q / 2) * 32 + (q % 2) * 4;
             const __m512i q0 = _mm512_set1_epi32((int) znq4_mx8_load_u32(a[ib].qs + offset));
             const __m512i q1 = _mm512_set1_epi32((int) znq4_mx8_load_u32(a[ib].qs + offset + 8));
             const __m512i q2 = _mm512_set1_epi32((int) znq4_mx8_load_u32(a[ib].qs + offset + 16));
@@ -8718,8 +8771,8 @@ static void znq_gemm_tile(const ggml_znq_gemm_panel * panel, const block_q8_0x4 
 
         const __m512i c0 = _mm512_set1_epi32(sums[ib]);
         const __m512i c1 = _mm512_set1_epi32(sums[sum_stride + ib]);
-        const __m512i c2 = _mm512_set1_epi32(sums[2*sum_stride + ib]);
-        const __m512i c3 = _mm512_set1_epi32(sums[3*sum_stride + ib]);
+        const __m512i c2 = _mm512_set1_epi32(sums[2 * sum_stride + ib]);
+        const __m512i c3 = _mm512_set1_epi32(sums[3 * sum_stride + ib]);
         const __m512 ad0 = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a[ib].d[0]));
         const __m512 ad1 = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a[ib].d[1]));
         const __m512 ad2 = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a[ib].d[2]));
@@ -8737,6 +8790,7 @@ static void znq_gemm_tile(const ggml_znq_gemm_panel * panel, const block_q8_0x4 
             r3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(dr3, c3)), _mm512_mul_ps(wd1, ad3), r3);
         }
     }
+
     _mm512_mask_storeu_ps(out0, mask0, l0);
     _mm512_mask_storeu_ps(out1, mask0, l1);
     _mm512_mask_storeu_ps(out2, mask0, l2);
@@ -8753,27 +8807,40 @@ template<int group, int index_bits = 2>
 static void znq_local_gemm(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc,
         const int32_t * map, size_t bs1, size_t bs2, const int32_t * prepared_sums) {
     const int nb = n / QK_ZNQ;
-    constexpr int stride = 8 * (4*index_bits + (group == 4 ? 4 : 3));
+    constexpr int stride = 8 * (4 * index_bits + (group == 16 ? 2 : group == 8 ? 3 : 4));
     const auto * x = (const uint8_t *) vx;
     const auto * y = (const block_q8_0x4 *) vy;
     const int8_t * values = index_bits == 2 ? (group == 4 ? kvalues_znq3_s : kvalues_znq2_l) :
                            index_bits == 3 ? (group == 4 ? kvalues_znq4_s : kvalues_znq3_l) :
-                                             (group == 4 ? kvalues_znq5_s : kvalues_znq4_l);
+                           index_bits == 4 ? (group == 4 ? kvalues_znq5_s : kvalues_znq4_l) :
+                           (group == 16 ? kvalues_znq5_m : group == 8 ? kvalues_znq5_l : kvalues_znq6_s);
     const __m512i table = _mm512_xor_si512(_mm512_loadu_si512(values), _mm512_set1_epi8(char(0x80)));
     __m512i table1 = _mm512_setzero_si512();
-    if constexpr ((index_bits == 3 && group == 8) || index_bits == 4) {
-        table1 = _mm512_xor_si512(_mm512_loadu_si512(values+64), _mm512_set1_epi8(char(0x80)));
+    if constexpr ((index_bits == 3 && group == 8) || index_bits >= 4) {
+        table1 = _mm512_xor_si512(_mm512_loadu_si512(values + 64), _mm512_set1_epi8(char(0x80)));
     }
+
     __m512i table2 = _mm512_setzero_si512();
     __m512i table3 = _mm512_setzero_si512();
-    if constexpr (index_bits == 4 && group == 8) {
+    if constexpr ((index_bits == 4 && group == 8) || index_bits == 5) {
         table2 = _mm512_xor_si512(_mm512_loadu_si512(values + 128), _mm512_set1_epi8(char(0x80)));
         table3 = _mm512_xor_si512(_mm512_loadu_si512(values + 192), _mm512_set1_epi8(char(0x80)));
     }
 
+    __m512i table4 = _mm512_setzero_si512();
+    __m512i table5 = _mm512_setzero_si512();
+    __m512i table6 = _mm512_setzero_si512();
+    __m512i table7 = _mm512_setzero_si512();
+    if constexpr (index_bits == 5 && group != 4) {
+        table4 = _mm512_xor_si512(_mm512_loadu_si512(values + 256), _mm512_set1_epi8(char(0x80)));
+        table5 = _mm512_xor_si512(_mm512_loadu_si512(values + 320), _mm512_set1_epi8(char(0x80)));
+        table6 = _mm512_xor_si512(_mm512_loadu_si512(values + 384), _mm512_set1_epi8(char(0x80)));
+        table7 = _mm512_xor_si512(_mm512_loadu_si512(values + 448), _mm512_set1_epi8(char(0x80)));
+    }
+
     const int blocks = std::min(nb, ZNQ_PANEL_BLOCKS);
-    const size_t panel_size = size_t(blocks)*sizeof(ggml_znq_gemm_panel);
-    const size_t sums_size = prepared_sums ? 0 : size_t(nr)*nb*sizeof(int32_t);
+    const size_t panel_size = size_t(blocks) * sizeof(ggml_znq_gemm_panel);
+    const size_t sums_size = prepared_sums ? 0 : size_t(nr) * nb * sizeof(int32_t);
     void * storage = znq_scratch.get(panel_size + sums_size + 63);
     if (!storage) {
         ggml_gemm_znq_local_generic(n, s, bs, vx, vy, nr, nc, group, map, bs1, bs2, prepared_sums, index_bits);
@@ -8790,22 +8857,26 @@ static void znq_local_gemm(int n, float * s, size_t bs, const void * vx, const v
     for (int col = 0; col < nc; col += 32) {
         const int width = std::min(32, nc - col);
         const int halves = width > 16 ? 2 : 1;
+
         for (int start = 0; start < nb; start += blocks) {
             const int count = std::min(blocks, nb - start);
 
             for (int ib = 0; ib < count; ++ib) {
                 for (int h = 0; h < halves; ++h) {
-                    const int hw = std::min(16, width - h*16);
-                    const uint8_t * a = x + (size_t((col + h*16)/8)*nb + start + ib)*stride;
-                    const uint8_t * b = hw == 16 ? a + size_t(nb)*stride : a;
+                    const int hw = std::min(16, width - h * 16);
+                    const uint8_t * a = x + (size_t((col + h * 16) / 8) * nb + start + ib) * stride;
+                    const uint8_t * b = hw == 16 ? a + size_t(nb) * stride : a;
                     const __m512i header = znq_local_header<group>(a, b);
                     _mm512_storeu_ps(panel[ib].scale[h], znq_local_scales<group>(a, b, header));
                     __m512i books = _mm512_setzero_si512();
+                    __mmask64 high = 0;
+
                     for (int q = 0; q < 8; ++q) {
                         if (q % (group / 4) == 0) {
-                            books = znq_local_book_indices<group, index_bits>(header, q);
+                            books = znq_local_book_indices<group, index_bits>(header, q, high);
                         }
-                        _mm512_storeu_si512(panel[ib].weights[h][q], znq_local_weights<group, index_bits>(a, b, q, books, table, table1, table2, table3));
+
+                        _mm512_storeu_si512(panel[ib].weights[h][q], znq_local_weights<group, index_bits>(a, b, q, books, high, table, table1, table2, table3, table4, table5, table6, table7));
                     }
                 }
             }
@@ -8815,8 +8886,8 @@ static void znq_local_gemm(int n, float * s, size_t bs, const void * vx, const v
                 float * out1 = znq_local_dst(s, bs, map, bs1, bs2, row + 1) + col;
                 float * out2 = znq_local_dst(s, bs, map, bs1, bs2, row + 2) + col;
                 float * out3 = znq_local_dst(s, bs, map, bs1, bs2, row + 3) + col;
-                const auto * a = y + size_t(row/4)*nb + start;
-                const auto * sum = prepared_sums + size_t(row)*nb + start;
+                const auto * a = y + size_t(row / 4) * nb + start;
+                const auto * sum = prepared_sums + size_t(row) * nb + start;
                 if (halves == 2) {
                     znq_gemm_tile<true>(panel, a, sum, nb, count, start != 0, width, out0, out1, out2, out3);
                 } else {
@@ -8844,9 +8915,17 @@ void ggml_gemm_znq_panel(const ggml_znq_gemm_panel * panel, const void * activat
 }
 
 void ggml_gemv_znq_local(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc, int group, const int32_t * prepared_sums, int index_bits) {
-    GGML_ASSERT(n % QK_ZNQ == 0 && nc % 8 == 0 && (group == 4 || group == 8) && (index_bits >= 2 && index_bits <= 4));
+    GGML_ASSERT(n % QK_ZNQ == 0 && nc % 8 == 0 && (group == 4 || group == 8 || (group == 16 && index_bits == 5)) && (index_bits >= 2 && index_bits <= 5));
 #if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
-    if (index_bits == 4) {
+    if (index_bits == 5) {
+        if (group == 16) {
+            znq_local_gemv<16, 5>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+        } else if (group == 8) {
+            znq_local_gemv<8, 5>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+        } else {
+            znq_local_gemv<4, 5>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+        }
+    } else if (index_bits == 4) {
         if (group == 4) {
             znq_local_gemv<4, 4>(n, s, bs, vx, vy, nr, nc, prepared_sums);
         } else {
@@ -8872,9 +8951,17 @@ void ggml_gemv_znq_local(int n, float * s, size_t bs, const void * vx, const voi
 
 void ggml_gemm_znq_local(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc,
         int group, const int32_t * map, size_t bs1, size_t bs2, const int32_t * prepared_sums, int index_bits) {
-    GGML_ASSERT(n % QK_ZNQ == 0 && nc % 8 == 0 && nr % 4 == 0 && (group == 4 || group == 8) && (index_bits >= 2 && index_bits <= 4));
+    GGML_ASSERT(n % QK_ZNQ == 0 && nc % 8 == 0 && nr % 4 == 0 && (group == 4 || group == 8 || (group == 16 && index_bits == 5)) && (index_bits >= 2 && index_bits <= 5));
 #if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
-    if (index_bits == 4) {
+    if (index_bits == 5) {
+        if (group == 16) {
+            znq_local_gemm<16, 5>(n, s, bs, vx, vy, nr, nc, map, bs1, bs2, prepared_sums);
+        } else if (group == 8) {
+            znq_local_gemm<8, 5>(n, s, bs, vx, vy, nr, nc, map, bs1, bs2, prepared_sums);
+        } else {
+            znq_local_gemm<4, 5>(n, s, bs, vx, vy, nr, nc, map, bs1, bs2, prepared_sums);
+        }
+    } else if (index_bits == 4) {
         if (group == 4) {
             znq_local_gemm<4, 4>(n, s, bs, vx, vy, nr, nc, map, bs1, bs2, prepared_sums);
         } else {
