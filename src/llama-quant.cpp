@@ -1540,6 +1540,13 @@ bool llama_quant_tensor_allows_quantization(
     return tensor_allows_quantization(params, llm_arch_from_string(architecture), tensor);
 }
 
+bool llama_quant_tensor_requires_imatrix(
+        const char * tensor_name,
+        ggml_type type,
+        llama_ftype ftype) {
+    return tensor_requires_imatrix(tensor_name, type, ftype);
+}
+
 void llama_quant_compute_types(
         quantize_state_impl * qs,
         llama_ftype ftype,

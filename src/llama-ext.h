@@ -56,6 +56,12 @@ LLAMA_API bool llama_quant_tensor_allows_quantization(
         const llama_model_quantize_params * params,
         const ggml_tensor * tensor);
 
+// Check the quantizer's calibration requirement for an explicit tensor type.
+LLAMA_API bool llama_quant_tensor_requires_imatrix(
+        const char * tensor_name,
+        ggml_type type,
+        llama_ftype ftype);
+
 // Compute quantization type assignments for a list of tensors.
 // All tensors should be quantizable (use llama_quant_tensor_allows_quantization to filter).
 // result_types: caller-allocated array of n_tensors elements, filled with assigned types.

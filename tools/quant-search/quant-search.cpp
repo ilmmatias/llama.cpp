@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <regex>
 #include <set>
 #include <stdexcept>
@@ -33,6 +34,8 @@ struct search_params {
     std::vector<std::regex> exclude_tensors;
     std::vector<std::regex> exclude_bpw;
     size_t max_buffer_size = 64 * 1024 * 1024;
+    size_t max_nodes = 100000;
+    long double target_bpw = 0.0;
     int n_threads = std::max(1u, std::thread::hardware_concurrency());
     bool dry_run = false;
     bool allow_requantize = false;
@@ -61,13 +64,15 @@ struct tensor_plan {
 
 static void usage(const char * executable) {
     fprintf(stderr, "usage: %s [options] model.gguf type[,type...]\n\n", executable);
-    fprintf(stderr, "Measure per-tensor quantization errors and storage costs. Writes a TSV table to stdout.\n\n");
+    fprintf(stderr, "Measure per-tensor costs and errors, or select types under a BPW limit.\n\n");
 
     fprintf(stderr, "  -h, --help                  show this help message\n");
     fprintf(stderr, "  --imatrix FILE              use activation statistics from llama-imatrix\n");
     fprintf(stderr, "  --tensor-type PATTERN=TYPES override candidate types (first matching regex wins)\n");
     fprintf(stderr, "  --exclude-tensors PATTERN   preserve matching tensors without searching them\n");
     fprintf(stderr, "  --exclude-bpw PATTERN       omit matching tensors from BPW accounting\n");
+    fprintf(stderr, "  --target-bpw N              write a llama-quantize tensor-type file to stdout\n");
+    fprintf(stderr, "  --max-nodes N               allocation search limit (default: 100000)\n");
     fprintf(stderr, "  --max-buffer-size MiB       limit tensor buffers (default: 64 MiB)\n");
     fprintf(stderr, "  -t, --threads N             number of quantization threads\n");
     fprintf(stderr, "  --allow-requantize          allow conversion from quantized source weights\n");
@@ -149,7 +154,8 @@ static search_params parse_params(int argc, char ** argv) {
         } else if (arg == "--allow-requantize") {
             params.allow_requantize = true;
         } else if (arg == "--imatrix" || arg == "--tensor-type" || arg == "--exclude-tensors" ||
-                   arg == "--exclude-bpw" || arg == "--max-buffer-size" || arg == "-t" || arg == "--threads") {
+                   arg == "--exclude-bpw" || arg == "--max-buffer-size" || arg == "--target-bpw" ||
+                   arg == "--max-nodes" || arg == "-t" || arg == "--threads") {
             if (++i == argc) {
                 throw std::runtime_error("missing value for " + arg);
             }
@@ -170,6 +176,14 @@ static search_params parse_params(int argc, char ** argv) {
                 params.exclude_bpw.emplace_back(value);
             } else if (arg == "--max-buffer-size") {
                 params.max_buffer_size = checked_mul(parse_positive(value), 1024 * 1024);
+            } else if (arg == "--max-nodes") {
+                params.max_nodes = parse_positive(value);
+            } else if (arg == "--target-bpw") {
+                size_t end = 0;
+                params.target_bpw = std::stold(value, &end);
+                if (end != value.size() || !std::isfinite(params.target_bpw) || params.target_bpw <= 0) {
+                    throw std::runtime_error("expected a positive finite BPW limit");
+                }
             } else {
                 const size_t n = parse_positive(value);
                 if (n > INT32_MAX) {
@@ -191,6 +205,10 @@ static search_params parse_params(int argc, char ** argv) {
 
     params.model = positional[0];
     params.types = parse_types(positional[1]);
+
+    if (params.dry_run && params.target_bpw > 0) {
+        throw std::runtime_error("--target-bpw requires measured errors; remove --dry-run");
+    }
 
     return params;
 }
@@ -326,7 +344,8 @@ static std::vector<tensor_plan> plan_tensors(const search_params & params, const
 
                     if (tensor->ne[0] % traits->blck_size != 0) {
                         reason = "row is not a multiple of the block size";
-                    } else if (type != tensor->type && ggml_quantize_requires_imatrix(type) && imatrix.entries.count(name) == 0) {
+                    } else if (type != tensor->type && imatrix.entries.count(name) == 0 &&
+                               (ggml_quantize_requires_imatrix(type) || llama_quant_tensor_requires_imatrix(name, type, LLAMA_FTYPE_MOSTLY_Q4_K_M))) {
                         reason = "requires imatrix data";
                     }
 
@@ -521,6 +540,222 @@ static bool measure_tensor(const search_params & params, const input_file & file
     return entry != nullptr;
 }
 
+struct allocation_option {
+    size_t candidate;
+    size_t bytes;
+    long double error;
+};
+
+struct allocation_edge {
+    size_t group;
+    size_t to;
+    size_t bytes;
+    long double gain;
+};
+
+static std::vector<size_t> allocate_types(const search_params & params, const std::vector<tensor_plan> & plans,
+                                          size_t elements, size_t budget) {
+    std::vector<std::vector<allocation_option>> groups;
+    std::vector<allocation_edge> edges;
+    long double error_scale = 0;
+
+    for (const auto & plan : plans) {
+        std::vector<allocation_option> options;
+        for (size_t j = 0; j < plan.candidates.size(); ++j) {
+            const auto & c = plan.candidates[j];
+            const long double error = plan.candidates.size() == 1 ? 0 : params.imatrix.empty() ? c.error : c.error_weighted;
+            options.push_back({j, plan.counted ? c.size : 0, error});
+        }
+
+        std::sort(options.begin(), options.end(), [](const allocation_option & a, const allocation_option & b) {
+            if (a.bytes != b.bytes) { return a.bytes < b.bytes; }
+            if (a.error != b.error) { return a.error < b.error; }
+            return a.candidate < b.candidate;
+        });
+
+        // Remove dominated choices, but retain points above the convex hull for discrete search.
+        std::vector<allocation_option> frontier;
+        for (const auto & option : options) {
+            if (frontier.empty() || (option.bytes > frontier.back().bytes && option.error < frontier.back().error)) {
+                frontier.push_back(option);
+            }
+        }
+
+        error_scale += frontier.front().error;
+        std::vector<size_t> hull;
+
+        for (size_t j = 0; j < frontier.size(); ++j) {
+            while (hull.size() >= 2) {
+                const auto & a = frontier[hull[hull.size() - 2]];
+                const auto & b = frontier[hull.back()];
+                const auto & c = frontier[j];
+                if ((a.error - b.error) / (b.bytes - a.bytes) > (b.error - c.error) / (c.bytes - b.bytes)) {
+                    break;
+                }
+
+                hull.pop_back();
+            }
+
+            hull.push_back(j);
+        }
+
+        for (size_t j = 1; j < hull.size(); ++j) {
+            const auto & a = frontier[hull[j - 1]];
+            const auto & b = frontier[hull[j]];
+            edges.push_back({groups.size(), hull[j], b.bytes - a.bytes, a.error - b.error});
+        }
+
+        groups.push_back(std::move(frontier));
+    }
+
+    if (!std::isfinite(error_scale)) {
+        throw std::runtime_error("allocation error sum overflow");
+    }
+
+    std::sort(edges.begin(), edges.end(), [](const allocation_edge & a, const allocation_edge & b) {
+        const long double slope_a = a.gain / a.bytes;
+        const long double slope_b = b.gain / b.bytes;
+        if (slope_a != slope_b) { return slope_a > slope_b; }
+        if (a.group != b.group) { return a.group < b.group; }
+        return a.to < b.to;
+    });
+
+    struct branch {
+        size_t group;
+        size_t next;
+    };
+
+    std::vector<branch> stack;
+    std::vector<size_t> fixed(groups.size(), SIZE_MAX);
+    std::vector<size_t> chosen(groups.size());
+    std::vector<size_t> best(groups.size());
+    long double best_error = std::numeric_limits<long double>::infinity();
+    long double root_bound = 0;
+    const long double roundoff = 64 * std::numeric_limits<long double>::epsilon() * (groups.size() + edges.size() + 1) * error_scale;
+    size_t best_bytes = budget;
+    size_t nodes = 0;
+    bool pending = true;
+
+    while (pending && nodes < params.max_nodes) {
+        ++nodes;
+        size_t bytes = 0;
+        for (size_t i = 0; i < groups.size(); ++i) {
+            chosen[i] = fixed[i] == SIZE_MAX ? 0 : fixed[i];
+            bytes = checked_add(bytes, groups[i][chosen[i]].bytes);
+        }
+
+        if (bytes <= budget) {
+            size_t remaining = budget - bytes;
+            size_t fractional = SIZE_MAX;
+            long double fractional_gain = 0;
+
+            // Sorted convex-hull upgrades solve the fractional multiple-choice relaxation.
+            for (const auto & edge : edges) {
+                if (fixed[edge.group] != SIZE_MAX) {
+                    continue;
+                }
+
+                if (edge.bytes > remaining) {
+                    if (remaining > 0) {
+                        fractional = edge.group;
+                        fractional_gain = edge.gain * ((long double) remaining / edge.bytes);
+                    }
+
+                    break;
+                }
+
+                chosen[edge.group] = edge.to;
+                remaining -= edge.bytes;
+            }
+
+            long double error = 0;
+            for (size_t i = 0; i < groups.size(); ++i) {
+                error += groups[i][chosen[i]].error;
+            }
+
+            const long double bound = std::max(0.0L, error - fractional_gain - roundoff);
+            if (nodes == 1) {
+                root_bound = bound;
+            }
+
+            // Round down the fractional group, then try its affordable non-hull choices.
+            if (fractional != SIZE_MAX) {
+                const auto & options = groups[fractional];
+                const auto original = options[chosen[fractional]];
+                for (size_t j = chosen[fractional] + 1; j < options.size(); ++j) {
+                    if (options[j].bytes - original.bytes > remaining) {
+                        break;
+                    }
+
+                    chosen[fractional] = j;
+                }
+            }
+
+            error = 0;
+            bytes = 0;
+            for (size_t i = 0; i < groups.size(); ++i) {
+                error += groups[i][chosen[i]].error;
+                bytes = checked_add(bytes, groups[i][chosen[i]].bytes);
+            }
+
+            if (error < best_error || (error == best_error && bytes < best_bytes)) {
+                best = chosen;
+                best_error = error;
+                best_bytes = bytes;
+            }
+
+            if (fractional != SIZE_MAX && bound < best_error) {
+                stack.push_back({fractional, 0});
+            }
+        }
+
+        pending = false;
+        while (!stack.empty()) {
+            auto & top = stack.back();
+            if (top.next < groups[top.group].size()) {
+                fixed[top.group] = top.next++;
+                pending = true;
+                break;
+            }
+
+            fixed[top.group] = SIZE_MAX;
+            stack.pop_back();
+        }
+    }
+
+    const long double lower_bound = pending ? std::min(root_bound, best_error) : best_error;
+    fprintf(stderr, "allocation: %zu/%zu counted payload bytes, %.8Lf bpw\n", best_bytes, budget, 8.0L * best_bytes / elements);
+    fprintf(stderr, "%s variable error: %.12Lg, lower bound: %.12Lg, gap: %.12Lg, nodes: %zu (%s)\n",
+            params.imatrix.empty() ? "unweighted" : "weighted", best_error, lower_bound, best_error - lower_bound, nodes,
+            pending ? "node limit" : "optimal");
+
+    for (size_t i = 0; i < best.size(); ++i) {
+        best[i] = groups[i][best[i]].candidate;
+    }
+
+    return best;
+}
+
+static std::string tensor_pattern(const char * name) {
+    std::string pattern = "^";
+    for (const unsigned char c : std::string(name)) {
+        // Hex escapes also survive llama-quantize's lowercasing of patterns.
+        if (c <= ' ' || c >= 127 || (c >= 'A' && c <= 'Z') || c == '=') {
+            char escaped[5];
+            snprintf(escaped, sizeof(escaped), "\\x%02x", c);
+            pattern += escaped;
+        } else {
+            if (strchr(".^$|()[]{}*+?\\", c)) {
+                pattern += '\\';
+            }
+
+            pattern += c;
+        }
+    }
+
+    return pattern + "$";
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -541,18 +776,58 @@ int main(int argc, char ** argv) {
         const auto files = open_inputs(params.model);
         auto plans = plan_tensors(params, files, imatrix);
 
+        if (params.target_bpw > 0 && !params.imatrix.empty()) {
+            for (const auto & plan : plans) {
+                if (plan.candidates.size() > 1 && imatrix.entries.count(plan.tensor->name) == 0) {
+                    throw std::runtime_error(std::string("missing imatrix for searchable tensor: ") + plan.tensor->name + "; fix its type with --tensor-type or use --exclude-tensors");
+                }
+            }
+        }
+
         size_t elements = 0;
         size_t size_min = 0;
         size_t size_max = 0;
-        printf("tensor\ttype\telements\tbytes\tbpw\tsearch\tcount\terror\tweighted_error\n");
+        for (const auto & plan : plans) {
+            size_t bytes_min = SIZE_MAX;
+            size_t bytes_max = 0;
+            for (const auto & c : plan.candidates) {
+                bytes_min = std::min(bytes_min, c.size);
+                bytes_max = std::max(bytes_max, c.size);
+            }
+
+            if (plan.counted) {
+                elements = checked_add(elements, ggml_nelements(plan.tensor));
+                size_min = checked_add(size_min, bytes_min);
+                size_max = checked_add(size_max, bytes_max);
+            }
+        }
+
+        size_t budget = 0;
+        if (params.target_bpw > 0) {
+            if (elements == 0) {
+                throw std::runtime_error("BPW allocation requires counted elements");
+            }
+
+            const long double target_bytes = std::floor(params.target_bpw * (long double) elements / 8);
+            budget = target_bytes >= (long double) SIZE_MAX ? SIZE_MAX : (size_t) target_bytes;
+            if (size_min > budget) {
+                throw std::runtime_error("infeasible BPW limit: minimum is " + std::to_string(size_min) + " counted payload bytes");
+            }
+        }
+
+        if (params.target_bpw == 0) {
+            printf("tensor\ttype\telements\tbytes\tbpw\tsearch\tcount\terror\tweighted_error\n");
+        }
 
         for (auto & plan : plans) {
             const bool weighted = measure_tensor(params, files[plan.file], plan, imatrix);
             const size_t nelements = ggml_nelements(plan.tensor);
-            size_t bytes_min = SIZE_MAX;
-            size_t bytes_max = 0;
 
             for (const auto & c : plan.candidates) {
+                if (params.target_bpw > 0) {
+                    continue;
+                }
+
                 printf("%s\t%s\t%zu\t%zu\t%.8f\t%d\t%d\t", plan.tensor->name, ggml_type_name(c.type),
                        nelements, c.size, nelements ? 8.0 * (double) c.size / (double) nelements : 0.0, plan.candidates.size() > 1, plan.counted);
 
@@ -566,15 +841,6 @@ int main(int argc, char ** argv) {
                         printf("-\n");
                     }
                 }
-
-                bytes_min = std::min(bytes_min, c.size);
-                bytes_max = std::max(bytes_max, c.size);
-            }
-
-            if (plan.counted) {
-                elements = checked_add(elements, nelements);
-                size_min = checked_add(size_min, bytes_min);
-                size_max = checked_add(size_max, bytes_max);
             }
         }
 
@@ -583,6 +849,14 @@ int main(int argc, char ** argv) {
             fprintf(stderr, ", %.8f..%.8f bpw", 8.0 * (double) size_min / (double) elements, 8.0 * (double) size_max / (double) elements);
         }
         fprintf(stderr, "\n");
+
+        if (params.target_bpw > 0) {
+            const auto selected = allocate_types(params, plans, elements, budget);
+            for (size_t i = 0; i < plans.size(); ++i) {
+                const auto & plan = plans[i];
+                printf("%s=%s\n", tensor_pattern(plan.tensor->name).c_str(), ggml_type_name(plan.candidates[selected[i]].type));
+            }
+        }
 
         if (fflush(stdout) != 0 || ferror(stdout)) {
             throw std::runtime_error("cannot write results");
