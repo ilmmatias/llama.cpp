@@ -391,7 +391,7 @@ static void to_float(ggml_type type, const void * data, float * out, int64_t n) 
 
 static bool measure_tensor(const search_params & params, const input_file & file, tensor_plan & plan,
                            const common_imatrix & imatrix) {
-    if (params.dry_run) {
+    if (params.dry_run || (params.target_bpw > 0 && plan.candidates.size() == 1)) {
         return false;
     }
 
@@ -435,14 +435,38 @@ static bool measure_tensor(const search_params & params, const input_file & file
             throw std::runtime_error(std::string("imatrix shape mismatch for ") + tensor->name);
         }
 
+        size_t observed = 0;
         importance.resize(entry->sums.size());
-        for (size_t j = 0; j < importance.size(); ++j) {
-            const int64_t count = entry->counts[entry->counts.size() == 1 ? 0 : j / cols];
-            if (count <= 0 || !std::isfinite(entry->sums[j]) || entry->sums[j] < 0) {
-                throw std::runtime_error(std::string("invalid or incomplete imatrix for ") + tensor->name);
+        for (size_t matrix = 0; matrix < matrices; ++matrix) {
+            const int64_t count = entry->counts[entry->counts.size() == 1 ? 0 : matrix];
+            if (count < 0) {
+                throw std::runtime_error(std::string("negative imatrix count for ") + tensor->name + ", matrix " + std::to_string(matrix));
             }
 
-            importance[j] = entry->sums[j] / (float) count;
+            observed += count > 0;
+            for (size_t col = 0; col < cols; ++col) {
+                const size_t j = matrix * cols + col;
+                const float sum = entry->sums[j];
+                if (!std::isfinite(sum) || sum < 0) {
+                    throw std::runtime_error(std::string("invalid imatrix sum for ") + tensor->name + ", matrix " + std::to_string(matrix) + ", column " + std::to_string(col));
+                }
+
+                if (count == 0 && sum != 0) {
+                    throw std::runtime_error(std::string("nonzero imatrix sum without observations for ") + tensor->name + ", matrix " + std::to_string(matrix));
+                }
+
+                // Match llama-quantize's encoding fallback; the raw sums still give these rows zero score weight.
+                importance[j] = count > 0 ? sum / (float) count : 1.0f;
+            }
+        }
+
+        if (observed == 0) {
+            throw std::runtime_error(std::string("imatrix has no observations for ") + tensor->name);
+        }
+
+        if (observed < matrices) {
+            fprintf(stderr, "%s: imatrix covers %zu/%zu matrices; unobserved matrices use uniform encoding weights and zero score weight\n",
+                    tensor->name, observed, matrices);
         }
 
         score_divisor = imatrix.is_legacy ? (double) entry->counts[0] : (double) imatrix.chunk_count * imatrix.chunk_size;

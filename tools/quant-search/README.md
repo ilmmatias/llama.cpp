@@ -15,9 +15,11 @@ The tool follows `llama-quantize` tensor eligibility and reads GGUF shards start
 
 The TSV contains payload bytes, BPW, search/accounting flags, squared weight error, and activation-weighted squared error. Missing measurements are `-`. Weighted error uses diagonal input second moments, with expert observation frequency retained for GGUF imatrices. It is a local reconstruction proxy, not a model-loss estimate.
 
+Partial expert coverage is reported on stderr. Unobserved experts use the quantizer's uniform encoding weights and contribute zero to the calibration-weighted error. Zero-count experts must have zero sums; invalid statistics and entries with no observations fail.
+
 `--target-bpw` writes an exact-name recipe for `llama-quantize --tensor-type-file` instead of TSV. Apply it with `Q4_K` as the base type, the same imatrix, and `--allow-requantize` if needed. The limit counts tensor payload only, excludes GGUF metadata and alignment, and rounds down to whole bytes. Fixed tensors remain counted unless excluded with `--exclude-bpw`.
 
-Allocation minimizes additive squared error, weighted when `--imatrix` is supplied. Every searchable tensor then requires calibration data; fix or exclude tensors with missing entries explicitly. Fixed tensors contribute no variable error. BPW exclusions do not remove tensors from the error objective.
+Allocation minimizes additive squared error, weighted when `--imatrix` is supplied. Every searchable tensor then requires calibration data; fix or exclude tensors with missing entries explicitly. Fixed tensors contribute no variable error and are not read for scoring in allocation mode. BPW exclusions do not remove tensors from the error objective.
 
 The allocator uses a convex relaxation and deterministic branch-and-bound, retaining non-convex choices for discrete search. Stderr reports the feasible error, lower bound, gap, and search status. `optimal` means the additive problem is solved within floating-point arithmetic; `node limit` means a feasible recipe with a remaining bound. `--max-nodes` limits work (default: 100000); solver storage scales with candidate count, not model bytes or budget.
 

@@ -314,22 +314,87 @@ class QuantSearchTests(unittest.TestCase):
         dense = next(r for r in rows if r["tensor"] == DENSE)
         self.assertAlmostEqual(float(dense["weighted_error"]), 2 * float(dense["error"]), places=12)
 
-    def test_incomplete_imatrix(self):
-        path = self.root / "incomplete.gguf"
+    def test_partial_expert_imatrix(self):
+        model = self.write_model("experts.gguf", {EXPERTS: self.experts})
+        path = self.root / "partial.gguf"
+        weights = 1 + (np.arange(1024, dtype=np.float32) % 17) / 17
+        sums = np.stack([100 * weights, np.zeros(1024, dtype=np.float32)])
         writer = gguf.GGUFWriter(path, "llama")
 
+        writer.add_array("imatrix.datasets", ["test"])
         writer.add_uint32("imatrix.chunk_count", 1)
         writer.add_uint32("imatrix.chunk_size", 100)
-        writer.add_tensor(EXPERTS + ".in_sum2", np.zeros((2, 1024), dtype=np.float32))
+        writer.add_tensor(EXPERTS + ".in_sum2", sums)
         writer.add_tensor(EXPERTS + ".counts", np.array([[100], [0]], dtype=np.float32))
-
         writer.write_header_to_file()
         writer.write_kv_data_to_file()
         writer.write_tensors_to_file()
         writer.close()
 
-        result = self.run_tool("--imatrix", path, success=False)
-        self.assertIn("incomplete imatrix", result.stderr)
+        result = self.run_tool("--imatrix", path, model=model, types="F16,IQ2_XXS")
+        self.assertIn("imatrix covers 1/2 matrices", result.stderr)
+        rows = self.table(result)
+        small = self.table(self.run_tool("--imatrix", path, "--max-buffer-size", "1", "-t", "3", model=model, types="F16,IQ2_XXS"))
+        for a, b in zip(rows, small):
+            for field in ("error", "weighted_error"):
+                self.assertTrue(math.isclose(float(a[field]), float(b[field]), rel_tol=1e-12, abs_tol=1e-12))
+
+        diff = self.experts[0].astype(np.float64) - self.experts[0].astype(np.float16).astype(np.float64)
+        expected = (np.square(diff) * (sums[0].astype(np.float64) / 100)).sum()
+        self.assertAlmostEqual(float(rows[0]["weighted_error"]), expected, places=12)
+        self.run_tool("--imatrix", path, "--target-bpw", "8", model=model, types="F16,IQ2_XXS")
+
+        quantizer = BINARY.with_name("llama-quantize" + BINARY.suffix)
+        if not quantizer.is_file():
+            self.skipTest("build llama-quantize to test partial calibration parity")
+
+        output = self.root / "partial-output.gguf"
+        applied = subprocess.run([str(quantizer), "--imatrix", str(path), "--tensor-type", EXPERTS + "=IQ2_XXS",
+                                  str(model), str(output), "Q4_K", "2"], capture_output=True, text=True, timeout=60)
+        self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+        tensor = gguf.GGUFReader(output).tensors[0]
+        decoded = gguf.dequantize(tensor.data, tensor.tensor_type).astype(np.float64)
+        errors = np.square(self.experts.astype(np.float64) - decoded)
+        self.assertTrue(math.isclose(float(rows[1]["error"]), float(errors.sum()), rel_tol=1e-6))
+        expected = float((errors[0] * (sums[0].astype(np.float64) / 100)).sum())
+        self.assertTrue(math.isclose(float(rows[1]["weighted_error"]), expected, rel_tol=1e-6))
+
+    def test_invalid_imatrix(self):
+        model = self.write_model("experts.gguf", {EXPERTS: self.experts})
+        cases = [([100, -1], 0, "negative imatrix count"),
+                 ([100, 0], 1, "nonzero imatrix sum without observations"),
+                 ([0, 0], 0, "imatrix has no observations"),
+                 ([100, 100], -1, "invalid imatrix sum"),
+                 ([100, 100], np.nan, "invalid imatrix sum"),
+                 ([100, 100], np.inf, "invalid imatrix sum")]
+
+        for counts, value, message in cases:
+            with self.subTest(counts=counts, value=value):
+                path = self.root / "invalid.gguf"
+                writer = gguf.GGUFWriter(path, "llama")
+                writer.add_uint32("imatrix.chunk_count", 1)
+                writer.add_uint32("imatrix.chunk_size", 100)
+                writer.add_tensor(EXPERTS + ".in_sum2", np.full((2, 1024), value, dtype=np.float32))
+                writer.add_tensor(EXPERTS + ".counts", np.array(counts, dtype=np.float32).reshape(2, 1))
+                writer.write_header_to_file()
+                writer.write_kv_data_to_file()
+                writer.write_tensors_to_file()
+                writer.close()
+
+                result = self.run_tool("--imatrix", path, model=model, success=False)
+                self.assertIn(message, result.stderr)
+                self.assertIn(EXPERTS, result.stderr)
+
+    def test_allocation_does_not_measure_fixed_conversions(self):
+        model = self.write_model("fixed-wide.gguf", {DENSE: np.ones((2, 262144), dtype=np.float32)})
+        options = ("--max-buffer-size", "1", "--tensor-type", "attn_q=F16")
+
+        # Reporting its conversion error needs a row buffer; exporting its fixed type does not.
+        self.run_tool(*options, model=model, success=False)
+        result = self.run_tool(*options, "--target-bpw", "16", model=model)
+        choices = self.recipe_choices(result, {DENSE: None})
+        self.assertEqual(choices[DENSE], "f16")
+        self.assertIn("1048576/1048576 counted payload bytes", result.stderr)
 
     def test_shards(self):
         first = self.write_model("split-00001-of-00002.gguf", {DENSE: self.dense}, split=(0, 2))
