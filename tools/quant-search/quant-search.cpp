@@ -6,6 +6,7 @@
 #include "../../src/llama-ext.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <clocale>
 #include <cmath>
@@ -389,21 +390,65 @@ static void to_float(ggml_type type, const void * data, float * out, int64_t n) 
     }
 }
 
+struct tensor_progress {
+    const char * name;
+    size_t rows;
+    size_t n_candidates;
+    bool terminal = common_is_tty(stderr);
+    int64_t started = ggml_time_us();
+    int64_t updated = started;
+    int width = 0;
+
+    void report(ggml_type type, size_t candidate_index, size_t rows_done, long double fraction, bool force = false) {
+        const int64_t now = ggml_time_us();
+        if (!force && now - updated < 1000000) {
+            return;
+        }
+
+        if (terminal) {
+            fputc('\r', stderr);
+        }
+
+        const int written = fprintf(stderr, "%s: %6.2Lf%%, %s (%zu/%zu), rows %zu/%zu, %.1fs",
+                                    name, 100 * fraction, ggml_type_name(type), candidate_index, n_candidates,
+                                    rows_done, rows, (now - started) / 1e6);
+        if (terminal) {
+            for (int i = written; i < width; ++i) {
+                fputc(' ', stderr);
+            }
+
+            width = std::max(0, written);
+        } else {
+            fputc('\n', stderr);
+        }
+
+        fflush(stderr);
+        updated = now;
+    }
+
+    ~tensor_progress() {
+        if (terminal && width > 0) {
+            fputc('\n', stderr);
+            fflush(stderr);
+        }
+    }
+};
+
 static bool measure_tensor(const search_params & params, const input_file & file, tensor_plan & plan,
-                           const common_imatrix & imatrix) {
+                           const common_imatrix & imatrix, size_t tensor_index, size_t n_tensors) {
     if (params.dry_run || (params.target_bpw > 0 && plan.candidates.size() == 1)) {
         return false;
     }
 
     const auto * tensor = plan.tensor;
-    bool converts = false;
+    size_t n_converts = 0;
     size_t row_size_max = 0;
     for (const auto & c : plan.candidates) {
-        converts |= c.type != tensor->type;
+        n_converts += c.type != tensor->type;
         row_size_max = std::max(row_size_max, ggml_row_size(c.type, tensor->ne[0]));
     }
 
-    if (!converts) {
+    if (n_converts == 0) {
         return false;
     }
 
@@ -477,10 +522,13 @@ static bool measure_tensor(const search_params & params, const input_file & file
 
     std::ifstream in(file.path, std::ios::binary);
     in.seekg(plan.offset);
-    fprintf(stderr, "%s: %s, %zu candidates\n", tensor->name, ggml_type_name(tensor->type), plan.candidates.size());
+    fprintf(stderr, "[%zu/%zu] %s: %s, %zu candidates, %.3f GiB source\n", tensor_index, n_tensors,
+            tensor->name, ggml_type_name(tensor->type), plan.candidates.size(), ggml_nbytes(tensor) / (1024.0 * 1024 * 1024));
 
     std::vector<double> errors(n_threads), errors_weighted(n_threads);
     std::vector<std::thread> workers;
+    tensor_progress progress{tensor->name, rows, n_converts};
+    std::atomic<size_t> completed{0};
 
     for (size_t first = 0; first < rows; first += slab_rows) {
         const size_t nrows = std::min(slab_rows, rows - first);
@@ -492,11 +540,21 @@ static bool measure_tensor(const search_params & params, const input_file & file
 
         to_float(tensor->type, source.data(), original.data(), nrows * cols);
 
+        size_t candidate_index = 0;
         for (auto & c : plan.candidates) {
             if (c.type == tensor->type) {
                 continue;
             }
 
+            ++candidate_index;
+            completed.store(0, std::memory_order_relaxed);
+            auto report_progress = [&](bool force) {
+                const size_t done = completed.load(std::memory_order_relaxed);
+                const long double work = (long double) first * n_converts + (long double) (candidate_index - 1) * nrows + done;
+                progress.report(c.type, candidate_index, first + done, work / ((long double) rows * n_converts), force);
+            };
+
+            report_progress(first == 0 && candidate_index == 1);
             ggml_quantize_init(c.type);
             const size_t row_size_dst = ggml_row_size(c.type, cols);
 
@@ -508,7 +566,7 @@ static bool measure_tensor(const search_params & params, const input_file & file
 
                 while (row < end) {
                     const size_t matrix = (first + row) / tensor->ne[1];
-                    const size_t count = std::min(end - row, (size_t) tensor->ne[1] - (first + row) % tensor->ne[1]);
+                    const size_t count = std::min({end - row, (size_t) tensor->ne[1] - (first + row) % tensor->ne[1], size_t(64)});
                     const float * weights = entry ? importance.data() + matrix * cols : nullptr;
                     void * dst = encoded.data() + row * row_size_dst;
 
@@ -524,6 +582,10 @@ static bool measure_tensor(const search_params & params, const input_file & file
                     }
 
                     row += count;
+                    completed.fetch_add(count, std::memory_order_relaxed);
+                    if (thread == 0) {
+                        report_progress(false);
+                    }
                 }
 
                 errors[thread] = error;
@@ -549,6 +611,7 @@ static bool measure_tensor(const search_params & params, const input_file & file
             }
 
             workers.clear();
+            report_progress(first + nrows == rows && candidate_index == n_converts);
 
             for (int thread = 0; thread < n_threads; ++thread) {
                 c.error += errors[thread];
@@ -782,6 +845,7 @@ static std::string tensor_pattern(const char * name) {
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
+    ggml_time_init();
 
     if (argc == 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         usage(argv[0]);
@@ -843,8 +907,9 @@ int main(int argc, char ** argv) {
             printf("tensor\ttype\telements\tbytes\tbpw\tsearch\tcount\terror\tweighted_error\n");
         }
 
-        for (auto & plan : plans) {
-            const bool weighted = measure_tensor(params, files[plan.file], plan, imatrix);
+        for (size_t i = 0; i < plans.size(); ++i) {
+            auto & plan = plans[i];
+            const bool weighted = measure_tensor(params, files[plan.file], plan, imatrix, i + 1, plans.size());
             const size_t nelements = ggml_nelements(plan.tensor);
 
             for (const auto & c : plan.candidates) {

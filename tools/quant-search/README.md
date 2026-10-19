@@ -2,6 +2,8 @@
 
 Measure candidate tensor types and select an allocation without loading the model weights into RAM or VRAM.
 
+Scoring progress is written to stderr, including the current type, completed rows, tensor work percentage, and elapsed time. Updates reuse one line in a terminal and use separate lines in redirected logs. Percentages count row/type evaluations, not estimated time.
+
 ```sh
 llama-quant-search --imatrix imatrix.gguf model-bf16.gguf Q3_K,Q4_K,Q5_K > candidates.tsv
 llama-quant-search --dry-run --tensor-type 'attn_v=Q6_K' --exclude-bpw 'token_embd' model-bf16.gguf Q3_K,Q4_K
