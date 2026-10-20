@@ -2,6 +2,7 @@
 #include "gated-delta-net-mma.cuh"
 #include "ggml-cuda/common.cuh"
 #include "convert.cuh"
+#include "dequantize.cuh"
 #include "unary.cuh"
 
 #include <cstdint>
@@ -529,20 +530,9 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
     ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
 }
 
-// weight row accessors: dense rows are indexed per element, quantized rows per block
-template <typename T>
-static __device__ __forceinline__ const T * gdn_ab_row(const T * w, int h, int K) {
-    return w + int64_t(h)*K;
-}
-
 template <typename T>
 static __device__ __forceinline__ float gdn_ab_at(const T * w, int k) {
     return ggml_cuda_cast<float>(w[k]);
-}
-
-template <>
-__device__ __forceinline__ const block_q8_0 * gdn_ab_row(const block_q8_0 * w, int h, int K) {
-    return w + int64_t(h)*(K/QK8_0);
 }
 
 template <>
@@ -551,12 +541,75 @@ __device__ __forceinline__ float gdn_ab_at(const block_q8_0 * w, int k) {
     return ggml_cuda_cast<float>(b.d)*b.qs[k % QK8_0];
 }
 
-// one block per (head, projection, token): heads alone cannot fill the GPU, so the K reduction carries the parallelism
-template <typename T, int block_size>
+template <typename T>
+static __device__ __forceinline__ float gdn_ab_dot(const void * weights, const float * x, int K) {
+    const T * w = (const T *) weights;
+    float sum = 0.0f;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        sum += gdn_ab_at(w, k)*x[k];
+    }
+    return sum;
+}
+
+template <int qk, int qr, dequantize_kernel_t dequantize>
+static __device__ __forceinline__ float gdn_ab_dot_q(const void * w, const float * x, int K) {
+    float sum = 0.0f;
+    for (int k = 2*threadIdx.x; k < K; k += 2*blockDim.x) {
+        const int ib = k/qk;
+        const int iq = (k % qk)/qr;
+        const int offset = qr == 1 ? 1 : qk/2;
+        float2 v;
+        dequantize(w, ib, iq, v);
+        sum += v.x*x[ib*qk + iq] + v.y*x[ib*qk + iq + offset];
+    }
+    return sum;
+}
+
+template <dequantize_kq_t<float> dequantize, int threads, int subblock = QK_K>
+static __device__ __forceinline__ float gdn_ab_dot_kq(const void * w, const float * x, int K, float * tile) {
+    const int group = threadIdx.x/threads;
+    const int lane = threadIdx.x % threads;
+    const int groups = blockDim.x/threads;
+    float * values = tile + group*QK_K;
+    float sum = 0.0f;
+
+    for (int base = 0; base < K; base += groups*QK_K) {
+        const int k = base + group*QK_K;
+        if (k < K && (subblock == QK_K || k + (lane % (QK_K/subblock))*subblock < K)) {
+            dequantize(w, k/QK_K, values, lane);
+        }
+        __syncthreads();
+        for (int j = lane; j < QK_K && k + j < K; j += threads) {
+            sum += values[j]*x[k + j];
+        }
+        __syncthreads();
+    }
+    return sum;
+}
+
+static __device__ __forceinline__ float gdn_ab_dot_nvfp4(const void * weights, const float * x, int K) {
+    const block_nvfp4 * w = (const block_nvfp4 *) weights;
+    float sum = 0.0f;
+    for (int k = threadIdx.x; k < K/2; k += blockDim.x) {
+        const int ib = k/(QK_NVFP4/2);
+        const int sub = (k % (QK_NVFP4/2))/(QK_NVFP4_SUB/2);
+        const int j = k % (QK_NVFP4_SUB/2);
+        const float d = ggml_cuda_ue4m3_to_fp32(w[ib].d[sub]);
+        const uint8_t q = w[ib].qs[sub*(QK_NVFP4_SUB/2) + j];
+        const int i = ib*QK_NVFP4 + sub*QK_NVFP4_SUB + j;
+        sum += d*(kvalues_mxfp4[q & 15]*x[i] + kvalues_mxfp4[q >> 4]*x[i + QK_NVFP4_SUB/2]);
+    }
+    return sum;
+}
+
+// One block per (head, projection, token).
+template <int block_size, ggml_type weight_type = GGML_TYPE_COUNT>
 static __global__ void k_gdn_ab_mul_mat(
         const float * __restrict__ x,
-        const T * __restrict__ w_alpha,
-        const T * __restrict__ w_beta,
+        const void * __restrict__ w_alpha,
+        const void * __restrict__ w_beta,
+        const ggml_type type_alpha, const ggml_type type_beta,
+        const size_t stride_alpha, const size_t stride_beta,
         const float * __restrict__ dt,
         const float * __restrict__ ssm_a,
         float * __restrict__ gate,
@@ -567,12 +620,64 @@ static __global__ void k_gdn_ab_mul_mat(
     const int  n       = blockIdx.y;
     const bool is_beta = blockIdx.z != 0;
 
-    const T *     w  = gdn_ab_row(is_beta ? w_beta : w_alpha, h, K);
+    const void * w = is_beta ? (const char *) w_beta + h*stride_beta : (const char *) w_alpha + h*stride_alpha;
     const float * xn = x + int64_t(n)*K;
 
     float sum = 0.0f;
-    for (int k = threadIdx.x; k < K; k += block_size) {
-        sum += gdn_ab_at(w, k)*xn[k];
+    if constexpr (weight_type == GGML_TYPE_F32) {
+        sum = gdn_ab_dot<float>(w, xn, K);
+    } else if constexpr (weight_type == GGML_TYPE_F16) {
+        sum = gdn_ab_dot<half>(w, xn, K);
+    } else if constexpr (weight_type == GGML_TYPE_BF16) {
+        sum = gdn_ab_dot<nv_bfloat16>(w, xn, K);
+    } else if constexpr (weight_type == GGML_TYPE_Q8_0) {
+        sum = gdn_ab_dot<block_q8_0>(w, xn, K);
+    } else {
+        __shared__ float tile[(block_size/32)*QK_K];
+        const ggml_type type = is_beta ? type_beta : type_alpha;
+        switch (type) {
+            case GGML_TYPE_F32:  sum = gdn_ab_dot<float>(w, xn, K);         break;
+            case GGML_TYPE_F16:  sum = gdn_ab_dot<half>(w, xn, K);          break;
+            case GGML_TYPE_BF16: sum = gdn_ab_dot<nv_bfloat16>(w, xn, K);   break;
+            case GGML_TYPE_Q8_0: sum = gdn_ab_dot<block_q8_0>(w, xn, K);    break;
+            case GGML_TYPE_Q1_0: sum = gdn_ab_dot_q<QK1_0, QR1_0, dequantize_q1_0>(w, xn, K); break;
+            case GGML_TYPE_Q2_0: sum = gdn_ab_dot_q<QK2_0, QR2_0, dequantize_q2_0>(w, xn, K); break;
+            case GGML_TYPE_Q4_0: sum = gdn_ab_dot_q<QK4_0, QR4_0, dequantize_q4_0>(w, xn, K); break;
+            case GGML_TYPE_Q4_1: sum = gdn_ab_dot_q<QK4_1, QR4_1, dequantize_q4_1>(w, xn, K); break;
+            case GGML_TYPE_Q5_0: sum = gdn_ab_dot_q<QK5_0, QR5_0, dequantize_q5_0>(w, xn, K); break;
+            case GGML_TYPE_Q5_1: sum = gdn_ab_dot_q<QK5_1, QR5_1, dequantize_q5_1>(w, xn, K); break;
+            case GGML_TYPE_ZNQ2_M: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<2, 16>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ2_L: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<2, 8>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ3_S: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<2, 4>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ3_M: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<3, 16>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ3_L: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<3, 8>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ4_S: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<3, 4>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ4_M: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<4, 16>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ4_L: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<4, 8>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ5_S: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<4, 4>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ5_M: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<5, 16>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ5_L: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<5, 8>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ6_S: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<5, 4>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ6_M: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<6, 16>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ6_L: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<6, 8>>(w, xn, K); break;
+            case GGML_TYPE_Q2_K: sum = gdn_ab_dot_kq<dequantize_q2_K, 64>(w, xn, K, tile); break;
+            case GGML_TYPE_Q3_K: sum = gdn_ab_dot_kq<dequantize_q3_K, 64>(w, xn, K, tile); break;
+            case GGML_TYPE_Q4_K: sum = gdn_ab_dot_kq<dequantize_q4_K, 32>(w, xn, K, tile); break;
+            case GGML_TYPE_Q5_K: sum = gdn_ab_dot_kq<dequantize_q5_K, 64>(w, xn, K, tile); break;
+            case GGML_TYPE_Q6_K: sum = gdn_ab_dot_kq<dequantize_q6_K, 64>(w, xn, K, tile); break;
+            case GGML_TYPE_IQ2_XXS: sum = gdn_ab_dot_kq<dequantize_iq2_xxs, 32>(w, xn, K, tile); break;
+            case GGML_TYPE_IQ2_XS: sum = gdn_ab_dot_kq<dequantize_iq2_xs, 32>(w, xn, K, tile); break;
+            case GGML_TYPE_IQ2_S: sum = gdn_ab_dot_kq<dequantize_iq2_s, 32>(w, xn, K, tile); break;
+            case GGML_TYPE_IQ3_XXS: sum = gdn_ab_dot_kq<dequantize_iq3_xxs, 32>(w, xn, K, tile); break;
+            case GGML_TYPE_IQ3_S: sum = gdn_ab_dot_kq<dequantize_iq3_s, 32>(w, xn, K, tile); break;
+            case GGML_TYPE_IQ1_S: sum = gdn_ab_dot_kq<dequantize_iq1_s, 32>(w, xn, K, tile); break;
+            case GGML_TYPE_IQ1_M: sum = gdn_ab_dot_kq<dequantize_iq1_m, 32>(w, xn, K, tile); break;
+            case GGML_TYPE_IQ4_XS: sum = gdn_ab_dot_kq<dequantize_iq4_xs, 32>(w, xn, K, tile); break;
+            case GGML_TYPE_IQ4_NL: sum = gdn_ab_dot_kq<dequantize_iq4_nl, 32, QK4_NL>(w, xn, K, tile); break;
+            case GGML_TYPE_MXFP4: sum = gdn_ab_dot_kq<dequantize_mxfp4, 32, QK_MXFP4>(w, xn, K, tile); break;
+            case GGML_TYPE_NVFP4: sum = gdn_ab_dot_nvfp4(w, xn, K); break;
+            default: NO_DEVICE_CODE;
+        }
     }
 
     __shared__ float s_sum[WARP_SIZE];
@@ -590,19 +695,77 @@ static __global__ void k_gdn_ab_mul_mat(
     }
 }
 
-template <typename T>
-static void ggml_cuda_op_gated_delta_net_ab_impl(
-        ggml_backend_cuda_context & ctx, const ggml_cuda_gated_delta_net_ab & ab) {
+bool ggml_cuda_gated_delta_net_ab_supported_type(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_ZNQ2_M:
+        case GGML_TYPE_ZNQ2_L:
+        case GGML_TYPE_ZNQ3_S:
+        case GGML_TYPE_ZNQ3_M:
+        case GGML_TYPE_ZNQ3_L:
+        case GGML_TYPE_ZNQ4_S:
+        case GGML_TYPE_ZNQ4_M:
+        case GGML_TYPE_ZNQ4_L:
+        case GGML_TYPE_ZNQ5_S:
+        case GGML_TYPE_ZNQ5_M:
+        case GGML_TYPE_ZNQ5_L:
+        case GGML_TYPE_ZNQ6_S:
+        case GGML_TYPE_ZNQ6_M:
+        case GGML_TYPE_ZNQ6_L:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void ggml_cuda_op_gated_delta_net_ab(ggml_backend_cuda_context & ctx, const ggml_cuda_gated_delta_net_ab & ab) {
     const int M = (int) ab.alpha_mm->ne[0];
     const int N = (int) ab.alpha_mm->ne[1];
     const int K = (int) ab.alpha_mm->src[0]->ne[0];
 
     constexpr int block_size = 256;
+    auto kernel = k_gdn_ab_mul_mat<block_size>;
+    if (ab.alpha_mm->src[0]->type == ab.beta_mm->src[0]->type) {
+        switch (ab.alpha_mm->src[0]->type) {
+            case GGML_TYPE_F32:  kernel = k_gdn_ab_mul_mat<block_size, GGML_TYPE_F32>;  break;
+            case GGML_TYPE_F16:  kernel = k_gdn_ab_mul_mat<block_size, GGML_TYPE_F16>;  break;
+            case GGML_TYPE_BF16: kernel = k_gdn_ab_mul_mat<block_size, GGML_TYPE_BF16>; break;
+            case GGML_TYPE_Q8_0: kernel = k_gdn_ab_mul_mat<block_size, GGML_TYPE_Q8_0>; break;
+            default: break;
+        }
+    }
 
-    k_gdn_ab_mul_mat<T, block_size><<<dim3(M, N, 2), block_size, 0, ctx.stream()>>>(
+    const ggml_cuda_kernel_launch_params params(dim3(M, N, 2), dim3(block_size, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(kernel, params,
         (const float *) ab.alpha_mm->src[1]->data,
-        (const T *)     ab.alpha_mm->src[0]->data,
-        (const T *)     ab.beta_mm->src[0]->data,
+        ab.alpha_mm->src[0]->data, ab.beta_mm->src[0]->data,
+        ab.alpha_mm->src[0]->type, ab.beta_mm->src[0]->type,
+        ab.alpha_mm->src[0]->nb[1], ab.beta_mm->src[0]->nb[1],
         (const float *) ab.dt->data,
         (const float *) ab.ssm_a->data,
         (float *)       ab.gate_out->data,
@@ -610,27 +773,4 @@ static void ggml_cuda_op_gated_delta_net_ab_impl(
         M, K);
 
     CUDA_CHECK(cudaGetLastError());
-}
-
-bool ggml_cuda_gated_delta_net_ab_supported_type(ggml_type type) {
-    return type == GGML_TYPE_BF16 || type == GGML_TYPE_F16 || type == GGML_TYPE_F32 || type == GGML_TYPE_Q8_0;
-}
-
-void ggml_cuda_op_gated_delta_net_ab(ggml_backend_cuda_context & ctx, const ggml_cuda_gated_delta_net_ab & ab) {
-    switch (ab.alpha_mm->src[0]->type) {
-        case GGML_TYPE_BF16:
-            ggml_cuda_op_gated_delta_net_ab_impl<nv_bfloat16>(ctx, ab);
-            break;
-        case GGML_TYPE_F16:
-            ggml_cuda_op_gated_delta_net_ab_impl<half>(ctx, ab);
-            break;
-        case GGML_TYPE_F32:
-            ggml_cuda_op_gated_delta_net_ab_impl<float>(ctx, ab);
-            break;
-        case GGML_TYPE_Q8_0:
-            ggml_cuda_op_gated_delta_net_ab_impl<block_q8_0>(ctx, ab);
-            break;
-        default:
-            GGML_ABORT("unsupported GDN projection type");
-    }
 }

@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "convert.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1613,6 +1614,315 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+template <ggml_type type>
+static __device__ __forceinline__ float mmvq_glu_dot(
+        const void * w, const block_q8_1 * x, const int K) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr vec_dot_q_cuda_t dot = get_vec_dot_q_cuda(type);
+
+    const int lane = threadIdx.x;
+    float sum = 0.0f;
+    for (int ib = lane / (qi/vdr); ib < K/qk; ib += vdr*warp_size/qi) {
+        sum += dot(w, x + ib*(qk/QK8_1), ib, vdr*(lane % (qi/vdr)));
+    }
+    return sum;
+}
+
+template <typename T>
+static __device__ __forceinline__ float mmvq_glu_dot_f(
+        const void * weights, const float * x, const block_q8_1 * xq, const int K) {
+    const T * w = (const T *) weights;
+    float sum = 0.0f;
+    for (int k = threadIdx.x; k < K; k += ggml_cuda_get_physical_warp_size()) {
+        const float value = x ? x[k] : __low2float(xq[k/QK8_1].ds)*xq[k/QK8_1].qs[k % QK8_1];
+        sum += ggml_cuda_cast<float>(w[k])*value;
+    }
+    return sum;
+}
+
+// Dispatch once per row, outside the dot-product loop. Gate and up need not share a decoder.
+static __device__ __forceinline__ float mmvq_glu_dot(
+        ggml_type type, const void * w, const float * x, const block_q8_1 * xq, const int K) {
+    switch (type) {
+        case GGML_TYPE_F32:  return mmvq_glu_dot_f<float>(w, x, xq, K);
+        case GGML_TYPE_F16:  return mmvq_glu_dot_f<half>(w, x, xq, K);
+        case GGML_TYPE_BF16: return mmvq_glu_dot_f<nv_bfloat16>(w, x, xq, K);
+        case GGML_TYPE_Q1_0: return mmvq_glu_dot<GGML_TYPE_Q1_0>(w, xq, K);
+        case GGML_TYPE_Q2_0: return mmvq_glu_dot<GGML_TYPE_Q2_0>(w, xq, K);
+        case GGML_TYPE_Q4_0: return mmvq_glu_dot<GGML_TYPE_Q4_0>(w, xq, K);
+        case GGML_TYPE_Q4_1: return mmvq_glu_dot<GGML_TYPE_Q4_1>(w, xq, K);
+        case GGML_TYPE_Q5_0: return mmvq_glu_dot<GGML_TYPE_Q5_0>(w, xq, K);
+        case GGML_TYPE_Q5_1: return mmvq_glu_dot<GGML_TYPE_Q5_1>(w, xq, K);
+        case GGML_TYPE_Q8_0: return mmvq_glu_dot<GGML_TYPE_Q8_0>(w, xq, K);
+        case GGML_TYPE_MXFP4: return mmvq_glu_dot<GGML_TYPE_MXFP4>(w, xq, K);
+        case GGML_TYPE_NVFP4: return mmvq_glu_dot<GGML_TYPE_NVFP4>(w, xq, K);
+        case GGML_TYPE_Q2_K: return mmvq_glu_dot<GGML_TYPE_Q2_K>(w, xq, K);
+        case GGML_TYPE_Q3_K: return mmvq_glu_dot<GGML_TYPE_Q3_K>(w, xq, K);
+        case GGML_TYPE_Q4_K: return mmvq_glu_dot<GGML_TYPE_Q4_K>(w, xq, K);
+        case GGML_TYPE_Q5_K: return mmvq_glu_dot<GGML_TYPE_Q5_K>(w, xq, K);
+        case GGML_TYPE_Q6_K: return mmvq_glu_dot<GGML_TYPE_Q6_K>(w, xq, K);
+        case GGML_TYPE_IQ2_XXS: return mmvq_glu_dot<GGML_TYPE_IQ2_XXS>(w, xq, K);
+        case GGML_TYPE_IQ2_XS: return mmvq_glu_dot<GGML_TYPE_IQ2_XS>(w, xq, K);
+        case GGML_TYPE_IQ2_S: return mmvq_glu_dot<GGML_TYPE_IQ2_S>(w, xq, K);
+        case GGML_TYPE_IQ3_XXS: return mmvq_glu_dot<GGML_TYPE_IQ3_XXS>(w, xq, K);
+        case GGML_TYPE_IQ1_S: return mmvq_glu_dot<GGML_TYPE_IQ1_S>(w, xq, K);
+        case GGML_TYPE_IQ1_M: return mmvq_glu_dot<GGML_TYPE_IQ1_M>(w, xq, K);
+        case GGML_TYPE_ZNQ2_M: return mmvq_glu_dot<GGML_TYPE_ZNQ2_M>(w, xq, K);
+        case GGML_TYPE_ZNQ2_L: return mmvq_glu_dot<GGML_TYPE_ZNQ2_L>(w, xq, K);
+        case GGML_TYPE_ZNQ3_S: return mmvq_glu_dot<GGML_TYPE_ZNQ3_S>(w, xq, K);
+        case GGML_TYPE_ZNQ3_M: return mmvq_glu_dot<GGML_TYPE_ZNQ3_M>(w, xq, K);
+        case GGML_TYPE_ZNQ3_L: return mmvq_glu_dot<GGML_TYPE_ZNQ3_L>(w, xq, K);
+        case GGML_TYPE_ZNQ4_S: return mmvq_glu_dot<GGML_TYPE_ZNQ4_S>(w, xq, K);
+        case GGML_TYPE_ZNQ4_M: return mmvq_glu_dot<GGML_TYPE_ZNQ4_M>(w, xq, K);
+        case GGML_TYPE_ZNQ4_L: return mmvq_glu_dot<GGML_TYPE_ZNQ4_L>(w, xq, K);
+        case GGML_TYPE_ZNQ5_S: return mmvq_glu_dot<GGML_TYPE_ZNQ5_S>(w, xq, K);
+        case GGML_TYPE_ZNQ5_M: return mmvq_glu_dot<GGML_TYPE_ZNQ5_M>(w, xq, K);
+        case GGML_TYPE_ZNQ5_L: return mmvq_glu_dot<GGML_TYPE_ZNQ5_L>(w, xq, K);
+        case GGML_TYPE_ZNQ6_S: return mmvq_glu_dot<GGML_TYPE_ZNQ6_S>(w, xq, K);
+        case GGML_TYPE_ZNQ6_M: return mmvq_glu_dot<GGML_TYPE_ZNQ6_M>(w, xq, K);
+        case GGML_TYPE_ZNQ6_L: return mmvq_glu_dot<GGML_TYPE_ZNQ6_L>(w, xq, K);
+        case GGML_TYPE_IQ4_NL: return mmvq_glu_dot<GGML_TYPE_IQ4_NL>(w, xq, K);
+        case GGML_TYPE_IQ4_XS: return mmvq_glu_dot<GGML_TYPE_IQ4_XS>(w, xq, K);
+        case GGML_TYPE_IQ3_S: return mmvq_glu_dot<GGML_TYPE_IQ3_S>(w, xq, K);
+        default: NO_DEVICE_CODE; return 0.0f;
+    }
+}
+
+bool ggml_cuda_mmvq_supported_type(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_ZNQ2_M:
+        case GGML_TYPE_ZNQ2_L:
+        case GGML_TYPE_ZNQ3_S:
+        case GGML_TYPE_ZNQ3_M:
+        case GGML_TYPE_ZNQ3_L:
+        case GGML_TYPE_ZNQ4_S:
+        case GGML_TYPE_ZNQ4_M:
+        case GGML_TYPE_ZNQ4_L:
+        case GGML_TYPE_ZNQ5_S:
+        case GGML_TYPE_ZNQ5_M:
+        case GGML_TYPE_ZNQ5_L:
+        case GGML_TYPE_ZNQ6_S:
+        case GGML_TYPE_ZNQ6_M:
+        case GGML_TYPE_ZNQ6_L:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ3_S:
+            return true;
+        default:
+            return false;
+    }
+}
+
+struct mmvq_glu_weights {
+    const char * data;
+    ggml_type type;
+    size_t stride_row;
+    size_t stride_expert;
+    const float * bias;
+    size_t stride_bias;
+    const float * scale;
+};
+
+template <bool quantize>
+static __global__ void mul_mat_vec_glu(
+        const mmvq_glu_weights gate, const mmvq_glu_weights up,
+        const float * x, const block_q8_1 * xq, const int32_t * ids,
+        void * dst, const int K, const int rows, const int routes_per_token, const int channels_x,
+        const size_t stride_x, const size_t stride_token_x, const size_t stride_xq, const size_t stride_token_xq,
+        const size_t stride_ids, const ggml_glu_op glu_op, const float glu_limit) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps = 8;
+    constexpr int rows_per_block = quantize ? QK8_1 : nwarps/2;
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int route = blockIdx.y;
+    const int token = route / routes_per_token;
+    const int slot = route % routes_per_token;
+    const int expert = ids ? ids[token*stride_ids + slot] : 0;
+    const int channel = slot % channels_x;
+    const int row_base = blockIdx.x*rows_per_block;
+    const mmvq_glu_weights w = (warp & 1) ? up : gate;
+    const float * xr = x ? x + token*stride_token_x + channel*stride_x : nullptr;
+    const block_q8_1 * xqr = xq ? xq + token*stride_token_xq + channel*stride_xq : nullptr;
+
+    __shared__ float projections[2][rows_per_block];
+    __shared__ float values[rows_per_block];
+
+    for (int r = warp/2; r < rows_per_block; r += nwarps/2) {
+        const int row = row_base + r;
+        float sum = 0.0f;
+        if (row < rows) {
+            const void * wr = w.data + expert*w.stride_expert + row*w.stride_row;
+            sum = mmvq_glu_dot(w.type, wr, xr, xqr, K);
+        }
+        sum = warp_reduce_sum<warp_size>(sum);
+        if (lane == 0) {
+            if (w.scale) {
+                sum *= w.scale[expert];
+            }
+            if (w.bias && row < rows) {
+                sum += w.bias[expert*w.stride_bias + row];
+            }
+            projections[warp & 1][r] = sum;
+        }
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        for (int r = lane; r < rows_per_block; r += warp_size) {
+            const float g = projections[0][r];
+            const float u = projections[1][r];
+            float result;
+            switch (glu_op) {
+                case GGML_GLU_OP_SWIGLU:       result = ggml_cuda_op_silu_single(g)*u;                 break;
+                case GGML_GLU_OP_GEGLU:        result = ggml_cuda_op_gelu_single(g)*u;                 break;
+                case GGML_GLU_OP_SWIGLU_OAI:   result = ggml_cuda_op_swiglu_oai_single(g, u);           break;
+                case GGML_GLU_OP_SWIGLU_CLAMP: result = ggml_cuda_op_swiglu_clamp_single(g, u, glu_limit); break;
+                default: NO_DEVICE_CODE; result = 0.0f;
+            }
+            if constexpr (quantize) {
+                values[r] = result;
+            } else if (row_base + r < rows) {
+                ((float *) dst)[int64_t(route)*rows + row_base + r] = result;
+            }
+        }
+    }
+
+    if constexpr (quantize) {
+        __syncthreads();
+        if (warp == 0 && lane < QK8_1) {
+            const float value = values[lane];
+            const float amax = warp_reduce_max<QK8_1>(fabsf(value));
+            const float sum = warp_reduce_sum<QK8_1>(value);
+            const float d = amax / 127.0f;
+            block_q8_1 & out = ((block_q8_1 *) dst)[int64_t(route)*(rows/QK8_1) + blockIdx.x];
+            out.qs[lane] = amax == 0.0f ? 0 : roundf(value / d);
+            if (lane == 0) {
+                out.ds = make_half2(d, sum);
+            }
+        }
+    }
+}
+
+bool ggml_cuda_mul_mat_vec_glu(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * x, const ggml_tensor * ids,
+        ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host & fusion) {
+    const auto supported = [](ggml_type type) {
+        return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || ggml_cuda_mmvq_supported_type(type);
+    };
+    if (!supported(gate->type) || !supported(up->type) || !ggml_are_same_shape(gate, up) ||
+            gate->nb[0] != ggml_type_size(gate->type) || up->nb[0] != ggml_type_size(up->type) ||
+            gate->ne[3] != 1 || x->ne[3] != 1 || dst->ne[3] != 1 ||
+            x->ne[0] != up->ne[0] || (x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_Q8_1) ||
+            !ggml_is_contiguous_1(x) || !ggml_is_contiguous(dst) ||
+            (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_Q8_1)) {
+        return false;
+    }
+
+    const bool quantize = dst->type == GGML_TYPE_Q8_1;
+    if (quantize && (ggml_cuda_info().devices[ctx.device].warp_size != QK8_1 || dst->ne[0] % QK8_1 != 0)) {
+        return false;
+    }
+    if (fusion.glu_op != GGML_GLU_OP_SWIGLU && fusion.glu_op != GGML_GLU_OP_GEGLU &&
+            fusion.glu_op != GGML_GLU_OP_SWIGLU_OAI && fusion.glu_op != GGML_GLU_OP_SWIGLU_CLAMP) {
+        return false;
+    }
+
+    const int64_t tokens = ids ? x->ne[2] : x->ne[1];
+    const int64_t routes = ids ? ids->ne[0] : 1;
+    if (tokens > MMVQ_MAX_BATCH_SIZE || dst->ne[0] != up->ne[1] ||
+            (ids && (ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) || ids->ne[1] != tokens ||
+                ids->ne[2] != 1 || ids->ne[3] != 1 || (x->ne[1] != 1 && x->ne[1] != routes) ||
+                dst->ne[1] != routes || dst->ne[2] != tokens)) ||
+            (!ids && (up->ne[2] != 1 || x->ne[2] != 1 || dst->ne[1] != tokens || dst->ne[2] != 1))) {
+        return false;
+    }
+
+    const auto valid_bias = [ids, up](const ggml_tensor * bias) {
+        return bias == nullptr || (bias->type == GGML_TYPE_F32 && ggml_is_contiguous_1(bias) &&
+            bias->ne[0] == up->ne[1] && bias->ne[1] == (ids ? up->ne[2] : 1) && bias->ne[2] == 1 && bias->ne[3] == 1);
+    };
+    const auto valid_scale = [ids, up](const ggml_tensor * scale) {
+        return scale == nullptr || (scale->type == GGML_TYPE_F32 && ggml_is_contiguous(scale) &&
+            ggml_nelements(scale) == (ids ? up->ne[2] : 1));
+    };
+    if (!valid_bias(fusion.gate_bias) || !valid_bias(fusion.x_bias) ||
+            !valid_scale(fusion.gate_scale) || !valid_scale(fusion.x_scale)) {
+        return false;
+    }
+
+    const bool needs_q8 = ggml_is_quantized(gate->type) || ggml_is_quantized(up->type);
+    if ((needs_q8 || x->type == GGML_TYPE_Q8_1) && x->ne[0] % QK8_1 != 0) {
+        return false;
+    }
+    ggml_cuda_pool_alloc<char> quantized_x(ctx.pool());
+    const block_q8_1 * xq = nullptr;
+    size_t stride_xq = 0, stride_token_xq = 0;
+    const float * xf = x->type == GGML_TYPE_F32 ? (const float *) x->data : nullptr;
+    if (x->type == GGML_TYPE_Q8_1) {
+        xq = (const block_q8_1 *) x->data;
+        stride_xq = x->nb[1]/sizeof(block_q8_1);
+        stride_token_xq = x->nb[2]/sizeof(block_q8_1);
+    } else if (needs_q8) {
+        const int64_t padded = GGML_PAD(x->ne[0], MATRIX_ROW_PADDING);
+        quantized_x.alloc(x->ne[1]*x->ne[2]*padded/QK8_1*sizeof(block_q8_1));
+        quantize_row_q8_1_cuda(xf, nullptr, quantized_x.get(), up->type, x->ne[0],
+            x->nb[1]/sizeof(float), x->nb[2]/sizeof(float), x->nb[3]/sizeof(float),
+            padded, x->ne[1], x->ne[2], 1, ctx.stream());
+        xq = (const block_q8_1 *) quantized_x.get();
+        stride_xq = padded/QK8_1;
+        stride_token_xq = x->ne[1]*stride_xq;
+    }
+
+    const auto weights = [](const ggml_tensor * w, const ggml_tensor * bias, const ggml_tensor * scale) {
+        return mmvq_glu_weights{ (const char *) w->data, w->type, w->nb[1], w->nb[2],
+            bias ? (const float *) bias->data : nullptr, bias ? bias->nb[1]/sizeof(float) : 0,
+            scale ? (const float *) scale->data : nullptr };
+    };
+    const int rows_per_block = quantize ? QK8_1 : 4;
+    const dim3 blocks((dst->ne[0] + rows_per_block - 1)/rows_per_block, routes*tokens, 1);
+    const dim3 threads(ggml_cuda_info().devices[ctx.device].warp_size, 8, 1);
+    const ggml_cuda_kernel_launch_params params(blocks, threads, 0, ctx.stream());
+    const size_t stride_x = x->type == GGML_TYPE_F32 ? x->nb[1]/sizeof(float) : 0;
+    const size_t stride_token_x = x->type == GGML_TYPE_F32 ? x->nb[2]/sizeof(float) : 0;
+    if (!ids) {
+        stride_token_xq = stride_xq;
+    }
+    const auto kernel = quantize ? mul_mat_vec_glu<true> : mul_mat_vec_glu<false>;
+    ggml_cuda_kernel_launch(kernel, params,
+        weights(gate, fusion.gate_bias, fusion.gate_scale), weights(up, fusion.x_bias, fusion.x_scale),
+        xf, xq, ids ? (const int32_t *) ids->data : nullptr, dst->data,
+        (int) x->ne[0], (int) dst->ne[0], (int) routes, ids ? (int) x->ne[1] : 1,
+        stride_x, ids ? stride_token_x : stride_x, stride_xq, stride_token_xq,
+        ids ? ids->nb[1]/sizeof(int32_t) : size_t(0), fusion.glu_op, fusion.glu_limit);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 // The ordinary MMVQ+GLU fusion produces one F32 row at a time. The down
 // projection immediately quantizes those rows back to Q8_1, so for the
 // single-token cached-MoE path it is cheaper to group 32 output rows in one
@@ -1770,6 +2080,66 @@ bool ggml_cuda_mul_mat_vec_q_glu_q8_1(
     }
 
     switch (up->type) {
+        case GGML_TYPE_Q1_0:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_Q1_0>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_Q2_0:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_Q2_0>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_Q4_0:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_Q4_0>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_Q4_1:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_Q4_1>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_Q5_0:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_Q5_0>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_Q5_1:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_Q5_1>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_Q8_0:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_Q8_0>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_MXFP4:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_MXFP4>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_NVFP4:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_NVFP4>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_Q2_K:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_Q2_K>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_Q3_K:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_Q3_K>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_Q4_K:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_Q4_K>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_Q5_K:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_Q5_K>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_Q6_K:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_Q6_K>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_IQ2_XXS:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_IQ2_XXS>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_IQ2_XS:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_IQ2_XS>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_IQ2_S:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_IQ2_S>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_IQ3_XXS:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_IQ3_XXS>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_IQ1_S:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_IQ1_S>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_IQ1_M:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_IQ1_M>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
         case GGML_TYPE_ZNQ2_M:
             mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_ZNQ2_M>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
             return true;
@@ -1820,6 +2190,15 @@ bool ggml_cuda_mul_mat_vec_q_glu_q8_1(
             return true;
         case GGML_TYPE_ZNQ7_L:
             mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_ZNQ7_L>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_IQ4_NL:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_IQ4_NL>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_IQ4_XS:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_IQ4_XS>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_IQ3_S:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_IQ3_S>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
             return true;
         default:
             return false;

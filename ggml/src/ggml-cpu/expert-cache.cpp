@@ -1703,12 +1703,22 @@ private:
             return nullptr;
         }
 
-        // Native Q8_1 skips the input conversion.
-        const auto input_type = layer.gate_up ? layer.gate_up->type : layer.gate->type;
-        t->input_q8 = (input_type == GGML_TYPE_ZNQ2_M || input_type == GGML_TYPE_ZNQ2_L || input_type == GGML_TYPE_ZNQ3_S || input_type == GGML_TYPE_ZNQ3_M || input_type == GGML_TYPE_ZNQ3_L || input_type == GGML_TYPE_ZNQ4_S || input_type == GGML_TYPE_ZNQ4_M || input_type == GGML_TYPE_ZNQ4_L || input_type == GGML_TYPE_ZNQ5_S || input_type == GGML_TYPE_ZNQ5_M || input_type == GGML_TYPE_ZNQ5_L || input_type == GGML_TYPE_ZNQ6_S || input_type == GGML_TYPE_ZNQ6_M || input_type == GGML_TYPE_ZNQ6_L) &&
-            layer.input_dim % ggml_blck_size(GGML_TYPE_Q8_1) == 0;
-        t->input = ggml_new_tensor_3d(t->ctx, t->input_q8 ? GGML_TYPE_Q8_1 : GGML_TYPE_F32, layer.input_dim, 1, batch_size);
         t->ids = ggml_new_tensor_2d(t->ctx, GGML_TYPE_I32, hit_count, batch_size);
+        t->input_q8 = layer.input_dim % ggml_blck_size(GGML_TYPE_Q8_1) == 0;
+        t->input = ggml_new_tensor_3d(t->ctx, t->input_q8 ? GGML_TYPE_Q8_1 : GGML_TYPE_F32, layer.input_dim, 1, batch_size);
+
+        if (t->input_q8) {
+            const auto supports_q8 = [&](ggml_tensor * weights, const std::array<uint8_t, GGML_MAX_OP_PARAMS> & op_params) {
+                auto * probe = ggml_mul_mat_id(t->ctx, weights, t->input, t->ids);
+                memcpy(probe->op_params, op_params.data(), GGML_MAX_OP_PARAMS);
+                return ggml_backend_supports_op(compute_backend, probe);
+            };
+            t->input_q8 = layer.cache_gate_up ? supports_q8(layer.cache_gate_up, layer.gate_up_params) :
+                supports_q8(layer.cache_gate, layer.gate_params) && supports_q8(layer.cache_up, layer.up_params);
+            if (!t->input_q8) {
+                t->input = ggml_new_tensor_3d(t->ctx, GGML_TYPE_F32, layer.input_dim, 1, batch_size);
+            }
+        }
 
         t->graph = ggml_new_graph_custom(t->ctx, graph_size, false);
         ggml_tensor * act = nullptr;

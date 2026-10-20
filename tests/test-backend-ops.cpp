@@ -5544,6 +5544,7 @@ struct test_gated_delta_net : public test_case {
 // alpha/beta projections + GGML_OP_GATED_DELTA_NET (producer fusion)
 struct test_gated_delta_net_ab_fusion : public test_case {
     const ggml_type w_type;
+    const ggml_type beta_type;
     const int64_t   head_count;
     const int64_t   head_size;
     const int64_t   n_tokens;
@@ -5556,7 +5557,7 @@ struct test_gated_delta_net_ab_fusion : public test_case {
     ggml_tensor * out_node  = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR7(w_type, head_count, head_size, n_tokens, n_embd, dt_per_token, dt_internal);
+        return VARS_TO_STR8(w_type, beta_type, head_count, head_size, n_tokens, n_embd, dt_per_token, dt_internal);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -5568,12 +5569,12 @@ struct test_gated_delta_net_ab_fusion : public test_case {
     int  n_warmup_runs()  override { return 2; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { gate_node, beta_node, out_node }; }
 
-    double max_nmse_err() override { return w_type == GGML_TYPE_F32 ? 1e-6 : 5e-4; }
+    double max_nmse_err() override { return w_type == GGML_TYPE_F32 && beta_type == GGML_TYPE_F32 ? 1e-6 : 5e-4; }
 
     test_gated_delta_net_ab_fusion(ggml_type w_type = GGML_TYPE_BF16, int64_t head_count = 4,
             int64_t head_size = 16, int64_t n_tokens = 4, int64_t n_embd = 128, bool dt_per_token = false,
-            bool dt_internal = false)
-        : w_type(w_type), head_count(head_count), head_size(head_size), n_tokens(n_tokens),
+            bool dt_internal = false, ggml_type beta_type = GGML_TYPE_COUNT)
+        : w_type(w_type), beta_type(beta_type == GGML_TYPE_COUNT ? w_type : beta_type), head_count(head_count), head_size(head_size), n_tokens(n_tokens),
           n_embd(n_embd), dt_per_token(dt_per_token), dt_internal(dt_internal) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -5582,7 +5583,7 @@ struct test_gated_delta_net_ab_fusion : public test_case {
 
         ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, N);
         ggml_tensor * wa = ggml_new_tensor_2d(ctx, w_type, n_embd, M);
-        ggml_tensor * wb = ggml_new_tensor_2d(ctx, w_type, n_embd, M);
+        ggml_tensor * wb = ggml_new_tensor_2d(ctx, beta_type, n_embd, M);
 
         ggml_tensor * dt = dt_per_token ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, M)
                                         : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, M);
@@ -9152,6 +9153,8 @@ struct test_mul_mat_add : public test_case {
 
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
+    const ggml_type gate_type;
+    const bool with_down;
     const ggml_glu_op glu_op;
     const int64_t m;
     const int64_t n;
@@ -9171,17 +9174,18 @@ struct test_mul_mat_vec_fusion : public test_case {
     test_mul_mat_vec_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k,
                         bool use_id = false, int n_mats = 1, int n_used = 1, bool b = false, bool with_bias = false, bool with_gate = true,
                         bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, bool full_bias_shape = false,
-                        bool strided_bias = false, ggml_type bias_type = GGML_TYPE_F32)
-    : type(type), glu_op(op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), b(b), with_bias(with_bias),
+                        bool strided_bias = false, ggml_type bias_type = GGML_TYPE_F32, ggml_type gate_type = GGML_TYPE_COUNT, bool with_down = false)
+    : type(type), gate_type(gate_type == GGML_TYPE_COUNT ? type : gate_type), with_down(with_down), glu_op(op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), b(b), with_bias(with_bias),
         with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), full_bias_shape(full_bias_shape),
         strided_bias(strided_bias), bias_type(bias_type) {
+        GGML_ASSERT(!with_down || (use_id && with_gate && !with_bias && !with_lane_scale));
         if (use_id) {
             GGML_ASSERT(n_used <= n_mats);
         }
     }
 
     std::string vars() override {
-        return VARS_TO_STR16(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims, full_bias_shape, strided_bias, bias_type);
+        return VARS_TO_STR16(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims, full_bias_shape, strided_bias, bias_type) + "," + VAR_TO_STR(gate_type) + "," + VAR_TO_STR(with_down);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -9245,7 +9249,7 @@ struct test_mul_mat_vec_fusion : public test_case {
             std::array<int64_t, 4> ne0      = { k, n, channels, samples };
 
             ggml_tensor * cur  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
-            ggml_tensor * gate = with_gate ? ggml_new_tensor(ctx, type, 4, ne0.data()) : nullptr;
+            ggml_tensor * gate = with_gate ? ggml_new_tensor(ctx, gate_type, 4, ne0.data()) : nullptr;
             ggml_tensor * up   = ggml_new_tensor(ctx, type, 4, ne0.data());
 
             auto build_lane_up = [&]() {
@@ -9287,7 +9291,7 @@ struct test_mul_mat_vec_fusion : public test_case {
             ggml_set_name(out, "out");
             return out;
         } else {
-            ggml_tensor * gates = ggml_new_tensor_3d(ctx, type, k, n, n_mats);
+            ggml_tensor * gates = ggml_new_tensor_3d(ctx, gate_type, k, n, n_mats);
             ggml_tensor * ups   = ggml_new_tensor_3d(ctx, type, k, n, n_mats);
             ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, m);
 
@@ -9326,6 +9330,10 @@ struct test_mul_mat_vec_fusion : public test_case {
             ggml_tensor * ffn_gate = with_gate ? build_lane_gate() : nullptr;
 
             ggml_tensor * out = with_gate ? build_gate(ctx, ffn_gate, ffn_up) : ffn_up;
+            if (with_down) {
+                ggml_tensor * down = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_K, n, 32, n_mats);
+                out = ggml_mul_mat_id(ctx, down, out, ids);
+            }
 
             std::array<int64_t, 4> scale_ne { 1, out->ne[1], out->ne[2], out->ne[3] };
             ggml_tensor * scale = ggml_new_tensor(ctx, out->type, 4, scale_ne.data());
@@ -14203,6 +14211,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // Deliberately leave the material z producer on the sigmoid DFS branch, between weight and sigmoid.
         test_cases.emplace_back(new norm(norm::UNEXPANDED_GATE, 1, 1));
         test_cases.emplace_back(new norm(norm::UNEXPANDED_GATE, 7, 2, true));
+    }
+
+    for (ggml_type type : all_types) {
+        if (type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0) {
+            continue;
+        }
+        for (ggml_type gate_type : { type, GGML_TYPE_Q8_0 }) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 256, 256,
+                true, 8, 3, true, false, true, false, {1, 1}, false, false, GGML_TYPE_F32, gate_type, true));
+        }
+        test_cases.emplace_back(new test_gated_delta_net_ab_fusion(type, 8, 32, 1, 256));
+        test_cases.emplace_back(new test_gated_delta_net_ab_fusion(type, 8, 32, 4, 256, false, false, GGML_TYPE_Q8_0));
+        for (bool use_id : { false, true }) {
+            for (bool bias : { false, true }) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 35, 256,
+                    use_id, 8, 3, true, bias, true, false, {1, 1}, false, false, GGML_TYPE_F32, GGML_TYPE_Q8_0));
+            }
+        }
+    }
+    for (auto pair : { std::make_pair(GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_M),
+                       std::make_pair(GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L),
+                       std::make_pair(GGML_TYPE_Q5_K, GGML_TYPE_Q6_K),
+                       std::make_pair(GGML_TYPE_BF16, GGML_TYPE_ZNQ4_M) }) {
+        for (ggml_glu_op op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI, GGML_GLU_OP_SWIGLU_CLAMP }) {
+            for (bool use_id : { false, true }) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(pair.second, op, 4, 33, 768,
+                    use_id, 8, 3, true, true, true, false, {1, 1}, false, false, GGML_TYPE_F32, pair.first));
+            }
+        }
+    }
+    for (ggml_type type : { GGML_TYPE_ZNQ6_L, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4 }) {
+        test_cases.emplace_back(new test_gated_delta_net_ab_fusion(type, 8, 32, 4, 640,
+            false, false, GGML_TYPE_ZNQ6_M));
     }
 
     // gdn alpha/beta producer fusion
