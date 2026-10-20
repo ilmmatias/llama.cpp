@@ -893,18 +893,6 @@ static bool tensor_requires_imatrix(const char * tensor_name, const ggml_type ds
         case GGML_TYPE_ZNQ2_M:
         case GGML_TYPE_ZNQ2_L:
         case GGML_TYPE_ZNQ3_S:
-        case GGML_TYPE_ZNQ3_L:
-        case GGML_TYPE_ZNQ4_S:
-        case GGML_TYPE_ZNQ4_L:
-        case GGML_TYPE_ZNQ5_S:
-        case GGML_TYPE_ZNQ5_M:
-        case GGML_TYPE_ZNQ5_L:
-        case GGML_TYPE_ZNQ6_S:
-        case GGML_TYPE_ZNQ6_M:
-        case GGML_TYPE_ZNQ6_L:
-        case GGML_TYPE_ZNQ7_S:
-        case GGML_TYPE_ZNQ7_M:
-        case GGML_TYPE_ZNQ7_L:
             return true;
         case GGML_TYPE_Q2_K:
             // as a general rule, the k-type quantizations don't require imatrix data.
@@ -959,13 +947,13 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:  return GGML_TYPE_IQ4_XS;
         case LLAMA_FTYPE_MOSTLY_IQ3_S:
         case LLAMA_FTYPE_MOSTLY_IQ3_M:   return GGML_TYPE_IQ3_S;
-        case LLAMA_FTYPE_MOSTLY_ZNQ2_M:    return GGML_TYPE_ZNQ2_M;
-        case LLAMA_FTYPE_MOSTLY_ZNQ2_L: return GGML_TYPE_ZNQ2_L;
-        case LLAMA_FTYPE_MOSTLY_ZNQ3_S: return GGML_TYPE_ZNQ3_S;
-        case LLAMA_FTYPE_MOSTLY_ZNQ3_M:    return GGML_TYPE_ZNQ3_M;
-        case LLAMA_FTYPE_MOSTLY_ZNQ3_L: return GGML_TYPE_ZNQ3_L;
-        case LLAMA_FTYPE_MOSTLY_ZNQ4_S: return GGML_TYPE_ZNQ4_S;
-        case LLAMA_FTYPE_MOSTLY_ZNQ4_M:    return GGML_TYPE_ZNQ4_M;
+        case LLAMA_FTYPE_MOSTLY_ZNQ2_M:  return GGML_TYPE_ZNQ2_M;
+        case LLAMA_FTYPE_MOSTLY_ZNQ2_L:  return GGML_TYPE_ZNQ2_L;
+        case LLAMA_FTYPE_MOSTLY_ZNQ3_S:  return GGML_TYPE_ZNQ3_S;
+        case LLAMA_FTYPE_MOSTLY_ZNQ3_M:  return GGML_TYPE_ZNQ3_M;
+        case LLAMA_FTYPE_MOSTLY_ZNQ3_L:  return GGML_TYPE_ZNQ3_L;
+        case LLAMA_FTYPE_MOSTLY_ZNQ4_S:  return GGML_TYPE_ZNQ4_S;
+        case LLAMA_FTYPE_MOSTLY_ZNQ4_M:  return GGML_TYPE_ZNQ4_M;
 
         case LLAMA_FTYPE_MOSTLY_ZNQ4_L: return GGML_TYPE_ZNQ4_L;
         case LLAMA_FTYPE_MOSTLY_ZNQ5_S: return GGML_TYPE_ZNQ5_S;
