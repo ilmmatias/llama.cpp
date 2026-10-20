@@ -4,6 +4,7 @@
 #include "ggml-cpp.h"
 
 #include "../../src/llama-ext.h"
+#include "../../src/llama-mmap.h"
 
 #include <algorithm>
 #include <atomic>
@@ -15,6 +16,8 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <map>
+#include <memory>
 #include <regex>
 #include <set>
 #include <stdexcept>
@@ -30,6 +33,15 @@ struct tensor_rule {
 struct search_params {
     std::string model;
     std::string imatrix;
+    std::vector<std::string> eval_recipes;
+    std::string calibration_file;
+    std::string eval_cache;
+    std::string global_recipe;
+    size_t response_rank = 64;
+    std::vector<std::regex> global_tensors;
+    uint32_t n_ctx = 512;
+    uint32_t n_batch = 32;
+    size_t n_chunks = 1;
     std::vector<ggml_type> types;
     std::vector<tensor_rule> rules;
     std::vector<std::regex> exclude_tensors;
@@ -78,6 +90,15 @@ static void usage(const char * executable) {
     fprintf(stderr, "  -t, --threads N             number of quantization threads\n");
     fprintf(stderr, "  --allow-requantize          allow conversion from quantized source weights\n");
     fprintf(stderr, "  --dry-run                   report types and sizes without reading weights\n");
+    fprintf(stderr, "  --eval-recipe FILE          evaluate a tensor-type recipe (repeatable)\n");
+    fprintf(stderr, "  --calibration-file FILE     text used for global recipe evaluation\n");
+    fprintf(stderr, "  --eval-cache PREFIX         temporary disk cache prefix for evaluation\n");
+    fprintf(stderr, "  --ctx-size N                evaluation context size (default: 512)\n");
+    fprintf(stderr, "  --batch-size N              evaluation batch size (default: 32)\n");
+    fprintf(stderr, "  --chunks N                  evaluation context chunks (default: 1)\n");
+    fprintf(stderr, "  --global-search FILE        refine a feasible initial recipe using global KL\n");
+    fprintf(stderr, "  --response-rank N           even Fisher sketch size per token (default: 64)\n");
+    fprintf(stderr, "  --global-tensors PATTERN    only refine matching tensors in the initial recipe\n");
 }
 
 static size_t checked_add(size_t a, size_t b) {
@@ -156,7 +177,10 @@ static search_params parse_params(int argc, char ** argv) {
             params.allow_requantize = true;
         } else if (arg == "--imatrix" || arg == "--tensor-type" || arg == "--exclude-tensors" ||
                    arg == "--exclude-bpw" || arg == "--max-buffer-size" || arg == "--target-bpw" ||
-                   arg == "--max-nodes" || arg == "-t" || arg == "--threads") {
+                   arg == "--max-nodes" || arg == "-t" || arg == "--threads" ||
+                   arg == "--eval-recipe" || arg == "--calibration-file" || arg == "--eval-cache" ||
+                   arg == "--ctx-size" || arg == "--batch-size" || arg == "--chunks" ||
+                   arg == "--global-search" || arg == "--response-rank" || arg == "--global-tensors") {
             if (++i == argc) {
                 throw std::runtime_error("missing value for " + arg);
             }
@@ -164,6 +188,34 @@ static search_params parse_params(int argc, char ** argv) {
             const std::string value = argv[i];
             if (arg == "--imatrix") {
                 params.imatrix = value;
+            } else if (arg == "--eval-recipe") {
+                params.eval_recipes.push_back(value);
+            } else if (arg == "--calibration-file") {
+                params.calibration_file = value;
+            } else if (arg == "--eval-cache") {
+                params.eval_cache = value;
+            } else if (arg == "--global-search") {
+                params.global_recipe = value;
+            } else if (arg == "--global-tensors") {
+                params.global_tensors.emplace_back(value);
+            } else if (arg == "--response-rank") {
+                params.response_rank = parse_positive(value);
+                if (params.response_rank < 2 || params.response_rank % 2) {
+                    throw std::runtime_error("--response-rank requires a positive even size of at least two");
+                }
+            } else if (arg == "--ctx-size" || arg == "--batch-size" || arg == "--chunks") {
+                const size_t n = parse_positive(value);
+                if (n > INT32_MAX) {
+                    throw std::runtime_error("evaluation size out of range");
+                }
+
+                if (arg == "--ctx-size") {
+                    params.n_ctx = (uint32_t) n;
+                } else if (arg == "--batch-size") {
+                    params.n_batch = (uint32_t) n;
+                } else {
+                    params.n_chunks = n;
+                }
             } else if (arg == "--tensor-type") {
                 const size_t sep = value.find('=');
                 if (sep == std::string::npos || sep == 0) {
@@ -209,6 +261,22 @@ static search_params parse_params(int argc, char ** argv) {
 
     if (params.dry_run && params.target_bpw > 0) {
         throw std::runtime_error("--target-bpw requires measured errors; remove --dry-run");
+    }
+
+    if (!params.eval_recipes.empty() && (params.calibration_file.empty() || params.eval_cache.empty() || params.dry_run || params.target_bpw > 0)) {
+        throw std::runtime_error("--eval-recipe requires --calibration-file and --eval-cache; cannot combine it with --target-bpw or --dry-run");
+    }
+
+    if (!params.global_recipe.empty() && (params.target_bpw <= 0 || params.calibration_file.empty() || params.eval_cache.empty() || params.dry_run || !params.eval_recipes.empty())) {
+        throw std::runtime_error("--global-search requires --target-bpw, --calibration-file, and --eval-cache; cannot combine it with --eval-recipe or --dry-run");
+    }
+
+    if (params.eval_recipes.empty() && params.global_recipe.empty() && (!params.calibration_file.empty() || !params.eval_cache.empty())) {
+        throw std::runtime_error("evaluation files require --eval-recipe or --global-search");
+    }
+
+    if (params.global_recipe.empty() && !params.global_tensors.empty()) {
+        throw std::runtime_error("--global-tensors requires --global-search");
     }
 
     return params;
@@ -435,7 +503,7 @@ struct tensor_progress {
 };
 
 static bool measure_tensor(const search_params & params, const input_file & file, tensor_plan & plan,
-                           const common_imatrix & imatrix, size_t tensor_index, size_t n_tensors) {
+                           const common_imatrix & imatrix, size_t tensor_index, size_t n_tensors, FILE * encoded_file = nullptr) {
     if (params.dry_run || (params.target_bpw > 0 && plan.candidates.size() == 1)) {
         return false;
     }
@@ -465,7 +533,7 @@ static bool measure_tensor(const search_params & params, const input_file & file
     std::vector<uint8_t> source(checked_mul(slab_rows, row_size_src));
     std::vector<uint8_t> encoded(checked_mul(slab_rows, row_size_max));
     std::vector<float> original(checked_mul(slab_rows, cols));
-    std::vector<float> decoded(original.size());
+    std::vector<float> decoded(encoded_file ? 0 : original.size());
 
     std::vector<float> importance;
     const common_imatrix_entry * entry = nullptr;
@@ -571,9 +639,11 @@ static bool measure_tensor(const search_params & params, const input_file & file
                     void * dst = encoded.data() + row * row_size_dst;
 
                     ggml_quantize_chunk(c.type, original.data() + row * cols, dst, 0, count, cols, weights);
-                    to_float(c.type, dst, decoded.data() + row * cols, count * cols);
+                    if (!encoded_file) {
+                        to_float(c.type, dst, decoded.data() + row * cols, count * cols);
+                    }
 
-                    for (size_t j = 0; j < count * cols; ++j) {
+                    for (size_t j = 0; !encoded_file && j < count * cols; ++j) {
                         const double diff = (double) original[row * cols + j] - decoded[row * cols + j];
                         error += diff * diff;
                         if (entry) {
@@ -613,6 +683,10 @@ static bool measure_tensor(const search_params & params, const input_file & file
             workers.clear();
             report_progress(first + nrows == rows && candidate_index == n_converts);
 
+            if (encoded_file && fwrite(encoded.data(), row_size_dst, nrows, encoded_file) != nrows) {
+                throw std::runtime_error("cannot write encoded tensor cache");
+            }
+
             for (int thread = 0; thread < n_threads; ++thread) {
                 c.error += errors[thread];
                 c.error_weighted += errors_weighted[thread];
@@ -641,7 +715,7 @@ struct allocation_edge {
 };
 
 static std::vector<size_t> allocate_types(const search_params & params, const std::vector<tensor_plan> & plans,
-                                          size_t elements, size_t budget) {
+                                          size_t elements, size_t budget, bool report = true) {
     std::vector<std::vector<allocation_option>> groups;
     std::vector<allocation_edge> edges;
     long double error_scale = 0;
@@ -811,10 +885,12 @@ static std::vector<size_t> allocate_types(const search_params & params, const st
     }
 
     const long double lower_bound = pending ? std::min(root_bound, best_error) : best_error;
-    fprintf(stderr, "allocation: %zu/%zu counted payload bytes, %.8Lf bpw\n", best_bytes, budget, 8.0L * best_bytes / elements);
-    fprintf(stderr, "%s variable error: %.12Lg, lower bound: %.12Lg, gap: %.12Lg, nodes: %zu (%s)\n",
-            params.imatrix.empty() ? "unweighted" : "weighted", best_error, lower_bound, best_error - lower_bound, nodes,
-            pending ? "node limit" : "optimal");
+    if (report) {
+        fprintf(stderr, "allocation: %zu/%zu counted payload bytes, %.8Lf bpw\n", best_bytes, budget, 8.0L * best_bytes / elements);
+        fprintf(stderr, "%s variable error: %.12Lg, lower bound: %.12Lg, gap: %.12Lg, nodes: %zu (%s)\n",
+                params.imatrix.empty() ? "unweighted" : "weighted", best_error, lower_bound, best_error - lower_bound, nodes,
+                pending ? "node limit" : "optimal");
+    }
 
     for (size_t i = 0; i < best.size(); ++i) {
         best[i] = groups[i][best[i]].candidate;
@@ -843,6 +919,665 @@ static std::string tensor_pattern(const char * name) {
     return pattern + "$";
 }
 
+struct eval_file {
+    std::string path;
+    FILE * file;
+
+    explicit eval_file(const std::string & path) : path(path), file(ggml_fopen(path.c_str(), "w+bx")) {
+        if (!file) {
+            throw std::runtime_error("cannot create evaluation cache: " + path);
+        }
+    }
+
+    ~eval_file() {
+        fclose(file);
+        std::remove(path.c_str());
+    }
+
+    eval_file(const eval_file &) = delete;
+    eval_file & operator=(const eval_file &) = delete;
+};
+
+struct eval_weight {
+    size_t file;
+    size_t offset;
+    size_t size;
+};
+
+struct eval_weights {
+    std::vector<std::unique_ptr<llama_file>> files;
+    std::vector<std::unique_ptr<llama_mmap>> mappings;
+    std::vector<ggml_backend_buffer_ptr> buffers;
+    std::map<std::string, eval_weight> tensors;
+
+    void map_file(std::unique_ptr<llama_file> file) {
+        if (!llama_mmap::SUPPORTED) {
+            throw std::runtime_error("global evaluation requires memory mapping support");
+        }
+
+        auto mapping = std::make_unique<llama_mmap>(file.get(), 0);
+        ggml_backend_buffer_ptr buffer(ggml_backend_cpu_buffer_from_ptr(mapping->addr(), mapping->size()));
+        if (!buffer) {
+            throw std::runtime_error("cannot wrap mapped CPU weights");
+        }
+
+        ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        files.push_back(std::move(file));
+        mappings.push_back(std::move(mapping));
+        buffers.push_back(std::move(buffer));
+    }
+
+    static void bind(ggml_tensor * tensor, void * user_data) {
+        auto & self = *(eval_weights *) user_data;
+        const auto it = self.tensors.find(tensor->name);
+        if (it == self.tensors.end()) {
+            throw std::runtime_error(std::string("no mapped data for ") + tensor->name);
+        }
+
+        const auto & weight = it->second;
+        const auto & mapping = self.mappings.at(weight.file);
+        if (ggml_nbytes(tensor) != weight.size || weight.offset > mapping->size() || weight.size > mapping->size() - weight.offset) {
+            throw std::runtime_error(std::string("mapped tensor size mismatch for ") + tensor->name);
+        }
+
+        tensor->data = (char *) mapping->addr() + weight.offset;
+        tensor->buffer = self.buffers.at(weight.file).get();
+    }
+};
+
+static gguf_context_ptr eval_metadata(const std::vector<input_file> & files, const std::vector<tensor_plan> & plans, bool reference) {
+    gguf_context_ptr metadata(gguf_init_empty());
+    gguf_set_kv(metadata.get(), files.front().gguf.get());
+    gguf_remove_key(metadata.get(), "split.no");
+    gguf_remove_key(metadata.get(), "split.count");
+    gguf_remove_key(metadata.get(), "split.tensors.count");
+
+    for (const auto & plan : plans) {
+        gguf_add_tensor(metadata.get(), plan.tensor);
+        if (!reference) {
+            gguf_set_tensor_type(metadata.get(), plan.tensor->name, plan.candidates.front().type);
+        }
+    }
+
+    return metadata;
+}
+
+struct eval_result {
+    size_t tokens = 0;
+    double nll = 0;
+    double kl = 0;
+};
+
+static double eval_logsumexp(const float * logits, size_t n) {
+    double maximum = -INFINITY;
+    for (size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(logits[i])) {
+            throw std::runtime_error("non-finite evaluation logits");
+        }
+
+        maximum = std::max(maximum, (double) logits[i]);
+    }
+
+    double sum = 0;
+    for (size_t i = 0; i < n; ++i) {
+        sum += std::exp((double) logits[i] - maximum);
+    }
+
+    return maximum + std::log(sum);
+}
+
+struct global_response {
+    FILE * baseline;
+    size_t rank;
+    size_t token = 0;
+    double linear = 0;
+    std::vector<float> values;
+    std::vector<float> logits_base;
+
+    global_response(FILE * baseline, size_t rank, size_t tokens) : baseline(baseline), rank(rank), values(checked_mul(rank, tokens)) {
+        rewind(baseline);
+    }
+
+    void observe(const float * logits, const std::vector<float> & reference) {
+        const size_t n = reference.size();
+        logits_base.resize(n);
+        if (fread(logits_base.data(), sizeof(float), n, baseline) != n) {
+            throw std::runtime_error("cannot read initial recipe logits");
+        }
+
+        const double logz_base = eval_logsumexp(logits_base.data(), n);
+        const double logz_ref = eval_logsumexp(reference.data(), n);
+        double mean = 0;
+        for (size_t j = 0; j < n; ++j) {
+            const double delta = (double) logits[j] - logits_base[j];
+            const double p = std::exp((double) logits_base[j] - logz_base);
+            mean += p * delta;
+            linear += (p - std::exp((double) reference[j] - logz_ref)) * delta;
+        }
+
+        // Two fixed CountSketch maps retain cross-tensor Fisher products without a vocabulary-sized response cache.
+        for (size_t j = 0; j < n; ++j) {
+            const double centered = ((double) logits[j] - logits_base[j] - mean) * std::exp(0.5 * ((double) logits_base[j] - logz_base)) / std::sqrt(2.0);
+            for (size_t k = 0; k < 2; ++k) {
+                uint64_t hash = j + (k + 1) * UINT64_C(0x9e3779b97f4a7c15);
+                hash = (hash ^ (hash >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+                hash = (hash ^ (hash >> 27)) * UINT64_C(0x94d049bb133111eb);
+                hash ^= hash >> 31;
+                const size_t bucket = token * rank + k * (rank / 2) + (hash >> 1) % (rank / 2);
+                values.at(bucket) += (float) ((hash & 1) ? centered : -centered);
+            }
+        }
+
+        ++token;
+    }
+
+    void normalize() {
+        if (!token) {
+            throw std::runtime_error("global response has no scored tokens");
+        }
+
+        linear /= token;
+        const double scale = 1.0 / std::sqrt((double) token);
+        for (auto & value : values) {
+            value = (float) (value * scale);
+            if (!std::isfinite(value)) {
+                throw std::runtime_error("non-finite global response");
+            }
+        }
+    }
+};
+
+static eval_result eval_tokens(const search_params & params, llama_model * model, const std::vector<llama_token> & tokens, FILE * reference, bool write_reference,
+                               FILE * save = nullptr, global_response * response = nullptr) {
+    auto cp = llama_context_default_params();
+    cp.n_ctx = params.n_ctx;
+    cp.n_batch = std::min(params.n_batch, params.n_ctx);
+    cp.n_ubatch = cp.n_batch;
+    cp.n_threads = params.n_threads;
+    cp.n_threads_batch = params.n_threads;
+    cp.offload_kqv = false;
+    cp.op_offload = false;
+    std::unique_ptr<llama_context, decltype(&llama_free)> ctx(llama_init_from_model(model, cp), llama_free);
+    if (!ctx) {
+        throw std::runtime_error("cannot initialize evaluation context");
+    }
+
+    struct eval_batch {
+        llama_batch value;
+        explicit eval_batch(int n) : value(llama_batch_init(n, 0, 1)) {}
+        ~eval_batch() { llama_batch_free(value); }
+    } batch(cp.n_batch);
+
+    const size_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    std::vector<float> base(n_vocab);
+    eval_result result;
+    rewind(reference);
+    const size_t count = std::min(tokens.size() - 1, checked_mul(params.n_ctx, params.n_chunks));
+
+    for (size_t chunk = 0; chunk < count; chunk += params.n_ctx) {
+        llama_memory_clear(llama_get_memory(ctx.get()), true);
+        const size_t end = std::min(count, chunk + params.n_ctx);
+
+        for (size_t first = chunk; first < end; first += cp.n_batch) {
+            auto & b = batch.value;
+            b.n_tokens = (int32_t) std::min((size_t) cp.n_batch, end - first);
+            for (int32_t i = 0; i < b.n_tokens; ++i) {
+                b.token[i] = tokens[first + i];
+                b.pos[i] = (llama_pos) (first + i - chunk);
+                b.n_seq_id[i] = 1;
+                b.seq_id[i][0] = 0;
+                b.logits[i] = true;
+            }
+
+            if (llama_decode(ctx.get(), b) != 0) {
+                throw std::runtime_error("evaluation decode failed");
+            }
+
+            for (int32_t i = 0; i < b.n_tokens; ++i) {
+                const float * logits = llama_get_logits_ith(ctx.get(), i);
+                if (!logits) {
+                    throw std::runtime_error("missing evaluation logits");
+                }
+
+                const double logz = eval_logsumexp(logits, n_vocab);
+                result.nll += logz - logits[tokens[first + i + 1]];
+                if (save && fwrite(logits, sizeof(float), n_vocab, save) != n_vocab) {
+                    throw std::runtime_error("cannot save initial recipe logits");
+                }
+
+                if (write_reference) {
+                    if (fwrite(logits, sizeof(float), n_vocab, reference) != n_vocab) {
+                        throw std::runtime_error("cannot write reference logits");
+                    }
+                } else {
+                    if (fread(base.data(), sizeof(float), n_vocab, reference) != n_vocab) {
+                        throw std::runtime_error("cannot read reference logits");
+                    }
+
+                    const double logz_base = eval_logsumexp(base.data(), n_vocab);
+                    for (size_t j = 0; j < n_vocab; ++j) {
+                        const double logp = (double) base[j] - logz_base;
+                        result.kl += std::exp(logp) * (logp - ((double) logits[j] - logz));
+                    }
+
+                    if (response) {
+                        response->observe(logits, base);
+                    }
+                }
+
+                ++result.tokens;
+            }
+
+            fprintf(stderr, "evaluation: %zu/%zu tokens\n", result.tokens, count);
+        }
+    }
+
+    if (write_reference && fflush(reference) != 0) {
+        throw std::runtime_error("cannot flush reference logits");
+    }
+
+    if (save && fflush(save) != 0) {
+        throw std::runtime_error("cannot flush initial recipe logits");
+    }
+
+    return result;
+}
+
+using eval_model_ptr = std::unique_ptr<llama_model, decltype(&llama_model_free)>;
+
+static std::vector<tensor_plan> eval_read_recipe(const search_params & params, const std::vector<input_file> & files, const common_imatrix & imatrix, const std::string & path) {
+    auto options = params;
+    std::ifstream input(path);
+    if (!input) {
+        throw std::runtime_error("cannot read recipe: " + path);
+    }
+
+    std::string rule;
+    while (input >> rule) {
+        const size_t sep = rule.find('=');
+        if (sep == std::string::npos || sep == 0) {
+            throw std::runtime_error("invalid recipe rule: " + rule);
+        }
+
+        auto types = parse_types(rule.substr(sep + 1));
+        if (types.size() != 1) {
+            throw std::runtime_error("evaluation recipes require one type per rule");
+        }
+
+        options.rules.push_back({std::regex(rule.substr(0, sep)), std::move(types)});
+    }
+
+    auto plans = plan_tensors(options, files, imatrix);
+    for (const auto & plan : plans) {
+        if (plan.candidates.size() != 1) {
+            throw std::runtime_error(std::string("ambiguous evaluation type for ") + plan.tensor->name);
+        }
+    }
+
+    return plans;
+}
+
+struct eval_cache {
+    const search_params & params;
+    const std::vector<input_file> & files;
+    const common_imatrix & imatrix;
+    eval_file encoded;
+    eval_weights weights;
+    std::map<std::pair<std::string, ggml_type>, eval_weight> cache;
+    size_t cache_size = 0;
+
+    eval_cache(const search_params & params, const std::vector<input_file> & files, const common_imatrix & imatrix)
+        : params(params), files(files), imatrix(imatrix), encoded(params.eval_cache + ".weights") {
+        for (const auto & file : files) {
+            weights.map_file(std::make_unique<llama_file>(file.path.c_str(), "rb"));
+        }
+    }
+
+    eval_model_ptr load(std::vector<tensor_plan> & plans, bool reference = false) {
+        if (weights.files.size() > files.size()) {
+            weights.buffers.pop_back();
+            weights.mappings.pop_back();
+            weights.files.pop_back();
+        }
+
+        llama_file cache_file(encoded.file);
+        cache_file.seek(cache_size, SEEK_SET);
+        for (size_t i = 0; i < plans.size(); ++i) {
+            auto & plan = plans[i];
+            const auto & candidate = plan.candidates.front();
+            if (reference || candidate.type == plan.tensor->type) {
+                weights.tensors[plan.tensor->name] = {plan.file, plan.offset, ggml_nbytes(plan.tensor)};
+                continue;
+            }
+
+            const auto key = std::make_pair(std::string(plan.tensor->name), candidate.type);
+            auto it = cache.find(key);
+            if (it == cache.end()) {
+                const size_t padding = (64 - cache_size % 64) % 64;
+                const uint8_t zeros[64] = {};
+                if (fwrite(zeros, 1, padding, encoded.file) != padding) {
+                    throw std::runtime_error("cannot pad encoded tensor cache");
+                }
+
+                cache_size = checked_add(cache_size, padding);
+                const eval_weight weight{files.size(), cache_size, candidate.size};
+                auto encoding_params = params;
+                encoding_params.target_bpw = 0;
+                measure_tensor(encoding_params, files[plan.file], plan, imatrix, i + 1, plans.size(), encoded.file);
+                cache_size = checked_add(cache_size, candidate.size);
+                it = cache.emplace(key, weight).first;
+            }
+
+            weights.tensors[plan.tensor->name] = it->second;
+        }
+
+        if (fflush(encoded.file) != 0) {
+            throw std::runtime_error("cannot flush encoded tensor cache");
+        }
+
+        if (cache_size) {
+            weights.map_file(std::make_unique<llama_file>(encoded.file));
+        }
+
+        auto metadata = eval_metadata(files, plans, reference);
+        std::unique_ptr<llama_model, decltype(&llama_model_free)> model(llama_model_init_from_buffers(metadata.get(), eval_weights::bind, &weights), llama_model_free);
+        if (!model) {
+            throw std::runtime_error("cannot load recipe model for global evaluation");
+        }
+
+        return model;
+    }
+};
+
+static std::vector<llama_token> eval_calibration_tokens(const search_params & params, llama_model * model) {
+    std::ifstream input(params.calibration_file, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("cannot read calibration text");
+    }
+
+    const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    auto tokens = common_tokenize(llama_model_get_vocab(model), text, true);
+    if (tokens.size() < 2) {
+        throw std::runtime_error("calibration text requires at least two tokens");
+    }
+
+    tokens.resize(std::min(tokens.size(), checked_add(checked_mul(params.n_ctx, params.n_chunks), 1)));
+    return tokens;
+}
+
+static std::pair<size_t, size_t> eval_payload(const std::vector<tensor_plan> & plans, bool reference = false) {
+    size_t elements = 0;
+    size_t bytes = 0;
+    for (const auto & plan : plans) {
+        if (plan.counted) {
+            elements = checked_add(elements, ggml_nelements(plan.tensor));
+            bytes = checked_add(bytes, reference ? ggml_nbytes(plan.tensor) : plan.candidates.front().size);
+        }
+    }
+
+    return {elements, bytes};
+}
+
+static void evaluate_recipes(const search_params & params, const std::vector<input_file> & files, const common_imatrix & imatrix) {
+    std::vector<std::vector<tensor_plan>> recipes;
+    for (const auto & path : params.eval_recipes) {
+        recipes.push_back(eval_read_recipe(params, files, imatrix, path));
+    }
+
+    ggml_backend_load_all();
+    llama_backend_init();
+    eval_file logits(params.eval_cache + ".logits");
+    eval_cache cache(params, files, imatrix);
+    std::vector<llama_token> tokens;
+    eval_result base_result;
+    {
+        auto model = cache.load(recipes.front(), true);
+        tokens = eval_calibration_tokens(params, model.get());
+        base_result = eval_tokens(params, model.get(), tokens, logits.file, true);
+    }
+
+    auto report = [](const char * name, std::pair<size_t, size_t> payload, const eval_result & result) {
+        const auto [elements, bytes] = payload;
+        printf("%s\t%zu\t%zu\t%.8f\t%zu\t%.12g\t%.12g\n", name, elements, bytes,
+               elements ? 8.0 * (double) bytes / (double) elements : 0.0, result.tokens,
+               std::exp(result.nll / result.tokens), std::max(0.0, result.kl / result.tokens));
+    };
+
+    printf("recipe\telements\tbytes\tbpw\ttokens\tppl\tkl\n");
+    report("reference", eval_payload(recipes.front(), true), base_result);
+    for (size_t r = 0; r < recipes.size(); ++r) {
+        auto model = cache.load(recipes[r]);
+        report(params.eval_recipes[r].c_str(), eval_payload(recipes[r]), eval_tokens(params, model.get(), tokens, logits.file, false));
+    }
+}
+
+struct global_option {
+    size_t offset = SIZE_MAX;
+    double linear = 0;
+};
+
+static double global_dot(const std::vector<float> & a, const std::vector<float> & b) {
+    double result = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        result += (double) a[i] * b[i];
+    }
+
+    return result;
+}
+
+static std::vector<size_t> global_solve(const search_params & params, std::vector<tensor_plan> plans,
+                                      const std::vector<std::vector<global_option>> & options, FILE * responses,
+                                      size_t dimensions, size_t elements, size_t budget, const std::vector<size_t> & initial) {
+    llama_file response_file(responses);
+    const size_t row_bytes = checked_mul(dimensions, sizeof(float));
+    std::vector<float> current(dimensions), vertex(dimensions), work(dimensions);
+    auto read = [&](const global_option & option) {
+        if (option.offset == SIZE_MAX) {
+            std::fill(work.begin(), work.end(), 0);
+            return;
+        }
+
+        if (option.offset > response_file.size() || row_bytes > response_file.size() - option.offset) {
+            throw std::runtime_error("global response outside cache");
+        }
+
+        response_file.seek(option.offset, SEEK_SET);
+        response_file.read_raw(work.data(), row_bytes);
+    };
+
+    double linear = 0;
+    double best_value = 0;
+    auto best = initial;
+    for (size_t iteration = 0; iteration < 64; ++iteration) {
+        for (size_t i = 0; i < plans.size(); ++i) {
+            double minimum = INFINITY;
+            for (size_t j = 0; j < options[i].size(); ++j) {
+                read(options[i][j]);
+                const double gradient = options[i][j].linear + global_dot(current, work);
+                plans[i].candidates[j].error = gradient;
+                minimum = std::min(minimum, gradient);
+            }
+
+            // Per-group constants leave the linear oracle unchanged and keep its error bounds nonnegative.
+            for (auto & candidate : plans[i].candidates) {
+                candidate.error -= minimum;
+                candidate.error_weighted = candidate.error;
+            }
+        }
+
+        const auto chosen = allocate_types(params, plans, elements, budget, false);
+        std::fill(vertex.begin(), vertex.end(), 0);
+        double vertex_linear = 0;
+        for (size_t i = 0; i < plans.size(); ++i) {
+            const auto & option = options[i][chosen[i]];
+            vertex_linear += option.linear;
+            read(option);
+            for (size_t k = 0; k < dimensions; ++k) {
+                vertex[k] += work[k];
+            }
+        }
+
+        const double value = vertex_linear + 0.5 * global_dot(vertex, vertex);
+        if (value < best_value) {
+            best_value = value;
+            best = chosen;
+        }
+
+        double derivative = vertex_linear - linear;
+        double curvature = 0;
+        for (size_t k = 0; k < dimensions; ++k) {
+            const double delta = (double) vertex[k] - current[k];
+            derivative += current[k] * delta;
+            curvature += delta * delta;
+        }
+
+        if (derivative >= -1e-12) {
+            break;
+        }
+
+        const double step = curvature > 0 ? std::min(1.0, -derivative / curvature) : 1.0;
+        linear += step * (vertex_linear - linear);
+        for (size_t k = 0; k < dimensions; ++k) {
+            current[k] = (float) (current[k] + step * ((double) vertex[k] - current[k]));
+        }
+
+        fprintf(stderr, "global quadratic: iteration %zu, predicted best KL change %.12g\n", iteration + 1, best_value);
+    }
+
+    return best;
+}
+
+static void global_search(const search_params & params, const std::vector<input_file> & files, const common_imatrix & imatrix) {
+    auto plans = plan_tensors(params, files, imatrix);
+    auto initial_plans = eval_read_recipe(params, files, imatrix, params.global_recipe);
+    const auto [elements, initial_bytes] = eval_payload(initial_plans);
+    if (!elements) {
+        throw std::runtime_error("global search requires counted elements");
+    }
+
+    const long double target = std::floor(params.target_bpw * (long double) elements / 8);
+    const size_t budget = target >= (long double) SIZE_MAX ? SIZE_MAX : (size_t) target;
+    if (initial_bytes > budget) {
+        throw std::runtime_error("initial recipe exceeds the BPW budget");
+    }
+
+    std::vector<size_t> initial;
+    std::vector<std::vector<global_option>> options;
+    size_t probes = 0;
+    for (size_t i = 0; i < plans.size(); ++i) {
+        if (!params.global_tensors.empty() && !matches(params.global_tensors, plans[i].tensor->name)) {
+            plans[i].candidates = initial_plans[i].candidates;
+        }
+
+        const auto & candidates = plans[i].candidates;
+        const auto type = initial_plans[i].candidates.front().type;
+        const auto it = std::find_if(candidates.begin(), candidates.end(), [&](const candidate & c) { return c.type == type; });
+        if (it == candidates.end()) {
+            throw std::runtime_error(std::string("initial type is not an allowed candidate for ") + plans[i].tensor->name);
+        }
+
+        initial.push_back(it - candidates.begin());
+        options.emplace_back(candidates.size());
+        probes = checked_add(probes, candidates.size() - 1);
+    }
+
+    fprintf(stderr, "global search: %zu alternatives, one full calibration evaluation per alternative\n", probes);
+    ggml_backend_load_all();
+    llama_backend_init();
+    eval_file reference(params.eval_cache + ".logits");
+    eval_file baseline(params.eval_cache + ".baseline");
+    eval_file responses(params.eval_cache + ".responses");
+    eval_cache cache(params, files, imatrix);
+    std::vector<llama_token> tokens;
+    {
+        auto model = cache.load(initial_plans, true);
+        tokens = eval_calibration_tokens(params, model.get());
+        const size_t dimensions = checked_mul(tokens.size() - 1, params.response_rank);
+        if (checked_mul(checked_mul(dimensions, sizeof(float)), 4) > params.max_buffer_size) {
+            throw std::runtime_error("global response buffers exceed --max-buffer-size; reduce --chunks, --ctx-size, or --response-rank");
+        }
+
+        eval_tokens(params, model.get(), tokens, reference.file, true);
+    }
+
+    eval_result initial_result;
+    {
+        auto model = cache.load(initial_plans);
+        initial_result = eval_tokens(params, model.get(), tokens, reference.file, false, baseline.file);
+    }
+
+    fprintf(stderr, "global initial: KL %.12g, PPL %.12g, %zu/%zu counted payload bytes\n",
+            initial_result.kl / initial_result.tokens, std::exp(initial_result.nll / initial_result.tokens), initial_bytes, budget);
+
+    const size_t dimensions = checked_mul(initial_result.tokens, params.response_rank);
+    const size_t row_bytes = checked_mul(dimensions, sizeof(float));
+    size_t response_bytes = 0;
+    size_t probe = 0;
+    for (size_t i = 0; i < plans.size(); ++i) {
+        for (size_t j = 0; j < plans[i].candidates.size(); ++j) {
+            if (j == initial[i]) {
+                continue;
+            }
+
+            fprintf(stderr, "global response [%zu/%zu]: %s=%s\n", ++probe, probes, plans[i].tensor->name, ggml_type_name(plans[i].candidates[j].type));
+            auto trial = initial_plans;
+            trial[i].candidates = {plans[i].candidates[j]};
+            global_response response(baseline.file, params.response_rank, initial_result.tokens);
+            {
+                auto model = cache.load(trial);
+                eval_tokens(params, model.get(), tokens, reference.file, false, nullptr, &response);
+            }
+
+            response.normalize();
+            options[i][j] = {response_bytes, response.linear};
+            if (fwrite(response.values.data(), sizeof(float), dimensions, responses.file) != dimensions) {
+                throw std::runtime_error("cannot write global response cache");
+            }
+
+            response_bytes = checked_add(response_bytes, row_bytes);
+        }
+    }
+
+    if (fflush(responses.file) != 0) {
+        throw std::runtime_error("cannot flush global response cache");
+    }
+
+    auto selected = probes ? global_solve(params, plans, options, responses.file, dimensions, elements, budget, initial) : initial;
+    if (selected != initial) {
+        auto trial = initial_plans;
+        for (size_t i = 0; i < trial.size(); ++i) {
+            trial[i].candidates = {plans[i].candidates[selected[i]]};
+        }
+
+        eval_result actual;
+        {
+            auto model = cache.load(trial);
+            actual = eval_tokens(params, model.get(), tokens, reference.file, false);
+        }
+
+        const bool improved = actual.kl + 1e-12 * actual.tokens < initial_result.kl;
+        fprintf(stderr, "global proposal: KL %.12g, PPL %.12g, %s\n", actual.kl / actual.tokens,
+                std::exp(actual.nll / actual.tokens), improved ? "accepted" : "rejected; retaining initial recipe");
+        if (!improved) {
+            selected = initial;
+        }
+    } else {
+        fprintf(stderr, "global search: no improving quadratic proposal; retaining initial recipe\n");
+    }
+
+    size_t selected_bytes = 0;
+    for (size_t i = 0; i < plans.size(); ++i) {
+        const auto & choice = plans[i].candidates[selected[i]];
+        if (plans[i].counted) {
+            selected_bytes = checked_add(selected_bytes, choice.size);
+        }
+
+        printf("%s=%s\n", tensor_pattern(plans[i].tensor->name).c_str(), ggml_type_name(choice.type));
+    }
+
+    fprintf(stderr, "global allocation: %zu/%zu counted payload bytes, %.8Lf bpw\n", selected_bytes, budget, 8.0L * selected_bytes / elements);
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     ggml_time_init();
@@ -856,12 +1591,42 @@ int main(int argc, char ** argv) {
     try {
         const auto params = parse_params(argc, argv);
 
+        if (!params.eval_recipes.empty() || !params.global_recipe.empty()) {
+            llama_log_set([](ggml_log_level level, const char * message, void *) {
+                if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
+                    fputs(message, stderr);
+                }
+            }, nullptr);
+        }
+
         common_imatrix imatrix;
         if (!params.imatrix.empty() && !common_imatrix_load(params.imatrix, imatrix)) {
             throw std::runtime_error("cannot load imatrix");
         }
 
         const auto files = open_inputs(params.model);
+        if (!params.global_recipe.empty()) {
+            global_search(params, files, imatrix);
+            if (fflush(stdout) != 0 || ferror(stdout)) {
+                throw std::runtime_error("cannot write global search recipe");
+            }
+
+            llama_backend_free();
+            ggml_quantize_free();
+            return 0;
+        }
+
+        if (!params.eval_recipes.empty()) {
+            evaluate_recipes(params, files, imatrix);
+            if (fflush(stdout) != 0 || ferror(stdout)) {
+                throw std::runtime_error("cannot write evaluation results");
+            }
+
+            llama_backend_free();
+            ggml_quantize_free();
+            return 0;
+        }
+
         auto plans = plan_tensors(params, files, imatrix);
 
         if (params.target_bpw > 0 && !params.imatrix.empty()) {

@@ -10,6 +10,13 @@
 #include <map>
 #include <vector>
 
+// Load exact GGUF tensor metadata with caller-owned CPU weight buffers.
+// The callback binds tensor->data and tensor->buffer; both must outlive the model.
+LLAMA_API llama_model * llama_model_init_from_buffers(
+        gguf_context * metadata,
+        llama_model_set_tensor_data_t bind,
+        void * user_data);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,

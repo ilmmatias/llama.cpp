@@ -1941,7 +1941,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         } else {
             ggml_backend_buffer_t buf;
-            if (ml.no_alloc) {
+            if (ml.no_alloc || ml.user_buffers) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them

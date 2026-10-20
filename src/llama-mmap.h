@@ -1,5 +1,7 @@
 #pragma once
 
+#include "llama.h"
+
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -17,7 +19,7 @@ using llama_files  = std::vector<std::unique_ptr<llama_file>>;
 using llama_mmaps  = std::vector<std::unique_ptr<llama_mmap>>;
 using llama_mlocks = std::vector<std::unique_ptr<llama_mlock>>;
 
-struct llama_file {
+struct LLAMA_API llama_file {
     llama_file(const char * fname, const char * mode, bool use_direct_io = false);
     llama_file(FILE * file);
     ~llama_file();
@@ -44,7 +46,7 @@ private:
     std::unique_ptr<impl> pimpl;
 };
 
-struct llama_mmap {
+struct LLAMA_API llama_mmap {
     // list of [first, last) byte ranges within a file
     using ranges = std::vector<std::pair<size_t, size_t>>;
 

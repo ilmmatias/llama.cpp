@@ -80,6 +80,284 @@ class QuantSearchTests(unittest.TestCase):
     def table(self, result):
         return list(csv.DictReader(io.StringIO(result.stdout), delimiter="\t"))
 
+    def write_eval_model(self, name="eval.gguf", experts=False, sparse=False, blind_query=False, seed=42, scale=1):
+        path = self.root / name
+        embd = 256 if sparse else 32
+        ff = 512 if sparse else 64
+        n_experts = 512 if sparse else 2
+        writer = gguf.GGUFWriter(path, "llama")
+        writer.add_context_length(64)
+        writer.add_embedding_length(embd)
+        writer.add_block_count(1)
+        writer.add_feed_forward_length(ff)
+        writer.add_head_count(4)
+        writer.add_layer_norm_rms_eps(1e-5)
+        writer.add_tokenizer_model("test")
+        writer.add_token_list([f"token{i}" for i in range(64)])
+
+        shapes = {"token_embd.weight": (64, embd), "output_norm.weight": (embd,)}
+        for projection in ("q", "k", "v", "output"):
+            shapes[f"blk.0.attn_{projection}.weight"] = (embd, embd)
+
+        shapes["blk.0.attn_norm.weight"] = (embd,)
+        shapes["blk.0.ffn_norm.weight"] = (embd,)
+        if experts:
+            writer.add_expert_count(n_experts)
+            writer.add_expert_used_count(1)
+            shapes["blk.0.ffn_gate_inp.weight"] = (n_experts, embd)
+            for part in ("gate", "up", "down"):
+                shapes[f"blk.0.ffn_{part}_exps.weight"] = (n_experts, embd, ff) if part == "down" else (n_experts, ff, embd)
+        else:
+            for part in ("gate", "up", "down"):
+                shapes[f"blk.0.ffn_{part}.weight"] = (embd, ff) if part == "down" else (ff, embd)
+
+        rng = np.random.default_rng(seed)
+        for tensor_name, shape in shapes.items():
+            if sparse:
+                writer.add_tensor_info(tensor_name, shape, np.dtype(np.float32), math.prod(shape) * 4)
+                continue
+
+            data = np.ones(shape, dtype=np.float32) if len(shape) == 1 else rng.normal(0, 0.15 * scale, shape).astype(np.float32)
+            if blind_query and tensor_name == "blk.0.attn_q.weight":
+                data *= 10
+            elif blind_query and tensor_name == "blk.0.attn_k.weight":
+                data.fill(0)
+
+            writer.add_tensor(tensor_name, data)
+
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        if sparse:
+            writer.write_ti_data_to_file()
+            assert writer.fout is not None
+            output = writer.fout[0]
+            writer.write_padding(output, output.tell())
+            output.truncate(output.tell() + sum(gguf.GGUFWriter.ggml_pad(math.prod(shape) * 4, writer.data_alignment) for shape in shapes.values()))
+        else:
+            writer.write_tensors_to_file()
+        writer.close()
+        return path
+
+    def eval_args(self):
+        text = self.root / "calibration.txt"
+        text.write_text("The quick brown fox jumps over the lazy dog. " * 8)
+        return ["--calibration-file", text, "--eval-cache", self.root / "cache", "--ctx-size", "16", "--batch-size", "4", "--chunks", "2", "-t", "2"]
+
+    def test_global_evaluation_resets_hybrid_recurrent_state(self):
+        source = self.root / "hybrid.gguf"
+        writer = gguf.GGUFWriter(source, "lfm2")
+        writer.add_context_length(64)
+        writer.add_embedding_length(32)
+        writer.add_block_count(2)
+        writer.add_feed_forward_length(64)
+        writer.add_head_count(4)
+        writer.add_key_value("lfm2.attention.head_count_kv", [0, 4], gguf.GGUFValueType.ARRAY, sub_type=gguf.GGUFValueType.UINT32)
+        writer.add_layer_norm_rms_eps(1e-5)
+        writer.add_uint32("lfm2.shortconv.l_cache", 3)
+        writer.add_tokenizer_model("test")
+        writer.add_token_list([f"token{i}" for i in range(64)])
+        shapes = {"token_embd.weight": (64, 32), "token_embd_norm.weight": (32,)}
+        for layer in (0, 1):
+            shapes[f"blk.{layer}.attn_norm.weight"] = (32,)
+            shapes[f"blk.{layer}.ffn_norm.weight"] = (32,)
+            for part in ("gate", "up", "down"):
+                shapes[f"blk.{layer}.ffn_{part}.weight"] = (32, 64) if part == "down" else (64, 32)
+
+        shapes["blk.0.shortconv.conv.weight"] = (32, 3)
+        shapes["blk.0.shortconv.in_proj.weight"] = (96, 32)
+        shapes["blk.0.shortconv.out_proj.weight"] = (32, 32)
+        for projection in ("q", "k", "v", "output"):
+            shapes[f"blk.1.attn_{projection}.weight"] = (32, 32)
+        for projection in ("q", "k"):
+            shapes[f"blk.1.attn_{projection}_norm.weight"] = (8,)
+
+        rng = np.random.default_rng(41)
+        for name, shape in shapes.items():
+            data = np.ones(shape, dtype=np.float32) if len(shape) == 1 else rng.normal(0, 0.1, shape).astype(np.float32)
+            writer.add_tensor(name, data)
+
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+        text = self.root / "repeated.txt"
+        text.write_text("abcde" * 33)
+        recipe = self.root / "hybrid.txt"
+        recipe.write_text(r"^blk\.0\.shortconv\.(in_proj|out_proj)\.weight$=Q4_0" + "\n.*=F32\n")
+        once = self.table(self.run_tool(*self.eval_args(), "--calibration-file", text, "--chunks", "1", "--eval-recipe", recipe, model=source, types="F32"))
+        twice = self.table(self.run_tool(*self.eval_args(), "--calibration-file", text, "--chunks", "2", "--eval-recipe", recipe, model=source, types="F32"))
+        for one, two in zip(once, twice):
+            self.assertEqual(int(one["tokens"]) * 2, int(two["tokens"]))
+            self.assertTrue(math.isclose(float(one["ppl"]), float(two["ppl"]), rel_tol=1e-10))
+            self.assertTrue(math.isclose(float(one["kl"]), float(two["kl"]), rel_tol=1e-10, abs_tol=1e-12))
+
+    def test_global_evaluation_identity_cache_and_moe(self):
+        identity = self.root / "identity.txt"
+        identity.write_text(".*=F32\n")
+        quantized = self.root / "quantized.txt"
+        quantized.write_text(r"^blk\.0\.(attn_(q|k|v|output)|ffn_(gate|up|down)(_exps)?)\.weight$=Q4_0" + "\n.*=F32\n")
+
+        for experts in (False, True):
+            with self.subTest(experts=experts):
+                model = self.write_eval_model(experts=experts)
+                result = self.run_tool(*self.eval_args(), "--eval-recipe", identity, "--eval-recipe", quantized,
+                                       "--eval-recipe", identity, "--eval-recipe", quantized, model=model, types="F32")
+                rows = self.table(result)
+                self.assertEqual(len(rows), 5)
+                self.assertEqual(rows[0]["tokens"], "32")
+                self.assertEqual(rows[0]["ppl"], rows[1]["ppl"])
+                self.assertEqual(float(rows[1]["kl"]), 0)
+                self.assertEqual(rows[1], rows[3])
+                self.assertEqual(rows[2], rows[4])
+                self.assertGreater(float(rows[2]["kl"]), 0)
+                self.assertLess(int(rows[2]["bytes"]), int(rows[1]["bytes"]))
+                self.assertFalse((self.root / "cache.logits").exists())
+                self.assertFalse((self.root / "cache.weights").exists())
+
+    def test_global_evaluation_matches_materialized_quantizer(self):
+        quantizer = BINARY.with_name("llama-quantize")
+        if not quantizer.exists():
+            self.skipTest("llama-quantize not built")
+
+        source = self.write_eval_model()
+        recipe = self.root / "types.txt"
+        recipe.write_text(r"^blk\.0\.(attn_(q|k|v|output)|ffn_(gate|up|down)(_exps)?)\.weight$=Q4_0" + "\n.*=F32\n")
+        materialized = self.root / "materialized.gguf"
+        result = subprocess.run([str(quantizer), "--tensor-type-file", str(recipe), str(source), str(materialized), "Q4_K", "2"], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        direct = self.table(self.run_tool(*self.eval_args(), "--eval-recipe", recipe, model=source, types="F32"))
+        stored = self.table(self.run_tool(*self.eval_args(), "--eval-recipe", recipe, model=materialized, types="F32"))
+        self.assertEqual(direct[1]["ppl"], stored[0]["ppl"])
+        self.assertEqual(stored[0]["ppl"], stored[1]["ppl"])
+        self.assertEqual(float(stored[1]["kl"]), 0)
+
+    def test_global_evaluation_preserves_existing_cache(self):
+        model = self.write_eval_model()
+        recipe = self.root / "types.txt"
+        recipe.write_text(".*=F32\n")
+        logits = self.root / "cache.logits"
+        logits.write_bytes(b"existing")
+        result = self.run_tool(*self.eval_args(), "--eval-recipe", recipe, model=model, types="F32", success=False)
+        self.assertIn("cannot create evaluation cache", result.stderr)
+        self.assertEqual(logits.read_bytes(), b"existing")
+
+    def test_global_score_distinguishes_local_error(self):
+        source = self.write_eval_model(blind_query=True)
+        q = "blk.0.attn_q.weight"
+        v = "blk.0.attn_v.weight"
+        override = r"^(?!blk\.0\.attn_[qv]\.weight$).*=F32"
+        rows = self.table(self.run_tool("--tensor-type", override, model=source, types="Q4_0,F32"))
+        errors = {r["tensor"]: float(r["error"]) for r in rows if r["type"] == "q4_0"}
+        self.assertGreater(errors[q], errors[v])
+
+        query = self.root / "query.txt"
+        query.write_text(r"^blk\.0\.attn_q\.weight$=Q4_0" + "\n.*=F32\n")
+        value = self.root / "value.txt"
+        value.write_text(r"^blk\.0\.attn_v\.weight$=Q4_0" + "\n.*=F32\n")
+        global_rows = self.table(self.run_tool(*self.eval_args(), "--eval-recipe", query, "--eval-recipe", value, model=source, types="F32"))
+        self.assertEqual(global_rows[1]["bytes"], global_rows[2]["bytes"])
+        self.assertLess(float(global_rows[1]["kl"]), 1e-12)
+        self.assertGreater(float(global_rows[2]["kl"]), 1e-8)
+
+    def test_global_search_repairs_wrong_local_allocation(self):
+        source = self.write_eval_model(blind_query=True)
+        override = r"^(?!blk\.0\.attn_[qv]\.weight$).*=F32"
+        rows = self.table(self.run_tool("--tensor-type", override, model=source, types="Q4_0,F32"))
+        initial = self.root / "initial.txt"
+        initial.write_text(r"^blk\.0\.attn_v\.weight$=Q4_0" + "\n.*=F32\n")
+        baseline_rows = self.table(self.run_tool(*self.eval_args(), "--eval-recipe", initial, model=source, types="F32"))
+        budget = int(baseline_rows[1]["bytes"])
+        elements = int(baseline_rows[1]["elements"])
+        bpw = str(8 * (budget + 0.5) / elements)
+
+        result = self.run_tool(*self.eval_args(), "--global-search", initial, "--target-bpw", bpw,
+                               "--tensor-type", override, model=source, types="Q4_0,F32")
+        choices = self.recipe_choices(result, {r["tensor"]: None for r in rows})
+        self.assertEqual(choices["blk.0.attn_q.weight"], "q4_0")
+        self.assertEqual(choices["blk.0.attn_v.weight"], "f32")
+        self.assertIn("accepted", result.stderr)
+        self.assertIn("global proposal: KL 0,", result.stderr)
+        self.assertNotIn("(optimal)", result.stderr)
+
+        selected = self.root / "selected.txt"
+        selected.write_text(result.stdout)
+        checked = self.table(self.run_tool(*self.eval_args(), "--eval-recipe", selected, model=source, types="F32"))
+        self.assertLessEqual(int(checked[1]["bytes"]), budget)
+        self.assertEqual(float(checked[1]["kl"]), 0)
+        for extension in ("logits", "baseline", "responses", "weights"):
+            self.assertFalse((self.root / f"cache.{extension}").exists())
+
+        self.run_tool(*self.eval_args(), "--global-search", initial, "--target-bpw", "1", model=source, types="Q4_0,F32", success=False)
+        limited = self.run_tool(*self.eval_args(), "--global-search", initial, "--target-bpw", bpw,
+                                "--tensor-type", override, "--response-rank", "4096", "--max-buffer-size", "1",
+                                model=source, types="Q4_0,F32", success=False)
+        self.assertIn("global response buffers exceed", limited.stderr)
+
+        fixed = self.run_tool(*self.eval_args(), "--global-search", initial, "--target-bpw", bpw,
+                              "--global-tensors", r"^blk\.0\.attn_q\.weight$", model=source, types="F32")
+        kept = self.recipe_choices(fixed, {r["tensor"]: None for r in rows})
+        self.assertEqual(kept["blk.0.attn_q.weight"], "f32")
+        self.assertEqual(kept["blk.0.attn_v.weight"], "q4_0")
+        self.assertIn("retaining initial recipe", fixed.stderr)
+
+    def test_global_search_retains_zero_kl_initial_recipe(self):
+        source = self.write_eval_model()
+        initial = self.root / "initial.txt"
+        initial.write_text(".*=F32\n")
+        result = self.run_tool(*self.eval_args(), "--global-search", initial, "--target-bpw", "32",
+                               "--global-tensors", r"^blk\.0\.attn_[qv]\.weight$", model=source, types="Q4_0,F32")
+        reader = gguf.GGUFReader(source)
+        choices = self.recipe_choices(result, {t.name: None for t in reader.tensors})
+        self.assertTrue(all(qtype == "f32" for qtype in choices.values()))
+        self.assertIn("retaining initial recipe", result.stderr)
+
+    def test_global_search_rejects_inaccurate_quadratic_proposal(self):
+        source = self.write_eval_model(seed=6, scale=8)
+        initial = self.root / "initial.txt"
+        initial.write_text(r"^blk\.0\.attn_q\.weight$=Q4_0" + "\n.*=F32\n")
+        rows = self.table(self.run_tool(*self.eval_args(), "--eval-recipe", initial, model=source, types="F32"))
+        bpw = str(8 * (int(rows[1]["bytes"]) + 0.5) / int(rows[1]["elements"]))
+        result = self.run_tool(*self.eval_args(), "--global-search", initial, "--target-bpw", bpw,
+                               "--global-tensors", r"^blk\.0\.attn_[qk]\.weight$", model=source, types="Q4_0,F32")
+        reader = gguf.GGUFReader(source)
+        choices = self.recipe_choices(result, {t.name: None for t in reader.tensors})
+        self.assertEqual(choices["blk.0.attn_q.weight"], "q4_0")
+        self.assertTrue(all(qtype == "f32" for name, qtype in choices.items() if name != "blk.0.attn_q.weight"))
+        self.assertIn("rejected; retaining initial recipe", result.stderr)
+
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux allocation limits and sparse files")
+    def test_global_evaluation_does_not_allocate_model_payload(self):
+        import resource
+
+        source = self.write_eval_model(experts=True, sparse=True)
+        self.assertGreater(source.stat().st_size, 768 * 1024 * 1024)
+        self.assertLess(source.stat().st_blocks * 512, 1024 * 1024)
+        recipe = self.root / "identity.txt"
+        recipe.write_text(".*=F32\n")
+
+        def limit_allocations():
+            limit = 128 * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_DATA, (limit, limit))
+
+        command = [BINARY, *self.eval_args(), "--eval-recipe", recipe, source, "F32"]
+        result = subprocess.run([str(arg) for arg in command], text=True, capture_output=True, preexec_fn=limit_allocations)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = self.table(result)
+        self.assertEqual(float(rows[1]["kl"]), 0)
+
+    def test_global_evaluation_rejects_truncated_weights(self):
+        source = self.write_eval_model()
+        with source.open("r+b") as output:
+            output.truncate(source.stat().st_size - 64)
+
+        recipe = self.root / "identity.txt"
+        recipe.write_text(".*=F32\n")
+        result = self.run_tool(*self.eval_args(), "--eval-recipe", recipe, model=source, types="F32", success=False)
+        self.assertIn("tensor outside file", result.stderr)
+        self.assertFalse((self.root / "cache.logits").exists())
+        self.assertFalse((self.root / "cache.weights").exists())
+
     def recipe_choices(self, result, names):
         choices = {}
         for line in result.stdout.splitlines():

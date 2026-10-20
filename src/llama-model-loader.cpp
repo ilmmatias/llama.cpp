@@ -559,8 +559,10 @@ llama_model_loader::llama_model_loader(
         bool no_alloc,
         bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        bool user_buffers)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+    this->user_buffers = user_buffers;
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -727,6 +729,32 @@ llama_model_loader::llama_model_loader(
             n_bytes    += ggml_nbytes(cur);
             weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
         }
+    } else if (user_buffers) {
+        get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
+        llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+
+        const uint64_t count = gguf_get_n_tensors(metadata);
+        if (count >= SIZE_MAX / ggml_tensor_overhead() || count > INT32_MAX) {
+            throw std::runtime_error("too many caller-owned tensors");
+        }
+
+        ggml_init_params params = { ggml_tensor_overhead() * (count + 1), nullptr, true };
+        ggml_context_ptr ctx(ggml_init(params));
+        if (!ctx) {
+            throw std::runtime_error("cannot allocate tensor metadata");
+        }
+
+        for (int64_t i = 0; i < gguf_get_n_tensors(metadata); ++i) {
+            auto * tensor = ggml_new_tensor(ctx.get(), gguf_get_tensor_type(metadata, i), GGML_MAX_DIMS, gguf_get_tensor_ne(metadata, i));
+            ggml_set_name(tensor, gguf_get_tensor_name(metadata, i));
+            if (!weights_map.emplace(tensor->name, llama_tensor_weight(tensor)).second) {
+                throw std::runtime_error(format("duplicate caller-owned tensor name: %s", tensor->name));
+            }
+            n_elements += ggml_nelements(tensor);
+            n_bytes += ggml_nbytes(tensor);
+        }
+
+        contexts.push_back(std::move(ctx));
     } else {
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
@@ -1362,7 +1390,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return buft;
     };
 
-    if (files.empty()) {
+    if (files.empty() && !user_buffers) {
         if (flags & TENSOR_SKIP_IF_VIRTUAL) {
             return nullptr;
         }
@@ -1630,7 +1658,24 @@ bool llama_model_loader::load_all_data(
         void * progress_callback_user_data) {
     if (files.empty()) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (!user_buffers) {
+                set_tensor_data(t, set_tensor_data_ud);
+                continue;
+            }
+
+            const ggml_tensor before = *t;
             set_tensor_data(t, set_tensor_data_ud);
+            if (t->type != before.type || memcmp(t->ne, before.ne, sizeof(t->ne)) != 0 ||
+                memcmp(t->nb, before.nb, sizeof(t->nb)) != 0 || !t->data || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+                throw std::runtime_error(format("invalid caller-owned weight buffer for %s", before.name));
+            }
+
+            const uintptr_t base = (uintptr_t) ggml_backend_buffer_get_base(t->buffer);
+            const uintptr_t data = (uintptr_t) t->data;
+            const size_t size = ggml_backend_buffer_get_size(t->buffer);
+            if (data < base || data - base > size || ggml_nbytes(t) > size - (data - base)) {
+                throw std::runtime_error(format("caller-owned weight outside buffer for %s", before.name));
+            }
         }
         return true;
     }

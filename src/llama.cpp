@@ -1,4 +1,5 @@
 #include "llama.h"
+#include "llama-ext.h"
 
 #include "llama-impl.h"
 #include "llama-version.h"
@@ -314,10 +315,10 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
-        const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
+        const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params, bool user_buffers = false) {
     try {
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
-            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides, user_buffers);
 
         ml.lazy.mode = params.lazy_mode;
 
@@ -384,7 +385,8 @@ static struct llama_model * llama_model_load_from_file_impl(
         const std::string & path_model,
         std::vector<std::string> & splits,
         FILE * file,
-        struct llama_model_params params) {
+        struct llama_model_params params,
+        bool user_buffers = false) {
     {
         int n_sources_defined = 0;
         if (metadata != nullptr) {
@@ -426,7 +428,7 @@ static struct llama_model * llama_model_load_from_file_impl(
         };
     }
 
-    const auto [status, model] = llama_model_load(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, file, params);
+    const auto [status, model] = llama_model_load(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, file, params, user_buffers);
     GGML_ASSERT(status <= 0);
     if (status < 0) {
         if (status == -1) {
@@ -456,6 +458,22 @@ struct llama_model * llama_model_init_from_user(
     params.use_extra_bufts = false;
     return llama_model_load_from_file_impl(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, /*file*/ nullptr, params);
 }
+
+llama_model * llama_model_init_from_buffers(gguf_context * metadata, llama_model_set_tensor_data_t bind, void * user_data) {
+    if (!metadata || !bind) {
+        return nullptr;
+    }
+
+    auto params = llama_model_default_params();
+    params.n_gpu_layers = 0;
+    params.load_mode = LLAMA_LOAD_MODE_NONE;
+    params.lazy_mode = LLAMA_LAZY_MODE_OFF;
+    params.use_extra_bufts = false;
+    params.load_mtp = false;
+    std::vector<std::string> splits;
+    return llama_model_load_from_file_impl(metadata, bind, user_data, "", splits, nullptr, params, true);
+}
+
 // deprecated
 struct llama_model * llama_load_model_from_file(
         const char * path_model,
