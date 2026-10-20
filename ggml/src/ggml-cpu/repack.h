@@ -223,6 +223,27 @@ struct block_znq6_lx8 {
 
 static_assert(sizeof(block_znq6_lx8) == 8 * sizeof(block_znq6_l), "wrong znq6_lx8 size");
 
+struct block_znq7_sx8 {
+    uint8_t header[32];
+    uint8_t qs[8][24];
+};
+
+static_assert(sizeof(block_znq7_sx8) == 8 * sizeof(block_znq7_s), "wrong znq7_sx8 size");
+
+struct block_znq7_mx8 {
+    uint8_t header[16];
+    uint8_t qs[8][28];
+};
+
+static_assert(sizeof(block_znq7_mx8) == 8 * sizeof(block_znq7_m), "wrong znq7_mx8 size");
+
+struct block_znq7_lx8 {
+    uint8_t header[24];
+    uint8_t qs[8][28];
+};
+
+static_assert(sizeof(block_znq7_lx8) == 8 * sizeof(block_znq7_l), "wrong znq7_lx8 size");
+
 
 struct block_iq4_nlx16 {
     ggml_half d[16];            // deltas for 16 iq4_nl blocks

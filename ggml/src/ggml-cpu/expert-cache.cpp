@@ -771,6 +771,130 @@ static bool unpack_repacked_znq_expert(const ggml_tensor * tensor, int32_t exper
 
             return true;
         }
+        case GGML_TYPE_ZNQ7_S: {
+            if (dst_size != (size_t) tensor->ne[1] * (size_t) nblocks * sizeof(block_znq7_s)) {
+                return false;
+            }
+
+            const auto * src = (const block_znq7_sx8 *) src_base;
+            auto * out = (block_znq7_s *) dst;
+
+            for (int64_t rg = 0; rg < row_groups; ++rg) {
+                for (int64_t ib = 0; ib < nblocks; ++ib) {
+                    const auto & in = src[rg * nblocks + ib];
+
+                    for (int r = 0; r < 8; ++r) {
+                        auto & b = out[(rg * 8 + r) * nblocks + ib];
+                        uint8_t * header = (uint8_t *) &b;
+
+                        for (int j = 0; j < 4; ++j) {
+                            header[j] = in.header[r * 4 + j];
+                        }
+
+                        memset(b.qs, 0, sizeof(b.qs));
+
+                        for (int j = 0; j < QK_ZNQ; ++j) {
+                            const uint8_t * quad = in.qs[j / 4];
+                            uint32_t high, high1;
+                            memcpy(&high, quad + 16, sizeof(high));
+                            memcpy(&high1, quad + 20, sizeof(high1));
+                            const unsigned code = ((quad[2 * r + (j % 4) / 2] >> (4 * (j % 2))) & 15) | (((high >> (4 * r + j % 4)) & 1) << 4) | (((high1 >> (4 * r + j % 4)) & 1) << 5);
+                            const int bit = 6 * j;
+                            b.qs[bit / 8] |= code << (bit % 8);
+                            if (bit % 8 > 2) {
+                                b.qs[bit / 8 + 1] |= code >> (8 - bit % 8);
+                            }
+                        }
+                    }
+                }
+            }
+
+            return true;
+        }
+        case GGML_TYPE_ZNQ7_M: {
+            if (dst_size != (size_t) tensor->ne[1] * (size_t) nblocks * sizeof(block_znq7_m)) {
+                return false;
+            }
+
+            const auto * src = (const block_znq7_mx8 *) src_base;
+            auto * out = (block_znq7_m *) dst;
+
+            for (int64_t rg = 0; rg < row_groups; ++rg) {
+                for (int64_t ib = 0; ib < nblocks; ++ib) {
+                    const auto & in = src[rg * nblocks + ib];
+
+                    for (int r = 0; r < 8; ++r) {
+                        auto & b = out[(rg * 8 + r) * nblocks + ib];
+                        uint8_t * header = (uint8_t *) &b;
+
+                        for (int j = 0; j < 2; ++j) {
+                            header[j] = in.header[j * 8 + r];
+                        }
+
+                        memset(b.qs, 0, sizeof(b.qs));
+
+                        for (int j = 0; j < QK_ZNQ; ++j) {
+                            const uint8_t * quad = in.qs[j / 4];
+                            uint32_t high;
+                            memcpy(&high, quad + 16, sizeof(high));
+                            uint32_t high1, high2;
+                            memcpy(&high1, quad + 20, sizeof(high1));
+                            memcpy(&high2, quad + 24, sizeof(high2));
+                            const unsigned code = ((quad[2 * r + (j % 4) / 2] >> (4 * (j % 2))) & 15) | (((high >> (4 * r + j % 4)) & 1) << 4) | (((high1 >> (4 * r + j % 4)) & 1) << 5) | (((high2 >> (4 * r + j % 4)) & 1) << 6);
+                            const int bit = 7 * j;
+                            b.qs[bit / 8] |= code << (bit % 8);
+                            if (bit % 8 > 1) {
+                                b.qs[bit / 8 + 1] |= code >> (8 - bit % 8);
+                            }
+                        }
+                    }
+                }
+            }
+
+            return true;
+        }
+        case GGML_TYPE_ZNQ7_L: {
+            if (dst_size != (size_t) tensor->ne[1] * (size_t) nblocks * sizeof(block_znq7_l)) {
+                return false;
+            }
+
+            const auto * src = (const block_znq7_lx8 *) src_base;
+            auto * out = (block_znq7_l *) dst;
+
+            for (int64_t rg = 0; rg < row_groups; ++rg) {
+                for (int64_t ib = 0; ib < nblocks; ++ib) {
+                    const auto & in = src[rg * nblocks + ib];
+
+                    for (int r = 0; r < 8; ++r) {
+                        auto & b = out[(rg * 8 + r) * nblocks + ib];
+                        uint8_t * header = (uint8_t *) &b;
+
+                        for (int j = 0; j < 3; ++j) {
+                            header[j] = in.header[j * 8 + r];
+                        }
+
+                        memset(b.qs, 0, sizeof(b.qs));
+
+                        for (int j = 0; j < QK_ZNQ; ++j) {
+                            const uint8_t * quad = in.qs[j / 4];
+                            uint32_t high;
+                            memcpy(&high, quad + 16, sizeof(high));
+                            uint32_t high1, high2;
+                            memcpy(&high1, quad + 20, sizeof(high1));
+                            memcpy(&high2, quad + 24, sizeof(high2));
+                            const unsigned code = ((quad[2 * r + (j % 4) / 2] >> (4 * (j % 2))) & 15) | (((high >> (4 * r + j % 4)) & 1) << 4) | (((high1 >> (4 * r + j % 4)) & 1) << 5) | (((high2 >> (4 * r + j % 4)) & 1) << 6);
+                            const int bit = 7 * j;
+                            b.qs[bit / 8] |= code << (bit % 8);
+                            if (bit % 8 > 1) {
+                                b.qs[bit / 8 + 1] |= code >> (8 - bit % 8);
+                            }
+                        }
+                    }
+                }
+            }
+
+            return true;
+        }
         default:
             return false;
     }
@@ -1290,7 +1414,7 @@ private:
                 return false;
             }
             if (is_cpu_repack_tensor(tensor) &&
-                tensor->type != GGML_TYPE_ZNQ2_M && tensor->type != GGML_TYPE_ZNQ2_L && tensor->type != GGML_TYPE_ZNQ3_S && tensor->type != GGML_TYPE_ZNQ3_M && tensor->type != GGML_TYPE_ZNQ3_L && tensor->type != GGML_TYPE_ZNQ4_S && tensor->type != GGML_TYPE_ZNQ4_M && tensor->type != GGML_TYPE_ZNQ4_L && tensor->type != GGML_TYPE_ZNQ5_S && tensor->type != GGML_TYPE_ZNQ5_M && tensor->type != GGML_TYPE_ZNQ5_L && tensor->type != GGML_TYPE_ZNQ6_S && tensor->type != GGML_TYPE_ZNQ6_M && tensor->type != GGML_TYPE_ZNQ6_L) {
+                tensor->type != GGML_TYPE_ZNQ2_M && tensor->type != GGML_TYPE_ZNQ2_L && tensor->type != GGML_TYPE_ZNQ3_S && tensor->type != GGML_TYPE_ZNQ3_M && tensor->type != GGML_TYPE_ZNQ3_L && tensor->type != GGML_TYPE_ZNQ4_S && tensor->type != GGML_TYPE_ZNQ4_M && tensor->type != GGML_TYPE_ZNQ4_L && tensor->type != GGML_TYPE_ZNQ5_S && tensor->type != GGML_TYPE_ZNQ5_M && tensor->type != GGML_TYPE_ZNQ5_L && tensor->type != GGML_TYPE_ZNQ6_S && tensor->type != GGML_TYPE_ZNQ6_M && tensor->type != GGML_TYPE_ZNQ6_L && tensor->type != GGML_TYPE_ZNQ7_S && tensor->type != GGML_TYPE_ZNQ7_M && tensor->type != GGML_TYPE_ZNQ7_L) {
                 fprintf(stderr, "expert_cache: layer %d CPU_REPACK type %s is not convertible to native GPU layout\n",
                         layer_id, ggml_type_name(tensor->type));
                 layer.disabled = true;

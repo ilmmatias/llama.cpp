@@ -108,6 +108,15 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_ZNQ6_L:
             mul_mat_q_case<GGML_TYPE_ZNQ6_L, GGML_PREC_Q8>(ctx, args, stream);
             break;
+        case GGML_TYPE_ZNQ7_S:
+            mul_mat_q_case<GGML_TYPE_ZNQ7_S, GGML_PREC_Q8>(ctx, args, stream);
+            break;
+        case GGML_TYPE_ZNQ7_M:
+            mul_mat_q_case<GGML_TYPE_ZNQ7_M, GGML_PREC_Q8>(ctx, args, stream);
+            break;
+        case GGML_TYPE_ZNQ7_L:
+            mul_mat_q_case<GGML_TYPE_ZNQ7_L, GGML_PREC_Q8>(ctx, args, stream);
+            break;
         case GGML_TYPE_IQ4_NL:
             mul_mat_q_case<GGML_TYPE_IQ4_NL, GGML_PREC_Q8>(ctx, args, stream);
             break;
@@ -602,6 +611,9 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_ZNQ6_S:
         case GGML_TYPE_ZNQ6_M:
         case GGML_TYPE_ZNQ6_L:
+        case GGML_TYPE_ZNQ7_S:
+        case GGML_TYPE_ZNQ7_M:
+        case GGML_TYPE_ZNQ7_L:
         case GGML_TYPE_IQ4_NL:
 // -------------------------------------------------
         case GGML_TYPE_MXFP4:

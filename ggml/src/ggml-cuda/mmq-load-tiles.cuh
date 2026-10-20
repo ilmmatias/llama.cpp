@@ -534,11 +534,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 template <ggml_type type, int J, bool fallback, int bits> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_znq(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
-    constexpr int group = (type == GGML_TYPE_ZNQ2_L || type == GGML_TYPE_ZNQ3_L || type == GGML_TYPE_ZNQ4_L || type == GGML_TYPE_ZNQ5_L || type == GGML_TYPE_ZNQ6_L) ? 8 :
-                          (type == GGML_TYPE_ZNQ3_S || type == GGML_TYPE_ZNQ4_S || type == GGML_TYPE_ZNQ5_S || type == GGML_TYPE_ZNQ6_S) ? 4 : 16;
-    using block_znq = std::conditional_t<group == 8, std::conditional_t<bits == 2, block_znq2_l, std::conditional_t<bits == 3, block_znq3_l, std::conditional_t<bits == 4, block_znq4_l, std::conditional_t<bits == 5, block_znq5_l, block_znq6_l>>>>,
-                      std::conditional_t<group == 4, std::conditional_t<bits == 2, block_znq3_s, std::conditional_t<bits == 3, block_znq4_s, std::conditional_t<bits == 4, block_znq5_s, block_znq6_s>>>,
-                      std::conditional_t<bits == 2, block_znq2_m, std::conditional_t<bits == 3, block_znq3_m, std::conditional_t<bits == 4, block_znq4_m, std::conditional_t<bits == 5, block_znq5_m, block_znq6_m>>>>>>;
+    constexpr int group = (type == GGML_TYPE_ZNQ2_L || type == GGML_TYPE_ZNQ3_L || type == GGML_TYPE_ZNQ4_L || type == GGML_TYPE_ZNQ5_L || type == GGML_TYPE_ZNQ6_L || type == GGML_TYPE_ZNQ7_L) ? 8 :
+                          (type == GGML_TYPE_ZNQ3_S || type == GGML_TYPE_ZNQ4_S || type == GGML_TYPE_ZNQ5_S || type == GGML_TYPE_ZNQ6_S || type == GGML_TYPE_ZNQ7_S) ? 4 : 16;
+    constexpr int block_size = znq_header_cuda<bits, group>() + 4 * bits;
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;
     constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8);
@@ -550,7 +548,7 @@ template <ggml_type type, int J, bool fallback, int bits> static __device__ __fo
 #else
     constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q8_0, I);
     if constexpr (type == GGML_TYPE_ZNQ2_M || type == GGML_TYPE_ZNQ2_L || type == GGML_TYPE_ZNQ3_S || type == GGML_TYPE_ZNQ3_M ||
-                  type == GGML_TYPE_ZNQ3_L || type == GGML_TYPE_ZNQ4_S || type == GGML_TYPE_ZNQ4_M || type == GGML_TYPE_ZNQ4_L || type == GGML_TYPE_ZNQ5_S || type == GGML_TYPE_ZNQ5_M || type == GGML_TYPE_ZNQ5_L || type == GGML_TYPE_ZNQ6_S || type == GGML_TYPE_ZNQ6_M || type == GGML_TYPE_ZNQ6_L) {
+                  type == GGML_TYPE_ZNQ3_L || type == GGML_TYPE_ZNQ4_S || type == GGML_TYPE_ZNQ4_M || type == GGML_TYPE_ZNQ4_L || type == GGML_TYPE_ZNQ5_S || type == GGML_TYPE_ZNQ5_M || type == GGML_TYPE_ZNQ5_L || type == GGML_TYPE_ZNQ6_S || type == GGML_TYPE_ZNQ6_M || type == GGML_TYPE_ZNQ6_L || type == GGML_TYPE_ZNQ7_S || type == GGML_TYPE_ZNQ7_M || type == GGML_TYPE_ZNQ7_L) {
         constexpr tile_x_sizes allocated = mmq_get_dp4a_tile_x_sizes(type, I);
         static_assert(allocated.qs == txs.qs && allocated.dm == txs.dm && allocated.sc == txs.sc,
                       "ZNQ DP4A allocation must match decoded Q8_0 tiles");
@@ -574,14 +572,14 @@ template <ggml_type type, int J, bool fallback, int bits> static __device__ __fo
             i = min(i, i_max);
         }
 
-        const block_znq * bxi = (const block_znq *) x + kbx0 + i*stride + kbx;
+        const uint8_t * bxi = (const uint8_t *) x + (kbx0 + i*stride + kbx) * block_size;
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_qs[i*sram_stride + 0             + txi] = znq_pack4_cuda<bits, false, group>((const uint8_t *) &bxi[0], 4*kqsx);
-        x_qs[i*sram_stride + MMQ_TILE_NE_K + txi] = znq_pack4_cuda<bits, false, group>((const uint8_t *) &bxi[MMQ_TILE_NE_K/QI8_0], 4*kqsx);
+        x_qs[i*sram_stride + 0             + txi] = znq_pack4_cuda<bits, false, group>(bxi, 4*kqsx);
+        x_qs[i*sram_stride + MMQ_TILE_NE_K + txi] = znq_pack4_cuda<bits, false, group>(bxi + (MMQ_TILE_NE_K/QI8_0) * block_size, 4*kqsx);
 #else
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 0             + txi] = znq_pack4_cuda<bits, false, group>((const uint8_t *) &bxi[0], 4*kqsx);
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = znq_pack4_cuda<bits, false, group>((const uint8_t *) &bxi[MMQ_TILE_NE_K/QI8_0], 4*kqsx);
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 0             + txi] = znq_pack4_cuda<bits, false, group>(bxi, 4*kqsx);
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = znq_pack4_cuda<bits, false, group>(bxi + (MMQ_TILE_NE_K/QI8_0) * block_size, 4*kqsx);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 
@@ -597,12 +595,12 @@ template <ggml_type type, int J, bool fallback, int bits> static __device__ __fo
             i = min(i, i_max);
         }
 
-        const block_znq * bxi = (const block_znq *) x + kbx0 + i*stride + kbxd;
+        const uint8_t * bxi = (const uint8_t *) x + (kbx0 + i*stride + kbxd) * block_size;
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_df[i*sram_stride                           + kbxd] = znq_scale_cuda(bxi->d);
+        x_df[i*sram_stride                           + kbxd] = znq_scale_cuda(bxi[0]);
 #else
-        x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + kbxd] = znq_scale_cuda(bxi->d);
+        x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + kbxd] = znq_scale_cuda(bxi[0]);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }

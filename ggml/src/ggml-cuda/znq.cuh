@@ -17,15 +17,15 @@ static __host__ __device__ constexpr int znq_header_cuda() {
 template <int bits, int group>
 static __device__ __forceinline__ const int8_t * znq_values_cuda() {
     if constexpr (group == 4) {
-        return bits == 2 ? kvalues_znq3_s : bits == 3 ? kvalues_znq4_s : bits == 4 ? kvalues_znq5_s : kvalues_znq6_s;
+        return bits == 2 ? kvalues_znq3_s : bits == 3 ? kvalues_znq4_s : bits == 4 ? kvalues_znq5_s : bits == 5 ? kvalues_znq6_s : kvalues_znq7_s;
     } else if constexpr (group == 8) {
-        return bits == 2 ? kvalues_znq2_l : bits == 3 ? kvalues_znq3_l : bits == 4 ? kvalues_znq4_l : bits == 5 ? kvalues_znq5_l : kvalues_znq6_l;
+        return bits == 2 ? kvalues_znq2_l : bits == 3 ? kvalues_znq3_l : bits == 4 ? kvalues_znq4_l : bits == 5 ? kvalues_znq5_l : bits == 6 ? kvalues_znq6_l : kvalues_znq7_l;
     } else if constexpr (bits == 2) {
         return kvalues_znq2_m;
     } else if constexpr (bits == 3) {
         return kvalues_znq3_m;
     } else {
-        return bits == 4 ? kvalues_znq4_m : bits == 5 ? kvalues_znq5_m : kvalues_znq6_m;
+        return bits == 4 ? kvalues_znq4_m : bits == 5 ? kvalues_znq5_m : bits == 6 ? kvalues_znq6_m : kvalues_znq7_m;
     }
 }
 
@@ -78,7 +78,12 @@ static __device__ __forceinline__ int znq_pack4_cuda(const uint8_t * block, int 
     } else if constexpr (bits >= 5) {
         const int offset = bits * j;
         const uint8_t * qs = block + znq_header_cuda<bits, group>() + offset / 8;
-        codes = (uint32_t(qs[0]) | (uint32_t(qs[1]) << 8) | (uint32_t(qs[2]) << 16)) >> (offset % 8);
+        codes = uint32_t(qs[0]) | (uint32_t(qs[1]) << 8) | (uint32_t(qs[2]) << 16);
+        if constexpr (bits == 7) {
+            codes |= uint32_t(qs[3]) << 24;
+        }
+
+        codes >>= offset % 8;
     } else {
         codes = uint32_t(block[znq_header_cuda<bits, group>() + j / 2]) | (uint32_t(block[znq_header_cuda<bits, group>() + 1 + j / 2]) << 8);
     }
