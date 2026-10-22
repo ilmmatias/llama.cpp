@@ -3249,14 +3249,20 @@ static void znq_local_scalar(int n, float * s, size_t bs, const void * vx, const
                         code = (p[(header + j / 4) * 8 + r] >> (2 * (j % 4))) & 3;
                     } else if (index_bits == 4) {
                         code = (p[8 * header + 16 * (j / 4) + 2 * r + (j % 4) / 2] >> (4 * (j % 2))) & 15;
-                    } else if (index_bits >= 6) {
-                        const uint8_t * quad = p + 8 * header + 4 * index_bits * (j / 4);
+                    } else if (index_bits == 7) {
+                        const uint8_t * codes = p + 8 * header + 28 * r;
+                        const int bit = 7 * j;
+                        code = codes[bit / 8] >> (bit % 8);
+                        if (bit % 8 + 7 > 8) {
+                            code |= unsigned(codes[bit / 8 + 1]) << (8 - bit % 8);
+                        }
+
+                        code &= 127;
+                    } else if (index_bits == 6) {
+                        const uint8_t * quad = p + 8 * header + 24 * (j / 4);
                         code = (quad[2 * r + (j % 4) / 2] >> (4 * (j % 2))) & 15;
                         code |= ((znq_local_load32(quad + 16) >> (4 * r + j % 4)) & 1) << 4;
                         code |= ((znq_local_load32(quad + 20) >> (4 * r + j % 4)) & 1) << 5;
-                        if (index_bits == 7) {
-                            code |= ((znq_local_load32(quad + 24) >> (4 * r + j % 4)) & 1) << 6;
-                        }
                     } else if (index_bits == 5) {
                         const uint8_t * quad = p + 8 * header + 20 * (j / 4);
                         code = (quad[2 * r + (j % 4) / 2] >> (4 * (j % 2))) & 15;
@@ -5146,25 +5152,7 @@ static block_znq7_mx8 make_block_znq7_mx8(const block_znq7_m * in) {
             out.header[b * 8 + r] = src[b];
         }
 
-        for (int q = 0; q < 8; ++q) {
-            uint32_t high[3];
-            memcpy(high, out.qs[q] + 16, sizeof(high));
-
-            for (int j = 0; j < 4; ++j) {
-                const int bit = 7 * (4 * q + j);
-                unsigned code = in[r].qs[bit / 8] >> (bit % 8);
-                if (bit % 8 + 7 > 8) {
-                    code |= unsigned(in[r].qs[bit / 8 + 1]) << (8 - bit % 8);
-                }
-
-                out.qs[q][2 * r + j / 2] |= (code & 15) << (4 * (j % 2));
-                high[0] |= uint32_t((code >> 4) & 1) << (4 * r + j);
-                high[1] |= uint32_t((code >> 5) & 1) << (4 * r + j);
-                high[2] |= uint32_t((code >> 6) & 1) << (4 * r + j);
-            }
-
-            memcpy(out.qs[q] + 16, high, sizeof(high));
-        }
+        memcpy(out.qs[r], in[r].qs, sizeof(in[r].qs));
     }
 
     return out;
@@ -5201,25 +5189,7 @@ static block_znq7_lx8 make_block_znq7_lx8(const block_znq7_l * in) {
             out.header[b * 8 + r] = src[b];
         }
 
-        for (int q = 0; q < 8; ++q) {
-            uint32_t high[3];
-            memcpy(high, out.qs[q] + 16, sizeof(high));
-
-            for (int j = 0; j < 4; ++j) {
-                const int bit = 7 * (4 * q + j);
-                unsigned code = in[r].qs[bit / 8] >> (bit % 8);
-                if (bit % 8 + 7 > 8) {
-                    code |= unsigned(in[r].qs[bit / 8 + 1]) << (8 - bit % 8);
-                }
-
-                out.qs[q][2 * r + j / 2] |= (code & 15) << (4 * (j % 2));
-                high[0] |= uint32_t((code >> 4) & 1) << (4 * r + j);
-                high[1] |= uint32_t((code >> 5) & 1) << (4 * r + j);
-                high[2] |= uint32_t((code >> 6) & 1) << (4 * r + j);
-            }
-
-            memcpy(out.qs[q] + 16, high, sizeof(high));
-        }
+        memcpy(out.qs[r], in[r].qs, sizeof(in[r].qs));
     }
 
     return out;

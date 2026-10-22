@@ -831,22 +831,7 @@ static bool unpack_repacked_znq_expert(const ggml_tensor * tensor, int32_t exper
                             header[j] = in.header[j * 8 + r];
                         }
 
-                        memset(b.qs, 0, sizeof(b.qs));
-
-                        for (int j = 0; j < QK_ZNQ; ++j) {
-                            const uint8_t * quad = in.qs[j / 4];
-                            uint32_t high;
-                            memcpy(&high, quad + 16, sizeof(high));
-                            uint32_t high1, high2;
-                            memcpy(&high1, quad + 20, sizeof(high1));
-                            memcpy(&high2, quad + 24, sizeof(high2));
-                            const unsigned code = ((quad[2 * r + (j % 4) / 2] >> (4 * (j % 2))) & 15) | (((high >> (4 * r + j % 4)) & 1) << 4) | (((high1 >> (4 * r + j % 4)) & 1) << 5) | (((high2 >> (4 * r + j % 4)) & 1) << 6);
-                            const int bit = 7 * j;
-                            b.qs[bit / 8] |= code << (bit % 8);
-                            if (bit % 8 > 1) {
-                                b.qs[bit / 8 + 1] |= code >> (8 - bit % 8);
-                            }
-                        }
+                        memcpy(b.qs, in.qs[r], sizeof(b.qs));
                     }
                 }
             }
@@ -873,22 +858,7 @@ static bool unpack_repacked_znq_expert(const ggml_tensor * tensor, int32_t exper
                             header[j] = in.header[j * 8 + r];
                         }
 
-                        memset(b.qs, 0, sizeof(b.qs));
-
-                        for (int j = 0; j < QK_ZNQ; ++j) {
-                            const uint8_t * quad = in.qs[j / 4];
-                            uint32_t high;
-                            memcpy(&high, quad + 16, sizeof(high));
-                            uint32_t high1, high2;
-                            memcpy(&high1, quad + 20, sizeof(high1));
-                            memcpy(&high2, quad + 24, sizeof(high2));
-                            const unsigned code = ((quad[2 * r + (j % 4) / 2] >> (4 * (j % 2))) & 15) | (((high >> (4 * r + j % 4)) & 1) << 4) | (((high1 >> (4 * r + j % 4)) & 1) << 5) | (((high2 >> (4 * r + j % 4)) & 1) << 6);
-                            const int bit = 7 * j;
-                            b.qs[bit / 8] |= code << (bit % 8);
-                            if (bit % 8 > 1) {
-                                b.qs[bit / 8 + 1] |= code >> (8 - bit % 8);
-                            }
-                        }
+                        memcpy(b.qs, in.qs[r], sizeof(b.qs));
                     }
                 }
             }

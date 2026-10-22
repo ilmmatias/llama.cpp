@@ -1354,20 +1354,25 @@ static __device__ __forceinline__ float vec_dot_iq1_m_q8_1(
     return d * ((sumi[0] + sumf[0]) * sc0 + (sumi[1] + sumf[1]) * sc1);
 }
 
-#define VDR_ZNQ2_M_Q8_1_MMVQ 8
-#define VDR_ZNQ3_M_Q8_1_MMVQ 8
-#define VDR_ZNQ4_M_Q8_1_MMVQ 8
+#define VDR_ZNQ_Q8_1_MMVQ 8
 
 template <int bits, int vdr, int group = 16>
 static __device__ __forceinline__ float vec_dot_znq_q8_1(
         const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const int & kbx, const int & iqs) {
     const uint8_t * block = (const uint8_t *) vx + kbx*(znq_header_cuda<bits, group>() + 4*bits);
-    int sum = 0;
+    constexpr int step = bits >= 6 ? 2 : 1;
+    int sum0 = 0;
+    int sum1 = 0;
 #pragma unroll
-    for (int l = 0; l < vdr; ++l) {
-        sum = ggml_cuda_dp4a(znq_pack4_cuda<bits, (vdr > 1), group>(block, 4*(iqs + l)), get_int_b2(y->qs, iqs + l), sum);
+    for (int l = 0; l < vdr; l += step) {
+        sum0 = ggml_cuda_dp4a(znq_pack4_cuda<bits, (vdr > 1), group>(block, 4*(iqs + l)), get_int_b2(y->qs, iqs + l), sum0);
+        if constexpr (bits >= 6) {
+            if (l + 1 < vdr) {
+                sum1 = ggml_cuda_dp4a(znq_pack4_cuda<bits, (vdr > 1), group>(block, 4*(iqs + l + 1)), get_int_b2(y->qs, iqs + l + 1), sum1);
+            }
+        }
     }
-    return znq_scale_cuda(block[0]) * __low2float(y->ds) * sum;
+    return znq_scale_cuda(block[0]) * __low2float(y->ds) * (sum0 + sum1);
 }
 
 #define VDR_IQ4_NL_Q8_1_MMVQ 2

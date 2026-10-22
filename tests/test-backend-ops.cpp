@@ -5585,6 +5585,8 @@ struct test_gated_delta_net_ab_fusion : public test_case {
         ggml_tensor * wa = ggml_new_tensor_2d(ctx, w_type, n_embd, M);
         ggml_tensor * wb = ggml_new_tensor_2d(ctx, beta_type, n_embd, M);
 
+        ggml_set_name(x, "x");
+
         ggml_tensor * dt = dt_per_token ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, M)
                                         : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, M);
         ggml_tensor * ssm_a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, M);
@@ -5624,6 +5626,21 @@ struct test_gated_delta_net_ab_fusion : public test_case {
                 init_tensor_uniform(t, -2.0f, 2.0f);
             } else if (strcmp(t->name, "v") == 0) {
                 init_tensor_uniform(t, -0.3f, 5.0f);
+            } else if (strcmp(t->name, "x") == 0 && (ggml_is_quantized(w_type) || ggml_is_quantized(beta_type))) {
+                init_tensor_uniform(t);
+
+                // The CPU reference quantizes activations. Use values that both Q8_0 and Q8_K represent exactly.
+                std::vector<float> data = tensor_to_float(t);
+                for (float & value : data) {
+                    value = std::round(127.0f * value) * (1.0f / 128.0f);
+                }
+
+                const size_t block_size = ggml_blck_size(GGML_TYPE_Q8_0);
+                for (size_t i = 0; i < data.size(); i += block_size) {
+                    data[i] = std::copysign(127.0f / 128.0f, data[i]);
+                }
+
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
             } else {
                 init_tensor_uniform(t);
             }
@@ -11420,9 +11437,40 @@ static const ggml_type other_types[] = {
 #pragma optimize("", off)
 #endif
 
+static void add_test_cases_mul_mat_znq(std::vector<std::unique_ptr<test_case>> & test_cases, bool perf) {
+    for (ggml_type type : {
+            GGML_TYPE_Q8_0,
+            GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L,
+            GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L,
+            GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M, GGML_TYPE_ZNQ4_L,
+            GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L,
+            GGML_TYPE_ZNQ6_S, GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L,
+            GGML_TYPE_ZNQ7_S, GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L}) {
+        for (const auto & shape : {
+                std::array<int64_t, 2>{4, 10240}, {4, 20480}, {48, 2560}, {64, 5120}, {128, 640},
+                {160, 20480}, {320, 10240}, {640, 640}, {640, 2560}, {1023, 1024}, {1024, 1024},
+                {2560, 6144}, {4096, 4096}, {10240, 320}, {20480, 160}}) {
+            for (int64_t n : {1, perf ? 512 : 17}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, shape[0], n, shape[1], {1, 1}, {1, 1}));
+            }
+        }
+
+        if (!perf) {
+            for (int64_t m : {3, 159, 255, 256, 257, 319, 320, 321}) {
+                for (int64_t n : {1, 17}) {
+                    test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, 4128, {1, 1}, {1, 1}));
+                }
+            }
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 3, 17, 4128, {2, 1}, {2, 1}));
+        }
+    }
+}
+
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    add_test_cases_mul_mat_znq(test_cases, false);
     std::default_random_engine rng(0);
 
     for (int64_t n : {1, 255, 256, 257, 513}) {
@@ -14232,6 +14280,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (auto pair : { std::make_pair(GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_M),
                        std::make_pair(GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L),
+                       std::make_pair(GGML_TYPE_ZNQ7_S, GGML_TYPE_ZNQ7_M),
+                       std::make_pair(GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L),
+                       std::make_pair(GGML_TYPE_ZNQ7_M, GGML_TYPE_Q8_0),
                        std::make_pair(GGML_TYPE_Q5_K, GGML_TYPE_Q6_K),
                        std::make_pair(GGML_TYPE_BF16, GGML_TYPE_ZNQ4_M) }) {
         for (ggml_glu_op op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI, GGML_GLU_OP_SWIGLU_CLAMP }) {
@@ -14241,9 +14292,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
-    for (ggml_type type : { GGML_TYPE_ZNQ6_L, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4 }) {
+    for (ggml_type type : { GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S, GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4 }) {
         test_cases.emplace_back(new test_gated_delta_net_ab_fusion(type, 8, 32, 4, 640,
             false, false, GGML_TYPE_ZNQ6_M));
+    }
+    for (ggml_type type : { GGML_TYPE_ZNQ7_S, GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L }) {
+        test_cases.emplace_back(new test_gated_delta_net_ab_fusion(GGML_TYPE_Q8_0, 8, 32, 1, 640,
+            false, false, type));
+        test_cases.emplace_back(new test_gated_delta_net_ab_fusion(type, 8, 32, 4, 768,
+            false, false, GGML_TYPE_Q6_K));
     }
 
     // gdn alpha/beta producer fusion
@@ -14297,6 +14354,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    add_test_cases_mul_mat_znq(test_cases, true);
 
     for (int64_t n : {256, 4096, 1048576}) {
         for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {

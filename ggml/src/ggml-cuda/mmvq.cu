@@ -60,23 +60,23 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1;
         case GGML_TYPE_IQ1_S:   return vec_dot_iq1_s_q8_1;
         case GGML_TYPE_IQ1_M:   return vec_dot_iq1_m_q8_1;
-        case GGML_TYPE_ZNQ2_M:    return vec_dot_znq_q8_1<2, VDR_ZNQ2_M_Q8_1_MMVQ>;
-        case GGML_TYPE_ZNQ2_L:    return vec_dot_znq_q8_1<2, VDR_ZNQ2_M_Q8_1_MMVQ, 8>;
-        case GGML_TYPE_ZNQ3_S:    return vec_dot_znq_q8_1<2, VDR_ZNQ2_M_Q8_1_MMVQ, 4>;
-        case GGML_TYPE_ZNQ3_M:    return vec_dot_znq_q8_1<3, VDR_ZNQ3_M_Q8_1_MMVQ>;
-        case GGML_TYPE_ZNQ3_L:    return vec_dot_znq_q8_1<3, VDR_ZNQ3_M_Q8_1_MMVQ, 8>;
-        case GGML_TYPE_ZNQ4_S:    return vec_dot_znq_q8_1<3, VDR_ZNQ3_M_Q8_1_MMVQ, 4>;
-        case GGML_TYPE_ZNQ4_M:    return vec_dot_znq_q8_1<4, VDR_ZNQ4_M_Q8_1_MMVQ>;
-        case GGML_TYPE_ZNQ4_L:    return vec_dot_znq_q8_1<4, VDR_ZNQ4_M_Q8_1_MMVQ, 8>;
-        case GGML_TYPE_ZNQ5_S:    return vec_dot_znq_q8_1<4, VDR_ZNQ4_M_Q8_1_MMVQ, 4>;
-        case GGML_TYPE_ZNQ5_M:    return vec_dot_znq_q8_1<5, VDR_ZNQ4_M_Q8_1_MMVQ>;
-        case GGML_TYPE_ZNQ5_L:    return vec_dot_znq_q8_1<5, VDR_ZNQ4_M_Q8_1_MMVQ, 8>;
-        case GGML_TYPE_ZNQ6_S:    return vec_dot_znq_q8_1<5, VDR_ZNQ4_M_Q8_1_MMVQ, 4>;
-        case GGML_TYPE_ZNQ6_M:    return vec_dot_znq_q8_1<6, VDR_ZNQ4_M_Q8_1_MMVQ>;
-        case GGML_TYPE_ZNQ6_L:    return vec_dot_znq_q8_1<6, VDR_ZNQ4_M_Q8_1_MMVQ, 8>;
-        case GGML_TYPE_ZNQ7_S:    return vec_dot_znq_q8_1<6, VDR_ZNQ4_M_Q8_1_MMVQ, 4>;
-        case GGML_TYPE_ZNQ7_M:    return vec_dot_znq_q8_1<7, VDR_ZNQ4_M_Q8_1_MMVQ>;
-        case GGML_TYPE_ZNQ7_L:    return vec_dot_znq_q8_1<7, VDR_ZNQ4_M_Q8_1_MMVQ, 8>;
+        case GGML_TYPE_ZNQ2_M:    return vec_dot_znq_q8_1<2, VDR_ZNQ_Q8_1_MMVQ>;
+        case GGML_TYPE_ZNQ2_L:    return vec_dot_znq_q8_1<2, VDR_ZNQ_Q8_1_MMVQ, 8>;
+        case GGML_TYPE_ZNQ3_S:    return vec_dot_znq_q8_1<2, VDR_ZNQ_Q8_1_MMVQ, 4>;
+        case GGML_TYPE_ZNQ3_M:    return vec_dot_znq_q8_1<3, VDR_ZNQ_Q8_1_MMVQ>;
+        case GGML_TYPE_ZNQ3_L:    return vec_dot_znq_q8_1<3, VDR_ZNQ_Q8_1_MMVQ, 8>;
+        case GGML_TYPE_ZNQ4_S:    return vec_dot_znq_q8_1<3, VDR_ZNQ_Q8_1_MMVQ, 4>;
+        case GGML_TYPE_ZNQ4_M:    return vec_dot_znq_q8_1<4, VDR_ZNQ_Q8_1_MMVQ>;
+        case GGML_TYPE_ZNQ4_L:    return vec_dot_znq_q8_1<4, VDR_ZNQ_Q8_1_MMVQ, 8>;
+        case GGML_TYPE_ZNQ5_S:    return vec_dot_znq_q8_1<4, VDR_ZNQ_Q8_1_MMVQ, 4>;
+        case GGML_TYPE_ZNQ5_M:    return vec_dot_znq_q8_1<5, VDR_ZNQ_Q8_1_MMVQ>;
+        case GGML_TYPE_ZNQ5_L:    return vec_dot_znq_q8_1<5, VDR_ZNQ_Q8_1_MMVQ, 8>;
+        case GGML_TYPE_ZNQ6_S:    return vec_dot_znq_q8_1<5, VDR_ZNQ_Q8_1_MMVQ, 4>;
+        case GGML_TYPE_ZNQ6_M:    return vec_dot_znq_q8_1<6, VDR_ZNQ_Q8_1_MMVQ>;
+        case GGML_TYPE_ZNQ6_L:    return vec_dot_znq_q8_1<6, VDR_ZNQ_Q8_1_MMVQ, 8>;
+        case GGML_TYPE_ZNQ7_S:    return vec_dot_znq_q8_1<6, VDR_ZNQ_Q8_1_MMVQ, 4>;
+        case GGML_TYPE_ZNQ7_M:    return vec_dot_znq_q8_1<7, VDR_ZNQ_Q8_1_MMVQ>;
+        case GGML_TYPE_ZNQ7_L:    return vec_dot_znq_q8_1<7, VDR_ZNQ_Q8_1_MMVQ, 8>;
         case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
         case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1;
         case GGML_TYPE_IQ3_S:   return vec_dot_iq3_s_q8_1;
@@ -105,23 +105,23 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_IQ2_S:   return VDR_IQ2_S_Q8_1_MMVQ;
         case GGML_TYPE_IQ3_XXS: return VDR_IQ3_XXS_Q8_1_MMVQ;
         case GGML_TYPE_IQ3_S:   return VDR_IQ3_S_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ2_M:    return VDR_ZNQ2_M_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ2_L:    return VDR_ZNQ2_M_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ3_S:    return VDR_ZNQ2_M_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ3_M:    return VDR_ZNQ3_M_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ3_L:    return VDR_ZNQ3_M_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ4_S:    return VDR_ZNQ3_M_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ4_M:    return VDR_ZNQ4_M_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ4_L:    return VDR_ZNQ4_M_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ5_S:    return VDR_ZNQ4_M_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ5_M:    return VDR_ZNQ4_M_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ5_L:    return VDR_ZNQ4_M_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ6_S:    return VDR_ZNQ4_M_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ6_M:    return VDR_ZNQ4_M_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ6_L:    return VDR_ZNQ4_M_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ7_S:    return VDR_ZNQ4_M_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ7_M:    return VDR_ZNQ4_M_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ7_L:    return VDR_ZNQ4_M_Q8_1_MMVQ;
+        case GGML_TYPE_ZNQ2_M:    return VDR_ZNQ_Q8_1_MMVQ;
+        case GGML_TYPE_ZNQ2_L:    return VDR_ZNQ_Q8_1_MMVQ;
+        case GGML_TYPE_ZNQ3_S:    return VDR_ZNQ_Q8_1_MMVQ;
+        case GGML_TYPE_ZNQ3_M:    return VDR_ZNQ_Q8_1_MMVQ;
+        case GGML_TYPE_ZNQ3_L:    return VDR_ZNQ_Q8_1_MMVQ;
+        case GGML_TYPE_ZNQ4_S:    return VDR_ZNQ_Q8_1_MMVQ;
+        case GGML_TYPE_ZNQ4_M:    return VDR_ZNQ_Q8_1_MMVQ;
+        case GGML_TYPE_ZNQ4_L:    return VDR_ZNQ_Q8_1_MMVQ;
+        case GGML_TYPE_ZNQ5_S:    return VDR_ZNQ_Q8_1_MMVQ;
+        case GGML_TYPE_ZNQ5_M:    return VDR_ZNQ_Q8_1_MMVQ;
+        case GGML_TYPE_ZNQ5_L:    return VDR_ZNQ_Q8_1_MMVQ;
+        case GGML_TYPE_ZNQ6_S:    return VDR_ZNQ_Q8_1_MMVQ;
+        case GGML_TYPE_ZNQ6_M:    return VDR_ZNQ_Q8_1_MMVQ;
+        case GGML_TYPE_ZNQ6_L:    return VDR_ZNQ_Q8_1_MMVQ;
+        case GGML_TYPE_ZNQ7_S:
+        case GGML_TYPE_ZNQ7_M:
+        case GGML_TYPE_ZNQ7_L:    return VDR_ZNQ_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_NL:  return VDR_IQ4_NL_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_XS:  return VDR_IQ4_XS_Q8_1_MMVQ;
         default:                return 1;
@@ -1684,6 +1684,9 @@ static __device__ __forceinline__ float mmvq_glu_dot(
         case GGML_TYPE_ZNQ6_S: return mmvq_glu_dot<GGML_TYPE_ZNQ6_S>(w, xq, K);
         case GGML_TYPE_ZNQ6_M: return mmvq_glu_dot<GGML_TYPE_ZNQ6_M>(w, xq, K);
         case GGML_TYPE_ZNQ6_L: return mmvq_glu_dot<GGML_TYPE_ZNQ6_L>(w, xq, K);
+        case GGML_TYPE_ZNQ7_S: return mmvq_glu_dot<GGML_TYPE_ZNQ7_S>(w, xq, K);
+        case GGML_TYPE_ZNQ7_M: return mmvq_glu_dot<GGML_TYPE_ZNQ7_M>(w, xq, K);
+        case GGML_TYPE_ZNQ7_L: return mmvq_glu_dot<GGML_TYPE_ZNQ7_L>(w, xq, K);
         case GGML_TYPE_IQ4_NL: return mmvq_glu_dot<GGML_TYPE_IQ4_NL>(w, xq, K);
         case GGML_TYPE_IQ4_XS: return mmvq_glu_dot<GGML_TYPE_IQ4_XS>(w, xq, K);
         case GGML_TYPE_IQ3_S: return mmvq_glu_dot<GGML_TYPE_IQ3_S>(w, xq, K);
@@ -1727,6 +1730,9 @@ bool ggml_cuda_mmvq_supported_type(ggml_type type) {
         case GGML_TYPE_ZNQ6_S:
         case GGML_TYPE_ZNQ6_M:
         case GGML_TYPE_ZNQ6_L:
+        case GGML_TYPE_ZNQ7_S:
+        case GGML_TYPE_ZNQ7_M:
+        case GGML_TYPE_ZNQ7_L:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:

@@ -1098,7 +1098,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
-template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool force_stream_k = false>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1), ggml_cuda_mmq_get_occupancy(type, J, fallback, prec_src1))
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
@@ -1126,7 +1126,7 @@ static __global__ void mul_mat_q(
 
     extern __shared__ int ids_dst_shared[]; // Stored at beginning of shared memory.
 
-    if constexpr (!ggml_cuda_mmq_get_stream_k(type, J, fallback, prec_src1)) {
+    if constexpr (!force_stream_k && !ggml_cuda_mmq_get_stream_k(type, J, fallback, prec_src1)) {
         int wt;
         int zt;
         int jt;
@@ -1616,7 +1616,7 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
-template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool force_stream_k = false>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
@@ -1624,18 +1624,31 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
 
     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
+
+    if constexpr (!force_stream_k && (type == GGML_TYPE_Q8_0 || (type >= GGML_TYPE_ZNQ2_M && type <= GGML_TYPE_ZNQ7_L))) {
+        const int64_t ntiles = ((args.nrows_x + config.I - 1) / config.I) * ((args.ncols_max + config.J - 1) / config.J) * args.nchannels_y * args.nsamples_y;
+
+        // Split long reductions when output tiling leaves compute units idle.
+        if (GGML_CUDA_CC_IS_RDNA2(cc) && !config.stream_k && !args.ids_dst &&
+                args.ncols_x >= 1024 && ntiles < nsm) {
+            launch_mul_mat_q<type, J, fallback, prec_src1, true>(ctx, args, stream);
+            return;
+        }
+    }
+
+    const bool stream_k = force_stream_k || config.stream_k;
     GGML_ASSERT(config.nthreads % warp_size == 0);
     const int nwarps = config.nthreads / warp_size;
     const int nbytes_shared = mmq_get_nbytes_shared(config, cc);
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false, prec_src1>), nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, prec_src1>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false, prec_src1, force_stream_k>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, prec_src1, force_stream_k>), nbytes_shared);
 
     const int nty = (args.nrows_x + config.I - 1) / config.I;
 
-    const bool compact_routed_tiles = args.ids_dst != nullptr && !config.stream_k;
+    const bool compact_routed_tiles = args.ids_dst != nullptr && !stream_k;
     const int ntx = compact_routed_tiles
         ? (args.ncols_y + config.J - 1) / config.J + args.nchannels_y - 1
         : (args.ncols_max + config.J - 1) / config.J;
@@ -1654,7 +1667,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
-    if (!config.stream_k) {
+    if (!stream_k) {
         ggml_cuda_pool_alloc<int32_t> block_start(ctx.pool(id));
         ggml_cuda_pool_alloc<int32_t> block_expert(ctx.pool(id));
         int n_experts = 0;
@@ -1670,7 +1683,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
             CUDA_CHECK(cudaGetLastError());
         }
 
-        mul_mat_q<type, J, fallback, prec_src1><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+        mul_mat_q<type, J, fallback, prec_src1, force_stream_k><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
@@ -1684,7 +1697,10 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int ntiles_dst = ntx * nty * ntzw;
     const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
     const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
+    const int blocks_per_tile = (args.ncols_x + config.K_vram - 1) / config.K_vram;
+    const int nblocks_stream_k = force_stream_k ? std::min(nsm, ntiles_dst*blocks_per_tile) :
+        (GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm);
+    const dim3 block_nums_stream_k(nblocks_stream_k, 1, 1);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
@@ -1699,7 +1715,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, 1);
     const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
 
-    mul_mat_q<type, J, fallback, prec_src1><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+    mul_mat_q<type, J, fallback, prec_src1, force_stream_k><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
         (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,

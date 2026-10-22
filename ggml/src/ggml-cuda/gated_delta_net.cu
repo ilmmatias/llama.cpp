@@ -633,7 +633,7 @@ static __global__ void k_gdn_ab_mul_mat(
     } else if constexpr (weight_type == GGML_TYPE_Q8_0) {
         sum = gdn_ab_dot<block_q8_0>(w, xn, K);
     } else {
-        __shared__ float tile[(block_size/32)*QK_K];
+        extern __shared__ float tile[];
         const ggml_type type = is_beta ? type_beta : type_alpha;
         switch (type) {
             case GGML_TYPE_F32:  sum = gdn_ab_dot<float>(w, xn, K);         break;
@@ -660,6 +660,9 @@ static __global__ void k_gdn_ab_mul_mat(
             case GGML_TYPE_ZNQ6_S: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<5, 4>>(w, xn, K); break;
             case GGML_TYPE_ZNQ6_M: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<6, 16>>(w, xn, K); break;
             case GGML_TYPE_ZNQ6_L: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<6, 8>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ7_S: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<6, 4>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ7_M: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<7, 16>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ7_L: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<7, 8>>(w, xn, K); break;
             case GGML_TYPE_Q2_K: sum = gdn_ab_dot_kq<dequantize_q2_K, 64>(w, xn, K, tile); break;
             case GGML_TYPE_Q3_K: sum = gdn_ab_dot_kq<dequantize_q3_K, 64>(w, xn, K, tile); break;
             case GGML_TYPE_Q4_K: sum = gdn_ab_dot_kq<dequantize_q4_K, 32>(w, xn, K, tile); break;
@@ -721,6 +724,9 @@ bool ggml_cuda_gated_delta_net_ab_supported_type(ggml_type type) {
         case GGML_TYPE_ZNQ6_S:
         case GGML_TYPE_ZNQ6_M:
         case GGML_TYPE_ZNQ6_L:
+        case GGML_TYPE_ZNQ7_S:
+        case GGML_TYPE_ZNQ7_M:
+        case GGML_TYPE_ZNQ7_L:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
@@ -760,7 +766,12 @@ void ggml_cuda_op_gated_delta_net_ab(ggml_backend_cuda_context & ctx, const ggml
         }
     }
 
-    const ggml_cuda_kernel_launch_params params(dim3(M, N, 2), dim3(block_size, 1, 1), 0, ctx.stream());
+    const auto uses_tile = [](ggml_type type) {
+        return ggml_blck_size(type) == QK_K || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_MXFP4;
+    };
+    const size_t shared_mem = uses_tile(ab.alpha_mm->src[0]->type) || uses_tile(ab.beta_mm->src[0]->type) ?
+        (block_size/32)*QK_K*sizeof(float) : 0;
+    const ggml_cuda_kernel_launch_params params(dim3(M, N, 2), dim3(block_size, 1, 1), shared_mem, ctx.stream());
     ggml_cuda_kernel_launch(kernel, params,
         (const float *) ab.alpha_mm->src[1]->data,
         ab.alpha_mm->src[0]->data, ab.beta_mm->src[0]->data,
