@@ -5309,33 +5309,31 @@ static void quantize_row_znq_ref_impl(const float * GGML_RESTRICT x, void * GGML
             scale = znq_ufp8_to_fp32(sc);
         }
 
-        if (bits != 4) {
-            uint8_t best_sc = sc;
-            double best_err = znq_encode_block(xb, bits, scale, q, NULL, NULL, weight);
-            for (int delta = 1; delta <= ZNQ_SCALE_SEARCH_RADIUS; ++delta) {
-                const int lower = (int) sc - delta;
-                if (lower > 0) {
-                    const float candidate_scale = znq_ufp8_to_fp32((uint8_t) lower);
-                    const double err = znq_encode_block(xb, bits, candidate_scale, q, NULL, NULL, weight);
-                    if (err < best_err) {
-                        best_err = err;
-                        best_sc = (uint8_t) lower;
-                    }
-                }
-
-                const int upper = (int) sc + delta;
-                if (upper <= UINT8_MAX) {
-                    const float candidate_scale = znq_ufp8_to_fp32((uint8_t) upper);
-                    const double err = znq_encode_block(xb, bits, candidate_scale, q, NULL, NULL, weight);
-                    if (err < best_err) {
-                        best_err = err;
-                        best_sc = (uint8_t) upper;
-                    }
+        uint8_t best_sc = sc;
+        double best_err = znq_encode_block(xb, bits, scale, q, NULL, NULL, weight);
+        for (int delta = 1; delta <= ZNQ_SCALE_SEARCH_RADIUS; ++delta) {
+            const int lower = (int) sc - delta;
+            if (lower > 0) {
+                const float candidate_scale = znq_ufp8_to_fp32((uint8_t) lower);
+                const double err = znq_encode_block(xb, bits, candidate_scale, q, NULL, NULL, weight);
+                if (err < best_err) {
+                    best_err = err;
+                    best_sc = (uint8_t) lower;
                 }
             }
-            sc = best_sc;
-            scale = znq_ufp8_to_fp32(sc);
+
+            const int upper = (int) sc + delta;
+            if (upper <= UINT8_MAX) {
+                const float candidate_scale = znq_ufp8_to_fp32((uint8_t) upper);
+                const double err = znq_encode_block(xb, bits, candidate_scale, q, NULL, NULL, weight);
+                if (err < best_err) {
+                    best_err = err;
+                    best_sc = (uint8_t) upper;
+                }
+            }
         }
+        sc = best_sc;
+        scale = znq_ufp8_to_fp32(sc);
 
         uint8_t books;
         uint8_t codes[QK_ZNQ];
