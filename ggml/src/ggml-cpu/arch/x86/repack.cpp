@@ -8930,10 +8930,15 @@ static void znq_gemm_tile(const ggml_znq_gemm_panel * panel, const block_q8_0x4 
     }
 
     for (int ib = 0; ib < count; ++ib) {
-        __m512i dl0 = _mm512_setzero_si512(), dl1 = _mm512_setzero_si512();
-        __m512i dl2 = _mm512_setzero_si512(), dl3 = _mm512_setzero_si512();
-        __m512i dr0 = _mm512_setzero_si512(), dr1 = _mm512_setzero_si512();
-        __m512i dr2 = _mm512_setzero_si512(), dr3 = _mm512_setzero_si512();
+        // Seed the weight-bias correction once per activation row, not per output half.
+        // Each dot is sum((w + 128)*a) - 128*sum(a).
+        const __m512i zero = _mm512_setzero_si512();
+        __m512i dl0 = _mm512_sub_epi32(zero, _mm512_set1_epi32(sums[ib]));
+        __m512i dl1 = _mm512_sub_epi32(zero, _mm512_set1_epi32(sums[sum_stride + ib]));
+        __m512i dl2 = _mm512_sub_epi32(zero, _mm512_set1_epi32(sums[2 * sum_stride + ib]));
+        __m512i dl3 = _mm512_sub_epi32(zero, _mm512_set1_epi32(sums[3 * sum_stride + ib]));
+        __m512i dr0 = dl0, dr1 = dl1;
+        __m512i dr2 = dl2, dr3 = dl3;
 
         for (int q = 0; q < 8; ++q) {
             const __m512i w0 = _mm512_loadu_si512(panel[ib].weights[0][q]);
@@ -8955,25 +8960,21 @@ static void znq_gemm_tile(const ggml_znq_gemm_panel * panel, const block_q8_0x4 
             }
         }
 
-        const __m512i c0 = _mm512_set1_epi32(sums[ib]);
-        const __m512i c1 = _mm512_set1_epi32(sums[sum_stride + ib]);
-        const __m512i c2 = _mm512_set1_epi32(sums[2 * sum_stride + ib]);
-        const __m512i c3 = _mm512_set1_epi32(sums[3 * sum_stride + ib]);
         const __m512 ad0 = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a[ib].d[0]));
         const __m512 ad1 = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a[ib].d[1]));
         const __m512 ad2 = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a[ib].d[2]));
         const __m512 ad3 = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a[ib].d[3]));
         const __m512 wd0 = _mm512_loadu_ps(panel[ib].scale[0]);
-        l0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(dl0, c0)), _mm512_mul_ps(wd0, ad0), l0);
-        l1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(dl1, c1)), _mm512_mul_ps(wd0, ad1), l1);
-        l2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(dl2, c2)), _mm512_mul_ps(wd0, ad2), l2);
-        l3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(dl3, c3)), _mm512_mul_ps(wd0, ad3), l3);
+        l0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dl0), _mm512_mul_ps(wd0, ad0), l0);
+        l1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dl1), _mm512_mul_ps(wd0, ad1), l1);
+        l2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dl2), _mm512_mul_ps(wd0, ad2), l2);
+        l3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dl3), _mm512_mul_ps(wd0, ad3), l3);
         if constexpr (two_tiles) {
             const __m512 wd1 = _mm512_loadu_ps(panel[ib].scale[1]);
-            r0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(dr0, c0)), _mm512_mul_ps(wd1, ad0), r0);
-            r1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(dr1, c1)), _mm512_mul_ps(wd1, ad1), r1);
-            r2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(dr2, c2)), _mm512_mul_ps(wd1, ad2), r2);
-            r3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(dr3, c3)), _mm512_mul_ps(wd1, ad3), r3);
+            r0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dr0), _mm512_mul_ps(wd1, ad0), r0);
+            r1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dr1), _mm512_mul_ps(wd1, ad1), r1);
+            r2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dr2), _mm512_mul_ps(wd1, ad2), r2);
+            r3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dr3), _mm512_mul_ps(wd1, ad3), r3);
         }
     }
 
