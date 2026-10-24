@@ -2,9 +2,11 @@
 #include "common.h"
 #include "download.h"
 #include "llama.h"
+#include "ngram-cache.h"
 #include "speculative.h"
 
 #include <cmath>
+#include <filesystem>
 #include <limits>
 #include <string>
 #include <vector>
@@ -155,6 +157,53 @@ static void test(void) {
         common_speculative_draft(drafter.get());
 
         assert(result2.empty());
+    }
+
+    // Dynamic-cache persistence must include completed requests without leaking them into later drafts.
+    for (bool existing : { false, true }) {
+        const auto path = std::filesystem::temp_directory_path() /
+                ("test-arg-parser-ngram-cache-" + std::to_string(ggml_time_us()) + ".bin");
+        assert(!std::filesystem::exists(path));
+
+        common_ngram_cache expected;
+        if (existing) {
+            llama_tokens seed = { 901, 902, 903, 904, 905, 906 };
+            common_ngram_cache_update(expected, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, seed, seed.size(), false);
+            common_ngram_cache_save(expected, path.string());
+        }
+
+        common_params_speculative spec;
+        spec.types = { COMMON_SPECULATIVE_TYPE_NGRAM_CACHE };
+        spec.ngram_cache.lookup_cache_dynamic = path.string();
+
+        {
+            common_speculative_ptr drafter(common_speculative_init(spec, 2));
+            assert(drafter != nullptr);
+
+            auto request = [&](llama_seq_id seq_id, llama_tokens prompt, llama_token id_last) {
+                common_speculative_begin(drafter.get(), seq_id, prompt);
+                llama_tokens result;
+                auto & dp = common_speculative_get_draft_params(drafter.get(), seq_id);
+                dp.drafting = true;
+                dp.prompt   = &prompt;
+                dp.id_last  = id_last;
+                dp.result   = &result;
+                common_speculative_draft(drafter.get());
+                dp.drafting = false;
+
+                prompt.push_back(id_last);
+                common_ngram_cache_update(expected, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, prompt, prompt.size(), false);
+                return result;
+            };
+
+            request(0, { 101, 102, 103, 104, 105, 106 }, 107);
+            assert(request(0, { 100, 104, 105 }, 106).empty());
+            request(1, { 201, 202, 203, 204, 205, 206 }, 207);
+            assert(request(1, { 200, 204, 205 }, 206).empty());
+        }
+
+        assert(common_ngram_cache_load(path.string()) == expected);
+        assert(std::filesystem::remove(path));
     }
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");

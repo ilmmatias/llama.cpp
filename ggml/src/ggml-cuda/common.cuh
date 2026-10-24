@@ -1666,15 +1666,10 @@ struct ggml_cuda_graph {
 #endif
 #ifdef USE_CUDA_GRAPH
     void reset() {
-        if (instance != nullptr) {
+        for (cudaGraphExec_t instance : instances) {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
-            instance = nullptr;
         }
-
-        if (graph != nullptr) {
-            CUDA_CHECK(cudaGraphDestroy(graph));
-            graph = nullptr;
-        }
+        instances.clear();
 
         warmup_complete = false;
 #ifdef GGML_HIP_RTC
@@ -1686,8 +1681,8 @@ struct ggml_cuda_graph {
         reset();
     }
 
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t instance = nullptr;
+    // Capture chunks separately so execution can overlap enqueueing the next chunk.
+    std::vector<cudaGraphExec_t> instances;
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
@@ -1795,7 +1790,7 @@ struct ggml_backend_cuda_context {
     // Check if any CUDA graph has an instance for this context
     bool any_cuda_graph_has_instance() const {
         for (const auto & [key, graph] : cuda_graphs) {
-            if (graph && graph->instance != nullptr) {
+            if (graph && !graph->instances.empty()) {
                 return true;
             }
         }

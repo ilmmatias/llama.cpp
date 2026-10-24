@@ -986,11 +986,15 @@ struct rtc_compiler_program {
     }
 };
 
+struct rtc_compiler;
+
 struct ggml_cuda_rtc_fusion {
     std::string target;
     ggml_fusion_cache_key identity;
     bool ready = false;
     bool initialization_attempted = false;
+
+    std::shared_ptr<rtc_compiler> compiler;
 
     int physical_device = -1;
     std::unordered_map<ggml_fusion_cache_key, std::shared_ptr<rtc_module>, rtc_key_hash, rtc_key_equal> cache;
@@ -1338,7 +1342,7 @@ bool ggml_cuda_rtc_fusion_prepare(ggml_backend_cuda_context & ctx, const ggml_cg
         return false;
     }
 
-    if (!capture_graph || !capture_graph->instance) {
+    if (!capture_graph || capture_graph->instances.empty()) {
         if (!rtc_reserve(ctx, state.bindings, plan->actions.size())) {
             state.direct_plan.reset();
             return false;
@@ -1626,12 +1630,6 @@ struct rtc_compiler {
         {
             std::lock_guard<std::mutex> lock(rtc_artifact_mutex);
             stopping = true;
-            for (auto & job : jobs) {
-                job.artifact->state.store(GGML_CUDA_RTC_COMPILE_FAILED, std::memory_order_release);
-                job.artifact->changed.notify_all();
-            }
-
-            jobs.clear();
         }
 
         changed.notify_one();
@@ -1642,7 +1640,7 @@ struct rtc_compiler {
         for (;;) {
             std::unique_lock<std::mutex> lock(rtc_artifact_mutex);
             changed.wait(lock, [&] { return stopping || !jobs.empty(); });
-            if (stopping) {
+            if (stopping && jobs.empty()) {
                 return;
             }
 
@@ -1679,12 +1677,16 @@ static bool rtc_async() {
     return enabled;
 }
 
-static std::shared_ptr<const rtc_artifact> rtc_artifact_get(const ggml_cuda_rtc_fusion & state,
+static std::shared_ptr<const rtc_artifact> rtc_artifact_get(ggml_cuda_rtc_fusion & state,
                                                           const ggml_fusion_cache_key & key,
                                                           const ggml_fusion_program & program,
                                                           const ggml_fusion_schedule & schedule,
                                                           bool & retry) {
     std::unique_lock<std::mutex> lock(rtc_artifact_mutex);
+    static std::weak_ptr<rtc_compiler> shared_compiler;
+    if (!state.compiler) {
+        state.compiler = shared_compiler.lock();
+    }
     auto found = rtc_artifacts.find(key);
     std::shared_ptr<rtc_artifact> artifact;
     if (found != rtc_artifacts.end()) {
@@ -1694,7 +1696,11 @@ static std::shared_ptr<const rtc_artifact> rtc_artifact_get(const ggml_cuda_rtc_
             return nullptr;
         }
 
-        static rtc_compiler compiler;
+        if (!state.compiler) {
+            state.compiler = std::make_shared<rtc_compiler>();
+            shared_compiler = state.compiler;
+        }
+        auto & compiler = *state.compiler;
         if (compiler.jobs.size() >= rtc_compiler::max_pending) {
             retry = true;
             return nullptr;

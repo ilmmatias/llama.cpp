@@ -38,6 +38,24 @@ static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
+// RDNA2 local-book formats use different dot widths to balance unpacking and register pressure.
+static constexpr __host__ __device__ int get_vdr_znq_rdna2(ggml_type type, int fallback = VDR_ZNQ_Q8_1_MMVQ) {
+    switch (type) {
+        case GGML_TYPE_ZNQ6_M: return 2;
+        case GGML_TYPE_ZNQ6_L: return 4;
+        default: return fallback;
+    }
+}
+
+static constexpr __host__ __device__ int get_vdr_znq(ggml_type type) {
+#if defined(RDNA2)
+    return get_vdr_znq_rdna2(type);
+#else
+    GGML_UNUSED(type);
+    return VDR_ZNQ_Q8_1_MMVQ;
+#endif
+}
+
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
@@ -60,23 +78,23 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1;
         case GGML_TYPE_IQ1_S:   return vec_dot_iq1_s_q8_1;
         case GGML_TYPE_IQ1_M:   return vec_dot_iq1_m_q8_1;
-        case GGML_TYPE_ZNQ2_M:    return vec_dot_znq_q8_1<2, VDR_ZNQ_Q8_1_MMVQ>;
-        case GGML_TYPE_ZNQ2_L:    return vec_dot_znq_q8_1<2, VDR_ZNQ_Q8_1_MMVQ, 8>;
-        case GGML_TYPE_ZNQ3_S:    return vec_dot_znq_q8_1<2, VDR_ZNQ_Q8_1_MMVQ, 4>;
-        case GGML_TYPE_ZNQ3_M:    return vec_dot_znq_q8_1<3, VDR_ZNQ_Q8_1_MMVQ>;
-        case GGML_TYPE_ZNQ3_L:    return vec_dot_znq_q8_1<3, VDR_ZNQ_Q8_1_MMVQ, 8>;
-        case GGML_TYPE_ZNQ4_S:    return vec_dot_znq_q8_1<3, VDR_ZNQ_Q8_1_MMVQ, 4>;
-        case GGML_TYPE_ZNQ4_M:    return vec_dot_znq_q8_1<4, VDR_ZNQ_Q8_1_MMVQ>;
-        case GGML_TYPE_ZNQ4_L:    return vec_dot_znq_q8_1<4, VDR_ZNQ_Q8_1_MMVQ, 8>;
-        case GGML_TYPE_ZNQ5_S:    return vec_dot_znq_q8_1<4, VDR_ZNQ_Q8_1_MMVQ, 4>;
-        case GGML_TYPE_ZNQ5_M:    return vec_dot_znq_q8_1<5, VDR_ZNQ_Q8_1_MMVQ>;
-        case GGML_TYPE_ZNQ5_L:    return vec_dot_znq_q8_1<5, VDR_ZNQ_Q8_1_MMVQ, 8>;
-        case GGML_TYPE_ZNQ6_S:    return vec_dot_znq_q8_1<5, VDR_ZNQ_Q8_1_MMVQ, 4>;
-        case GGML_TYPE_ZNQ6_M:    return vec_dot_znq_q8_1<6, VDR_ZNQ_Q8_1_MMVQ>;
-        case GGML_TYPE_ZNQ6_L:    return vec_dot_znq_q8_1<6, VDR_ZNQ_Q8_1_MMVQ, 8>;
-        case GGML_TYPE_ZNQ7_S:    return vec_dot_znq_q8_1<6, VDR_ZNQ_Q8_1_MMVQ, 4>;
-        case GGML_TYPE_ZNQ7_M:    return vec_dot_znq_q8_1<7, VDR_ZNQ_Q8_1_MMVQ>;
-        case GGML_TYPE_ZNQ7_L:    return vec_dot_znq_q8_1<7, VDR_ZNQ_Q8_1_MMVQ, 8>;
+        case GGML_TYPE_ZNQ2_M:    return vec_dot_znq_q8_1<2, get_vdr_znq(GGML_TYPE_ZNQ2_M)>;
+        case GGML_TYPE_ZNQ2_L:    return vec_dot_znq_q8_1<2, get_vdr_znq(GGML_TYPE_ZNQ2_L), 8>;
+        case GGML_TYPE_ZNQ3_S:    return vec_dot_znq_q8_1<2, get_vdr_znq(GGML_TYPE_ZNQ3_S), 4>;
+        case GGML_TYPE_ZNQ3_M:    return vec_dot_znq_q8_1<3, get_vdr_znq(GGML_TYPE_ZNQ3_M)>;
+        case GGML_TYPE_ZNQ3_L:    return vec_dot_znq_q8_1<3, get_vdr_znq(GGML_TYPE_ZNQ3_L), 8>;
+        case GGML_TYPE_ZNQ4_S:    return vec_dot_znq_q8_1<3, get_vdr_znq(GGML_TYPE_ZNQ4_S), 4>;
+        case GGML_TYPE_ZNQ4_M:    return vec_dot_znq_q8_1<4, get_vdr_znq(GGML_TYPE_ZNQ4_M)>;
+        case GGML_TYPE_ZNQ4_L:    return vec_dot_znq_q8_1<4, get_vdr_znq(GGML_TYPE_ZNQ4_L), 8>;
+        case GGML_TYPE_ZNQ5_S:    return vec_dot_znq_q8_1<4, get_vdr_znq(GGML_TYPE_ZNQ5_S), 4>;
+        case GGML_TYPE_ZNQ5_M:    return vec_dot_znq_q8_1<5, get_vdr_znq(GGML_TYPE_ZNQ5_M)>;
+        case GGML_TYPE_ZNQ5_L:    return vec_dot_znq_q8_1<5, get_vdr_znq(GGML_TYPE_ZNQ5_L), 8>;
+        case GGML_TYPE_ZNQ6_S:    return vec_dot_znq_q8_1<5, get_vdr_znq(GGML_TYPE_ZNQ6_S), 4>;
+        case GGML_TYPE_ZNQ6_M:    return vec_dot_znq_q8_1<6, get_vdr_znq(GGML_TYPE_ZNQ6_M)>;
+        case GGML_TYPE_ZNQ6_L:    return vec_dot_znq_q8_1<6, get_vdr_znq(GGML_TYPE_ZNQ6_L), 8>;
+        case GGML_TYPE_ZNQ7_S:    return vec_dot_znq_q8_1<6, get_vdr_znq(GGML_TYPE_ZNQ7_S), 4>;
+        case GGML_TYPE_ZNQ7_M:    return vec_dot_znq_q8_1<7, get_vdr_znq(GGML_TYPE_ZNQ7_M)>;
+        case GGML_TYPE_ZNQ7_L:    return vec_dot_znq_q8_1<7, get_vdr_znq(GGML_TYPE_ZNQ7_L), 8>;
         case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
         case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1;
         case GGML_TYPE_IQ3_S:   return vec_dot_iq3_s_q8_1;
@@ -105,23 +123,23 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_IQ2_S:   return VDR_IQ2_S_Q8_1_MMVQ;
         case GGML_TYPE_IQ3_XXS: return VDR_IQ3_XXS_Q8_1_MMVQ;
         case GGML_TYPE_IQ3_S:   return VDR_IQ3_S_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ2_M:    return VDR_ZNQ_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ2_L:    return VDR_ZNQ_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ3_S:    return VDR_ZNQ_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ3_M:    return VDR_ZNQ_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ3_L:    return VDR_ZNQ_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ4_S:    return VDR_ZNQ_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ4_M:    return VDR_ZNQ_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ4_L:    return VDR_ZNQ_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ5_S:    return VDR_ZNQ_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ5_M:    return VDR_ZNQ_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ5_L:    return VDR_ZNQ_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ6_S:    return VDR_ZNQ_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ6_M:    return VDR_ZNQ_Q8_1_MMVQ;
-        case GGML_TYPE_ZNQ6_L:    return VDR_ZNQ_Q8_1_MMVQ;
+        case GGML_TYPE_ZNQ2_M:
+        case GGML_TYPE_ZNQ2_L:
+        case GGML_TYPE_ZNQ3_S:
+        case GGML_TYPE_ZNQ3_M:
+        case GGML_TYPE_ZNQ3_L:
+        case GGML_TYPE_ZNQ4_S:
+        case GGML_TYPE_ZNQ4_M:
+        case GGML_TYPE_ZNQ4_L:
+        case GGML_TYPE_ZNQ5_S:
+        case GGML_TYPE_ZNQ5_M:
+        case GGML_TYPE_ZNQ5_L:
+        case GGML_TYPE_ZNQ6_S:
+        case GGML_TYPE_ZNQ6_M:
+        case GGML_TYPE_ZNQ6_L:
         case GGML_TYPE_ZNQ7_S:
         case GGML_TYPE_ZNQ7_M:
-        case GGML_TYPE_ZNQ7_L:    return VDR_ZNQ_Q8_1_MMVQ;
+        case GGML_TYPE_ZNQ7_L:    return get_vdr_znq(type);
         case GGML_TYPE_IQ4_NL:  return VDR_IQ4_NL_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_XS:  return VDR_IQ4_XS_Q8_1_MMVQ;
         default:                return 1;
@@ -509,10 +527,12 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     } else if (table_id == MMVQ_PARAMETERS_GCN) {
         switch (ncols_dst) {
             case 1:
+                return 2;
             case 2:
             case 3:
+                return type == GGML_TYPE_Q3_K ? 1 : 2;
             case 4:
-                return 2;
+                return type == GGML_TYPE_Q6_K? 1 : 2;
             case 5:
             case 6:
             case 7:
@@ -625,14 +645,34 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+// Low bit types load few weight bytes per thread, a second row per block shares the q8_1 loads and adds memory parallelism.
+static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_RDNA2 && ncols_dst == 1 && small_k) {
         return 4;
     }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
-                return small_k ? nwarps : 1;
+                if (small_k) {
+                    return nwarps;
+                }
+                if (table_id == MMVQ_PARAMETERS_GB10) {
+                    return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_S ? 2 : 1;
+                }
+                return table_id == MMVQ_PARAMETERS_GENERIC && mmvq_two_rows_ncols1(type) ? 2 : 1;
             case 2:
             case 3:
             case 4:
@@ -667,7 +707,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     // a gate costs a second dot product and reduction buffer per column, so wider kernels fuse only the epilogue
@@ -786,7 +826,8 @@ static __global__ void mul_mat_vec_q(
 #if __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
         // start the next iterations' weight loads early
         if constexpr (mmvq_should_prefetch(type)) {
-            constexpr int pf_dist = 2; // loop iterations, not blocks
+            // loop iterations, not blocks; q3_K and q6_K keep the distance in blocks they had with vdr 1
+            constexpr int pf_dist = type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q6_K ? 1 : 2;
             const int kbx_pf = kbx + pf_dist*blocks_per_iter;
             if (kbx_pf < blocks_per_row_x) {
 #pragma unroll
@@ -1078,7 +1119,7 @@ static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -1177,11 +1218,16 @@ static void mul_mat_vec_q_switch_ncols_dst(
     // How the K loop divides up at the baseline block width, both decisions below use these.
     constexpr int qk                    = ggml_cuda_type_traits<type>::qk;
     constexpr int qi                    = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr                   = get_vdr_mmvq(type);
+    const int vdr = GGML_CUDA_CC_IS_RDNA2(cc) ? get_vdr_znq_rdna2(type, get_vdr_mmvq(type)) : get_vdr_mmvq(type);
     const int     blocks_per_row_x      = ncols_x / qk;
     const int     blocks_per_iter_1warp = vdr * warp_size / qi;
 
     const auto should_use_small_k = [&](int c_ncols_dst) {
+        if (table_id == MMVQ_PARAMETERS_RDNA2 && c_ncols_dst == 1 &&
+                (type == GGML_TYPE_ZNQ4_L || type == GGML_TYPE_ZNQ6_M)) {
+            // Four-row groups help large projections but reduce occupancy on narrow matrices.
+            return nrows_x >= 4096 && ncols_x >= 4096 && nrows_x % 4 == 0;
+        }
         if (table_id == MMVQ_PARAMETERS_RDNA2 && c_ncols_dst == 1 && calc_nwarps(type, c_ncols_dst, table_id) > 1) {
             // Group medium-K rows only when enough rows remain to populate the device.
             const int grouped_k_limit = nrows_x >= 128 ? 16 : 4;

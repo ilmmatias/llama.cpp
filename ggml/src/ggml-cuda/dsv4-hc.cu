@@ -229,7 +229,8 @@ static __global__ void dsv4_hc_pre_f32_tiled(
     dst[i0*sd0 + it*sd1] = scale * sum;
 }
 
-template <bool has_comb, bool gated_post>
+// gated: post = gate_scale_out*sigmoid(gate_scale_in*post)
+template <bool has_comb, bool gated>
 static __global__ void dsv4_hc_post_f32_tiled(
         const float * x,
         const float * residual,
@@ -245,17 +246,16 @@ static __global__ void dsv4_hc_post_f32_tiled(
         int64_t sr2,
         int64_t sp0,
         int64_t sp1,
-        float gate_scale,
         int64_t sc0,
         int64_t sc1,
         int64_t sc2,
         int64_t sd0,
         int64_t sd1,
-        int64_t sd2) {
+        int64_t sd2,
+        float gate_scale_in,
+        float gate_scale_out) {
     __shared__ float post_s[DSV4_HC];
     __shared__ float comb_s[DSV4_HC*DSV4_HC];
-
-    static_assert(!has_comb || !gated_post, "gated HC post only supports identity mixing");
 
     ggml_cuda_pdl_lc();
 
@@ -267,8 +267,8 @@ static __global__ void dsv4_hc_post_f32_tiled(
 
     if (tid < DSV4_HC) {
         float pv = post[tid*sp0 + it*sp1];
-        if constexpr (gated_post) {
-            pv = 2.0f / (1.0f + expf(-pv * gate_scale));
+        if constexpr (gated) {
+            pv = gate_scale_out * (1.0f / (1.0f + expf(-(gate_scale_in * pv))));
         }
         post_s[tid] = pv;
     }
@@ -405,11 +405,23 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             scale);
 }
 
-void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * gate_scale_in, const ggml_tensor * gate_scale_out) {
     const ggml_tensor * x        = dst->src[0];
     const ggml_tensor * residual = dst->src[1];
-    const ggml_tensor * post     = dst->src[2];
     const ggml_tensor * comb     = dst->src[3];
+
+    const bool gated_post = ggml_get_op_params_i32(dst, 1) != 0;
+    GGML_ASSERT(!gated_post || (comb == nullptr && gate_scale_in == nullptr));
+
+    // A fused chain reads the raw post weights before SCALE -> SIGMOID -> SCALE.
+    const bool          gated = gated_post || gate_scale_in != nullptr;
+    const ggml_tensor * post  = gate_scale_in ? gate_scale_in->src[0] : dst->src[2];
+
+    const float gate_in  = gate_scale_in  ? ggml_get_op_params_f32(gate_scale_in,  0) :
+                          gated_post ? ggml_get_op_params_f32(dst, 0) : 1.0f;
+    const float gate_out = gate_scale_out ? ggml_get_op_params_f32(gate_scale_out, 0) :
+                          gated_post ? 2.0f : 1.0f;
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(residual->type == GGML_TYPE_F32);
@@ -430,23 +442,15 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const int64_t n_tokens = x->ne[1];
     const int64_t hc       = residual->ne[1];
 
-    const float gate_scale = ggml_get_op_params_f32(dst, 0);
-    const bool  gated_post = ggml_get_op_params_i32(dst, 1) != 0;
-
     GGML_ASSERT(hc == DSV4_HC);
-    GGML_ASSERT(!gated_post || comb == nullptr);
 
     constexpr int block_size = 256;
     const dim3 block_dims(block_size, 1, 1);
     const dim3 grid_dims((n_embd + block_size - 1) / block_size, n_tokens, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    auto kernel = comb
-        ? dsv4_hc_post_f32_tiled<true, false>
-        : gated_post
-            ? dsv4_hc_post_f32_tiled<false, true>
-            : dsv4_hc_post_f32_tiled<false, false>;
-
+    auto kernel = comb ? (gated ? dsv4_hc_post_f32_tiled<true,  true> : dsv4_hc_post_f32_tiled<true,  false>)
+                       : (gated ? dsv4_hc_post_f32_tiled<false, true> : dsv4_hc_post_f32_tiled<false, false>);
     ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data,
             (const float *) residual->data,
@@ -457,7 +461,7 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbx0 / sizeof(float), nbx1 / sizeof(float),
             nbr0 / sizeof(float), nbr1 / sizeof(float), nbr2 / sizeof(float),
             nbp0 / sizeof(float), nbp1 / sizeof(float),
-            gate_scale,
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
-            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
+            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
+            gate_in, gate_out);
 }

@@ -2034,7 +2034,10 @@ struct capture_limit_graph {
 };
 
 static void capture_limits() {
+    // CTest pins 512-node chunks, aligned with this chain's 16-node fusions.
+    constexpr int chunk_size = 512;
     for (int nodes : {4096, 6144}) {
+        const uint64_t chunks = (nodes + chunk_size - 1) / chunk_size;
         auto backend = ggml_backend_cuda_init(0);
         REQUIRE(backend);
 
@@ -2062,20 +2065,23 @@ static void capture_limits() {
             const bool admitted = after[HIPRTC_TEST_CAPTURE_BEGIN] != before[HIPRTC_TEST_CAPTURE_BEGIN];
             if (admitted) {
                 REQUIRE(!refused);
-                REQUIRE(after[HIPRTC_TEST_CAPTURE_BEGIN] == before[HIPRTC_TEST_CAPTURE_BEGIN] + 1);
-                REQUIRE(after[HIPRTC_TEST_GRAPH_LAUNCH] == before[HIPRTC_TEST_GRAPH_LAUNCH] + 2);
+                REQUIRE(after[HIPRTC_TEST_CAPTURE_BEGIN] == before[HIPRTC_TEST_CAPTURE_BEGIN] + chunks);
+                REQUIRE(after[HIPRTC_TEST_CAPTURE_END] == before[HIPRTC_TEST_CAPTURE_END] + chunks);
+                REQUIRE(after[HIPRTC_TEST_GRAPH_LAUNCH] == before[HIPRTC_TEST_GRAPH_LAUNCH] + 2 * chunks);
                 ++captured;
             } else {
                 refused = true;
                 REQUIRE(after[HIPRTC_TEST_GRAPH_LAUNCH] == before[HIPRTC_TEST_GRAPH_LAUNCH]);
+                REQUIRE(after[HIPRTC_TEST_CAPTURE_END] == before[HIPRTC_TEST_CAPTURE_END]);
             }
 
             for (size_t retained = 0; retained < captured; ++retained) {
                 observer_snapshot(before);
                 fixtures[retained]->run(backend);
                 observer_snapshot(after);
-                REQUIRE(after[HIPRTC_TEST_GRAPH_LAUNCH] == before[HIPRTC_TEST_GRAPH_LAUNCH] + 1);
+                REQUIRE(after[HIPRTC_TEST_GRAPH_LAUNCH] == before[HIPRTC_TEST_GRAPH_LAUNCH] + chunks);
                 REQUIRE(after[HIPRTC_TEST_CAPTURE_BEGIN] == before[HIPRTC_TEST_CAPTURE_BEGIN]);
+                REQUIRE(after[HIPRTC_TEST_CAPTURE_END] == before[HIPRTC_TEST_CAPTURE_END]);
                 REQUIRE(after[HIPRTC_TEST_MODULE_LAUNCH] == before[HIPRTC_TEST_MODULE_LAUNCH]);
                 REQUIRE(after[HIPRTC_TEST_UNLOAD] == start[HIPRTC_TEST_UNLOAD]);
             }

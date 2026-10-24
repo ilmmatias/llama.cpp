@@ -6,7 +6,7 @@ llama.cpp supports speculative decoding, a technique that can significantly acce
 
 When partial draft acceptance requires restoring a model checkpoint, rejection-sampling replay also restores the sampler snapshot before re-accepting the retained tokens. This keeps grammar, reasoning, and token-history state aligned with the restored model state. Sample-and-match replay retains the advanced sampler because it does not re-accept those tokens.
 
-With `--expert-cache-slots`, supported CPU-resident MoE experts can use the GPU cache during multi-token verification and MTP drafting. Each token has its own cache-hit set; misses stay on CPU, and cache slots remain fixed until the batch finishes. The cache uses token-sized GPU graphs for batches of up to 128 tokens. Larger batches retain the CPU bulk-prefill path.
+With `--expert-cache-slots`, supported CPU-resident MoE experts can use the GPU cache during multi-token verification and MTP drafting. Alternatively, `--moe-cache-mib` sets a byte budget, split across devices by their host-resident expert weights; it cannot be combined with `--expert-cache-slots`. Each token has its own cache-hit set; misses stay on CPU, and cache slots remain fixed until the batch finishes. The cache uses token-sized GPU graphs for batches of up to 128 tokens. Larger batches retain the CPU bulk-prefill path.
 `--expert-cache-admit-window` counts tokens in cache-eligible batches separately for each layer, including speculative tokens that are later rejected. Repeated draft-head evaluations do not age the trunk layers' admission windows.
 
 When the expert outputs feed the cache GPU directly, cached rows stay on-device and CPU miss rows are uploaded for a device-side merge and weighted reduction. Fully cached batches do not upload CPU expert outputs. Device events protect cache slots and CPU staging storage until their readers finish. CPU consumers, observed expert outputs, and evaluation callbacks retain the host-side join.
@@ -14,6 +14,8 @@ When the expert outputs feed the cache GPU directly, cached rows stay on-device 
 The device-side merge uses one workspace shared across layers and MTP evaluations. It grows only when a larger supported batch or expert shape is needed, and device events protect it until the previous copy finishes. Parameter fitting includes the maximum merge and expert-compute workspace sizes when GPU expert caching is enabled; `--fit-target` remains the margin for other runtime allocations.
 
 On HIP, changed graph executables are rebuilt rather than updated in place. This releases the old kernel-argument storage and avoids [ROCm's accumulating graph-update allocations](https://github.com/ROCm/rocm-systems/issues/10021), which speculative batch-size changes can exhaust.
+
+CUDA and HIP graph capture uses chunks of 512 ggml nodes by default. Set `GGML_CUDA_GRAPH_CHUNK_SIZE` to change this limit, or use `0` to capture the whole graph as one chunk. Captured chunks retain their runtime-compiled kernels until the graphs are released. HIPRTC compilation remains asynchronous during inference; the last compiler-owning backend waits for pending jobs before releasing the compiler, before process-wide LLVM teardown.
 
 Qwen4Exp MTP supports both combined and detached draft-head GGUF files. Draft attention remains dense by default; set `LLAMA_QWEN4EXP_MTP_QSA=1` to use the branch's compact QSA block cache. The converter preserves the draft head's compression ratio in either mode.
 
@@ -131,6 +133,8 @@ See:
 
 An n-gram is a sequence of n tokens. The n-gram cache implementation maintains statistics about short n-gram sequences.
 A draft is computed using probabilities derived from these statistics. External statistics can also be loaded from files for improved accuracy.
+
+The context cache is reset for each request. With `--lookup-cache-dynamic FILE`, statistics loaded at startup remain available for drafting, and statistics from all requests and sequences are added to the file when the speculative decoder is destroyed. A missing file is created on exit. Newly learned statistics do not affect other requests in the same run.
 
 See:
 
