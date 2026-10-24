@@ -536,6 +536,44 @@ static int run_pure_tests() {
     return n_fail > 0 ? 1 : 0;
 }
 
+static int run_qwen4exp_merge_tests() {
+    const llama_quant_model_desc desc = {
+        "qwen4exp", 4096, 11008, 1, 32, 8, 0, 128, 128,
+    };
+    llama_model * model = llama_quant_model_from_metadata(&desc);
+    llama_model_quantize_params qparams = llama_model_quantize_default_params();
+    quantize_state_impl * qs = llama_quant_init(model, &qparams);
+    ggml_context_ptr ctx(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+    ggml_tensor * tensor = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 4096, 3072);
+    const struct {
+        const char * name;
+        ggml_type expected;
+    } cases[] = {
+        {"blk.0.attn_qkv.weight",            GGML_TYPE_Q4_K},
+        {"blk.0.attn_qkv_gate.weight",       GGML_TYPE_Q4_K},
+        {"blk.0.hc_attn_down.weight",        GGML_TYPE_Q2_K},
+        {"blk.0.hc_attn_down_inject.weight", GGML_TYPE_Q2_K},
+        {"blk.0.hc_ffn_down.weight",         GGML_TYPE_Q3_K},
+        {"blk.0.hc_ffn_down_inject.weight",  GGML_TYPE_Q3_K},
+        {"blk.0.ssm_beta.weight",            GGML_TYPE_Q2_K},
+        {"blk.0.ssm_beta_alpha.weight",      GGML_TYPE_Q2_K},
+    };
+    int n_fail = 0;
+    for (const auto & test : cases) {
+        ggml_set_name(tensor, test.name);
+        ggml_type result;
+        llama_quant_compute_types(qs, LLAMA_FTYPE_MOSTLY_Q2_K, &tensor, &result, 1);
+        if (result != test.expected) {
+            printf("  FAIL  %s expected %s, got %s\n", test.name, ggml_type_name(test.expected), ggml_type_name(result));
+            ++n_fail;
+        }
+    }
+    llama_quant_free(qs);
+    llama_model_free(model);
+    printf("  %s  Qwen4Exp merged projection type selection\n\n", n_fail == 0 ? "PASS" : "FAIL");
+    return n_fail > 0 ? 1 : 0;
+}
+
 int main(int argc, char ** argv) {
     std::string snapshot_dir = SNAPSHOT_DIR;
     bool        generate     = false;
@@ -556,5 +594,6 @@ int main(int argc, char ** argv) {
     llama_log_set([](enum ggml_log_level, const char *, void *) {}, nullptr);
 
     int result = run_pure_tests();
+    result |= run_qwen4exp_merge_tests();
     return run_remote_tests(snapshot_dir, argv[0]) || result;
 }

@@ -3030,6 +3030,10 @@ class TensorNameMap:
             MODEL_TENSOR.HC_FFN_INJECT: (
                 "model.layers.{bid}.mlp_hyper_connection.block_inject_weight",
             ),
+            MODEL_TENSOR.HC_ATTN_DOWN_INJECT: (),
+            MODEL_TENSOR.HC_FFN_DOWN_INJECT: (),
+            MODEL_TENSOR.ATTN_QKV_GATE: (),
+            MODEL_TENSOR.SSM_BETA_ALPHA_CAT: (),
             MODEL_TENSOR.HC_HEAD_NORM: (
                 "model.hyper_connection_mixer.hc_norm",
             ),

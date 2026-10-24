@@ -146,8 +146,8 @@ static int ggml_cuda_mmq_select_J(
         const int cc, const size_t smpbo, const ggml_prec prec_src1, size_t & src1_q8_1_padding) {
     const bool fallback = ggml_cuda_mmq_needs_fallback(src0->ne[1]);
     int64_t ncols_opt = ids ? src1->ne[2] : src1->ne[1];
-    if (ids && (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc))) {
-        // Each expert sees this many rows on average.
+    if (ids && (GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc))) {
+        // Size routed tiles for the average expert batch instead of the total token count.
         ncols_opt = (src1->ne[2]*ids->ne[0] + src0->ne[2] - 1) / src0->ne[2];
     }
 

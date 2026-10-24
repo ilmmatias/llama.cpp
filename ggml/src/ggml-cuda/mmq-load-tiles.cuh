@@ -577,11 +577,16 @@ template <ggml_type type, int J, bool fallback, int bits> static __device__ __fo
     float * x_df = (float *) (x_qs + txs.qs);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 
-    // MMQ_ITER_K / (4 * QR8_0) == 64 required. but NV has only 32 threads per warp
-    constexpr int threads_per_row = 32;
+#if defined(GGML_USE_HIP) && defined(RDNA2)
+    // Decode a full block per lane to reuse codebooks across quads.
+    constexpr bool decode_block = (bits == 4 && group >= 8) || bits >= 6 || (bits == 5 && group == 4);
+#else
+    constexpr bool decode_block = false;
+#endif
+    constexpr int threads_per_row = decode_block ? 2*MMQ_TILE_NE_K/QI8_0 : 32;
     constexpr int nrows = warp_size / threads_per_row;
     const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
-    const int kbx  = txi / QI8_0;
+    const int kbx = decode_block ? txi : txi / QI8_0;
     const int kqsx = txi % QI8_0;
 
 #pragma unroll
@@ -598,8 +603,15 @@ template <ggml_type type, int J, bool fallback, int bits> static __device__ __fo
         x_qs[i*sram_stride + 0             + txi] = znq_pack4_cuda<bits, false, group>(bxi, 4*kqsx);
         x_qs[i*sram_stride + MMQ_TILE_NE_K + txi] = znq_pack4_cuda<bits, false, group>(bxi + (MMQ_TILE_NE_K/QI8_0) * block_size, 4*kqsx);
 #else
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 0             + txi] = znq_pack4_cuda<bits, false, group>(bxi, 4*kqsx);
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = znq_pack4_cuda<bits, false, group>(bxi + (MMQ_TILE_NE_K/QI8_0) * block_size, 4*kqsx);
+        if constexpr (decode_block) {
+#pragma unroll
+            for (int q = 0; q < QI8_0; ++q) {
+                x_qs[i*(2*MMQ_TILE_NE_K + 1) + txi*QI8_0 + q] = znq_pack4_cuda<bits, true, group>(bxi, 4*q);
+            }
+        } else {
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 0             + txi] = znq_pack4_cuda<bits, false, group>(bxi, 4*kqsx);
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = znq_pack4_cuda<bits, false, group>(bxi + (MMQ_TILE_NE_K/QI8_0) * block_size, 4*kqsx);
+        }
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 

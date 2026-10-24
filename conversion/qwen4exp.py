@@ -43,6 +43,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self._ple_shards: dict[int, str] = {}
         self._ple_row_dim: int | None = None
         self._mtp_fc: dict[str, Tensor] = {}
+        self._merge_parts: dict[tuple[int, gguf.MODEL_TENSOR], dict[int, Tensor]] = {}
 
     @classmethod
     def filter_tensors(cls, item):
@@ -137,44 +138,70 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         # int64 hash constants must stay exact; 1-D tensors force F32, so use KV
         if name.endswith("ple_embedding.layer_multipliers"):
             self._ple_multipliers = [int(x) for x in data_torch.tolist()]
-            return []
+            return
         if name.endswith("ple_embedding.ngram_heads_offsets"):
             self._ple_head_offsets = [int(x) for x in data_torch.tolist()]
-            return []
+            return
         if name.endswith("ple_embedding.ngram_heads_vocab_sizes"):
             self._ple_head_vocab_sizes = [int(x) for x in data_torch.tolist()]
-            return []
+            return
 
         if ".ngram_embedding.shard_" in name:
-            return self._place_ple_shard(data_torch, name)
+            yield from self._place_ple_shard(data_torch, name)
+            return
 
         # eh_proj([e ; h_s]) = fc_embedding(e) + fc_hidden(h_s) for every hc stream s
         if name.endswith((".nextn_fc_embedding.weight", ".nextn_fc_hidden.weight")):
             self._mtp_fc[name.rsplit(".", 2)[1]] = data_torch
             if len(self._mtp_fc) < 2:
-                return []
+                return
             eh = torch.cat([self._mtp_fc.pop("nextn_fc_embedding"), self._mtp_fc.pop("nextn_fc_hidden")], dim=1)
-            return [(self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_EH_PROJ, bid, ".weight"), eh)]
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_EH_PROJ, bid, ".weight"), eh)
+            return
 
         # one projection feeds indexer q and k; split it, as minimax-m3 does
         if ".indexer.index_qk_proj.weight" in name:
             n_q = self.hparams["indexer_n_heads"] * self.hparams["indexer_head_dim"]
-            q = data_torch[:n_q]
-            k = data_torch[n_q:]
-            return [
-                (self.format_tensor_name(gguf.MODEL_TENSOR.INDEXER_Q_PROJ, bid, ".weight"), q),
-                (self.format_tensor_name(gguf.MODEL_TENSOR.INDEXER_K_PROJ, bid, ".weight"), k),
-            ]
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.INDEXER_Q_PROJ, bid, ".weight"), data_torch[:n_q])
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.INDEXER_K_PROJ, bid, ".weight"), data_torch[n_q:])
+            return
 
         # Gemma zero-centred gammas the inherited norm.weight rule misses
         if name.endswith((".ple.norm_key.weight", ".ple.norm_query.weight", ".ple.norm_conv.weight",
                           ".indexer.q_layernorm.weight", ".indexer.k_layernorm.weight")):
-            return [(self.map_tensor_name(name), data_torch + 1)]
+            yield (self.map_tensor_name(name), data_torch + 1)
+            return
 
         if name.endswith(".ple.conv1d.weight"):
-            return [(self.map_tensor_name(name), data_torch.squeeze())]
+            yield (self.map_tensor_name(name), data_torch.squeeze())
+            return
 
-        return super().modify_tensors(data_torch, name, bid)
+        for new_name, data in super().modify_tensors(data_torch, name, bid):
+            yield from self._merge_shared_input(new_name, data, bid)
+
+    def _merge_shared_input(self, name: str, data: Tensor, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Pre-quantized checkpoints can carry independent scales for each projection.
+        if bid is None or self.hparams.get("quantization_config"):
+            yield (name, data)
+            return
+
+        layer_types = self.hparams.get("layer_types") or []
+        is_linear = bid < len(layer_types) and layer_types[bid] == "linear_attention"
+        for merged, parts, linear_only in gguf.QWEN4EXP_SHARED_INPUT_MERGES:
+            if linear_only and not is_linear:
+                continue
+            for idx, part in enumerate(parts):
+                if not self.match_model_tensor_name(name, part, bid):
+                    continue
+                halves = self._merge_parts.setdefault((bid, merged), {})
+                if idx in halves:
+                    raise ValueError(f"duplicate projection for {name}")
+                halves[idx] = data
+                if len(halves) == 2:
+                    del self._merge_parts[(bid, merged)]
+                    yield (self.format_tensor_name(merged, bid), torch.cat([halves[0], halves[1]], dim=0))
+                return
+        yield (name, data)
 
     # the shards concatenate into a tensor of well over 100 GB
     # use LazyChunkedTensor here, a single shard resident at a time
@@ -220,6 +247,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         super().prepare_tensors()
         if self._mtp_fc:
             raise ValueError(f"MTP projection missing its other half: {sorted(self._mtp_fc)}")
+        if self._merge_parts:
+            raise ValueError(f"merged weights missing a half: {sorted((bid, t.name) for bid, t in self._merge_parts)}")
         n_parts = self.hparams.get("split_ngram_parts", 0)
         if self._ple_shards and len(self._ple_shards) != n_parts:
             raise ValueError(

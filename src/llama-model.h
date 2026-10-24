@@ -619,6 +619,14 @@ struct llama_layer {
     struct ggml_tensor * hc_ffn_down    = nullptr;
     struct ggml_tensor * hc_ffn_up      = nullptr;
     struct ggml_tensor * hc_ffn_inject  = nullptr;
+    struct ggml_tensor * hc_attn_down_inject = nullptr;
+    struct ggml_tensor * hc_ffn_down_inject  = nullptr;
+    struct ggml_tensor * wqkv_z             = nullptr;
+    struct ggml_tensor * ssm_beta_alpha_cat = nullptr; // concatenated rows, not the grouped ssm_beta_alpha
+    struct ggml_tensor * hc_attn_down_inject_s = nullptr;
+    struct ggml_tensor * hc_ffn_down_inject_s  = nullptr;
+    struct ggml_tensor * wqkv_z_s             = nullptr;
+    struct ggml_tensor * ssm_beta_alpha_cat_s = nullptr;
 
     struct ggml_tensor * ple_key        = nullptr;
     struct ggml_tensor * ple_value      = nullptr;

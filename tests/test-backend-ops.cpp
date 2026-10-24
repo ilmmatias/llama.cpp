@@ -2806,14 +2806,16 @@ struct test_set_rows : public test_case {
 // GGML_OP_ROPE + GGML_OP_VIEW + GGML_OP_SET_ROWS
 struct test_rope_set_rows : public test_case {
     const ggml_type type;
+    const ggml_type type_src;
     const ggml_type type_idx;
     const std::array<int64_t, 4> ne_a;
     int mode;
+    const int n_dims;
+    const bool ff;
     const int n_ctx{512};
-    const int n_dims{128};
 
     std::string vars() override {
-        return VARS_TO_STR4(type, type_idx, ne_a, mode);
+        return VARS_TO_STR7(type, type_src, type_idx, ne_a, mode, n_dims, ff);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -2826,11 +2828,14 @@ struct test_rope_set_rows : public test_case {
     test_rope_set_rows(ggml_type type,
             ggml_type type_idx,
             std::array<int64_t, 4> ne_a,
-            int mode)
-        : type(type), type_idx(type_idx), ne_a(ne_a), mode(mode) {}
+            int mode,
+            int n_dims = 128,
+            ggml_type type_src = GGML_TYPE_F32,
+            bool ff = false)
+        : type(type), type_src(type_src), type_idx(type_idx), ne_a(ne_a), mode(mode), n_dims(n_dims), ff(ff) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne_a[0], ne_a[1], ne_a[2], 1);
+        ggml_tensor * a = ggml_new_tensor(ctx, type_src, 4, ne_a.data());
         ggml_set_name(a, "a");
 
         const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
@@ -2848,6 +2853,11 @@ struct test_rope_set_rows : public test_case {
         float ef = 0.7465f;
         float af = 1.4245f;
         ggml_tensor * freq = nullptr;
+        if (ff) {
+            // The CPU reference builds a frequency cache for the whole head.
+            freq = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne_a[0]/2);
+            ggml_set_name(freq, "freq");
+        }
 
         ggml_tensor * rope = nullptr;
         if (is_mrope) {
@@ -2856,20 +2866,20 @@ struct test_rope_set_rows : public test_case {
                 int rope_sections[4] = {n_dims/4, n_dims/4, 0, 0}; // Vision-RoPE only use first two dimension for image (x, y) coordinate
                 rope = ggml_rope_multi(ctx, a, pos, freq, n_dims/2, rope_sections, mode, 0, 10000.0f, fs, ef, af, 1.0f, 1.0f);
             } else {
-                GGML_ASSERT(n_dims/3 > 0);
-                int rope_sections[4] = {n_dims/3, n_dims/3, n_dims/3, 0};
+                GGML_ASSERT(n_dims/8 > 0);
+                int rope_sections[4] = {n_dims/8, n_dims/8, n_dims/8, n_dims/8};
                 rope = ggml_rope_multi(ctx, a, pos, freq, n_dims, rope_sections, mode, 0, 10000.0f, fs, ef, af, 1.0f, 1.0f);
             }
         } else {
-            rope = ggml_rope(ctx, a, pos, ne_a[0], mode);
+            rope = ggml_rope(ctx, a, pos, n_dims, mode);
         }
 
-        ggml_tensor * view = ggml_view_2d(ctx, rope, ne_a[0] * ne_a[1], ne_a[2], rope->nb[2], 0);
+        ggml_tensor * view = ggml_view_2d(ctx, rope, ne_a[0] * ne_a[1], ne_a[2] * ne_a[3], rope->nb[2], 0);
 
         ggml_tensor * dst = ggml_new_tensor_4d(ctx, type, ne_a[0] * ne_a[1], ne_a[2] * ne_a[3], 1, 1);
         ggml_set_name(dst, "dst");
 
-        ggml_tensor * row_idxs = ggml_new_tensor_3d(ctx, type_idx, ne_a[2], 1, 1);
+        ggml_tensor * row_idxs = ggml_new_tensor_3d(ctx, type_idx, ne_a[2] * ne_a[3], 1, 1);
         ggml_set_name(row_idxs, "row_idxs");
 
         ggml_tensor * out = ggml_set_rows(ctx, dst, view, row_idxs);
@@ -2884,7 +2894,7 @@ struct test_rope_set_rows : public test_case {
                 if (ggml_is_view_op(t->op)) {
                     continue;
                 }
-                init_set_rows_row_ids(t, ne_a[2]);
+                init_set_rows_row_ids(t, ne_a[2] * ne_a[3]);
             } else if (t->type == GGML_TYPE_I32) {
                 // pos
                 const int num_pos_ids = (mode & GGML_ROPE_TYPE_MROPE) ? ne_a[2] * 4 : ne_a[2];
@@ -2894,7 +2904,7 @@ struct test_rope_set_rows : public test_case {
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, num_pos_ids * sizeof(int));
             } else {
-                if (t->ne[0] == n_dims/2) {
+                if (strcmp(t->name, "freq") == 0) {
                     // frequency factors in the range [0.9f, 1.1f]
                     init_tensor_uniform(t, 0.9f, 1.1f);
                 } else {
@@ -6698,9 +6708,10 @@ struct test_mul_mat_id : public test_case {
     const int64_t m_v; // rows of as in memory, the experts of as are strided for m_v > m, no view for m_v == 0
     const bool ids_offset;
     const bool skip; // set some ids to a negative value
+    const int64_t k_v; // activation row width in memory, no view for k_v == 0
 
     std::string vars() override {
-        return VARS_TO_STR11(type_a, type_b, n_mats, n_used, b, m, n, k, m_v, ids_offset, skip);
+        return VARS_TO_STR12(type_a, type_b, n_mats, n_used, b, m, n, k, m_v, ids_offset, skip, k_v);
     }
 
     double max_nmse_err() override {
@@ -6725,11 +6736,12 @@ struct test_mul_mat_id : public test_case {
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
             int64_t m = 32, int64_t n = 32, int64_t k = 32,
-            int64_t m_v = 0, bool ids_offset = false, bool skip = false)
+            int64_t m_v = 0, bool ids_offset = false, bool skip = false, int64_t k_v = 0)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), m_v(m_v), ids_offset(ids_offset), skip(skip) {
+            m(m), n(n), k(k), m_v(m_v), ids_offset(ids_offset), skip(skip), k_v(k_v) {
             GGML_ASSERT(n_used <= n_mats);
             GGML_ASSERT(m_v == 0 || m_v > m);
+            GGML_ASSERT(k_v == 0 || k_v > k);
         }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -6747,7 +6759,10 @@ struct test_mul_mat_id : public test_case {
             ggml_set_name(ids, "view_of_ids");
         }
 
-        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k_v == 0 ? k : k_v, this->b ? 1 : n_used, n);
+        if (k_v != 0) {
+            b = ggml_view_3d(ctx, b, k, b->ne[1], n, b->nb[1], b->nb[2], 0);
+        }
         ggml_set_name(b, "b");
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
@@ -6768,8 +6783,9 @@ struct test_mul_mat_id : public test_case {
 struct test_mul_mat_id_routes : public test_mul_mat_id {
     const bool skew;
 
-    test_mul_mat_id_routes(int n_mats, int n_used, int64_t n, bool b, bool skew)
-        : test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, n_mats, n_used, b, 32, n, 32), skew(skew) {}
+    test_mul_mat_id_routes(ggml_type type_a, int n_mats, int n_used, int64_t n, bool b, bool skew,
+            int64_t m = 32, int64_t k = 32, int64_t k_v = 0)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, m, n, k, 0, false, false, k_v), skew(skew) {}
 
     std::string vars() override {
         return test_mul_mat_id::vars() + "," + VAR_TO_STR(skew);
@@ -12182,6 +12198,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_rope_set_rows(GGML_TYPE_F32, GGML_TYPE_I32, { 128, 32, 8, 1 }, GGML_ROPE_TYPE_IMROPE));
+    // Partial rotation, including the unfused multi-stream path.
+    for (int mode : { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE }) {
+        for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+            for (int ne3 : {1, 3}) {
+                test_cases.emplace_back(new test_rope_set_rows(type, GGML_TYPE_I64, { 256, 4, 8, ne3 }, mode, 64));
+            }
+        }
+    }
+    for (int mode : { GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE }) {
+        test_cases.emplace_back(new test_rope_set_rows(GGML_TYPE_F16, GGML_TYPE_I32, { 256, 4, 8, 1 }, mode, 64));
+        for (bool ff : {false, true}) {
+            test_cases.emplace_back(new test_rope_set_rows(GGML_TYPE_F16, GGML_TYPE_I64, { 256, 4, 8, 1 }, mode, 64, GGML_TYPE_F16, ff));
+        }
+        for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+            test_cases.emplace_back(new test_rope_set_rows(type, GGML_TYPE_I64, { 256, 4, 8, 1 }, mode, 64, GGML_TYPE_F32, true));
+        }
+    }
 
     for (ggml_type type_input : {GGML_TYPE_F32}) {
         for (ggml_op_pool pool_type : {GGML_OP_POOL_AVG, GGML_OP_POOL_MAX}) {
@@ -13411,11 +13444,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     for (bool b : {false, true}) {
-        test_cases.emplace_back(new test_mul_mat_id_routes(  63, 3,  127, b, false));
-        test_cases.emplace_back(new test_mul_mat_id_routes(  63, 3,  128, b, true));
-        test_cases.emplace_back(new test_mul_mat_id_routes(  63, 8,  129, b, false));
-        test_cases.emplace_back(new test_mul_mat_id_routes(1024, 8,  128, b, true));
-        test_cases.emplace_back(new test_mul_mat_id_routes(1024, 3, 1024, b, false));
+        test_cases.emplace_back(new test_mul_mat_id_routes(GGML_TYPE_F32,   63, 3,  127, b, false));
+        test_cases.emplace_back(new test_mul_mat_id_routes(GGML_TYPE_F32,   63, 3,  128, b, true));
+        test_cases.emplace_back(new test_mul_mat_id_routes(GGML_TYPE_F32,   63, 8,  129, b, false));
+        test_cases.emplace_back(new test_mul_mat_id_routes(GGML_TYPE_F32, 1024, 8,  128, b, true));
+        test_cases.emplace_back(new test_mul_mat_id_routes(GGML_TYPE_F32, 1024, 3, 1024, b, false));
+    }
+
+    // Repeated routes across the HIP histogram threshold, with padded activation rows.
+    for (ggml_type type_a : all_types) {
+        if (!ggml_is_quantized(type_a)) {
+            continue;
+        }
+        const int64_t k = std::max<int64_t>(256, 3*ggml_blck_size(type_a));
+        test_cases.emplace_back(new test_mul_mat_id_routes(type_a, 63, 3, 127, false, false, 128, k, k + 4));
+        test_cases.emplace_back(new test_mul_mat_id_routes(type_a, 63, 3, 128, true,  true,   64, k, k + 4));
+        test_cases.emplace_back(new test_mul_mat_id_routes(type_a, 63, 8, 129, false, false, 128, k, k + 4));
     }
 
     // For issue 27873
@@ -13666,6 +13710,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             // inplace tests
             test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {16, 2, 32, 1}, mask, sinks, GGML_TYPE_F32, {1, 1}, 0.1f, 0.0f, true));
             test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {16, 2, 32, 1}, mask, sinks, GGML_TYPE_F16, {1, 1}, 0.1f, 0.0f, true));
+            for (ggml_type mask_type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+                if (mask || mask_type == GGML_TYPE_F32) {
+                    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {1024, 1, 5, 3}, mask, sinks, mask_type, {1, 1}, 0.1f, mask ? 8.0f : 0.0f));
+                }
+            }
         }
     }
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {16, 2, 32, 1}, true,  true,  GGML_TYPE_F32, {1, 1}, 0.1f, 0.0f));
@@ -14126,6 +14175,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1024, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {4, 1}, 1024, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+
+    // Tile-aligned chunks, a partial final chunk, and non-aligned query tails.
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 32, {1, 1}, 256, 192, true, false, 0, 0, GGML_PREC_F32, type, type));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 26, {1, 1}, 256, 512, true, false, 0, 0, GGML_PREC_F32, type, type));
+    }
+    for (int64_t nb : {63, 65, 127, 129}) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 26, {1, 1}, 256, nb));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {1, 1}, 256, 64));
 
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
@@ -14992,6 +15051,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {256, 256, 20, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {64, 64, 20, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {77, 64, 20, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
+    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {8192, 1, 32, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
 
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {32, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 10, 1, 1}));
@@ -15074,7 +15134,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
-        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_XS}) {
+        for (ggml_type type_a : all_types) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
@@ -15083,7 +15143,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
-        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_XS}) {
+        for (ggml_type type_a : all_types) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 4, false, 1792, bs, 2048));
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 32, 4, false, 1792, bs, 2048, 1));
@@ -15128,6 +15188,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, true, false, 2048));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
     }
+
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 32, {1, 1}, 256, 192));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 26, {1, 1}, 256, 512));
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -15229,6 +15292,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     test_cases.emplace_back(new test_rope(type, {128,  12, 512, 1}, 128, GGML_ROPE_TYPE_IMROPE,  512, 1.0f, 0.0f, 1.0f, ff, v, fw)); // rope_multi,imrope (qwen3vl 2B)
                     test_cases.emplace_back(new test_rope(type, { 80,  16, 2, 1},  80, GGML_ROPE_TYPE_VISION, 512, 1.0f, 0.0f, 1.0f, ff, v, fw)); // rope_multi,m-rope (qwen2vl ViT)
                 }
+            }
+        }
+    }
+
+    for (int mode : { GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE }) {
+        for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+            for (int n_token : {1, 512}) {
+                test_cases.emplace_back(new test_rope_set_rows(type, GGML_TYPE_I64, { 128, 4, n_token, 1 }, mode));
+                test_cases.emplace_back(new test_rope_set_rows(type, GGML_TYPE_I64, { 256, 4, n_token, 1 }, mode, 64));
             }
         }
     }

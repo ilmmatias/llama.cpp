@@ -10,6 +10,7 @@
 #include "../../src/llama-ext.h" // llama_model_set_attn_rot
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -634,6 +635,65 @@ struct case_state_rotation : ctx_test {
     }
 };
 
+struct case_rotation_buffers : ctx_test {
+    const char * name() const override { return "rot_buf"; }
+
+    const char * description() const override {
+        return "resident rotation constants survive cache clearing and graph rebuilding";
+    }
+
+    case_result run(model_run & mr) const override {
+        ctx_opts opts;
+        opts.n_ctx = 32;
+        opts.n_batch = opts.n_ubatch = opts.n_seq_max = 1;
+        opts.type_k = opts.type_v = GGML_TYPE_Q8_0;
+        opts.fa = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        opts.quiet = true;
+        auto ctx = mr.ctx(opts);
+        if (!ctx) {
+            return case_result::skip("quantized KV cache is not supported");
+        }
+
+        for (bool clear : { false, true }) {
+            if (clear) {
+                llama_memory_clear(llama_get_memory(ctx.get()), true);
+            }
+            auto * graph = llama_graph_reserve(ctx.get(), 1, 1, 1);
+            CTX_REQUIRE(graph, "failed to reserve the rotation graph");
+            bool resident = false;
+            for (const char * name : { "attn_inp_k_rot", "attn_inp_v_rot" }) {
+                auto * t = ggml_graph_get_tensor(graph, name);
+                if (!t || !t->buffer || ggml_backend_buffer_is_host(t->buffer)) {
+                    continue;
+                }
+                resident = true;
+                CTX_REQUIRE(t->type == GGML_TYPE_F32 && ggml_is_matrix(t) &&
+                        t->ne[0] == t->ne[1] && ggml_is_contiguous(t), "invalid rotation matrix layout");
+                // FWHT kernels do not read the matrix contents.
+                std::vector<float> values(ggml_nelements(t));
+                ggml_backend_tensor_get(t, values.data(), 0, ggml_nbytes(t));
+                const int64_t n = t->ne[0];
+                const float scale = 1.0f / std::sqrt((float) n);
+                for (int64_t row = 0; row < n; ++row) {
+                    for (int64_t col = 0; col < n; ++col) {
+                        float expected = scale;
+                        for (int64_t bits = row & col; bits; bits &= bits - 1) {
+                            expected = -expected;
+                        }
+                        CTX_REQUIRE(std::isfinite(values[row*n + col]) &&
+                                std::fabs(values[row*n + col] - expected) <= 1e-6f,
+                                clear ? "rotation matrix changed after clearing the cache" : "invalid rotation matrix");
+                    }
+                }
+            }
+            if (!resident) {
+                return case_result::skip("no resident rotation matrices");
+            }
+        }
+        return case_result::pass();
+    }
+};
+
 // restore a sequence into a fragmented cache: the slots freed by the removed sequence are
 // scattered between live cells of the other sequences, so the restore cannot claim one
 // contiguous block
@@ -760,6 +820,7 @@ std::vector<ctx_test_ptr> make_kv_cases() {
     cases.push_back(std::make_unique<case_state_partial_size>());
     cases.push_back(std::make_unique<case_state_restore_failure>());
     cases.push_back(std::make_unique<case_state_rotation>());
+    cases.push_back(std::make_unique<case_rotation_buffers>());
     cases.push_back(std::make_unique<case_state_restore_fragmented>());
 
     return cases;

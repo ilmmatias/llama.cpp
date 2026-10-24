@@ -3029,11 +3029,45 @@ public:
     llama_io_write_host(
             uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
-    ~llama_io_write_host() {
-        // TODO: add backend support to batch tensor_get? or some other way to speed this up
-        for (const auto & winfo : winfos) {
-            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+    void flush() {
+        // Merge nearby small device ranges to avoid one blocking copy per interleaved cell.
+        const size_t small_range = 64*1024;
+        const size_t max_extra = 1u << 20;
+        std::vector<uint8_t> staging;
+        for (size_t i = 0; i < winfos.size(); ) {
+            const write_info & first = winfos[i];
+            const auto buffer = first.tensor->view_src ? first.tensor->view_src->buffer : first.tensor->buffer;
+            const bool merge = first.size < small_range && buffer && !ggml_backend_buffer_is_host(buffer);
+            size_t end = first.offset + first.size;
+            size_t payload = first.size;
+            size_t j = i + 1;
+            for (; merge && j < winfos.size(); ++j) {
+                const write_info & next = winfos[j];
+                if (next.tensor != first.tensor || next.offset < end || next.size >= small_range) {
+                    break;
+                }
+                const size_t next_end = next.offset + next.size;
+                const size_t span = next_end - first.offset;
+                const size_t next_payload = payload + next.size;
+                // Read at most 8x the payload plus 1 MiB, without overflowing the comparison.
+                if (span > max_extra && (span - max_extra - 1)/8 >= next_payload) {
+                    break;
+                }
+                end = next_end;
+                payload = next_payload;
+            }
+            if (j == i + 1) {
+                ggml_backend_tensor_get(first.tensor, first.ptr, first.offset, first.size);
+            } else {
+                staging.resize(end - first.offset);
+                ggml_backend_tensor_get(first.tensor, staging.data(), first.offset, staging.size());
+                for (size_t k = i; k < j; ++k) {
+                    memcpy(winfos[k].ptr, staging.data() + (winfos[k].offset - first.offset), winfos[k].size);
+                }
+            }
+            i = j;
         }
+        winfos.clear();
     }
 
     void write(const void * src, size_t size) override {
@@ -3051,7 +3085,10 @@ public:
             throw std::runtime_error("unexpectedly reached end of buffer");
         }
 
-        // save the write for later during destruction
+        const size_t tensor_size = ggml_nbytes(tensor);
+        GGML_ASSERT(offset <= tensor_size && size <= tensor_size - offset && "tensor read out of bounds");
+
+        // Save the write for the explicit flush, so allocation failures reach the caller's error handler.
         winfos.push_back({tensor, ptr, size, offset});
 
         ptr += size;
@@ -3503,7 +3540,9 @@ size_t llama_context::state_get_size() {
 size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
     llama_io_write_host io(dst, size);
     try {
-        return state_write_data(io);
+        const size_t n_written = state_write_data(io);
+        io.flush();
+        return n_written;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
@@ -3548,7 +3587,11 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         io->write(&io_magic, sizeof(io_magic));
         io->write(&seq_id, sizeof(seq_id));
 
-        return state_seq_write_data(*io, seq_id, flags);
+        const size_t n_written = state_seq_write_data(*io, seq_id, flags);
+        if (!(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
+            static_cast<llama_io_write_host *>(io.get())->flush();
+        }
+        return n_written;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;

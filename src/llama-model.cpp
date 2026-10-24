@@ -1749,6 +1749,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (!layer.wqkv_gate_s && layer.wqkv_gate) {
                 layer.wqkv_gate_s = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
+            if (!layer.wqkv_z_s && layer.wqkv_z) {
+                layer.wqkv_z_s = create_tensor(tn(LLM_TENSOR_ATTN_QKV_GATE, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.hc_attn_down_inject_s && layer.hc_attn_down_inject) {
+                layer.hc_attn_down_inject_s = create_tensor(tn(LLM_TENSOR_HC_ATTN_DOWN_INJECT, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.hc_ffn_down_inject_s && layer.hc_ffn_down_inject) {
+                layer.hc_ffn_down_inject_s = create_tensor(tn(LLM_TENSOR_HC_FFN_DOWN_INJECT, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+            }
 
             // dense FFN weight scales (per-tensor, shape {1})
             if (!layer.ffn_gate_s && layer.ffn_gate) {
@@ -1793,6 +1802,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (!layer.ssm_beta_s && layer.ssm_beta) {
                 layer.ssm_beta_s = create_tensor(tn(LLM_TENSOR_SSM_BETA, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.ssm_beta_alpha_cat_s && layer.ssm_beta_alpha_cat) {
+                layer.ssm_beta_alpha_cat_s = create_tensor(tn(LLM_TENSOR_SSM_BETA_ALPHA_CAT, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.nextn.eh_proj_s && layer.nextn.eh_proj) {
                 layer.nextn.eh_proj_s = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "scale", i), {1}, TENSOR_NOT_REQUIRED);

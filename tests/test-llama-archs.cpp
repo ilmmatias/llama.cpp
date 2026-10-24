@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <initializer_list>
 #include <memory>
 #include <random>
 #include <regex>
@@ -643,14 +644,14 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
 }
 
 static std::vector<float> get_logits(
-        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false, uint32_t n_past = 0) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const uint32_t n_ctx    = llama_n_ctx(lctx);
     const uint32_t n_tokens = tokens.size();
     common_batch batch(lctx);
-    GGML_ASSERT(n_tokens <= n_ctx);
+    GGML_ASSERT(n_past + n_tokens <= n_ctx);
     for (uint32_t pos = 0; pos < n_tokens; pos++) {
-        batch.add(tokens[pos], pos, 0, true);
+        batch.add(tokens[pos], n_past + pos, 0, true);
     }
     if (encode) {
         if (llama_process(lctx, LLAMA_PROCESS_TYPE_ENCODE, batch.get())) {
@@ -672,62 +673,98 @@ static std::vector<float> get_logits(
     return ret;
 }
 
-static bool check_fused_qkv(
-        gguf_context * metadata, const llama_model * reference,
+static bool check_qwen4exp_merged_projections(
+        gguf_context * metadata, llama_model * reference,
         const std::vector<ggml_backend_dev_t> & devs,
         const std::vector<llama_token> & tokens, const std::vector<float> & logits_reference) {
     gguf_context_ptr fused_metadata(gguf_init_empty());
     gguf_set_kv(fused_metadata.get(), metadata);
-    const std::regex separate_projection(R"(blk\.[0-9]+\.attn_[qkv]\.(weight|scale|input_scale))");
+    const std::regex separate_projection(R"(blk\.[0-9]+\.(attn_[qkv]|hc_(attn|ffn)_(down|inject)|attn_(qkv|gate)|ssm_(beta|alpha))\.(weight|scale|input_scale))");
     for (const auto & entry : reference->tensors_by_name) {
         if (!std::regex_match(entry.first, separate_projection)) {
             gguf_add_tensor(fused_metadata.get(), entry.second);
         }
     }
 
-    ggml_context_ptr weights(ggml_init({ reference->layers.size()*ggml_tensor_overhead(), nullptr, true }));
+    ggml_context_ptr weights(ggml_init({ reference->layers.size()*10*ggml_tensor_overhead(), nullptr, true }));
     std::vector<std::vector<float>> fused_data;
+    auto merge = [&](const std::string & name, std::initializer_list<std::pair<const ggml_tensor *, const ggml_tensor *>> parts) {
+        if (!parts.begin()->first) {
+            return;
+        }
+        const int64_t n_in = parts.begin()->first->ne[0];
+        int64_t n_out = 0;
+        for (const auto & part : parts) {
+            GGML_ASSERT(part.first && part.first->type == GGML_TYPE_F32 && part.first->ne[0] == n_in);
+            n_out += part.first->ne[1];
+        }
+        ggml_tensor * merged = ggml_new_tensor_2d(weights.get(), GGML_TYPE_F32, n_in, n_out);
+        ggml_set_name(merged, name.c_str());
+        fused_data.emplace_back(ggml_nelements(merged));
+        merged->data = fused_data.back().data();
+        size_t offset = 0;
+        for (const auto & part : parts) {
+            ggml_backend_tensor_get(part.first, fused_data.back().data() + offset, 0, ggml_nbytes(part.first));
+            float scale = 1.0f;
+            if (part.second) {
+                ggml_backend_tensor_get(part.second, &scale, 0, sizeof(scale));
+            }
+            // Preserve each separate projection's scale, and exercise a non-unit merged scale.
+            for (int64_t j = 0; j < ggml_nelements(part.first); ++j) {
+                fused_data.back()[offset + j] *= scale / 2.0f;
+            }
+            offset += ggml_nelements(part.first);
+        }
+        gguf_add_tensor(fused_metadata.get(), merged);
+        ggml_tensor * scale = ggml_new_tensor_1d(weights.get(), GGML_TYPE_F32, 1);
+        ggml_set_name(scale, (name.substr(0, name.size() - 6) + "scale").c_str());
+        fused_data.push_back({2.0f});
+        scale->data = fused_data.back().data();
+        gguf_add_tensor(fused_metadata.get(), scale);
+    };
     for (size_t il = 0; il < reference->layers.size(); ++il) {
         const auto & layer = reference->layers[il];
-        if (!layer.wq) {
-            continue;
-        }
-
-        ggml_tensor * qkv = ggml_new_tensor_2d(weights.get(), GGML_TYPE_F32, layer.wq->ne[0],
-                layer.wq->ne[1] + layer.wk->ne[1] + layer.wv->ne[1]);
-        ggml_format_name(qkv, "blk.%zu.attn_qkv.weight", il);
-        fused_data.emplace_back(ggml_nelements(qkv));
-        qkv->data = fused_data.back().data();
-        const ggml_tensor * projections[] = { layer.wq, layer.wk, layer.wv };
-        const ggml_tensor * scales[] = { layer.wq_s, layer.wk_s, layer.wv_s };
-        size_t offset = 0;
-        for (size_t i = 0; i < 3; ++i) {
-            const ggml_tensor * projection = projections[i];
-            GGML_ASSERT(projection->type == GGML_TYPE_F32);
-            ggml_backend_tensor_get(projection, fused_data.back().data() + offset, 0, ggml_nbytes(projection));
-
-            // The synthetic model has separate projection scales; fold them into the fused weights.
-            float scale = 1.0f;
-            if (scales[i]) {
-                ggml_backend_tensor_get(scales[i], &scale, 0, sizeof(scale));
-            }
-            for (int64_t j = 0; j < ggml_nelements(projection); ++j) {
-                fused_data.back()[offset + j] *= scale;
-            }
-            offset += ggml_nelements(projection);
-        }
-        gguf_add_tensor(fused_metadata.get(), qkv);
+        const std::string prefix = "blk." + std::to_string(il) + ".";
+        merge(prefix + "attn_qkv.weight", {{layer.wq, layer.wq_s}, {layer.wk, layer.wk_s}, {layer.wv, layer.wv_s}});
+        merge(prefix + "hc_attn_down_inject.weight", {{layer.hc_attn_down, nullptr}, {layer.hc_attn_inject, nullptr}});
+        merge(prefix + "hc_ffn_down_inject.weight", {{layer.hc_ffn_down, nullptr}, {layer.hc_ffn_inject, nullptr}});
+        merge(prefix + "attn_qkv_gate.weight", {{layer.wqkv, layer.wqkv_s}, {layer.wqkv_gate, layer.wqkv_gate_s}});
+        merge(prefix + "ssm_beta_alpha.weight", {{layer.ssm_beta, layer.ssm_beta_s}, {layer.ssm_alpha, layer.ssm_alpha_s}});
     }
 
     std::unique_ptr<FILE, int (*)(FILE *)> file(tmpfile(), fclose);
     if (!file || !gguf_write_to_file_ptr(fused_metadata.get(), file.get(), false)) {
-        throw std::runtime_error("failed to write fused QKV model");
+        throw std::runtime_error("failed to write merged Qwen4Exp model");
     }
     rewind(file.get());
-
     auto model_and_ctx = get_model_and_ctx(nullptr, file.get(), 0, 0.0f, devs);
-    const double error = nmse(logits_reference, get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens));
-    return std::isfinite(error) && error < 1e-4;
+    const auto logits = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+    double error = nmse(logits_reference, logits);
+    if (!std::isfinite(error) || error >= 1e-4) {
+        return false;
+    }
+
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx = 256;
+    params.n_ubatch = 64;
+    params.n_threads = params.n_threads_batch = 4;
+    llama_context_ptr legacy(llama_init_from_model(reference, params));
+    if (!legacy) {
+        throw std::runtime_error("failed to create separate-projection reference context");
+    }
+    get_logits(reference, legacy.get(), tokens);
+    uint32_t n_past = tokens.size();
+    for (uint32_t n_tokens : {1u, 3u}) {
+        const std::vector<llama_token> continuation(tokens.begin(), tokens.begin() + n_tokens);
+        const auto logits_legacy = get_logits(reference, legacy.get(), continuation, false, n_past);
+        const auto logits_merged = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), continuation, false, n_past);
+        error = nmse(logits_legacy, logits_merged);
+        if (!std::isfinite(error) || error >= 1e-4) {
+            return false;
+        }
+        n_past += n_tokens;
+    }
+    return true;
 }
 
 // entries [n/4, n/2) are embd rows, decoded either as token/embd/token chunks or as one mixed batch
@@ -1274,10 +1311,10 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                             test_ok = false;
                             status_roundtrip = "\033[1;31mFAIL\033[0m";
                         }
-                        if (arch == LLM_ARCH_QWEN4EXP && !check_fused_qkv(
+                        if (arch == LLM_ARCH_QWEN4EXP && !check_qwen4exp_merged_projections(
                                 gguf_ctx.get(), model_and_ctx_cpu.first.get(), dc.devs, tokens, logits_cpu)) {
                             test_ok = false;
-                            status_roundtrip = "\033[1;31mFAIL\033[0m (fused QKV)";
+                            status_roundtrip = "\033[1;31mFAIL\033[0m (merged projections)";
                         }
                     }
                 }
