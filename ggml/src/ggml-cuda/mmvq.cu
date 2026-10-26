@@ -1225,8 +1225,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const auto should_use_small_k = [&](int c_ncols_dst) {
         if (table_id == MMVQ_PARAMETERS_RDNA2 && c_ncols_dst == 1 &&
                 (type == GGML_TYPE_ZNQ4_L || type == GGML_TYPE_ZNQ6_M)) {
-            // Four-row groups help large projections but reduce occupancy on narrow matrices.
-            return nrows_x >= 4096 && ncols_x >= 4096 && nrows_x % 4 == 0;
+            // Four-row groups need enough output rows; ZNQ6_M also benefits at medium K.
+            return nrows_x >= 4096 && ncols_x >= (type == GGML_TYPE_ZNQ6_M ? 2048 : 4096) && nrows_x % 4 == 0;
         }
         if (table_id == MMVQ_PARAMETERS_RDNA2 && c_ncols_dst == 1 && calc_nwarps(type, c_ncols_dst, table_id) > 1) {
             // Group medium-K rows only when enough rows remain to populate the device.

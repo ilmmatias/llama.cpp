@@ -4048,6 +4048,259 @@ static inline __m128i znq4_m_x86_codes_hi(__m128i packed) {
     return _mm_unpackhi_epi8(lo, hi);
 }
 
+#if defined(__AVX512VBMI__) && defined(__AVX512BW__)
+#if defined(_MSC_VER)
+#define ZNQ_X86_INLINE static __forceinline
+#else
+#define ZNQ_X86_INLINE static inline __attribute__((always_inline))
+#endif
+
+ZNQ_X86_INLINE __m512i znq_x86_lookup_group16(__m512i codes, const int8_t * table, int bits) {
+    const __m512i lo = _mm512_maskz_loadu_epi8(bits == 5 ? UINT64_C(0xffffffff) : UINT64_MAX, table);
+    if (bits == 7) {
+        return _mm512_permutex2var_epi8(lo, codes, _mm512_loadu_si512(table + 64));
+    }
+    return _mm512_permutexvar_epi8(codes, lo);
+}
+
+ZNQ_X86_INLINE __m512i znq_x86_lookup_group8(__m512i codes, const int8_t * table0, const int8_t * table1, int bits) {
+    const __mmask64 mask = bits == 5 ? UINT64_C(0xffffffff) : UINT64_MAX;
+    const __m512i lo0 = _mm512_maskz_loadu_epi8(mask, table0);
+    const __m512i lo1 = _mm512_maskz_loadu_epi8(mask, table1);
+    if (bits == 7) {
+        const __m512i values0 = _mm512_permutex2var_epi8(lo0, codes, _mm512_loadu_si512(table0 + 64));
+        const __m512i values1 = _mm512_permutex2var_epi8(lo1, codes, _mm512_loadu_si512(table1 + 64));
+        return _mm512_mask_blend_epi32(0xff00, values0, values1);
+    }
+    const __m512i indices = _mm512_mask_add_epi32(codes, 0xff00, codes, _mm512_set1_epi32(64));
+    return _mm512_permutex2var_epi8(lo0, indices, lo1);
+}
+
+// Constant format parameters remove all format dispatch from the block loop.
+ZNQ_X86_INLINE void ggml_vec_dot_znq_q8_0_avx512(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, size_t by, int ncols, int bits, int group, const int8_t * values) {
+    static_assert(QK_ZNQ == QK8_0, "QK_ZNQ and QK8_0 must be the same");
+    assert(n % QK_ZNQ == 0);
+    const int book_bits = group == 4 ? 3 : 4;
+    const int book_bytes = (QK_ZNQ / group) * book_bits / 8;
+    const size_t block_size = 1 + book_bytes + bits * QK_ZNQ / 8;
+    const uint8_t * x = vx;
+    const block_q8_0 * y[4];
+    const __m512i lanes = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    const __m512i bit_positions = _mm512_mullo_epi32(lanes, _mm512_set1_epi32(bits));
+    const __m512i byte_positions = _mm512_srli_epi32(bit_positions, 3);
+    const __m512i bytes = _mm512_or_si512(byte_positions,
+            _mm512_slli_epi32(_mm512_add_epi32(byte_positions, _mm512_set1_epi32(1)), 8));
+    const __m512i shifts = _mm512_and_si512(bit_positions, _mm512_set1_epi32(7));
+    const __m512i code_mask = _mm512_set1_epi32((1 << bits) - 1);
+    const __m512i book_shifts = _mm512_mullo_epi32(
+            _mm512_srli_epi32(lanes, group == 4 ? 2 : 3), _mm512_set1_epi32(book_bits));
+    const int group_tables = group == 16 || (group == 8 && bits >= 5);
+    const int table_size = 1 << (bits + book_bits);
+    const __m512i table0 = !group_tables ? _mm512_maskz_loadu_epi8(table_size < 64 ? UINT64_C(0xffffffff) : UINT64_MAX, values) : _mm512_setzero_si512();
+    const __m512i table1 = !group_tables && table_size > 64 ? _mm512_loadu_si512(values + 64) : _mm512_setzero_si512();
+    const __m512i table2 = !group_tables && table_size > 128 ? _mm512_loadu_si512(values + 128) : _mm512_setzero_si512();
+    const __m512i table3 = !group_tables && table_size > 128 ? _mm512_loadu_si512(values + 192) : _mm512_setzero_si512();
+    __m512 accum[4];
+    for (int col = 0; col < ncols; ++col) {
+        y[col] = (const block_q8_0 *) ((const char *) vy + col * by);
+        accum[col] = _mm512_setzero_ps();
+    }
+
+    for (int ib = 0; ib < n / QK_ZNQ; ++ib) {
+        const uint8_t * xb = x + ib * block_size;
+        const uint32_t books = xb[1] | (book_bytes > 1 ? (uint32_t) xb[2] << 8 : 0) |
+                (book_bytes > 2 ? (uint32_t) xb[3] << 16 : 0);
+        // Only the packed payload is readable, including in the last block.
+        const __m512i packed = _mm512_maskz_loadu_epi8((UINT64_C(1) << (4 * bits)) - 1, xb + 1 + book_bytes);
+        __m512i products[4];
+        for (int col = 0; col < ncols; ++col) {
+            products[col] = _mm512_setzero_si512();
+        }
+
+        for (int half = 0; half < 2; ++half) {
+            const __m512i positions = _mm512_add_epi8(bytes, _mm512_set1_epi8(2 * bits * half));
+            const __m512i codes = _mm512_and_si512(
+                    _mm512_srlv_epi32(_mm512_permutexvar_epi8(positions, packed), shifts), code_mask);
+            const uint32_t half_books = books >> (half * (16 / group) * book_bits);
+            __m512i selected;
+            if (group == 16) {
+                selected = znq_x86_lookup_group16(codes, values + ((half_books & 15) << bits), bits);
+            } else if (group_tables) {
+                selected = znq_x86_lookup_group8(codes, values + ((half_books & 15) << bits),
+                        values + (((half_books >> 4) & 15) << bits), bits);
+            } else {
+                const __m512i book = _mm512_and_si512(
+                        _mm512_srlv_epi32(_mm512_set1_epi32(half_books), book_shifts), _mm512_set1_epi32((1 << book_bits) - 1));
+                const __m512i indices = _mm512_or_si512(codes, _mm512_slli_epi32(book, bits));
+                if (table_size <= 64) {
+                    selected = _mm512_permutexvar_epi8(indices, table0);
+                } else if (table_size <= 128) {
+                    selected = _mm512_permutex2var_epi8(table0, indices, table1);
+                } else {
+                    selected = _mm512_mask_blend_epi32(_mm512_test_epi32_mask(indices, _mm512_set1_epi32(128)),
+                            _mm512_permutex2var_epi8(table0, indices, table1), _mm512_permutex2var_epi8(table2, indices, table3));
+                }
+            }
+            const __m512i weights = _mm512_srai_epi32(_mm512_slli_epi32(selected, 24), 24);
+            for (int col = 0; col < ncols; ++col) {
+                const __m512i q8 = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *) (y[col][ib].qs + 16 * half)));
+                products[col] = _mm512_add_epi32(products[col], _mm512_mullo_epi32(weights, q8));
+            }
+        }
+        const float d = znq4_m_x86_ufp8_to_fp32(xb[0]);
+        for (int col = 0; col < ncols; ++col) {
+            const __m512 scale = _mm512_set1_ps(d * GGML_CPU_FP16_TO_FP32(y[col][ib].d));
+            accum[col] = _mm512_fmadd_ps(scale, _mm512_cvtepi32_ps(products[col]), accum[col]);
+        }
+    }
+    for (int col = 0; col < ncols; ++col) {
+        *(float *) ((char *) s + col * bs) = _mm512_reduce_add_ps(accum[col]);
+    }
+}
+
+ZNQ_X86_INLINE void ggml_vec_dot_znq7_s_q8_0_avx512(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, size_t by, int ncols) {
+    assert(n % QK_ZNQ == 0);
+
+    const block_znq7_s * x = vx;
+    const block_q8_0 * y[4];
+    const __m512i bytes = _mm512_setr_epi32(
+            0x0100, 0x0100, 0x0201, 0x0302, 0x0403, 0x0403, 0x0504, 0x0605,
+            0x0706, 0x0706, 0x0807, 0x0908, 0x0a09, 0x0a09, 0x0b0a, 0x0c0b);
+    const __m512i shifts = _mm512_setr_epi32(0, 6, 4, 2, 0, 6, 4, 2, 0, 6, 4, 2, 0, 6, 4, 2);
+    const __m512i book_shifts = _mm512_setr_epi32(0, 0, 0, 0, 3, 3, 3, 3, 6, 6, 6, 6, 9, 9, 9, 9);
+    const __m512i table0 = _mm512_loadu_si512(kvalues_znq7_s);
+    const __m512i table1 = _mm512_loadu_si512(kvalues_znq7_s + 64);
+    const __m512i table2 = _mm512_loadu_si512(kvalues_znq7_s + 128);
+    const __m512i table3 = _mm512_loadu_si512(kvalues_znq7_s + 192);
+    const __m512i table4 = _mm512_loadu_si512(kvalues_znq7_s + 256);
+    const __m512i table5 = _mm512_loadu_si512(kvalues_znq7_s + 320);
+    const __m512i table6 = _mm512_loadu_si512(kvalues_znq7_s + 384);
+    const __m512i table7 = _mm512_loadu_si512(kvalues_znq7_s + 448);
+    __m512 accum[4];
+    for (int col = 0; col < ncols; ++col) {
+        y[col] = (const block_q8_0 *) ((const char *) vy + col * by);
+        accum[col] = _mm512_setzero_ps();
+    }
+
+    for (int ib = 0; ib < n / QK_ZNQ; ++ib) {
+        const uint32_t books = x[ib].books[0] | (uint32_t) x[ib].books[1] << 8 | (uint32_t) x[ib].books[2] << 16;
+        const __m512i packed = _mm512_maskz_loadu_epi8(0xffffff, x[ib].qs);
+        const float d = znq4_m_x86_ufp8_to_fp32(x[ib].d);
+        __m512 scales[4];
+        for (int col = 0; col < ncols; ++col) {
+            scales[col] = _mm512_set1_ps(d * GGML_CPU_FP16_TO_FP32(y[col][ib].d));
+        }
+
+        for (int half = 0; half < 2; ++half) {
+            const __m512i positions = _mm512_add_epi8(bytes, _mm512_set1_epi8(12 * half));
+            const __m512i codes = _mm512_and_si512(_mm512_srlv_epi32(_mm512_permutexvar_epi8(positions, packed), shifts), _mm512_set1_epi32(63));
+            const __m512i book = _mm512_and_si512(_mm512_srlv_epi32(_mm512_set1_epi32(books >> (12 * half)), book_shifts), _mm512_set1_epi32(7));
+            const __m512i indices = _mm512_or_si512(codes, _mm512_slli_epi32(book, 6));
+            const __mmask16 high = _mm512_test_epi32_mask(indices, _mm512_set1_epi32(128));
+            const __m512i lo = _mm512_mask_blend_epi32(high,
+                    _mm512_permutex2var_epi8(table0, indices, table1), _mm512_permutex2var_epi8(table2, indices, table3));
+            const __m512i hi = _mm512_mask_blend_epi32(high,
+                    _mm512_permutex2var_epi8(table4, indices, table5), _mm512_permutex2var_epi8(table6, indices, table7));
+            const __m512i values = _mm512_mask_blend_epi32(_mm512_test_epi32_mask(indices, _mm512_set1_epi32(256)), lo, hi);
+            const __m512i weights = _mm512_srai_epi32(_mm512_slli_epi32(values, 24), 24);
+            for (int col = 0; col < ncols; ++col) {
+                const __m512i q8 = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *) (y[col][ib].qs + 16 * half)));
+                accum[col] = _mm512_fmadd_ps(scales[col], _mm512_cvtepi32_ps(_mm512_mullo_epi32(weights, q8)), accum[col]);
+            }
+        }
+    }
+
+    for (int col = 0; col < ncols; ++col) {
+        *(float *) ((char *) s + col * bs) = _mm512_reduce_add_ps(accum[col]);
+    }
+}
+
+#undef ZNQ_X86_INLINE
+
+#define GGML_DEFINE_ZNQ_LOCAL_DOT(name, bits, group) \
+void ggml_vec_dot_##name##_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, \
+        size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) { \
+    assert(n % QK_ZNQ == 0 && nrc == 1); \
+    static_assert(sizeof(block_##name) == 1 + (QK_ZNQ / group) * (group == 4 ? 3 : 4) / 8 + bits * QK_ZNQ / 8, "wrong ZNQ layout"); \
+    UNUSED(bs); \
+    UNUSED(bx); \
+    UNUSED(by); \
+    UNUSED(nrc); \
+    ggml_vec_dot_znq_q8_0_avx512(n, s, 0, vx, vy, 0, 1, bits, group, kvalues_##name); \
+}
+#else
+#define GGML_DEFINE_ZNQ_LOCAL_DOT(name, bits, group) \
+void ggml_vec_dot_##name##_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, \
+        size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) { \
+    ggml_vec_dot_##name##_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc); \
+}
+#endif
+
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq2_l, 2,  8)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq3_s, 2,  4)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq3_l, 3,  8)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq4_s, 3,  4)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq4_l, 4,  8)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq5_s, 4,  4)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq5_m, 5, 16)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq5_l, 5,  8)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq6_s, 5,  4)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq6_m, 6, 16)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq6_l, 6,  8)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq7_m, 7, 16)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq7_l, 7,  8)
+
+#undef GGML_DEFINE_ZNQ_LOCAL_DOT
+
+bool ggml_vec_dot_znq_q8_0_4(enum ggml_type type, int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, size_t by) {
+#if defined(__AVX512VBMI__) && defined(__AVX512BW__)
+#define GGML_ZNQ_BATCH_DOT_CASE(type, name, bits, group) \
+        case GGML_TYPE_##type: \
+            ggml_vec_dot_znq_q8_0_avx512(n, s, bs, vx, vy, by, 4, bits, group, kvalues_##name); \
+            return true;
+    switch (type) {
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ2_L, znq2_l, 2,  8)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ3_S, znq3_s, 2,  4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ3_L, znq3_l, 3,  8)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ4_S, znq4_s, 3,  4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ4_L, znq4_l, 4,  8)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ5_S, znq5_s, 4,  4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ5_M, znq5_m, 5, 16)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ5_L, znq5_l, 5,  8)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ6_S, znq6_s, 5,  4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ6_M, znq6_m, 6, 16)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ6_L, znq6_l, 6,  8)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ7_M, znq7_m, 7, 16)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ7_L, znq7_l, 7,  8)
+        case GGML_TYPE_ZNQ7_S:
+            ggml_vec_dot_znq7_s_q8_0_avx512(n, s, bs, vx, vy, by, 4);
+            return true;
+        default:
+            return false;
+    }
+#undef GGML_ZNQ_BATCH_DOT_CASE
+#else
+    return ggml_vec_dot_znq_q8_0_4_generic(type, n, s, bs, vx, vy, by);
+#endif
+}
+
+void ggml_vec_dot_znq7_s_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+        size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+#if defined(__AVX512VBMI__) && defined(__AVX512BW__)
+    assert(n % QK_ZNQ == 0 && nrc == 1);
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(nrc);
+    ggml_vec_dot_znq7_s_q8_0_avx512(n, s, 0, vx, vy, 0, 1);
+#else
+    ggml_vec_dot_znq7_s_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_znq4_m_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
         size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);

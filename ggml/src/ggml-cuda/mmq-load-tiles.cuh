@@ -579,7 +579,7 @@ template <ggml_type type, int J, bool fallback, int bits> static __device__ __fo
 
 #if defined(GGML_USE_HIP) && defined(RDNA2)
     // Decode a full block per lane to reuse codebooks across quads.
-    constexpr bool decode_block = (bits == 4 && group >= 8) || bits >= 6 || (bits == 5 && group == 4);
+    constexpr bool decode_block = bits == 4 && group >= 8;
 #else
     constexpr bool decode_block = false;
 #endif

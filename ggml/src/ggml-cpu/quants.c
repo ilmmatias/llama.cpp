@@ -362,6 +362,18 @@ void ggml_vec_dot_nvfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
     *s = sumf;
 }
 
+bool ggml_vec_dot_znq_q8_0_4_generic(enum ggml_type type, int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, size_t by) {
+    UNUSED(type);
+    UNUSED(n);
+    UNUSED(s);
+    UNUSED(bs);
+    UNUSED(vx);
+    UNUSED(vy);
+    UNUSED(by);
+    return false;
+}
+
 static inline float znq_cpu_ufp8_to_fp32(uint8_t code) {
     const uint32_t e = code >> 3;
     const uint32_t m = code & 7u;
@@ -445,7 +457,7 @@ void ggml_vec_dot_znq4_m_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
     ggml_vec_dot_znq_q8_0_generic_impl(n, s, vx, vy, 4);
 }
 
-void ggml_vec_dot_znq2_l_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+void ggml_vec_dot_znq2_l_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     GGML_ASSERT(n % QK_ZNQ == 0 && nrc == 1);
     UNUSED(bs);
@@ -477,7 +489,7 @@ void ggml_vec_dot_znq2_l_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     *s = sum;
 }
 
-void ggml_vec_dot_znq3_s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+void ggml_vec_dot_znq3_s_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     GGML_ASSERT(n % QK_ZNQ == 0 && nrc == 1);
     UNUSED(bs);
@@ -509,7 +521,7 @@ void ggml_vec_dot_znq3_s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     *s = sum;
 }
 
-void ggml_vec_dot_znq3_l_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+void ggml_vec_dot_znq3_l_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     GGML_ASSERT(n % QK_ZNQ == 0 && nrc == 1);
     UNUSED(bs);
@@ -547,7 +559,7 @@ void ggml_vec_dot_znq3_l_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     *s = sum;
 }
 
-void ggml_vec_dot_znq4_s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+void ggml_vec_dot_znq4_s_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     GGML_ASSERT(n % QK_ZNQ == 0 && nrc == 1);
     UNUSED(bs);
@@ -585,7 +597,7 @@ void ggml_vec_dot_znq4_s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     *s = sum;
 }
 
-void ggml_vec_dot_znq4_l_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+void ggml_vec_dot_znq4_l_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     GGML_ASSERT(n % QK_ZNQ == 0 && nrc == 1);
     UNUSED(bs);
@@ -618,7 +630,7 @@ void ggml_vec_dot_znq4_l_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     *s = sum;
 }
 
-void ggml_vec_dot_znq5_s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+void ggml_vec_dot_znq5_s_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     GGML_ASSERT(n % QK_ZNQ == 0 && nrc == 1);
     UNUSED(bs);
@@ -651,7 +663,7 @@ void ggml_vec_dot_znq5_s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     *s = sum;
 }
 
-void ggml_vec_dot_znq5_m_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+void ggml_vec_dot_znq5_m_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     GGML_ASSERT(n % QK_ZNQ == 0 && nrc == 1);
     UNUSED(bs);
@@ -690,7 +702,7 @@ void ggml_vec_dot_znq5_m_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     *s = sum;
 }
 
-void ggml_vec_dot_znq5_l_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+void ggml_vec_dot_znq5_l_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     GGML_ASSERT(n % QK_ZNQ == 0 && nrc == 1);
     UNUSED(bs);
@@ -729,7 +741,7 @@ void ggml_vec_dot_znq5_l_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     *s = sum;
 }
 
-void ggml_vec_dot_znq6_s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+void ggml_vec_dot_znq6_s_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     GGML_ASSERT(n % QK_ZNQ == 0 && nrc == 1);
     UNUSED(bs);
@@ -768,7 +780,7 @@ void ggml_vec_dot_znq6_s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     *s = sum;
 }
 
-void ggml_vec_dot_znq6_m_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+void ggml_vec_dot_znq6_m_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     GGML_ASSERT(n % QK_ZNQ == 0 && nrc == 1);
     UNUSED(bs);
@@ -807,7 +819,7 @@ void ggml_vec_dot_znq6_m_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     *s = sum;
 }
 
-void ggml_vec_dot_znq6_l_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+void ggml_vec_dot_znq6_l_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     GGML_ASSERT(n % QK_ZNQ == 0 && nrc == 1);
     UNUSED(bs);
@@ -846,7 +858,7 @@ void ggml_vec_dot_znq6_l_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     *s = sum;
 }
 
-void ggml_vec_dot_znq7_s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+void ggml_vec_dot_znq7_s_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     GGML_ASSERT(n % QK_ZNQ == 0 && nrc == 1);
     UNUSED(bs);
@@ -885,7 +897,7 @@ void ggml_vec_dot_znq7_s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     *s = sum;
 }
 
-void ggml_vec_dot_znq7_m_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+void ggml_vec_dot_znq7_m_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     GGML_ASSERT(n % QK_ZNQ == 0 && nrc == 1);
     UNUSED(bs);
@@ -920,7 +932,7 @@ void ggml_vec_dot_znq7_m_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     *s = sum;
 }
 
-void ggml_vec_dot_znq7_l_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+void ggml_vec_dot_znq7_l_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     GGML_ASSERT(n % QK_ZNQ == 0 && nrc == 1);
     UNUSED(bs);

@@ -4,6 +4,24 @@
 // Rename `_generic` functions if no native implementation is available.
 // This effectively selects the generic implementation.
 
+#if defined(GGML_CPU_GENERIC) || !(defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
+#define ggml_vec_dot_znq_q8_0_4_generic ggml_vec_dot_znq_q8_0_4
+#define ggml_vec_dot_znq2_l_q8_0_generic ggml_vec_dot_znq2_l_q8_0
+#define ggml_vec_dot_znq3_s_q8_0_generic ggml_vec_dot_znq3_s_q8_0
+#define ggml_vec_dot_znq3_l_q8_0_generic ggml_vec_dot_znq3_l_q8_0
+#define ggml_vec_dot_znq4_s_q8_0_generic ggml_vec_dot_znq4_s_q8_0
+#define ggml_vec_dot_znq4_l_q8_0_generic ggml_vec_dot_znq4_l_q8_0
+#define ggml_vec_dot_znq5_s_q8_0_generic ggml_vec_dot_znq5_s_q8_0
+#define ggml_vec_dot_znq5_m_q8_0_generic ggml_vec_dot_znq5_m_q8_0
+#define ggml_vec_dot_znq5_l_q8_0_generic ggml_vec_dot_znq5_l_q8_0
+#define ggml_vec_dot_znq6_s_q8_0_generic ggml_vec_dot_znq6_s_q8_0
+#define ggml_vec_dot_znq6_m_q8_0_generic ggml_vec_dot_znq6_m_q8_0
+#define ggml_vec_dot_znq6_l_q8_0_generic ggml_vec_dot_znq6_l_q8_0
+#define ggml_vec_dot_znq7_s_q8_0_generic ggml_vec_dot_znq7_s_q8_0
+#define ggml_vec_dot_znq7_m_q8_0_generic ggml_vec_dot_znq7_m_q8_0
+#define ggml_vec_dot_znq7_l_q8_0_generic ggml_vec_dot_znq7_l_q8_0
+#endif
+
 #if defined(GGML_CPU_GENERIC)
 // quants.c
 #define quantize_row_q8_0_generic quantize_row_q8_0

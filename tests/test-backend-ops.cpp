@@ -11844,6 +11844,11 @@ static void add_test_cases_mul_mat_znq(std::vector<std::unique_ptr<test_case>> &
                     test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, 1, 4096, {1, 1}, {1, 1}));
                 }
             }
+            if (type == GGML_TYPE_ZNQ6_M) {
+                for (int64_t m : {4096, 4097}) {
+                    test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, 1, 2080, {1, 1}, {1, 1}));
+                }
+            }
             for (int64_t m : {3, 159, 255, 256, 257, 319, 320, 321}) {
                 for (int64_t n : {1, 17}) {
                     test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, 4128, {1, 1}, {1, 1}));

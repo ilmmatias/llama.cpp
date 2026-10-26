@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <math.h>
 #include <stdio.h>
 #include <string>
@@ -249,6 +250,212 @@ static int test_vec_dot_q(bool verbose) {
     return num_failed;
 }
 
+static int test_vec_dot_znq(bool verbose) {
+    const auto * activations = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    int num_failed = 0;
+
+    for (ggml_type type : {GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S,
+                          GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L,
+                          GGML_TYPE_ZNQ6_S, GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S,
+                          GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L}) {
+        const auto * weights = ggml_get_type_traits(type);
+        const auto * cpu = ggml_get_type_traits_cpu(type);
+        assert(cpu->vec_dot_type == GGML_TYPE_Q8_0);
+        ggml_quantize_init(type);
+
+        for (int n : {32, 96, 10240}) {
+            std::vector<float> x(n), y(n), dx(n), dy(n);
+            std::vector<uint8_t> qx(ggml_row_size(type, n) + 1);
+            std::vector<uint8_t> qy(ggml_row_size(GGML_TYPE_Q8_0, n));
+
+            const auto check = [&](const char * input, int seed) {
+                weights->to_float(qx.data() + 1, dx.data(), n);
+                activations->to_float(qy.data(), dy.data(), n);
+
+                float result = INFINITY;
+                cpu->vec_dot(n, &result, 0, qx.data() + 1, 0, qy.data(), 0, 1);
+                const float reference = dot_product(dx.data(), dy.data(), n);
+                const bool failed = !(fabsf(result - reference) / n < MAX_QUANTIZATION_REFERENCE_ERROR);
+                num_failed += failed;
+                if (failed || verbose) {
+                    printf("%s native dot %s n=%d seed=%d: %s (ref=%f got=%f)\n",
+                           ggml_type_name(type), input, n, seed, RESULT_STR[failed], reference, result);
+                }
+            };
+
+            // Keep the expensive reference quantization bounded for long rows.
+            for (int seed = 0; seed < (n == 10240 ? 2 : 8); ++seed) {
+                for (int i = 0; i < n; ++i) {
+                    x[i] = sinf(float(i * 17 + seed * 31)) * (1 + (i / 32) % 7);
+                    y[i] = cosf(float(i * 13 + seed * 19));
+                }
+                weights->from_float_ref(x.data(), qx.data() + 1, n);
+                activations->from_float_ref(y.data(), qy.data(), n);
+                check("quantized", seed);
+            }
+
+            if (n == 10240) {
+                continue;
+            }
+
+            const size_t bx = ggml_type_size(type);
+            const size_t by = ggml_type_size(GGML_TYPE_Q8_0);
+            // Sweep every selector/payload byte, then isolate zero and subnormal scales and the last block.
+            for (int seed = 0; seed < 264; ++seed) {
+                for (int ib = 0; ib < n / 32; ++ib) {
+                    uint8_t * px = qx.data() + 1 + ib*bx;
+                    uint8_t * py = qy.data() + ib*by;
+                    for (size_t j = 1; j < bx; ++j) {
+                        px[j] = seed < 256 ? uint8_t(seed + 37*j + 61*ib) :
+                                seed == 256 ? 0 : seed == 257 ? 0x55 : seed == 258 ? 0xaa : 0xff;
+                    }
+                    px[0] = seed == 258 ? 0 : seed == 259 ? 1 : seed == 260 ? 7 : seed == 261 ? 8 :
+                            seed == 262 ? 120 : seed == 263 && ib != n / 32 - 1 ? 0 : 104 + ib;
+
+                    // Q8_0 is a half scale followed by 32 signed bytes; include -128, which quantization does not emit.
+                    const ggml_fp16_t scale = seed == 256 ? 0 : seed == 257 ? 1 : ggml_fp32_to_fp16(1.0f / 128.0f);
+                    std::memcpy(py, &scale, sizeof(scale));
+                    for (int j = 0; j < 32; ++j) {
+                        py[sizeof(scale) + j] = seed % 4 == 0 ? (j % 2 == 0 ? 0x80 : 0x7f) :
+                                               seed % 4 == 1 ? 0x7f : seed % 4 == 2 ? 0x80 :
+                                               uint8_t(13*j + 17*seed + 29*ib);
+                    }
+                }
+                check("packed", seed);
+            }
+        }
+    }
+    return num_failed;
+}
+
+static int test_mul_mat_znq(bool verbose) {
+    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    assert(backend);
+    int num_failed = 0;
+    // Plane sizes deliberately do not align with four-column batches or 16-column chunks.
+    const int shapes[][7] = {
+        // k, m, n, weight planes 2/3, input planes 2/3
+        {32,   1,  3, 1, 1, 2, 2},
+        {32,   1,  4, 1, 1, 1, 1},
+        {32,   3,  4, 2, 1, 4, 1},
+        {96,   3,  5, 2, 1, 4, 1},
+        {32,   9,  7, 1, 2, 1, 4},
+        {96,   9, 17, 2, 2, 4, 2},
+        {96, 324,  5, 1, 1, 1, 1},
+        {96, 324, 17, 2, 1, 2, 1},
+    };
+    const auto * q8 = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    const auto quantize_input = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0)->from_float;
+
+    for (ggml_type type : {GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S,
+                          GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L,
+                          GGML_TYPE_ZNQ6_S, GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S,
+                          GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L}) {
+        ggml_quantize_init(type);
+        const auto * traits = ggml_get_type_traits(type);
+        for (const auto & shape : shapes) {
+            const int k = shape[0], m = shape[1], n = shape[2];
+            const int w2 = shape[3], w3 = shape[4], a2 = shape[5], a3 = shape[6];
+            const size_t weight_row_size = ggml_row_size(type, k);
+            const size_t q8_row_size = ggml_row_size(GGML_TYPE_Q8_0, k);
+            std::vector<uint8_t> weight_data(weight_row_size*m*w2*w3);
+            std::vector<float> weight_float(k*m*w2*w3);
+            // Valid packed payloads avoid expensive weight quantization and vary every row and plane.
+            for (int row = 0; row < m*w2*w3; ++row) {
+                for (int block = 0; block < k/32; ++block) {
+                    auto * packed = weight_data.data() + row*weight_row_size + block*ggml_type_size(type);
+                    packed[0] = 100 + (7*row + block) % 20;
+                    for (size_t j = 1; j < ggml_type_size(type); ++j) {
+                        packed[j] = uint8_t(37*j + 61*block + 17*row + 11*(row/256));
+                    }
+                }
+                traits->to_float(weight_data.data() + row*weight_row_size, weight_float.data() + row*k, k);
+            }
+
+            for (int mode = 0; mode < 3; ++mode) {
+                const ggml_type input_type = mode == 0 ? GGML_TYPE_F32 : GGML_TYPE_Q8_0;
+                const int stride = mode == 2 ? 2 : 1;
+                ggml_init_params params = { 1024*1024, nullptr, true };
+                ggml_context_ptr weight_ctx(ggml_init(params));
+                ggml_context_ptr ctx(ggml_init(params));
+                auto * weights = ggml_new_tensor_4d(weight_ctx.get(), type, k, m, w2, w3);
+                ggml_backend_buffer_ptr weight_buf(ggml_backend_alloc_ctx_tensors_from_buft(weight_ctx.get(), ggml_backend_cpu_buffer_type()));
+                assert(weight_buf);
+                ggml_backend_buffer_set_usage(weight_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                auto * storage = ggml_new_tensor_4d(ctx.get(), input_type, k, stride*n, a2, a3);
+                const size_t input_row_size = ggml_row_size(input_type, k);
+                const size_t offset = stride == 2 ? input_row_size : 0;
+                auto * input = ggml_view_4d(ctx.get(), storage, k, n, a2, a3,
+                                           stride*input_row_size, storage->nb[2], storage->nb[3], offset);
+                auto * out = ggml_mul_mat(ctx.get(), weights, input);
+                if (!ggml_backend_supports_op(backend.get(), out)) {
+                    fprintf(stderr, "%s native matmul does not support %s input\n", ggml_type_name(type), ggml_type_name(input_type));
+                    return num_failed + 1;
+                }
+                auto * graph = ggml_new_graph(ctx.get());
+                ggml_build_forward_expand(graph, out);
+                ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type()));
+                assert(buf);
+                ggml_backend_tensor_set(weights, weight_data.data(), 0, weight_data.size());
+
+                std::vector<float> data(ggml_nelements(storage));
+                std::vector<uint8_t> quantized(q8_row_size*stride*n*a2*a3);
+                for (int row = 0; row < stride*n*a2*a3; ++row) {
+                    for (int i = 0; i < k; ++i) {
+                        data[row*k + i] = sinf(float(13*i + 19*row)) * (1 + row % 5) + 0.03f*(row % 7);
+                    }
+                    quantize_input(data.data() + row*k, quantized.data() + row*q8_row_size, k);
+                }
+                if (input_type == GGML_TYPE_F32) {
+                    ggml_backend_tensor_set(storage, data.data(), 0, ggml_nbytes(storage));
+                } else {
+                    ggml_backend_tensor_set(storage, quantized.data(), 0, quantized.size());
+                }
+
+                std::vector<float> expected(ggml_nelements(out)), actual(expected.size()), input_float(k);
+                for (int i3 = 0; i3 < a3; ++i3) {
+                    for (int i2 = 0; i2 < a2; ++i2) {
+                        const int weight_plane = i2/(a2/w2) + w2*(i3/(a3/w3));
+                        for (int col = 0; col < n; ++col) {
+                            const int input_row = stride*(col + n*(i2 + a2*i3)) + (stride == 2 ? 1 : 0);
+                            q8->to_float(quantized.data() + input_row*q8_row_size, input_float.data(), k);
+                            for (int row = 0; row < m; ++row) {
+                                const int index = row + m*(col + n*(i2 + a2*i3));
+                                expected[index] = dot_product(weight_float.data() + k*(row + m*weight_plane), input_float.data(), k);
+                            }
+                        }
+                    }
+                }
+
+                for (int threads : { 1, 3 }) {
+                    ggml_backend_cpu_set_n_threads(backend.get(), threads);
+                    std::fill(actual.begin(), actual.end(), NAN);
+                    ggml_backend_tensor_set(out, actual.data(), 0, ggml_nbytes(out));
+                    assert(ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS);
+                    ggml_backend_tensor_get(out, actual.data(), 0, ggml_nbytes(out));
+                    size_t mismatch = actual.size();
+                    for (size_t i = 0; i < actual.size(); ++i) {
+                        if (!(fabsf(actual[i] - expected[i])/k < MAX_QUANTIZATION_REFERENCE_ERROR)) {
+                            mismatch = i;
+                            break;
+                        }
+                    }
+                    const bool failed = mismatch != actual.size();
+                    num_failed += failed;
+                    if (failed || verbose) {
+                        printf("%s native matmul input=%s stride=%d k=%d m=%d n=%d weights=%dx%d inputs=%dx%d threads=%d: %s\n",
+                               ggml_type_name(type), ggml_type_name(input_type), stride, k, m, n, w2, w3, a2, a3, threads, RESULT_STR[failed]);
+                        if (failed) {
+                            printf("  output[%zu]: ref=%f got=%f\n", mismatch, expected[mismatch], actual[mismatch]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return num_failed;
+}
+
 static int test_repack(bool verbose, ggml_type weight_type, ggml_type input_type, bool dense = false, int dense_planes = 1) {
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     assert(backend);
@@ -457,6 +664,8 @@ int main(int argc, char * argv[]) {
 
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_vec_dot_q(verbose);
+    num_failed += test_vec_dot_znq(verbose);
+    num_failed += test_mul_mat_znq(verbose);
     num_failed += test_repack(verbose, GGML_TYPE_ZNQ3_M, GGML_TYPE_F32);
     for (ggml_type type : {GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_S, GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S, GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L}) {
         num_failed += test_repack(verbose, type, GGML_TYPE_F32);
