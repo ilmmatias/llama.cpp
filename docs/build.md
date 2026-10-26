@@ -435,10 +435,6 @@ You can download it from your Linux distro's package manager or from here: [ROCm
 The environment variable [`HIP_VISIBLE_DEVICES`](https://rocm.docs.amd.com/en/latest/understand/gpu_isolation.html#hip-visible-devices) can be used to specify which GPU(s) will be used.
 If your GPU is not officially supported you can use the environment variable [`HSA_OVERRIDE_GFX_VERSION`] set to a similar GPU, for example 10.3.0 on RDNA2 (e.g. gfx1030, gfx1031, or gfx1035) or 11.0.0 on RDNA3. Note that [`HSA_OVERRIDE_GFX_VERSION`] is [not supported on Windows](https://github.com/ROCm/ROCm/issues/2654)
 
-HIP MoE matrix multiplication uses histogram-based expert routing for batches of at least 128 tokens and up to 1024 experts. The routing pass preserves duplicate route slots and supports broadcast or strided activation inputs. Smaller batches and larger expert counts retain the warp-based routing path. This adapts the histogram routing idea from [strix-llama.cpp](https://github.com/asf0/strix-llama.cpp/tree/rdna35-perf) to the backend's physical wave size.
-
-RDNA2 uses separate projections for dense Q8_0 gates with at least 16384 input columns and 1024 output rows. Smaller gates and other quantization types retain fused matvec dispatch. This adapts the wide-gate cutoff from [strix-llama.cpp](https://github.com/asf0/strix-llama.cpp/commit/a44e83af440f5b6aa0f92da6b8cc491bbc75fa45) to measured RDNA2 shapes.
-
 ### Paged QSA KV cache
 
 For Qwen4Exp on CUDA/HIP, `LLAMA_QSA_KV_RESIDENT=16384` keeps a bounded KV page cache in GPU memory and authoritative KV data in mapped host memory. The resident token budget is rounded down to a multiple of four and must be smaller than the context size. This does not change the model's QSA selection threshold.

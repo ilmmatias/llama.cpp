@@ -11848,6 +11848,21 @@ static void add_test_cases_mul_mat_znq(std::vector<std::unique_ptr<test_case>> &
                 for (int64_t m : {4096, 4097}) {
                     test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, 1, 2080, {1, 1}, {1, 1}));
                 }
+                for (int64_t m : {2048, 2049, 4094}) {
+                    test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, 1, 4128, {2, 1}, {1, 1}));
+                }
+            }
+            if (type == GGML_TYPE_ZNQ7_S) {
+                for (int64_t k : {480, 512, 544}) {
+                    for (int64_t m : {1024, 1025, 1026}) {
+                        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, 1, k, {2, 1}, {2, 1}));
+                    }
+                }
+            }
+            if (type == GGML_TYPE_ZNQ4_M) {
+                for (int64_t m : {4096, 4097, 4098}) {
+                    test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, 1, 2080, {1, 1}, {1, 1}));
+                }
             }
             for (int64_t m : {3, 159, 255, 256, 257, 319, 320, 321}) {
                 for (int64_t n : {1, 17}) {
@@ -14543,6 +14558,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, op, 1, rows, 16384,
                 false, 1, 1, false, with_bias, true, false, {1, 1}));
         }
+    }
+
+    for (bool with_gate : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_ZNQ6_M, GGML_GLU_OP_SWIGLU, 1, 2048, 4128,
+            false, 1, 1, false, true, with_gate, false, {1, 1}));
+        for (int64_t rows : {1024, 1025, 1028}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_ZNQ7_S, GGML_GLU_OP_SWIGLU, 1, rows, 320,
+                false, 1, 1, false, true, with_gate, false, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_ZNQ4_M, GGML_GLU_OP_SWIGLU, 1, 4098, 2080,
+            false, 1, 1, false, true, with_gate, false, {1, 1}));
     }
 
     for (bool b : {false, true}) {
