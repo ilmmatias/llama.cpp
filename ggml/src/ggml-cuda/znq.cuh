@@ -138,8 +138,9 @@ static __device__ __forceinline__ int znq_pack4_cuda(const uint8_t * block, int 
     const int book = znq_book_cuda<group>(block, j);
 
 #if defined(GGML_USE_HIP)
-    // Larger books pay off when one lane decodes several quads from the same book.
-    if constexpr (bits <= 3 || (reuse_book && bits < 6 && (bits != 5 || group != 4))) {
+    // Loading a whole book pays off when one lane reuses it across several quads.
+    // MMQ's single-quad lanes keep direct lookups for books larger than four bytes.
+    if constexpr (bits == 2 || (reuse_book && bits < 6 && (bits != 5 || group != 4))) {
         uint32_t indices = 0;
         if constexpr (bits == 4) {
             // Selectors 0, 4, 1, 5 put the four nibble codes in separate bytes.

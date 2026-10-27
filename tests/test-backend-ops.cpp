@@ -11876,6 +11876,10 @@ static void add_test_cases_mul_mat_znq(std::vector<std::unique_ptr<test_case>> &
                 }
             }
             if (type == GGML_TYPE_ZNQ6_M) {
+                for (int64_t k : {224, 256, 288, 480, 512, 544}) {
+                    test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 1025, k,
+                        false, 1, 1, false, true, true, false, {2, 2}));
+                }
                 for (int64_t m : {4096, 4097}) {
                     test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, 1, 2080, {1, 1}, {1, 1}));
                 }

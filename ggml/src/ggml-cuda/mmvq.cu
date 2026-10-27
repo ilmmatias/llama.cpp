@@ -1270,7 +1270,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
         }
         if (table_id == MMVQ_PARAMETERS_RDNA2 && c_ncols_dst == 1 &&
                 (type == GGML_TYPE_ZNQ4_L || type == GGML_TYPE_ZNQ6_M)) {
-            // Four-row groups need enough output rows; ZNQ6_M also benefits at medium K.
+            // Dense ZNQ6_M is dispatched separately; keep the routed/shared grouped policy.
+            // Four-row groups need enough output rows to populate the device.
             return nrows_x >= 4096 && ncols_x >= (type == GGML_TYPE_ZNQ6_M ? 2048 : 4096);
         }
         if (table_id == MMVQ_PARAMETERS_RDNA2 && c_ncols_dst == 1 && calc_nwarps(type, c_ncols_dst, table_id) > 1) {
@@ -1353,6 +1354,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
 #if defined(GGML_USE_HIP)
     if constexpr (znq_bits_cuda(type) != 0) {
+        // ZNQ6_M dense decode benefits from four quads per lane without grouping output rows.
+        // Keep the existing dot width for routed experts and multi-token projections.
+        constexpr int dense_vdr = type == GGML_TYPE_ZNQ6_M ? 4 : get_vdr_znq_rdna2(type);
+        const bool dense_rdna2 = table_id == MMVQ_PARAMETERS_RDNA2 && ncols_dst == 1 && !has_ids && !fusion.shared_up;
+
         // Developer overrides isolate row grouping and dot width in the same binary.
         static const int rows_override = []() {
             const char * value = std::getenv("GGML_CUDA_ZNQ_MMVQ_ROWS");
@@ -1374,7 +1380,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             }
             GGML_ABORT("GGML_CUDA_ZNQ_MMVQ_VDR must be 0, 2, 4, or 8");
         }();
-        if ((rows_override || vdr_override) && table_id == MMVQ_PARAMETERS_RDNA2 && ncols_dst == 1 && !has_ids && !fusion.shared_up) {
+        if ((rows_override || vdr_override) && dense_rdna2) {
             const auto launch_vdr = [&](auto vdr_tag) {
                 constexpr int dot_width = decltype(vdr_tag)::value;
                 const auto launch_rows = [&](auto rows_tag) {
@@ -1394,7 +1400,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 }
             };
             switch (vdr_override) {
-                case 0: launch_vdr(std::integral_constant<int, get_vdr_znq_rdna2(type)>{}); break;
+                case 0: launch_vdr(std::integral_constant<int, dense_vdr>{}); break;
                 case 2: launch_vdr(std::integral_constant<int, 2>{}); break;
                 case 4: launch_vdr(std::integral_constant<int, 4>{}); break;
                 case 8: launch_vdr(std::integral_constant<int, 8>{}); break;
@@ -1404,30 +1410,29 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
         // Short rows leave at least half a wave idle. Four subgroups share the wave across rows.
         constexpr int subgroups = 4;
-        if (table_id == MMVQ_PARAMETERS_RDNA2 && ncols_dst == 1 && !has_ids && !fusion.shared_up &&
-                nrows_x >= 1024 && blocks_per_row_x <= blocks_per_iter_1warp / 2) {
+        const int dense_blocks_per_iter = dense_vdr * warp_size / qi;
+        if (dense_rdna2 && nrows_x >= 1024 && blocks_per_row_x <= dense_blocks_per_iter / 2) {
             const auto dims = calc_launch_params<type>(1, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, false, subgroups);
-            mul_mat_vec_q_switch_fusion<type, 1, false, false, 0, subgroups>(
+            constexpr int subgroup_vdr = type == GGML_TYPE_ZNQ6_M ? dense_vdr : 0;
+            mul_mat_vec_q_switch_fusion<type, 1, false, false, 0, subgroups, subgroup_vdr>(
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                 stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride, stream, nrows_x);
             return;
+        }
+
+        if constexpr (type == GGML_TYPE_ZNQ6_M) {
+            if (dense_rdna2) {
+                const auto dims = calc_launch_params<type>(1, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, false, 1);
+                mul_mat_vec_q_switch_fusion<type, 1, false, false, 1, 1, dense_vdr>(
+                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                    channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                    stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride, stream, nrows_x);
+                return;
+            }
         }
     }
 #endif // defined(GGML_USE_HIP)
-
-    if constexpr (type == GGML_TYPE_ZNQ6_M) {
-        // Pair medium-sized projections without the register pressure of four-row groups.
-        if (table_id == MMVQ_PARAMETERS_RDNA2 && ncols_dst == 1 && !has_ids && !fusion.shared_up &&
-                nrows_x >= 2048 && nrows_x < 4096 && ncols_x >= 4096) {
-            const auto dims = calc_launch_params<type>(1, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, false, 2);
-            mul_mat_vec_q_switch_fusion<type, 1, false, false, 2>(
-                vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
-                channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
-                stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride, stream, nrows_x);
-            return;
-        }
-    }
 
     switch (ncols_dst) {
         case 1: {
