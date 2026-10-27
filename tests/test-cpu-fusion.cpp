@@ -164,7 +164,7 @@ static void test_fallbacks() {
     ggml_build_forward_expand(graph, out);
 
     fusion_ptr broadcast(ggml_cpu_fusion_plan_create(graph), ggml_cpu_fusion_plan_free);
-    REQUIRE(ggml_cpu_fusion_compute(broadcast.get(), 0, 0, 1) == 0);
+    REQUIRE(ggml_cpu_fusion_compute(broadcast.get(), 0, 0, 1) == 1);
     compute(graph, 4);
     REQUIRE(static_cast<float *>(out->data)[127] == 1);
 
@@ -176,6 +176,144 @@ static void test_fallbacks() {
     REQUIRE(ggml_cpu_fusion_compute(reduction.get(), 0, 0, 1) == 0);
     compute(graph, 4);
     REQUIRE(static_cast<float *>(out->data)[0] == 512);
+}
+
+static void test_indexed(const char * layout, int64_t columns, int threads) {
+    auto ctx = make_context();
+    const bool repeat = std::strcmp(layout, "repeat") == 0;
+    const int64_t width = repeat ? 2 * columns : columns;
+    auto * a = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, width, 3, 2, 2);
+    ggml_tensor * b;
+
+    if (std::strcmp(layout, "scalar") == 0) {
+        b = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 1);
+    } else if (std::strcmp(layout, "row") == 0) {
+        b = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, width);
+    } else if (repeat) {
+        b = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, columns, 1, 2, 1);
+    } else if (std::strcmp(layout, "permuted") == 0) {
+        auto * storage = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, 3, width, 2, 2);
+        b = ggml_permute(ctx.get(), storage, 1, 0, 2, 3);
+    } else {
+        const int64_t pitch = width + (std::strcmp(layout, "padded") == 0 ? 3 : 0);
+        auto * storage = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, pitch * 12 + 1);
+        b = ggml_view_4d(ctx.get(), storage, width, 3, 2, 2,
+                        pitch * sizeof(float), pitch * 3 * sizeof(float), pitch * 6 * sizeof(float), sizeof(float));
+    }
+
+    const int64_t n = ggml_nelements(a);
+    for (int64_t i = 0; i < n; ++i) {
+        static_cast<float *>(a->data)[i] = float(i % 37 - 18) * 0.125f;
+    }
+    for (int64_t i = 0; i < ggml_nelements(b); ++i) {
+        int64_t index = i;
+        size_t offset = 0;
+        for (int d = 0; d < 4; ++d) {
+            offset += size_t(index % b->ne[d]) * b->nb[d];
+            index /= b->ne[d];
+        }
+        const float value = float(i % 31 - 15) * 0.0625f;
+        std::memcpy(static_cast<char *>(b->data) + offset, &value, sizeof(value));
+    }
+
+    auto * sum = ggml_add(ctx.get(), a, b);
+    ggml_set_output(sum);
+    auto * out = ggml_scale_bias(ctx.get(), ggml_sqr(ctx.get(), sum), 0.25f, 1.0f);
+    auto * graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, out);
+
+    compute(graph, threads, true);
+    const std::vector<float> expected(static_cast<float *>(out->data), static_cast<float *>(out->data) + n);
+    const std::vector<float> expected_sum(static_cast<float *>(sum->data), static_cast<float *>(sum->data) + n);
+    ggml_set_f32(out, -1000);
+    ggml_set_f32(sum, -1000);
+
+    int first = 0;
+    while (first < graph->n_nodes && graph->nodes[first] != sum) {
+        ++first;
+    }
+    REQUIRE(first < graph->n_nodes);
+
+    fusion_ptr fusion(ggml_cpu_fusion_plan_create(graph), ggml_cpu_fusion_plan_free);
+    REQUIRE(fusion);
+    for (int ith = 0; ith < threads; ++ith) {
+        REQUIRE(ggml_cpu_fusion_compute(fusion.get(), first, ith, threads) == 2);
+    }
+    equal(static_cast<float *>(out->data), expected);
+    equal(static_cast<float *>(sum->data), expected_sum);
+
+    ggml_set_f32(out, -1000);
+    compute(graph, threads);
+    equal(static_cast<float *>(out->data), expected);
+}
+
+static void test_indexed_multi() {
+    auto ctx = make_context();
+    auto * a = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, 30, 3, 2, 2);
+    auto * b = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, 10, 1, 2, 1);
+    auto * storage = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, 3, 30, 2, 2);
+    auto * c = ggml_permute(ctx.get(), storage, 1, 0, 2, 3);
+    for (auto * tensor : {a, b, storage}) {
+        for (int64_t i = 0; i < ggml_nelements(tensor); ++i) {
+            static_cast<float *>(tensor->data)[i] = float(i % 29 - 14) * 0.0625f;
+        }
+    }
+
+    auto * sum = ggml_add(ctx.get(), a, b);
+    auto * out = ggml_sqr(ctx.get(), ggml_mul(ctx.get(), sum, c));
+    ggml_set_output(sum);
+    auto * graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, c);
+    ggml_build_forward_expand(graph, out);
+    int first = 0;
+    while (first < graph->n_nodes && graph->nodes[first] != sum) {
+        ++first;
+    }
+    REQUIRE(first < graph->n_nodes);
+
+    for (int threads : {1, 4}) {
+        compute(graph, threads, true);
+        const auto * values = static_cast<float *>(out->data);
+        const std::vector<float> expected(values, values + ggml_nelements(out));
+        ggml_set_f32(out, -1000);
+        fusion_ptr fusion(ggml_cpu_fusion_plan_create(graph), ggml_cpu_fusion_plan_free);
+        REQUIRE(fusion);
+        for (int ith = 0; ith < threads; ++ith) {
+            REQUIRE(ggml_cpu_fusion_compute(fusion.get(), first, ith, threads) == 2);
+        }
+        equal(static_cast<float *>(out->data), expected);
+        ggml_set_f32(out, -1000);
+        compute(graph, threads);
+        equal(static_cast<float *>(out->data), expected);
+    }
+}
+
+static void test_indexed_aliases() {
+    auto ctx = make_context();
+    auto * a = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 17, 3);
+    auto * b = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 17);
+    auto * out = ggml_sqr(ctx.get(), ggml_add(ctx.get(), a, b));
+    auto * graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, out);
+
+    void * saved = out->data;
+    out->data = b->data;
+    fusion_ptr broadcast(ggml_cpu_fusion_plan_create(graph), ggml_cpu_fusion_plan_free);
+    REQUIRE(ggml_cpu_fusion_compute(broadcast.get(), 0, 0, 1) == 0);
+    out->data = saved;
+
+    a = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 8, 8);
+    b = ggml_transpose(ctx.get(), a);
+    auto * sum = ggml_add(ctx.get(), a, b);
+    out = ggml_sqr(ctx.get(), sum);
+    graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, out);
+
+    saved = out->data;
+    out->data = a->data;
+    fusion_ptr permuted(ggml_cpu_fusion_plan_create(graph), ggml_cpu_fusion_plan_free);
+    REQUIRE(!permuted);
+    out->data = saved;
 }
 
 static void test_boundaries_and_aliases() {
@@ -292,12 +430,13 @@ static void test_backend_allocation() {
     ggml_gallocr_free(allocator);
 }
 
-static void benchmark() {
-    const int64_t n = 1024 * 1024;
+static void benchmark(bool indexed) {
+    const int64_t columns = indexed ? 1009 : 1024;
+    const int64_t rows = 1024;
     auto ctx = make_context(32 * 1024 * 1024);
 
-    auto * a = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1024, n / 1024);
-    auto * b = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1024, n / 1024);
+    auto * a = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, columns, rows);
+    auto * b = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, columns, indexed ? 1 : rows);
 
     ggml_set_f32(a, 0.5f);
     ggml_set_f32(b, 1.5f);
@@ -348,8 +487,8 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
-    if (argc == 2 && std::strcmp(argv[1], "bench") == 0) {
-        benchmark();
+    if (argc == 2 && (std::strcmp(argv[1], "bench") == 0 || std::strcmp(argv[1], "bench-indexed") == 0)) {
+        benchmark(std::strcmp(argv[1], "bench-indexed") == 0);
         return 0;
     }
 
@@ -361,6 +500,15 @@ int main(int argc, char ** argv) {
 
     test_numerics();
     test_fallbacks();
+    for (const char * layout : {"scalar", "row", "repeat", "padded", "permuted", "offset"}) {
+        for (int64_t columns : {1, 7, 8, 9, 17, 33}) {
+            for (int threads : {1, 4}) {
+                test_indexed(layout, columns, threads);
+            }
+        }
+    }
+    test_indexed_multi();
+    test_indexed_aliases();
     test_boundaries_and_aliases();
     test_arithmetic_and_abort();
     test_backend_allocation();

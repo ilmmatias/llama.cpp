@@ -26,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -56,7 +57,7 @@ bool fusion_supported_op(ggml_op op, ggml_unary_op unary) {
 }
 
 bool fusion_supported(const ggml_fusion_program & program) {
-    if (program.indexed || program.reduction.value >= 0) {
+    if (program.reduction.value >= 0) {
         return false;
     }
 
@@ -77,29 +78,25 @@ bool fusion_supported(const ggml_fusion_program & program) {
     return true;
 }
 
-// Each iteration loads all inputs before storing, so exact in-place bindings are safe.
+// Each iteration loads all inputs before storing, so matching flat in-place bindings are safe.
 // Shifted overlaps can create dependencies between iterations.
 bool fusion_bindings_valid(const ggml_fusion_region & region, const ggml_fusion_program & program) {
     if (!region.n || region.n > std::numeric_limits<size_t>::max() / sizeof(float)) {
         return false;
     }
 
-    const size_t bytes = size_t(region.n) * sizeof(float);
-
-    auto valid = [&](const ggml_tensor * tensor) {
+    auto valid = [](const ggml_tensor * tensor) {
         return tensor->type == GGML_TYPE_F32 &&
-               ggml_is_contiguous(tensor) &&
                tensor->data &&
                uintptr_t(tensor->data) % alignof(float) == 0 &&
-               uintptr_t(tensor->data) <= std::numeric_limits<uintptr_t>::max() - bytes &&
-               uint64_t(ggml_nelements(tensor)) == region.n;
+               uintptr_t(tensor->data) <= std::numeric_limits<uintptr_t>::max() - ggml_nbytes(tensor);
     };
 
-    auto overlaps = [&](const ggml_tensor * a, const ggml_tensor * b) {
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
         const uintptr_t x = uintptr_t(a->data);
         const uintptr_t y = uintptr_t(b->data);
 
-        return x < y + bytes && y < x + bytes;
+        return x < y + ggml_nbytes(b) && y < x + ggml_nbytes(a);
     };
 
     for (int i = 0; i < program.inputs; ++i) {
@@ -109,12 +106,15 @@ bool fusion_bindings_valid(const ggml_fusion_region & region, const ggml_fusion_
     }
 
     for (int i = 0; i < program.outputs; ++i) {
-        if (!valid(region.outputs[i])) {
+        const auto * output = region.outputs[i];
+        if (!valid(output) || !ggml_is_contiguous(output) || uint64_t(ggml_nelements(output)) != region.n) {
             return false;
         }
 
         for (int j = 0; j < program.inputs; ++j) {
-            if (overlaps(region.outputs[i], region.inputs[j]) && region.outputs[i]->data != region.inputs[j]->data) {
+            const auto * input = region.inputs[j];
+            if (overlaps(output, input) && (output->data != input->data ||
+                    !ggml_is_contiguous(input) || !ggml_are_same_shape(output, input))) {
                 return false;
             }
         }
@@ -127,6 +127,41 @@ bool fusion_bindings_valid(const ggml_fusion_region & region, const ggml_fusion_
     }
 
     return true;
+}
+
+bool fusion_flat_access(const ggml_fusion_access & access) {
+    size_t stride = sizeof(float);
+    for (int d = 0; d < 4; ++d) {
+        if (access.ne[d] > 1 && access.nb[d] != stride) {
+            return false;
+        }
+        stride *= size_t(access.ne[d]);
+    }
+    return access.repeat == 0;
+}
+
+std::pair<uint64_t, size_t> fusion_linear_access(const ggml_fusion_access & access, const int64_t * ne) {
+    uint64_t span = 1;
+    size_t step = 0;
+    bool first = true;
+    for (int d = 0; d < 4; ++d) {
+        if (ne[d] == 1) {
+            continue;
+        }
+        const size_t current = access.ne[d] == 1 ? 0 : access.nb[d] / sizeof(float);
+        if (!first && ((step != 0 && span > std::numeric_limits<size_t>::max() / step) || current != step * span)) {
+            break;
+        }
+        if (first) {
+            step = current;
+            first = false;
+        }
+        span *= uint64_t(access.ne[d] == 1 ? ne[d] : access.ne[d]);
+        if (access.ne[d] > 1 && access.ne[d] != ne[d]) {
+            break;
+        }
+    }
+    return {span, step};
 }
 
 llvm::PointerType * fusion_pointer_type(llvm::Type * element) {
@@ -181,10 +216,98 @@ std::unique_ptr<llvm::Module> fusion_module(const ggml_fusion_program & program,
 
         std::vector<llvm::Value *> sources;
 
-        for (auto * input : inputs) {
-            auto * pointer = b.CreateInBoundsGEP(f32, input, index);
-            pointer = b.CreateBitCast(pointer, fusion_pointer_type(value_type));
-            sources.push_back(b.CreateAlignedLoad(value_type, pointer, llvm::Align(alignof(float))));
+        for (int i = 0; i < program.inputs; ++i) {
+            auto * input = inputs[i];
+            const auto & access = program.accesses[i];
+            if (fusion_flat_access(access)) {
+                auto * pointer = b.CreateInBoundsGEP(f32, input, index);
+                pointer = b.CreateBitCast(pointer, fusion_pointer_type(value_type));
+                sources.push_back(b.CreateAlignedLoad(value_type, pointer, llvm::Align(alignof(float))));
+                continue;
+            }
+
+            if (access.ne[0] == 1 && access.ne[1] == 1 && access.ne[2] == 1 && access.ne[3] == 1) {
+                sources.push_back(splat(b.CreateAlignedLoad(f32, input, llvm::Align(alignof(float)))));
+                continue;
+            }
+
+            auto offset_for = [&](llvm::Value * position, bool vector) {
+                auto constant = [&](uint64_t value) -> llvm::Value * {
+                    return vector ? splat(b.getInt64(value)) : b.getInt64(value);
+                };
+                llvm::Value * offset = constant(0);
+                for (int d = 0; d < 4; ++d) {
+                    if (access.ne[d] > 1) {
+                        auto * coordinate = b.CreateURem(position, constant(program.ne[d]));
+                        if (access.ne[d] != program.ne[d]) {
+                            coordinate = b.CreateURem(coordinate, constant(access.ne[d]));
+                        }
+                        offset = b.CreateAdd(offset, b.CreateMul(coordinate, constant(access.nb[d] / sizeof(float))));
+                    }
+                    if (d != 3) {
+                        position = b.CreateUDiv(position, constant(program.ne[d]));
+                    }
+                }
+                return offset;
+            };
+
+            if (width == 1) {
+                auto * pointer = b.CreateInBoundsGEP(f32, input, offset_for(index, false));
+                sources.push_back(b.CreateAlignedLoad(f32, pointer, llvm::Align(alignof(float))));
+                continue;
+            }
+
+            std::vector<llvm::Constant *> lane_values;
+            for (unsigned lane = 0; lane < width; ++lane) {
+                lane_values.push_back(b.getInt64(lane));
+            }
+            auto * lanes = llvm::ConstantVector::get(lane_values);
+            auto gather = [&](llvm::Value * offset) {
+                auto * pointer = b.CreateInBoundsGEP(f32, input, offset);
+                auto * mask = llvm::Constant::getAllOnesValue(llvm::FixedVectorType::get(b.getInt1Ty(), width));
+                return b.CreateMaskedGather(value_type, pointer, llvm::Align(alignof(float)), mask);
+            };
+            auto indexed = [&] {
+                return gather(offset_for(b.CreateAdd(splat(index), lanes), true));
+            };
+
+            const auto linear = fusion_linear_access(access, program.ne);
+            if (linear.first < width) {
+                sources.push_back(indexed());
+                continue;
+            }
+
+            // Unravel only the first lane when the vector stays within an affine span.
+            auto * fast = llvm::BasicBlock::Create(context, "access.linear", function);
+            auto * slow = llvm::BasicBlock::Create(context, "access.indexed", function);
+            auto * merge = llvm::BasicBlock::Create(context, "access.merge", function);
+            auto * position = b.CreateURem(index, b.getInt64(linear.first));
+            b.CreateCondBr(b.CreateICmpULE(position, b.getInt64(linear.first - width)), fast, slow);
+
+            b.SetInsertPoint(fast);
+            auto * offset = offset_for(index, false);
+            llvm::Value * loaded;
+            if (linear.second == 0) {
+                auto * pointer = b.CreateInBoundsGEP(f32, input, offset);
+                loaded = splat(b.CreateAlignedLoad(f32, pointer, llvm::Align(alignof(float))));
+            } else if (linear.second == 1) {
+                auto * pointer = b.CreateInBoundsGEP(f32, input, offset);
+                pointer = b.CreateBitCast(pointer, fusion_pointer_type(value_type));
+                loaded = b.CreateAlignedLoad(value_type, pointer, llvm::Align(alignof(float)));
+            } else {
+                loaded = gather(b.CreateAdd(splat(offset), b.CreateMul(lanes, splat(b.getInt64(linear.second)))));
+            }
+            b.CreateBr(merge);
+
+            b.SetInsertPoint(slow);
+            auto * boundary = indexed();
+            b.CreateBr(merge);
+
+            b.SetInsertPoint(merge);
+            auto * value = b.CreatePHI(value_type, 2);
+            value->addIncoming(loaded, fast);
+            value->addIncoming(boundary, slow);
+            sources.push_back(value);
         }
 
         std::vector<llvm::Value *> values;
@@ -254,8 +377,9 @@ std::unique_ptr<llvm::Module> fusion_module(const ggml_fusion_program & program,
     b.SetInsertPoint(vector_body);
     emit(vi, fusion_width);
     auto * next_vector = b.CreateAdd(vi, b.getInt64(fusion_width));
+    auto * vector_end = b.GetInsertBlock();
     b.CreateBr(vector_test);
-    vi->addIncoming(next_vector, vector_body);
+    vi->addIncoming(next_vector, vector_end);
 
     b.SetInsertPoint(scalar_test);
     auto * si = b.CreatePHI(b.getInt64Ty(), 2);
@@ -404,6 +528,7 @@ public:
 
     fusion_kernel get(const ggml_fusion_program & program) {
         ggml_fusion_schedule schedule;
+        schedule.kind    = program.indexed ? GGML_FUSION_SCHEDULE_POINTWISE_INDEXED : GGML_FUSION_SCHEDULE_POINTWISE_FLAT;
         schedule.threads = 1;
         schedule.tile    = fusion_width;
 

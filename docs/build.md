@@ -95,11 +95,11 @@ cmake --build build --config Release
 
 ### Experimental LLVM CPU fusion
 
-Add `-DGGML_CPU_FUSION_LLVM=ON` to enable runtime fusion of supported contiguous F32 pointwise operations. This requires LLVM 14 or newer; set `LLVM_DIR` if CMake cannot find its package configuration.
+Add `-DGGML_CPU_FUSION_LLVM=ON` to enable runtime fusion of supported F32 pointwise operations. Inputs may be contiguous, broadcast, repeated, or strided views; outputs must be contiguous. Reductions and unsafe overlapping bindings use the ordinary CPU path. This requires LLVM 14 or newer; set `LLVM_DIR` if CMake cannot find its package configuration.
 
 Compiled objects are cached across processes in the platform cache directory under `llama.cpp/cpu-fusion`. Set `GGML_CPU_FUSION_CACHE_DIR` to choose another directory, or set it to `0` to disable disk caching. The in-memory cache remains available. Use a directory that only trusted users can write to, since cached objects contain executable code.
 
-Cache keys include the generated IR, target CPU and features, data layout, target triple, and LLVM version. Tensor pointers, scalar values, and flat tensor sizes are bound at runtime. Missing or damaged cache entries are recompiled; an unavailable cache directory does not prevent fusion. Files are published atomically so processes can share the directory. Old entries can be removed by deleting the directory.
+Cache keys include the generated IR, target CPU and features, data layout, target triple, and LLVM version. Tensor pointers, scalar values, and flat tensor sizes are bound at runtime; indexed programs also key on dimensions and strides. Missing or damaged cache entries are recompiled; an unavailable cache directory does not prevent fusion. Files are published atomically so processes can share the directory. Old entries can be removed by deleting the directory.
 
 ## BLAS Build
 
