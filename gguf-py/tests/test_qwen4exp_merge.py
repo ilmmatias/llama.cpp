@@ -13,6 +13,18 @@ PAIRS = (
 )
 
 
+@pytest.mark.parametrize("name,type_id,type_size", [
+    ("ZNQ2_S", 62, 8), ("ZNQ2_SM", 63, 9), ("ZNQ3_SM", 64, 13),
+    ("ZNQ4_SM", 65, 17), ("ZNQ5_SM", 66, 21), ("ZNQ6_SM", 67, 25),
+    ("ZNQ7_SM", 68, 29),
+])
+def test_znq_quarter_step_wire_contract(name, type_id, type_size):
+    tensor_type = gguf.GGMLQuantizationType[name]
+    assert int(tensor_type) == type_id
+    assert gguf.GGML_QUANT_SIZES[tensor_type] == (32, type_size)
+    assert int(gguf.LlamaFileType["MOSTLY_" + name]) == type_id - 1
+
+
 def raw_tensor(rows, width, tensor_type, seed=0):
     block_size, type_size = gguf.GGML_QUANT_SIZES[tensor_type]
     assert width % block_size == 0
@@ -50,7 +62,14 @@ def metadata(reader):
 @pytest.mark.parametrize("tensor_type", [gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16,
                                         gguf.GGMLQuantizationType.BF16, gguf.GGMLQuantizationType.Q4_0,
                                         gguf.GGMLQuantizationType.Q4_K, gguf.GGMLQuantizationType.IQ2_XXS,
-                                        gguf.GGMLQuantizationType.ZNQ3_M])
+                                        gguf.GGMLQuantizationType.ZNQ3_M,
+                                        gguf.GGMLQuantizationType.ZNQ2_S,
+                                        gguf.GGMLQuantizationType.ZNQ2_SM,
+                                        gguf.GGMLQuantizationType.ZNQ3_SM,
+                                        gguf.GGMLQuantizationType.ZNQ4_SM,
+                                        gguf.GGMLQuantizationType.ZNQ5_SM,
+                                        gguf.GGMLQuantizationType.ZNQ6_SM,
+                                        gguf.GGMLQuantizationType.ZNQ7_SM])
 @pytest.mark.parametrize("endian", [gguf.GGUFEndian.LITTLE, gguf.GGUFEndian.BIG])
 def test_raw_rows_and_metadata_preserved(tmp_path, tensor_type, endian):
     block_size, _ = gguf.GGML_QUANT_SIZES[tensor_type]

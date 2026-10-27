@@ -4078,10 +4078,9 @@ ZNQ_X86_INLINE __m512i znq_x86_lookup_group8(__m512i codes, const int8_t * table
 
 // Constant format parameters remove all format dispatch from the block loop.
 ZNQ_X86_INLINE void ggml_vec_dot_znq_q8_0_avx512(int n, float * GGML_RESTRICT s, size_t bs,
-        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, size_t by, int ncols, int bits, int group, const int8_t * values) {
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, size_t by, int ncols, int bits, int group, int book_bits, const int8_t * values) {
     static_assert(QK_ZNQ == QK8_0, "QK_ZNQ and QK8_0 must be the same");
     assert(n % QK_ZNQ == 0);
-    const int book_bits = group == 4 ? 3 : 4;
     const int book_bytes = (QK_ZNQ / group) * book_bits / 8;
     const size_t block_size = 1 + book_bytes + bits * QK_ZNQ / 8;
     const uint8_t * x = vx;
@@ -4095,9 +4094,9 @@ ZNQ_X86_INLINE void ggml_vec_dot_znq_q8_0_avx512(int n, float * GGML_RESTRICT s,
     const __m512i code_mask = _mm512_set1_epi32((1 << bits) - 1);
     const __m512i book_shifts = _mm512_mullo_epi32(
             _mm512_srli_epi32(lanes, group == 4 ? 2 : group == 8 ? 3 : 4), _mm512_set1_epi32(book_bits));
-    const int group_tables = group >= 8 && bits >= 5;
+    const int group_tables = (group >= 8 || book_bits == 4) && bits >= 5;
     const int table_size = 1 << (bits + book_bits);
-    const __m512i table0 = !group_tables ? _mm512_maskz_loadu_epi8(table_size < 64 ? UINT64_C(0xffffffff) : UINT64_MAX, values) : _mm512_setzero_si512();
+    const __m512i table0 = !group_tables ? _mm512_maskz_loadu_epi8(table_size < 64 ? (UINT64_C(1) << table_size) - 1 : UINT64_MAX, values) : _mm512_setzero_si512();
     const __m512i table1 = !group_tables && table_size > 64 ? _mm512_loadu_si512(values + 64) : _mm512_setzero_si512();
     const __m512i table2 = !group_tables && table_size > 128 ? _mm512_loadu_si512(values + 128) : _mm512_setzero_si512();
     const __m512i table3 = !group_tables && table_size > 128 ? _mm512_loadu_si512(values + 192) : _mm512_setzero_si512();
@@ -4110,7 +4109,8 @@ ZNQ_X86_INLINE void ggml_vec_dot_znq_q8_0_avx512(int n, float * GGML_RESTRICT s,
     for (int ib = 0; ib < n / QK_ZNQ; ++ib) {
         const uint8_t * xb = x + ib * block_size;
         const uint32_t books = xb[1] | (book_bytes > 1 ? (uint32_t) xb[2] << 8 : 0) |
-                (book_bytes > 2 ? (uint32_t) xb[3] << 16 : 0);
+                (book_bytes > 2 ? (uint32_t) xb[3] << 16 : 0) |
+                (book_bytes > 3 ? (uint32_t) xb[4] << 24 : 0);
         // Only the packed payload is readable, including in the last block.
         const __m512i packed = _mm512_maskz_loadu_epi8((UINT64_C(1) << (4 * bits)) - 1, xb + 1 + book_bytes);
         __m512i products[4];
@@ -4126,9 +4126,18 @@ ZNQ_X86_INLINE void ggml_vec_dot_znq_q8_0_avx512(int n, float * GGML_RESTRICT s,
             __m512i selected;
             if (group_tables && group == 16) {
                 selected = znq_x86_lookup_group16(codes, values + ((half_books & 15) << bits), bits);
-            } else if (group_tables) {
+            } else if (group_tables && group == 8) {
                 selected = znq_x86_lookup_group8(codes, values + ((half_books & 15) << bits),
                         values + (((half_books >> 4) & 15) << bits), bits);
+            } else if (group_tables) {
+                // Four independent group-4 books. Load only their 32/64-byte levels.
+                selected = znq_x86_lookup_group16(codes, values + ((half_books & 15) << bits), bits);
+                selected = _mm512_mask_blend_epi32(0x00f0, selected,
+                        znq_x86_lookup_group16(codes, values + (((half_books >> 4) & 15) << bits), bits));
+                selected = _mm512_mask_blend_epi32(0x0f00, selected,
+                        znq_x86_lookup_group16(codes, values + (((half_books >> 8) & 15) << bits), bits));
+                selected = _mm512_mask_blend_epi32(0xf000, selected,
+                        znq_x86_lookup_group16(codes, values + (((half_books >> 12) & 15) << bits), bits));
             } else {
                 const __m512i book = _mm512_and_si512(
                         _mm512_srlv_epi32(_mm512_set1_epi32(half_books), book_shifts), _mm512_set1_epi32((1 << book_bits) - 1));
@@ -4281,7 +4290,7 @@ ZNQ_X86_INLINE void ggml_vec_dot_znq4_m_q8_0_avx512(int n, float * GGML_RESTRICT
 
     float tail[4] = {0};
     if (ib < nb) {
-        ggml_vec_dot_znq_q8_0_avx512(QK_ZNQ, tail, sizeof(float), x + ib, y[0] + ib, by, ncols, 4, 16, kvalues_znq4_m);
+        ggml_vec_dot_znq_q8_0_avx512(QK_ZNQ, tail, sizeof(float), x + ib, y[0] + ib, by, ncols, 4, 16, 4, kvalues_znq4_m);
     }
     for (int col = 0; col < ncols; ++col) {
         *(float *) ((char *) s + col * bs) = _mm512_reduce_add_ps(accum[col]) + tail[col];
@@ -4291,73 +4300,88 @@ ZNQ_X86_INLINE void ggml_vec_dot_znq4_m_q8_0_avx512(int n, float * GGML_RESTRICT
 
 #undef ZNQ_X86_INLINE
 
-#define GGML_DEFINE_ZNQ_LOCAL_DOT(name, bits, group) \
+#define GGML_DEFINE_ZNQ_LOCAL_DOT(name, bits, group, selector_bits) \
 void ggml_vec_dot_##name##_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, \
         size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) { \
     assert(n % QK_ZNQ == 0 && nrc == 1); \
-    static_assert(sizeof(block_##name) == 1 + (QK_ZNQ / group) * (group == 4 ? 3 : 4) / 8 + bits * QK_ZNQ / 8, "wrong ZNQ layout"); \
+    static_assert(sizeof(block_##name) == 1 + (QK_ZNQ / group) * selector_bits / 8 + bits * QK_ZNQ / 8, "wrong ZNQ layout"); \
     UNUSED(bs); \
     UNUSED(bx); \
     UNUSED(by); \
     UNUSED(nrc); \
-    ggml_vec_dot_znq_q8_0_avx512(n, s, 0, vx, vy, 0, 1, bits, group, kvalues_##name); \
+    ggml_vec_dot_znq_q8_0_avx512(n, s, 0, vx, vy, 0, 1, bits, group, selector_bits, kvalues_##name); \
 }
 #else
-#define GGML_DEFINE_ZNQ_LOCAL_DOT(name, bits, group) \
+#define GGML_DEFINE_ZNQ_LOCAL_DOT(name, bits, group, selector_bits) \
 void ggml_vec_dot_##name##_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, \
         size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) { \
     ggml_vec_dot_##name##_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc); \
 }
 #endif
 
-GGML_DEFINE_ZNQ_LOCAL_DOT(znq2_m, 2, 16)
-GGML_DEFINE_ZNQ_LOCAL_DOT(znq2_l, 2,  8)
-GGML_DEFINE_ZNQ_LOCAL_DOT(znq3_s, 2,  4)
-GGML_DEFINE_ZNQ_LOCAL_DOT(znq3_m, 3, 16)
-GGML_DEFINE_ZNQ_LOCAL_DOT(znq3_l, 3,  8)
-GGML_DEFINE_ZNQ_LOCAL_DOT(znq4_s, 3,  4)
-GGML_DEFINE_ZNQ_LOCAL_DOT(znq4_l, 4,  8)
-GGML_DEFINE_ZNQ_LOCAL_DOT(znq5_s, 4,  4)
-GGML_DEFINE_ZNQ_LOCAL_DOT(znq5_m, 5, 16)
-GGML_DEFINE_ZNQ_LOCAL_DOT(znq5_l, 5,  8)
-GGML_DEFINE_ZNQ_LOCAL_DOT(znq6_s, 5,  4)
-GGML_DEFINE_ZNQ_LOCAL_DOT(znq6_m, 6, 16)
-GGML_DEFINE_ZNQ_LOCAL_DOT(znq6_l, 6,  8)
-GGML_DEFINE_ZNQ_LOCAL_DOT(znq7_m, 7, 16)
-GGML_DEFINE_ZNQ_LOCAL_DOT(znq7_l, 7,  8)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq2_m, 2, 16, 4)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq2_l, 2,  8, 4)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq3_s, 2,  4, 3)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq3_m, 3, 16, 4)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq3_l, 3,  8, 4)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq4_s, 3,  4, 3)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq4_l, 4,  8, 4)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq5_s, 4,  4, 3)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq5_m, 5, 16, 4)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq5_l, 5,  8, 4)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq6_s, 5,  4, 3)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq6_m, 6, 16, 4)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq6_l, 6,  8, 4)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq7_m, 7, 16, 4)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq7_l, 7,  8, 4)
+
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq2_s, 1,  4, 3)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq2_sm, 1,  4, 4)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq3_sm, 2,  4, 4)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq4_sm, 3,  4, 4)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq5_sm, 4,  4, 4)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq6_sm, 5,  4, 4)
+GGML_DEFINE_ZNQ_LOCAL_DOT(znq7_sm, 6,  4, 4)
 
 #undef GGML_DEFINE_ZNQ_LOCAL_DOT
 
 bool ggml_vec_dot_znq_q8_0_4(enum ggml_type type, int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, size_t by) {
 #if defined(__AVX512VBMI__) && defined(__AVX512BW__)
-#define GGML_ZNQ_BATCH_DOT_CASE(type, name, bits, group) \
+#define GGML_ZNQ_BATCH_DOT_CASE(type, name, bits, group, selector_bits) \
         case GGML_TYPE_##type: \
-            ggml_vec_dot_znq_q8_0_avx512(n, s, bs, vx, vy, by, 4, bits, group, kvalues_##name); \
+            ggml_vec_dot_znq_q8_0_avx512(n, s, bs, vx, vy, by, 4, bits, group, selector_bits, kvalues_##name); \
             return true;
     switch (type) {
-        GGML_ZNQ_BATCH_DOT_CASE(ZNQ2_M, znq2_m, 2, 16)
-        GGML_ZNQ_BATCH_DOT_CASE(ZNQ2_L, znq2_l, 2,  8)
-        GGML_ZNQ_BATCH_DOT_CASE(ZNQ3_S, znq3_s, 2,  4)
-        GGML_ZNQ_BATCH_DOT_CASE(ZNQ3_M, znq3_m, 3, 16)
-        GGML_ZNQ_BATCH_DOT_CASE(ZNQ3_L, znq3_l, 3,  8)
-        GGML_ZNQ_BATCH_DOT_CASE(ZNQ4_S, znq4_s, 3,  4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ2_S, znq2_s, 1,  4, 3)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ2_SM, znq2_sm, 1,  4, 4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ3_SM, znq3_sm, 2,  4, 4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ4_SM, znq4_sm, 3,  4, 4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ5_SM, znq5_sm, 4,  4, 4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ6_SM, znq6_sm, 5,  4, 4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ7_SM, znq7_sm, 6,  4, 4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ2_M, znq2_m, 2, 16, 4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ2_L, znq2_l, 2,  8, 4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ3_S, znq3_s, 2,  4, 3)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ3_M, znq3_m, 3, 16, 4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ3_L, znq3_l, 3,  8, 4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ4_S, znq4_s, 3,  4, 3)
 #if defined(__AVX512VNNI__)
         case GGML_TYPE_ZNQ4_M:
             ggml_vec_dot_znq4_m_q8_0_avx512(n, s, bs, vx, vy, by, 4);
             return true;
 #else
-        GGML_ZNQ_BATCH_DOT_CASE(ZNQ4_M, znq4_m, 4, 16)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ4_M, znq4_m, 4, 16, 4)
 #endif
-        GGML_ZNQ_BATCH_DOT_CASE(ZNQ4_L, znq4_l, 4,  8)
-        GGML_ZNQ_BATCH_DOT_CASE(ZNQ5_S, znq5_s, 4,  4)
-        GGML_ZNQ_BATCH_DOT_CASE(ZNQ5_M, znq5_m, 5, 16)
-        GGML_ZNQ_BATCH_DOT_CASE(ZNQ5_L, znq5_l, 5,  8)
-        GGML_ZNQ_BATCH_DOT_CASE(ZNQ6_S, znq6_s, 5,  4)
-        GGML_ZNQ_BATCH_DOT_CASE(ZNQ6_M, znq6_m, 6, 16)
-        GGML_ZNQ_BATCH_DOT_CASE(ZNQ6_L, znq6_l, 6,  8)
-        GGML_ZNQ_BATCH_DOT_CASE(ZNQ7_M, znq7_m, 7, 16)
-        GGML_ZNQ_BATCH_DOT_CASE(ZNQ7_L, znq7_l, 7,  8)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ4_L, znq4_l, 4,  8, 4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ5_S, znq5_s, 4,  4, 3)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ5_M, znq5_m, 5, 16, 4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ5_L, znq5_l, 5,  8, 4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ6_S, znq6_s, 5,  4, 3)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ6_M, znq6_m, 6, 16, 4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ6_L, znq6_l, 6,  8, 4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ7_M, znq7_m, 7, 16, 4)
+        GGML_ZNQ_BATCH_DOT_CASE(ZNQ7_L, znq7_l, 7,  8, 4)
         case GGML_TYPE_ZNQ7_S:
             ggml_vec_dot_znq7_s_q8_0_avx512(n, s, bs, vx, vy, by, 4);
             return true;

@@ -177,6 +177,14 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_ZNQ7_M        = 59, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_ZNQ7_L        = 60, // except 1d tensors
 
+        LLAMA_FTYPE_MOSTLY_ZNQ2_S        = 61, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_ZNQ2_SM       = 62, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_ZNQ3_SM       = 63, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_ZNQ4_SM       = 64, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_ZNQ5_SM       = 65, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_ZNQ6_SM       = 66, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_ZNQ7_SM       = 67, // except 1d tensors
+
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
 

@@ -389,6 +389,48 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+    [GGML_TYPE_ZNQ2_S] = {
+        .from_float               = quantize_row_znq2_s,
+        .vec_dot                  = ggml_vec_dot_znq2_s_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_ZNQ2_SM] = {
+        .from_float               = quantize_row_znq2_sm,
+        .vec_dot                  = ggml_vec_dot_znq2_sm_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_ZNQ3_SM] = {
+        .from_float               = quantize_row_znq3_sm,
+        .vec_dot                  = ggml_vec_dot_znq3_sm_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_ZNQ4_SM] = {
+        .from_float               = quantize_row_znq4_sm,
+        .vec_dot                  = ggml_vec_dot_znq4_sm_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_ZNQ5_SM] = {
+        .from_float               = quantize_row_znq5_sm,
+        .vec_dot                  = ggml_vec_dot_znq5_sm_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_ZNQ6_SM] = {
+        .from_float               = quantize_row_znq6_sm,
+        .vec_dot                  = ggml_vec_dot_znq6_sm_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_ZNQ7_SM] = {
+        .from_float               = quantize_row_znq7_sm,
+        .vec_dot                  = ggml_vec_dot_znq7_sm_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_ZNQ2_M] = {
         .from_float               = quantize_row_znq2_m,
         .vec_dot                  = ggml_vec_dot_znq2_m_q8_0,

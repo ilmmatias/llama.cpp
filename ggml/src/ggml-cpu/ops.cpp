@@ -5646,6 +5646,13 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_ZNQ2_S:
+        case GGML_TYPE_ZNQ2_SM:
+        case GGML_TYPE_ZNQ3_SM:
+        case GGML_TYPE_ZNQ4_SM:
+        case GGML_TYPE_ZNQ5_SM:
+        case GGML_TYPE_ZNQ6_SM:
+        case GGML_TYPE_ZNQ7_SM:
         case GGML_TYPE_ZNQ2_M:
         case GGML_TYPE_ZNQ2_L:
         case GGML_TYPE_ZNQ3_S:
@@ -6466,6 +6473,13 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_ZNQ2_S:
+        case GGML_TYPE_ZNQ2_SM:
+        case GGML_TYPE_ZNQ3_SM:
+        case GGML_TYPE_ZNQ4_SM:
+        case GGML_TYPE_ZNQ5_SM:
+        case GGML_TYPE_ZNQ6_SM:
+        case GGML_TYPE_ZNQ7_SM:
         case GGML_TYPE_ZNQ2_M:
         case GGML_TYPE_ZNQ2_L:
         case GGML_TYPE_ZNQ3_S:

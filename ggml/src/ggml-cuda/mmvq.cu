@@ -95,6 +95,13 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_ZNQ7_S:    return vec_dot_znq_q8_1<6, get_vdr_znq(GGML_TYPE_ZNQ7_S), 4>;
         case GGML_TYPE_ZNQ7_M:    return vec_dot_znq_q8_1<7, get_vdr_znq(GGML_TYPE_ZNQ7_M)>;
         case GGML_TYPE_ZNQ7_L:    return vec_dot_znq_q8_1<7, get_vdr_znq(GGML_TYPE_ZNQ7_L), 8>;
+        case GGML_TYPE_ZNQ2_S:    return vec_dot_znq_q8_1<1, get_vdr_znq(GGML_TYPE_ZNQ2_S), 4, 3>;
+        case GGML_TYPE_ZNQ2_SM:    return vec_dot_znq_q8_1<1, get_vdr_znq(GGML_TYPE_ZNQ2_SM), 4, 4>;
+        case GGML_TYPE_ZNQ3_SM:    return vec_dot_znq_q8_1<2, get_vdr_znq(GGML_TYPE_ZNQ3_SM), 4, 4>;
+        case GGML_TYPE_ZNQ4_SM:    return vec_dot_znq_q8_1<3, get_vdr_znq(GGML_TYPE_ZNQ4_SM), 4, 4>;
+        case GGML_TYPE_ZNQ5_SM:    return vec_dot_znq_q8_1<4, get_vdr_znq(GGML_TYPE_ZNQ5_SM), 4, 4>;
+        case GGML_TYPE_ZNQ6_SM:    return vec_dot_znq_q8_1<5, get_vdr_znq(GGML_TYPE_ZNQ6_SM), 4, 4>;
+        case GGML_TYPE_ZNQ7_SM:    return vec_dot_znq_q8_1<6, get_vdr_znq(GGML_TYPE_ZNQ7_SM), 4, 4>;
         case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
         case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1;
         case GGML_TYPE_IQ3_S:   return vec_dot_iq3_s_q8_1;
@@ -105,7 +112,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
 template <ggml_type type, int vdr>
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda() {
     if constexpr (znq_bits_cuda(type) != 0) {
-        return vec_dot_znq_q8_1<znq_bits_cuda(type), vdr, znq_group_cuda(type)>;
+        return vec_dot_znq_q8_1<znq_bits_cuda(type), vdr, znq_group_cuda(type), znq_selector_bits_cuda(type)>;
     } else {
         return get_vec_dot_q_cuda(type);
     }
@@ -148,6 +155,13 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_ZNQ6_L:
         case GGML_TYPE_ZNQ7_S:
         case GGML_TYPE_ZNQ7_M:
+        case GGML_TYPE_ZNQ2_S:
+        case GGML_TYPE_ZNQ2_SM:
+        case GGML_TYPE_ZNQ3_SM:
+        case GGML_TYPE_ZNQ4_SM:
+        case GGML_TYPE_ZNQ5_SM:
+        case GGML_TYPE_ZNQ6_SM:
+        case GGML_TYPE_ZNQ7_SM:
         case GGML_TYPE_ZNQ7_L:    return get_vdr_znq(type);
         case GGML_TYPE_IQ4_NL:  return VDR_IQ4_NL_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_XS:  return VDR_IQ4_XS_Q8_1_MMVQ;
@@ -1764,6 +1778,48 @@ static void mul_mat_vec_q_switch_type(
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
             break;
+        case GGML_TYPE_ZNQ2_S:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_ZNQ2_S>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_ZNQ2_SM:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_ZNQ2_SM>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_ZNQ3_SM:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_ZNQ3_SM>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_ZNQ4_SM:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_ZNQ4_SM>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_ZNQ5_SM:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_ZNQ5_SM>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_ZNQ6_SM:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_ZNQ6_SM>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_ZNQ7_SM:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_ZNQ7_SM>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
         case GGML_TYPE_IQ4_NL:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ4_NL>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
@@ -1860,6 +1916,13 @@ static __device__ __forceinline__ float mmvq_glu_dot(
         case GGML_TYPE_ZNQ7_S: return mmvq_glu_dot<GGML_TYPE_ZNQ7_S>(w, xq, K);
         case GGML_TYPE_ZNQ7_M: return mmvq_glu_dot<GGML_TYPE_ZNQ7_M>(w, xq, K);
         case GGML_TYPE_ZNQ7_L: return mmvq_glu_dot<GGML_TYPE_ZNQ7_L>(w, xq, K);
+        case GGML_TYPE_ZNQ2_S: return mmvq_glu_dot<GGML_TYPE_ZNQ2_S>(w, xq, K);
+        case GGML_TYPE_ZNQ2_SM: return mmvq_glu_dot<GGML_TYPE_ZNQ2_SM>(w, xq, K);
+        case GGML_TYPE_ZNQ3_SM: return mmvq_glu_dot<GGML_TYPE_ZNQ3_SM>(w, xq, K);
+        case GGML_TYPE_ZNQ4_SM: return mmvq_glu_dot<GGML_TYPE_ZNQ4_SM>(w, xq, K);
+        case GGML_TYPE_ZNQ5_SM: return mmvq_glu_dot<GGML_TYPE_ZNQ5_SM>(w, xq, K);
+        case GGML_TYPE_ZNQ6_SM: return mmvq_glu_dot<GGML_TYPE_ZNQ6_SM>(w, xq, K);
+        case GGML_TYPE_ZNQ7_SM: return mmvq_glu_dot<GGML_TYPE_ZNQ7_SM>(w, xq, K);
         case GGML_TYPE_IQ4_NL: return mmvq_glu_dot<GGML_TYPE_IQ4_NL>(w, xq, K);
         case GGML_TYPE_IQ4_XS: return mmvq_glu_dot<GGML_TYPE_IQ4_XS>(w, xq, K);
         case GGML_TYPE_IQ3_S: return mmvq_glu_dot<GGML_TYPE_IQ3_S>(w, xq, K);
@@ -1906,6 +1969,13 @@ bool ggml_cuda_mmvq_supported_type(ggml_type type) {
         case GGML_TYPE_ZNQ7_S:
         case GGML_TYPE_ZNQ7_M:
         case GGML_TYPE_ZNQ7_L:
+        case GGML_TYPE_ZNQ2_S:
+        case GGML_TYPE_ZNQ2_SM:
+        case GGML_TYPE_ZNQ3_SM:
+        case GGML_TYPE_ZNQ4_SM:
+        case GGML_TYPE_ZNQ5_SM:
+        case GGML_TYPE_ZNQ6_SM:
+        case GGML_TYPE_ZNQ7_SM:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
@@ -2369,6 +2439,27 @@ bool ggml_cuda_mul_mat_vec_q_glu_q8_1(
             return true;
         case GGML_TYPE_ZNQ7_L:
             mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_ZNQ7_L>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_ZNQ2_S:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_ZNQ2_S>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_ZNQ2_SM:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_ZNQ2_SM>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_ZNQ3_SM:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_ZNQ3_SM>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_ZNQ4_SM:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_ZNQ4_SM>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_ZNQ5_SM:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_ZNQ5_SM>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_ZNQ6_SM:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_ZNQ6_SM>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
+            return true;
+        case GGML_TYPE_ZNQ7_SM:
+            mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_ZNQ7_SM>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);
             return true;
         case GGML_TYPE_IQ4_NL:
             mul_mat_vec_q_glu_q8_1_launch<GGML_TYPE_IQ4_NL>(ctx, gate, up, src1, ids, dst_q8, glu_op, glu_limit);

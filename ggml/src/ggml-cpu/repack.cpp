@@ -3213,14 +3213,19 @@ void ggml_znq_local_prepare_sums(int n, int nr, bool packed, const void * vy, in
 }
 
 static void znq_local_scalar(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc,
-        int group, bool packed, const int32_t * map, size_t bs1, size_t bs2, int index_bits) {
+        int group, bool packed, const int32_t * map, size_t bs1, size_t bs2, int index_bits, int selector_bits) {
     const int nb = n / QK_ZNQ;
-    const int header = group == 16 ? 2 : group == 8 ? 3 : 4;
+    const int sbits = selector_bits ? selector_bits : (group == 4 ? 3 : 4);
+    const int header = 1 + (QK_ZNQ / group) * sbits / 8;
     const int stride = 8 * (header + 4 * index_bits);
     const auto * x = (const uint8_t *) vx;
     const auto * y = (const block_q8_0 *) vy;
     const auto * y4 = (const block_q8_0x4 *) vy;
-    const int8_t * values = index_bits == 2 ? (group == 4 ? kvalues_znq3_s : kvalues_znq2_l) :
+    const int8_t * values = group == 4 && sbits == 4 ?
+                           (index_bits == 1 ? kvalues_znq2_sm : index_bits == 2 ? kvalues_znq3_sm :
+                            index_bits == 3 ? kvalues_znq4_sm : index_bits == 4 ? kvalues_znq5_sm :
+                            index_bits == 5 ? kvalues_znq6_sm : kvalues_znq7_sm) :
+                           index_bits == 1 ? kvalues_znq2_s : index_bits == 2 ? (group == 4 ? kvalues_znq3_s : kvalues_znq2_l) :
                            index_bits == 3 ? (group == 4 ? kvalues_znq4_s : kvalues_znq3_l) :
                            index_bits == 4 ? (group == 4 ? kvalues_znq5_s : kvalues_znq4_l) :
                            index_bits == 5 ? (group == 16 ? kvalues_znq5_m : group == 8 ? kvalues_znq5_l : kvalues_znq6_s) :
@@ -3237,15 +3242,17 @@ static void znq_local_scalar(int n, float * s, size_t bs, const void * vx, const
                 uint32_t selectors = 0;
 
                 for (int b = 1; b < header; ++b) {
-                    selectors |= uint32_t(p[group == 4 ? r * 4 + b : b * 8 + r]) << (8 * (b - 1));
+                    selectors |= uint32_t(p[group == 4 ? (sbits == 4 ? 8 + 4 * r + b - 1 : r * 4 + b) : b * 8 + r]) << (8 * (b - 1));
                 }
 
                 int dot = 0;
 
                 for (int j = 0; j < QK_ZNQ; ++j) {
-                    const int book = (selectors >> ((group == 4 ? 3 : 4) * (j / group))) & (group == 4 ? 7 : 15);
+                    const int book = (selectors >> (sbits * (j / group))) & ((1 << sbits) - 1);
                     int code;
-                    if (index_bits == 2) {
+                    if (index_bits == 1) {
+                        code = (znq_local_load32(p + 8 * header + 4 * (j / 4)) >> (4 * r + j % 4)) & 1;
+                    } else if (index_bits == 2) {
                         code = (p[(header + j / 4) * 8 + r] >> (2 * (j % 4))) & 3;
                     } else if (index_bits == 4) {
                         code = (p[8 * header + 16 * (j / 4) + 2 * r + (j % 4) / 2] >> (4 * (j % 2))) & 15;
@@ -3280,7 +3287,7 @@ static void znq_local_scalar(int n, float * s, size_t bs, const void * vx, const
                 }
 
                 const float ad = GGML_CPU_FP16_TO_FP32(packed ? y4[size_t(row / 4) * nb + ib].d[row % 4] : y[size_t(row) * nb + ib].d);
-                acc += dot * znq_local_scale(p[group == 4 ? r * 4 : r]) * ad;
+                acc += dot * znq_local_scale(p[group == 4 && sbits == 3 ? r * 4 : r]) * ad;
             }
 
             znq_local_dst(s, bs, map, bs1, bs2, row)[col] = acc;
@@ -3317,19 +3324,19 @@ void ggml_gemm_znq_panel_generic(const ggml_znq_gemm_panel * panel, const void *
     }
 }
 
-void ggml_gemv_znq_local_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc, int group, const int32_t * prepared_sums, int index_bits) {
-    GGML_ASSERT(n % QK_ZNQ == 0 && nc % 8 == 0 && (group == 4 || group == 8 || (group == 16 && index_bits >= 5)) && (index_bits >= 2 && index_bits <= 7) && (index_bits != 7 || group != 4));
+void ggml_gemv_znq_local_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc, int group, const int32_t * prepared_sums, int index_bits, int selector_bits) {
+    GGML_ASSERT(n % QK_ZNQ == 0 && nc % 8 == 0 && (group == 4 || group == 8 || (group == 16 && index_bits >= 5)) && (index_bits >= 1 && index_bits <= 7) && (index_bits != 1 || group == 4) && (index_bits != 7 || group != 4));
     GGML_UNUSED(prepared_sums);
 
-    znq_local_scalar(n, s, bs, vx, vy, nr, nc, group, false, nullptr, 0, 0, index_bits);
+    znq_local_scalar(n, s, bs, vx, vy, nr, nc, group, false, nullptr, 0, 0, index_bits, selector_bits);
 }
 
 void ggml_gemm_znq_local_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc,
-        int group, const int32_t * map, size_t bs1, size_t bs2, const int32_t * prepared_sums, int index_bits) {
-    GGML_ASSERT(n % QK_ZNQ == 0 && nc % 8 == 0 && nr % 4 == 0 && (group == 4 || group == 8 || (group == 16 && index_bits >= 5)) && (index_bits >= 2 && index_bits <= 7) && (index_bits != 7 || group != 4));
+        int group, const int32_t * map, size_t bs1, size_t bs2, const int32_t * prepared_sums, int index_bits, int selector_bits) {
+    GGML_ASSERT(n % QK_ZNQ == 0 && nc % 8 == 0 && nr % 4 == 0 && (group == 4 || group == 8 || (group == 16 && index_bits >= 5)) && (index_bits >= 1 && index_bits <= 7) && (index_bits != 1 || group == 4) && (index_bits != 7 || group != 4));
     GGML_UNUSED(prepared_sums);
 
-    znq_local_scalar(n, s, bs, vx, vy, nr, nc, group, true, map, bs1, bs2, index_bits);
+    znq_local_scalar(n, s, bs, vx, vy, nr, nc, group, true, map, bs1, bs2, index_bits, selector_bits);
 }
 
 } // extern "C"
@@ -4434,6 +4441,56 @@ static void repack_znq_8_bl_parallel(
     }
 }
 
+template<typename block_t, typename block_x8_t, int bits, int sbits>
+static block_x8_t make_block_znq_g4x8(const block_t * in) {
+    block_x8_t out = {};
+    for (int r = 0; r < 8; ++r) {
+        if constexpr (sbits == 4) {
+            out.header[r] = in[r].d;
+            memcpy(out.header + 8 + 4 * r, in[r].books, 4);
+        } else {
+            memcpy(out.header + 4 * r, &in[r], 4);
+        }
+        for (int j = 0; j < QK_ZNQ; ++j) {
+            const int bit = bits * j;
+            unsigned code = in[r].qs[bit / 8] >> (bit % 8);
+            if (bit % 8 + bits > 8) {
+                code |= unsigned(in[r].qs[bit / 8 + 1]) << (8 - bit % 8);
+            }
+            code &= (1 << bits) - 1;
+            const int q = j / 4;
+            const int k = j % 4;
+            if constexpr (bits == 1 || bits == 3) {
+                for (int b = 0; b < bits; ++b) {
+                    const int out_bit = 4 * r + k;
+                    out.qs[4 * (bits * q + b) + out_bit / 8] |= ((code >> b) & 1) << (out_bit % 8);
+                }
+            } else if constexpr (bits == 2) {
+                out.qs[8 * q + r] |= code << (2 * k);
+            } else {
+                out.qs[4 * bits * q + 2 * r + k / 2] |= (code & 15) << (4 * (k % 2));
+                for (int b = 4; b < bits; ++b) {
+                    const int out_bit = 4 * r + k;
+                    out.qs[4 * bits * q + 16 + 4 * (b - 4) + out_bit / 8] |= ((code >> b) & 1) << (out_bit % 8);
+                }
+            }
+        }
+    }
+    return out;
+}
+
+template<typename block_t, typename block_x8_t, int bits, int sbits>
+static int repack_znq_g4x8(ggml_tensor * t, const void * data, size_t size) {
+    static_assert(sizeof(block_x8_t) == 8 * sizeof(block_t), "wrong group-4 repack size");
+    GGML_ASSERT(t->ne[0] % QK_ZNQ == 0 && size == ggml_nbytes(t));
+    if (t->ne[1] % 8 != 0) {
+        return -1;
+    }
+    repack_znq_8_bl_parallel((const block_t *) data, (block_x8_t *) t->data,
+            ggml_nrows(t), t->ne[0] / QK_ZNQ, size, make_block_znq_g4x8<block_t, block_x8_t, bits, sbits>);
+    return 0;
+}
+
 static block_znq2_mx8 make_block_znq2_mx8(const block_znq2_m * in) {
     block_znq2_mx8 out = {};
 
@@ -5455,6 +5512,41 @@ template <> int repack<block_iq4_nl, 8, 8>(struct ggml_tensor * t, const void * 
 }
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+template <> int repack<block_znq2_s, 8, 8>(ggml_tensor * t, const void * data, size_t size) {
+    GGML_ASSERT(t->type == GGML_TYPE_ZNQ2_S);
+    return repack_znq_g4x8<block_znq2_s, block_znq2_sx8, 1, 3>(t, data, size);
+}
+
+template <> int repack<block_znq2_sm, 8, 8>(ggml_tensor * t, const void * data, size_t size) {
+    GGML_ASSERT(t->type == GGML_TYPE_ZNQ2_SM);
+    return repack_znq_g4x8<block_znq2_sm, block_znq2_smx8, 1, 4>(t, data, size);
+}
+
+template <> int repack<block_znq3_sm, 8, 8>(ggml_tensor * t, const void * data, size_t size) {
+    GGML_ASSERT(t->type == GGML_TYPE_ZNQ3_SM);
+    return repack_znq_g4x8<block_znq3_sm, block_znq3_smx8, 2, 4>(t, data, size);
+}
+
+template <> int repack<block_znq4_sm, 8, 8>(ggml_tensor * t, const void * data, size_t size) {
+    GGML_ASSERT(t->type == GGML_TYPE_ZNQ4_SM);
+    return repack_znq_g4x8<block_znq4_sm, block_znq4_smx8, 3, 4>(t, data, size);
+}
+
+template <> int repack<block_znq5_sm, 8, 8>(ggml_tensor * t, const void * data, size_t size) {
+    GGML_ASSERT(t->type == GGML_TYPE_ZNQ5_SM);
+    return repack_znq_g4x8<block_znq5_sm, block_znq5_smx8, 4, 4>(t, data, size);
+}
+
+template <> int repack<block_znq6_sm, 8, 8>(ggml_tensor * t, const void * data, size_t size) {
+    GGML_ASSERT(t->type == GGML_TYPE_ZNQ6_SM);
+    return repack_znq_g4x8<block_znq6_sm, block_znq6_smx8, 5, 4>(t, data, size);
+}
+
+template <> int repack<block_znq7_sm, 8, 8>(ggml_tensor * t, const void * data, size_t size) {
+    GGML_ASSERT(t->type == GGML_TYPE_ZNQ7_SM);
+    return repack_znq_g4x8<block_znq7_sm, block_znq7_smx8, 6, 4>(t, data, size);
+}
+
 template <> int repack<block_znq2_m, 8, 8>(ggml_tensor * t, const void * data, size_t data_size) {
     return repack_znq2_m_to_znq2_m_8_bl(t, data, data_size);
 }
@@ -5630,6 +5722,34 @@ template <> void gemv<block_iq4_nl, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size
 }
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+template <> void gemv<block_znq2_s, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_znq_local(n, s, bs, vx, vy, nr, nc, 4, nullptr, 1, 3);
+}
+
+template <> void gemv<block_znq2_sm, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_znq_local(n, s, bs, vx, vy, nr, nc, 4, nullptr, 1, 4);
+}
+
+template <> void gemv<block_znq3_sm, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_znq_local(n, s, bs, vx, vy, nr, nc, 4, nullptr, 2, 4);
+}
+
+template <> void gemv<block_znq4_sm, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_znq_local(n, s, bs, vx, vy, nr, nc, 4, nullptr, 3, 4);
+}
+
+template <> void gemv<block_znq5_sm, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_znq_local(n, s, bs, vx, vy, nr, nc, 4, nullptr, 4, 4);
+}
+
+template <> void gemv<block_znq6_sm, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_znq_local(n, s, bs, vx, vy, nr, nc, 4, nullptr, 5, 4);
+}
+
+template <> void gemv<block_znq7_sm, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_znq_local(n, s, bs, vx, vy, nr, nc, 4, nullptr, 6, 4);
+}
+
 template <> void gemv<block_znq2_m, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemv_znq2_m_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
@@ -5805,6 +5925,34 @@ template <> void gemm<block_iq4_nl, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size
 }
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+template <> void gemm<block_znq2_s, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_znq_local(n, s, bs, vx, vy, nr, nc, 4, nullptr, 0, 0, nullptr, 1, 3);
+}
+
+template <> void gemm<block_znq2_sm, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_znq_local(n, s, bs, vx, vy, nr, nc, 4, nullptr, 0, 0, nullptr, 1, 4);
+}
+
+template <> void gemm<block_znq3_sm, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_znq_local(n, s, bs, vx, vy, nr, nc, 4, nullptr, 0, 0, nullptr, 2, 4);
+}
+
+template <> void gemm<block_znq4_sm, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_znq_local(n, s, bs, vx, vy, nr, nc, 4, nullptr, 0, 0, nullptr, 3, 4);
+}
+
+template <> void gemm<block_znq5_sm, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_znq_local(n, s, bs, vx, vy, nr, nc, 4, nullptr, 0, 0, nullptr, 4, 4);
+}
+
+template <> void gemm<block_znq6_sm, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_znq_local(n, s, bs, vx, vy, nr, nc, 4, nullptr, 0, 0, nullptr, 5, 4);
+}
+
+template <> void gemm<block_znq7_sm, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_znq_local(n, s, bs, vx, vy, nr, nc, 4, nullptr, 0, 0, nullptr, 6, 4);
+}
+
 template <> void gemm<block_znq2_m, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemm_znq2_m_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
@@ -5941,19 +6089,27 @@ static void repack_activation_rows(const void * const rows[4], void * dst, int64
 }
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
-    static constexpr bool local_znq = std::is_same_v<BLOC_TYPE, block_znq2_l> || std::is_same_v<BLOC_TYPE, block_znq3_s> ||
+    static constexpr bool sm_znq = std::is_same_v<BLOC_TYPE, block_znq2_sm> ||
+        std::is_same_v<BLOC_TYPE, block_znq3_sm> ||
+        std::is_same_v<BLOC_TYPE, block_znq4_sm> ||
+        std::is_same_v<BLOC_TYPE, block_znq5_sm> ||
+        std::is_same_v<BLOC_TYPE, block_znq6_sm> ||
+        std::is_same_v<BLOC_TYPE, block_znq7_sm>;
+    static constexpr bool onebit_znq = std::is_same_v<BLOC_TYPE, block_znq2_s> || std::is_same_v<BLOC_TYPE, block_znq2_sm>;
+    static constexpr bool local_znq = sm_znq || onebit_znq || std::is_same_v<BLOC_TYPE, block_znq2_l> || std::is_same_v<BLOC_TYPE, block_znq3_s> ||
         std::is_same_v<BLOC_TYPE, block_znq3_l> || std::is_same_v<BLOC_TYPE, block_znq4_s> ||
         std::is_same_v<BLOC_TYPE, block_znq4_l> || std::is_same_v<BLOC_TYPE, block_znq5_s> ||
         std::is_same_v<BLOC_TYPE, block_znq5_m> || std::is_same_v<BLOC_TYPE, block_znq5_l> || std::is_same_v<BLOC_TYPE, block_znq6_s> ||
         std::is_same_v<BLOC_TYPE, block_znq6_m> || std::is_same_v<BLOC_TYPE, block_znq6_l> ||
         std::is_same_v<BLOC_TYPE, block_znq7_s> || std::is_same_v<BLOC_TYPE, block_znq7_m> || std::is_same_v<BLOC_TYPE, block_znq7_l>;
-    static constexpr int local_group = (std::is_same_v<BLOC_TYPE, block_znq3_s> || std::is_same_v<BLOC_TYPE, block_znq4_s> || std::is_same_v<BLOC_TYPE, block_znq5_s> || std::is_same_v<BLOC_TYPE, block_znq6_s> || std::is_same_v<BLOC_TYPE, block_znq7_s>) ? 4 :
+    static constexpr int local_group = (sm_znq || onebit_znq || std::is_same_v<BLOC_TYPE, block_znq3_s> || std::is_same_v<BLOC_TYPE, block_znq4_s> || std::is_same_v<BLOC_TYPE, block_znq5_s> || std::is_same_v<BLOC_TYPE, block_znq6_s> || std::is_same_v<BLOC_TYPE, block_znq7_s>) ? 4 :
         (std::is_same_v<BLOC_TYPE, block_znq5_m> || std::is_same_v<BLOC_TYPE, block_znq6_m> || std::is_same_v<BLOC_TYPE, block_znq7_m>) ? 16 : 8;
-    static constexpr int local_bits = (std::is_same_v<BLOC_TYPE, block_znq7_m> || std::is_same_v<BLOC_TYPE, block_znq7_l>) ? 7 :
-        (std::is_same_v<BLOC_TYPE, block_znq6_m> || std::is_same_v<BLOC_TYPE, block_znq6_l> || std::is_same_v<BLOC_TYPE, block_znq7_s>) ? 6 :
-        (std::is_same_v<BLOC_TYPE, block_znq5_m> || std::is_same_v<BLOC_TYPE, block_znq5_l> || std::is_same_v<BLOC_TYPE, block_znq6_s>) ? 5 :
-        (std::is_same_v<BLOC_TYPE, block_znq4_l> || std::is_same_v<BLOC_TYPE, block_znq5_s>) ? 4 :
-        (std::is_same_v<BLOC_TYPE, block_znq3_l> || std::is_same_v<BLOC_TYPE, block_znq4_s>) ? 3 : 2;
+    static constexpr int local_bits = onebit_znq ? 1 : (std::is_same_v<BLOC_TYPE, block_znq7_m> || std::is_same_v<BLOC_TYPE, block_znq7_l>) ? 7 :
+        (std::is_same_v<BLOC_TYPE, block_znq7_sm> || std::is_same_v<BLOC_TYPE, block_znq6_m> || std::is_same_v<BLOC_TYPE, block_znq6_l> || std::is_same_v<BLOC_TYPE, block_znq7_s>) ? 6 :
+        (std::is_same_v<BLOC_TYPE, block_znq6_sm> || std::is_same_v<BLOC_TYPE, block_znq5_m> || std::is_same_v<BLOC_TYPE, block_znq5_l> || std::is_same_v<BLOC_TYPE, block_znq6_s>) ? 5 :
+        (std::is_same_v<BLOC_TYPE, block_znq5_sm> || std::is_same_v<BLOC_TYPE, block_znq4_l> || std::is_same_v<BLOC_TYPE, block_znq5_s>) ? 4 :
+        (std::is_same_v<BLOC_TYPE, block_znq4_sm> || std::is_same_v<BLOC_TYPE, block_znq3_l> || std::is_same_v<BLOC_TYPE, block_znq4_s>) ? 3 : 2;
+    static constexpr int local_selector_bits = sm_znq ? 4 : (local_group == 4 ? 3 : 4);
 #if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
     static constexpr bool group16_znq = std::is_same_v<BLOC_TYPE, block_znq2_m> || std::is_same_v<BLOC_TYPE, block_znq3_m> || std::is_same_v<BLOC_TYPE, block_znq4_m>;
 #else
@@ -5990,7 +6146,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
                     if constexpr (PARAM_TYPE == GGML_TYPE_Q8_0 && INTER_SIZE == 8 && NB_COLS == 8) {
                         const ggml_type src0_type = op->src[0]->type;
-                        if ((src0_type == GGML_TYPE_ZNQ2_M || src0_type == GGML_TYPE_ZNQ2_L || src0_type == GGML_TYPE_ZNQ3_S || src0_type == GGML_TYPE_ZNQ3_M || src0_type == GGML_TYPE_ZNQ3_L ||
+                        if ((src0_type == GGML_TYPE_ZNQ2_S || src0_type == GGML_TYPE_ZNQ2_SM || src0_type == GGML_TYPE_ZNQ3_SM || src0_type == GGML_TYPE_ZNQ4_SM || src0_type == GGML_TYPE_ZNQ5_SM || src0_type == GGML_TYPE_ZNQ6_SM || src0_type == GGML_TYPE_ZNQ7_SM || src0_type == GGML_TYPE_ZNQ2_M || src0_type == GGML_TYPE_ZNQ2_L || src0_type == GGML_TYPE_ZNQ3_S || src0_type == GGML_TYPE_ZNQ3_M || src0_type == GGML_TYPE_ZNQ3_L ||
                              src0_type == GGML_TYPE_ZNQ4_S ||
                              src0_type == GGML_TYPE_ZNQ4_M || src0_type == GGML_TYPE_ZNQ4_L || src0_type == GGML_TYPE_ZNQ5_S || src0_type == GGML_TYPE_ZNQ5_M || src0_type == GGML_TYPE_ZNQ5_L || src0_type == GGML_TYPE_ZNQ6_S || src0_type == GGML_TYPE_ZNQ6_M || src0_type == GGML_TYPE_ZNQ6_L || src0_type == GGML_TYPE_ZNQ7_S || src0_type == GGML_TYPE_ZNQ7_M || src0_type == GGML_TYPE_ZNQ7_L) && ne12 > 1) {
                             const int64_t n_ids = op->src[2]->ne[0];
@@ -6087,7 +6243,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             if constexpr (local_znq) {
                 ggml_gemm_znq_local(ne00, (float *) dst_ptr + src0_start, nb1 / nb0,
                                     src0_ptr + src0_start * nb01, src1_ptr, nrows - nrows % 4, ncols,
-                                    local_group, nullptr, 0, 0, sums, local_bits);
+                                    local_group, nullptr, 0, 0, sums, local_bits, local_selector_bits);
             } else {
                 bool done = false;
                 if constexpr (group16_znq) {
@@ -6110,7 +6266,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     : src1_ptr + src1_col_stride*tail_start;
                 ggml_gemv_znq_local(ne00, (float *) (dst_ptr + tail_start*nb1) + src0_start, nb1 / nb0,
                                     src0_ptr + src0_start*nb01, row, nrows % 4, ncols,
-                                    local_group, sums + tail_start*(ne10/QK_ZNQ), local_bits);
+                                    local_group, sums + tail_start*(ne10/QK_ZNQ), local_bits, local_selector_bits);
                 return;
             }
         }
@@ -6120,7 +6276,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 : src1_ptr + src1_col_stride*iter;
             if constexpr (local_znq) {
                 ggml_gemv_znq_local(ne00, (float *) (dst_ptr + iter*nb1) + src0_start, ne01,
-                                    src0_ptr + src0_start * nb01, row, 1, ncols, local_group, sums + iter*(ne10/QK_ZNQ), local_bits);
+                                    src0_ptr + src0_start * nb01, row, 1, ncols, local_group, sums + iter*(ne10/QK_ZNQ), local_bits, local_selector_bits);
             } else {
                 gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst_ptr + (iter * nb1)) + src0_start,
                                                                  ne01, src0_ptr + src0_start * nb01,
@@ -6339,7 +6495,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         bool use_znq_moe = false;
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
         if constexpr (PARAM_TYPE == GGML_TYPE_Q8_0 && INTER_SIZE == 8 && NB_COLS == 8) {
-            use_znq_moe = (src0->type == GGML_TYPE_ZNQ2_M || src0->type == GGML_TYPE_ZNQ2_L || src0->type == GGML_TYPE_ZNQ3_S || src0->type == GGML_TYPE_ZNQ3_M || src0->type == GGML_TYPE_ZNQ3_L ||
+            use_znq_moe = (src0->type == GGML_TYPE_ZNQ2_S || src0->type == GGML_TYPE_ZNQ2_SM || src0->type == GGML_TYPE_ZNQ3_SM || src0->type == GGML_TYPE_ZNQ4_SM || src0->type == GGML_TYPE_ZNQ5_SM || src0->type == GGML_TYPE_ZNQ6_SM || src0->type == GGML_TYPE_ZNQ7_SM || src0->type == GGML_TYPE_ZNQ2_M || src0->type == GGML_TYPE_ZNQ2_L || src0->type == GGML_TYPE_ZNQ3_S || src0->type == GGML_TYPE_ZNQ3_M || src0->type == GGML_TYPE_ZNQ3_L ||
                             src0->type == GGML_TYPE_ZNQ4_S ||
                             src0->type == GGML_TYPE_ZNQ4_M || src0->type == GGML_TYPE_ZNQ4_L || src0->type == GGML_TYPE_ZNQ5_S || src0->type == GGML_TYPE_ZNQ5_M || src0->type == GGML_TYPE_ZNQ5_L || src0->type == GGML_TYPE_ZNQ6_S || src0->type == GGML_TYPE_ZNQ6_M || src0->type == GGML_TYPE_ZNQ6_L || src0->type == GGML_TYPE_ZNQ7_S || src0->type == GGML_TYPE_ZNQ7_M || src0->type == GGML_TYPE_ZNQ7_L) && ne12 > 1;
         }
@@ -6553,7 +6709,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                                 const void * activations, int nr, int nc, const int32_t * sums) {
             if constexpr (local_znq) {
                 ggml_gemm_znq_local(n, out, 0, weights, activations, nr, nc,
-                                    local_group, row_map, dst_bs1, dst_bs2, sums, local_bits);
+                                    local_group, row_map, dst_bs1, dst_bs2, sums, local_bits, local_selector_bits);
             } else {
                 switch (src0->type) {
                     case GGML_TYPE_ZNQ2_M:
@@ -6644,7 +6800,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                             const int32_t * row_map =
                                 reinterpret_cast<const int32_t *>(&MMID_MATRIX_ROW(cur_a, ir1));
                             ggml_gemv_znq_local_moe(ne00, (float *) dst->data + col, dst_bs1, dst_bs2, row_map,
-                                src0_cur + col*nb01, shared_q8, nr1 - ir1, tile, local_group, shared_sums, local_bits);
+                                src0_cur + col*nb01, shared_q8, nr1 - ir1, tile, local_group, shared_sums, local_bits, local_selector_bits);
                             ir1 = nr1;
                         }
                     }
@@ -6660,7 +6816,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                         const int tail_rows = (int) (nr1 - ir1);
                         if constexpr (local_znq) {
                             ggml_gemv_znq_local(ne00, tail, tile, src0_cur + col*nb01, expert_q8 + ir1*nbw1,
-                                tail_rows, tile, local_group, routed_sums + (expert_row_begin + ir1)*sums_stride, local_bits);
+                                tail_rows, tile, local_group, routed_sums + (expert_row_begin + ir1)*sums_stride, local_bits, local_selector_bits);
                         } else {
                             ggml_gemv_znq3_m_8x8_q8_0(
                                 ne00, tail, tile, src0_cur + col*nb01, expert_q8 + ir1*nbw1, tail_rows, tile);
@@ -6682,7 +6838,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                             const int32_t * sums = reuse_znq_input ? shared_sums + row.i2*sums_stride :
                                 routed_sums + (expert_row_begin + ir1)*sums_stride;
                             ggml_gemv_znq_local(ne00, out + col, ne01, src0_cur + col*nb01, src1_col,
-                                                1, tile, local_group, sums, local_bits);
+                                                1, tile, local_group, sums, local_bits, local_selector_bits);
                         } else {
                             gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
                                 ne00, out + col, ne01,
@@ -6833,6 +6989,13 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     static const ggml::cpu::repack::tensor_traits<block_iq4_nl, 8, 8, GGML_TYPE_Q8_0> iq4_nl_8x8_q8_0;
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+    static const ggml::cpu::repack::tensor_traits<block_znq2_s, 8, 8, GGML_TYPE_Q8_0> znq2_s_8x8_q8_0;
+    static const ggml::cpu::repack::tensor_traits<block_znq2_sm, 8, 8, GGML_TYPE_Q8_0> znq2_sm_8x8_q8_0;
+    static const ggml::cpu::repack::tensor_traits<block_znq3_sm, 8, 8, GGML_TYPE_Q8_0> znq3_sm_8x8_q8_0;
+    static const ggml::cpu::repack::tensor_traits<block_znq4_sm, 8, 8, GGML_TYPE_Q8_0> znq4_sm_8x8_q8_0;
+    static const ggml::cpu::repack::tensor_traits<block_znq5_sm, 8, 8, GGML_TYPE_Q8_0> znq5_sm_8x8_q8_0;
+    static const ggml::cpu::repack::tensor_traits<block_znq6_sm, 8, 8, GGML_TYPE_Q8_0> znq6_sm_8x8_q8_0;
+    static const ggml::cpu::repack::tensor_traits<block_znq7_sm, 8, 8, GGML_TYPE_Q8_0> znq7_sm_8x8_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_znq2_m, 8, 8, GGML_TYPE_Q8_0> znq2_m_8x8_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_znq2_l, 8, 8, GGML_TYPE_Q8_0> znq2_l_8x8_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_znq3_s, 8, 8, GGML_TYPE_Q8_0> znq3_s_8x8_q8_0;
@@ -7010,6 +7173,34 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
                 }
                 return &znq2_m_8x8_q8_0;
             }
+        }
+    } else if (cur->type == GGML_TYPE_ZNQ2_S) {
+        if (ggml_cpu_has_avx512_vbmi() && ggml_cpu_has_avx512_vnni() && cur->ne[1] % 8 == 0) {
+            return &znq2_s_8x8_q8_0;
+        }
+    } else if (cur->type == GGML_TYPE_ZNQ2_SM) {
+        if (ggml_cpu_has_avx512_vbmi() && ggml_cpu_has_avx512_vnni() && cur->ne[1] % 8 == 0) {
+            return &znq2_sm_8x8_q8_0;
+        }
+    } else if (cur->type == GGML_TYPE_ZNQ3_SM) {
+        if (ggml_cpu_has_avx512_vbmi() && ggml_cpu_has_avx512_vnni() && cur->ne[1] % 8 == 0) {
+            return &znq3_sm_8x8_q8_0;
+        }
+    } else if (cur->type == GGML_TYPE_ZNQ4_SM) {
+        if (ggml_cpu_has_avx512_vbmi() && ggml_cpu_has_avx512_vnni() && cur->ne[1] % 8 == 0) {
+            return &znq4_sm_8x8_q8_0;
+        }
+    } else if (cur->type == GGML_TYPE_ZNQ5_SM) {
+        if (ggml_cpu_has_avx512_vbmi() && ggml_cpu_has_avx512_vnni() && cur->ne[1] % 8 == 0) {
+            return &znq5_sm_8x8_q8_0;
+        }
+    } else if (cur->type == GGML_TYPE_ZNQ6_SM) {
+        if (ggml_cpu_has_avx512_vbmi() && ggml_cpu_has_avx512_vnni() && cur->ne[1] % 8 == 0) {
+            return &znq6_sm_8x8_q8_0;
+        }
+    } else if (cur->type == GGML_TYPE_ZNQ7_SM) {
+        if (ggml_cpu_has_avx512_vbmi() && ggml_cpu_has_avx512_vnni() && cur->ne[1] % 8 == 0) {
+            return &znq7_sm_8x8_q8_0;
         }
     } else if (cur->type == GGML_TYPE_ZNQ3_M) {
         if (ggml_cpu_has_avx512_vbmi() && ggml_cpu_has_avx512_vnni()) {

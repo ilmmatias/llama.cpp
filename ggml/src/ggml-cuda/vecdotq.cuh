@@ -1429,19 +1429,19 @@ static __device__ __forceinline__ float vec_dot_iq1_m_q8_1(
 
 #define VDR_ZNQ_Q8_1_MMVQ 8
 
-template <int bits, int vdr, int group = 16>
+template <int bits, int vdr, int group = 16, int selector_bits = group == 4 ? 3 : 4>
 static __device__ __forceinline__ float vec_dot_znq_q8_1(
         const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const int & kbx, const int & iqs) {
-    const uint8_t * block = (const uint8_t *) vx + kbx*(znq_header_cuda<bits, group>() + 4*bits);
+    const uint8_t * block = (const uint8_t *) vx + kbx*(znq_header_cuda<bits, group, selector_bits>() + 4*bits);
     constexpr int step = bits >= 6 ? 2 : 1;
     int sum0 = 0;
     int sum1 = 0;
 #pragma unroll
     for (int l = 0; l < vdr; l += step) {
-        sum0 = ggml_cuda_dp4a(znq_pack4_cuda<bits, (vdr > 1), group>(block, 4*(iqs + l)), get_int_b2(y->qs, iqs + l), sum0);
+        sum0 = ggml_cuda_dp4a(znq_pack4_cuda<bits, (vdr > 1), group, selector_bits>(block, 4*(iqs + l)), get_int_b2(y->qs, iqs + l), sum0);
         if constexpr (bits >= 6) {
             if (l + 1 < vdr) {
-                sum1 = ggml_cuda_dp4a(znq_pack4_cuda<bits, (vdr > 1), group>(block, 4*(iqs + l + 1)), get_int_b2(y->qs, iqs + l + 1), sum1);
+                sum1 = ggml_cuda_dp4a(znq_pack4_cuda<bits, (vdr > 1), group, selector_bits>(block, 4*(iqs + l + 1)), get_int_b2(y->qs, iqs + l + 1), sum1);
             }
         }
     }
@@ -1454,21 +1454,24 @@ static __device__ __forceinline__ void vec_dot_znq_q8_1_multi(
         const uint32_t stride_col_y, float (&dst)[ncols]) {
     constexpr int bits = znq_bits_cuda(type);
     constexpr int group = znq_group_cuda(type);
+    constexpr int selector_bits = znq_selector_bits_cuda(type);
     static_assert(bits != 0, "ZNQ decoder requires a ZNQ type");
-    const uint8_t * block = (const uint8_t *) vx + kbx*(znq_header_cuda<bits, group>() + 4*bits);
+    const uint8_t * block = (const uint8_t *) vx + kbx*(znq_header_cuda<bits, group, selector_bits>() + 4*bits);
+    // Keep eight-column SM decoding within the register budget for per-quad 4-bit books.
+    constexpr bool reuse_book = vdr > 1 && !(bits == 4 && group == 4 && selector_bits == 4 && ncols >= 8);
     constexpr int step = bits >= 6 ? 2 : 1;
     int sum0[ncols] = {0};
     int sum1[ncols] = {0};
 #pragma unroll
     for (int l = 0; l < vdr; l += step) {
-        const int q0 = znq_pack4_cuda<bits, (vdr > 1), group>(block, 4*(iqs + l));
+        const int q0 = znq_pack4_cuda<bits, reuse_book, group, selector_bits>(block, 4*(iqs + l));
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
             sum0[j] = ggml_cuda_dp4a(q0, get_int_b2(y[j*stride_col_y].qs, iqs + l), sum0[j]);
         }
         if constexpr (bits >= 6) {
             if (l + 1 < vdr) {
-                const int q1 = znq_pack4_cuda<bits, (vdr > 1), group>(block, 4*(iqs + l + 1));
+                const int q1 = znq_pack4_cuda<bits, reuse_book, group, selector_bits>(block, 4*(iqs + l + 1));
 #pragma unroll
                 for (int j = 0; j < ncols; ++j) {
                     sum1[j] = ggml_cuda_dp4a(q1, get_int_b2(y[j*stride_col_y].qs, iqs + l + 1), sum1[j]);

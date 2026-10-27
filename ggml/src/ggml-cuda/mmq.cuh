@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "znq.cuh"
 
 #include <climits>
 #include <cstdint>
@@ -109,6 +110,13 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
         case GGML_TYPE_ZNQ7_S:
         case GGML_TYPE_ZNQ7_M:
         case GGML_TYPE_ZNQ7_L:
+        case GGML_TYPE_ZNQ2_S:
+        case GGML_TYPE_ZNQ2_SM:
+        case GGML_TYPE_ZNQ3_SM:
+        case GGML_TYPE_ZNQ4_SM:
+        case GGML_TYPE_ZNQ5_SM:
+        case GGML_TYPE_ZNQ6_SM:
+        case GGML_TYPE_ZNQ7_SM:
         case GGML_TYPE_IQ4_NL:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         default:
@@ -220,7 +228,7 @@ struct ggml_cuda_mmq_config {
 };
 
 #define CASE(type_, nthreads_, occupancy_, I_, J_, sram_layout_, K_vram_, stream_k_, fallback_)                                           \
-    if ((type == (type_) || ((type == GGML_TYPE_ZNQ2_M || type == GGML_TYPE_ZNQ2_L || type == GGML_TYPE_ZNQ3_S || type == GGML_TYPE_ZNQ3_M || type == GGML_TYPE_ZNQ3_L || type == GGML_TYPE_ZNQ4_S || type == GGML_TYPE_ZNQ4_M || type == GGML_TYPE_ZNQ4_L || type == GGML_TYPE_ZNQ5_S || type == GGML_TYPE_ZNQ5_M || type == GGML_TYPE_ZNQ5_L || type == GGML_TYPE_ZNQ6_S || type == GGML_TYPE_ZNQ6_M || type == GGML_TYPE_ZNQ6_L || type == GGML_TYPE_ZNQ7_S || type == GGML_TYPE_ZNQ7_M || type == GGML_TYPE_ZNQ7_L) && (type_) == GGML_TYPE_IQ4_NL)) && J == (J_) && fallback == (fallback_)) {                                                                        \
+    if ((type == (type_) || (znq_bits_cuda(type) != 0 && (type_) == GGML_TYPE_IQ4_NL)) && J == (J_) && fallback == (fallback_)) {                                                                        \
         static_assert((nthreads_) %  32 == 0 && (nthreads_)       <= 512, "bad nthreads");                                                \
         static_assert(                          (occupancy_)      <=   8, "bad occupancy");                                               \
         static_assert((I_)        %  32 == 0,                             "bad I");                                                       \
@@ -444,6 +452,13 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_ZNQ7_S:
         case GGML_TYPE_ZNQ7_M:
         case GGML_TYPE_ZNQ7_L:
+        case GGML_TYPE_ZNQ2_S:
+        case GGML_TYPE_ZNQ2_SM:
+        case GGML_TYPE_ZNQ3_SM:
+        case GGML_TYPE_ZNQ4_SM:
+        case GGML_TYPE_ZNQ5_SM:
+        case GGML_TYPE_ZNQ6_SM:
+        case GGML_TYPE_ZNQ7_SM:
         case GGML_TYPE_IQ4_NL:  return MMQ_DP4A_TXS_Q8_0;
         default:                return tile_x_sizes{0, 0, 0};
     }
@@ -688,9 +703,17 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     ggml_cuda_mmq_load_tiles_iq4_xs<type, J, fallback>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+            case GGML_TYPE_ZNQ2_S:
+            case GGML_TYPE_ZNQ2_SM:
+                return ggml_cuda_mmq_util_funcs(
+                    4,
+                    ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 1>,
+                    ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
             case GGML_TYPE_ZNQ2_M:
             case GGML_TYPE_ZNQ2_L:
             case GGML_TYPE_ZNQ3_S:
+            case GGML_TYPE_ZNQ3_SM:
                 return ggml_cuda_mmq_util_funcs(
                     4,
                     ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 2>,
@@ -699,6 +722,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
             case GGML_TYPE_ZNQ3_M:
             case GGML_TYPE_ZNQ3_L:
             case GGML_TYPE_ZNQ4_S:
+            case GGML_TYPE_ZNQ4_SM:
                 return ggml_cuda_mmq_util_funcs(
                     4,
                     ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 3>,
@@ -707,6 +731,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
             case GGML_TYPE_ZNQ4_M:
             case GGML_TYPE_ZNQ4_L:
             case GGML_TYPE_ZNQ5_S:
+            case GGML_TYPE_ZNQ5_SM:
                 return ggml_cuda_mmq_util_funcs(
                     4,
                     ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 4>,
@@ -715,6 +740,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
             case GGML_TYPE_ZNQ5_M:
             case GGML_TYPE_ZNQ5_L:
             case GGML_TYPE_ZNQ6_S:
+            case GGML_TYPE_ZNQ6_SM:
                 return ggml_cuda_mmq_util_funcs(
                     4,
                     ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 5>,
@@ -728,6 +754,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
             case GGML_TYPE_ZNQ7_S:
+            case GGML_TYPE_ZNQ7_SM:
                 return ggml_cuda_mmq_util_funcs(
                     4,
                     ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 6>,
@@ -915,9 +942,17 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 ggml_cuda_mmq_load_tiles_iq4_xs<type, J, fallback>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>);
+        case GGML_TYPE_ZNQ2_S:
+        case GGML_TYPE_ZNQ2_SM:
+            return ggml_cuda_mmq_util_funcs(
+                -1,
+                ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 1>,
+                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>);
         case GGML_TYPE_ZNQ2_M:
         case GGML_TYPE_ZNQ2_L:
         case GGML_TYPE_ZNQ3_S:
+        case GGML_TYPE_ZNQ3_SM:
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 2>,
@@ -926,6 +961,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
         case GGML_TYPE_ZNQ3_M:
         case GGML_TYPE_ZNQ3_L:
         case GGML_TYPE_ZNQ4_S:
+        case GGML_TYPE_ZNQ4_SM:
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 3>,
@@ -934,6 +970,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
         case GGML_TYPE_ZNQ4_M:
         case GGML_TYPE_ZNQ4_L:
         case GGML_TYPE_ZNQ5_S:
+        case GGML_TYPE_ZNQ5_SM:
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 4>,
@@ -942,6 +979,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
         case GGML_TYPE_ZNQ5_M:
         case GGML_TYPE_ZNQ5_L:
         case GGML_TYPE_ZNQ6_S:
+        case GGML_TYPE_ZNQ6_SM:
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 5>,
@@ -955,6 +993,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>);
         case GGML_TYPE_ZNQ7_S:
+        case GGML_TYPE_ZNQ7_SM:
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 6>,
@@ -1626,7 +1665,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
 
-    if constexpr (!force_stream_k && (type == GGML_TYPE_Q8_0 || (type >= GGML_TYPE_ZNQ2_M && type <= GGML_TYPE_ZNQ7_L))) {
+    if constexpr (!force_stream_k && (type == GGML_TYPE_Q8_0 || znq_bits_cuda(type) != 0)) {
         const int64_t ntiles = ((args.nrows_x + config.I - 1) / config.I) * ((args.ncols_max + config.J - 1) / config.J) * args.nchannels_y * args.nsamples_y;
 
         // Split long reductions when output tiling leaves compute units idle.
@@ -1845,6 +1884,13 @@ extern DECL_MMQ_CASE(GGML_TYPE_ZNQ6_L);
 extern DECL_MMQ_CASE(GGML_TYPE_ZNQ7_S);
 extern DECL_MMQ_CASE(GGML_TYPE_ZNQ7_M);
 extern DECL_MMQ_CASE(GGML_TYPE_ZNQ7_L);
+extern DECL_MMQ_CASE(GGML_TYPE_ZNQ2_S);
+extern DECL_MMQ_CASE(GGML_TYPE_ZNQ2_SM);
+extern DECL_MMQ_CASE(GGML_TYPE_ZNQ3_SM);
+extern DECL_MMQ_CASE(GGML_TYPE_ZNQ4_SM);
+extern DECL_MMQ_CASE(GGML_TYPE_ZNQ5_SM);
+extern DECL_MMQ_CASE(GGML_TYPE_ZNQ6_SM);
+extern DECL_MMQ_CASE(GGML_TYPE_ZNQ7_SM);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ4_NL);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
 // -----------------------------------------

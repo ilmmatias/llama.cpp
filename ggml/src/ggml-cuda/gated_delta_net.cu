@@ -663,6 +663,13 @@ static __global__ void k_gdn_ab_mul_mat(
             case GGML_TYPE_ZNQ7_S: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<6, 4>>(w, xn, K); break;
             case GGML_TYPE_ZNQ7_M: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<7, 16>>(w, xn, K); break;
             case GGML_TYPE_ZNQ7_L: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<7, 8>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ2_S: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<1, 4, 3>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ2_SM: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<1, 4, 4>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ3_SM: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<2, 4, 4>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ4_SM: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<3, 4, 4>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ5_SM: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<4, 4, 4>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ6_SM: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<5, 4, 4>>(w, xn, K); break;
+            case GGML_TYPE_ZNQ7_SM: sum = gdn_ab_dot_q<QK_ZNQ, 1, dequantize_znq<6, 4, 4>>(w, xn, K); break;
             case GGML_TYPE_Q2_K: sum = gdn_ab_dot_kq<dequantize_q2_K, 64>(w, xn, K, tile); break;
             case GGML_TYPE_Q3_K: sum = gdn_ab_dot_kq<dequantize_q3_K, 64>(w, xn, K, tile); break;
             case GGML_TYPE_Q4_K: sum = gdn_ab_dot_kq<dequantize_q4_K, 32>(w, xn, K, tile); break;
@@ -727,6 +734,13 @@ bool ggml_cuda_gated_delta_net_ab_supported_type(ggml_type type) {
         case GGML_TYPE_ZNQ7_S:
         case GGML_TYPE_ZNQ7_M:
         case GGML_TYPE_ZNQ7_L:
+        case GGML_TYPE_ZNQ2_S:
+        case GGML_TYPE_ZNQ2_SM:
+        case GGML_TYPE_ZNQ3_SM:
+        case GGML_TYPE_ZNQ4_SM:
+        case GGML_TYPE_ZNQ5_SM:
+        case GGML_TYPE_ZNQ6_SM:
+        case GGML_TYPE_ZNQ7_SM:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:

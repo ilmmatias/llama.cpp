@@ -6,6 +6,13 @@
 
 #if defined(GGML_CPU_GENERIC) || !(defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
 #define ggml_vec_dot_znq_q8_0_4_generic ggml_vec_dot_znq_q8_0_4
+#define ggml_vec_dot_znq2_s_q8_0_generic ggml_vec_dot_znq2_s_q8_0
+#define ggml_vec_dot_znq2_sm_q8_0_generic ggml_vec_dot_znq2_sm_q8_0
+#define ggml_vec_dot_znq3_sm_q8_0_generic ggml_vec_dot_znq3_sm_q8_0
+#define ggml_vec_dot_znq4_sm_q8_0_generic ggml_vec_dot_znq4_sm_q8_0
+#define ggml_vec_dot_znq5_sm_q8_0_generic ggml_vec_dot_znq5_sm_q8_0
+#define ggml_vec_dot_znq6_sm_q8_0_generic ggml_vec_dot_znq6_sm_q8_0
+#define ggml_vec_dot_znq7_sm_q8_0_generic ggml_vec_dot_znq7_sm_q8_0
 #define ggml_vec_dot_znq2_l_q8_0_generic ggml_vec_dot_znq2_l_q8_0
 #define ggml_vec_dot_znq3_s_q8_0_generic ggml_vec_dot_znq3_s_q8_0
 #define ggml_vec_dot_znq3_l_q8_0_generic ggml_vec_dot_znq3_l_q8_0

@@ -120,6 +120,56 @@ struct block_iq4_nlx8 {
 
 static_assert(sizeof(block_iq4_nlx8) == 8 * sizeof(ggml_half) + QK4_NL * 4, "wrong iq4_nlx8 block size/padding");
 
+// Group-4 SM headers store eight scales followed by eight selector words.
+struct block_znq2_sx8 {
+    uint8_t header[32];
+    uint8_t qs[32];
+};
+
+static_assert(sizeof(block_znq2_sx8) == 8 * sizeof(block_znq2_s), "wrong znq2_sx8 size");
+
+struct block_znq2_smx8 {
+    uint8_t header[40];
+    uint8_t qs[32];
+};
+
+static_assert(sizeof(block_znq2_smx8) == 8 * sizeof(block_znq2_sm), "wrong znq2_smx8 size");
+
+struct block_znq3_smx8 {
+    uint8_t header[40];
+    uint8_t qs[64];
+};
+
+static_assert(sizeof(block_znq3_smx8) == 8 * sizeof(block_znq3_sm), "wrong znq3_smx8 size");
+
+struct block_znq4_smx8 {
+    uint8_t header[40];
+    uint8_t qs[96];
+};
+
+static_assert(sizeof(block_znq4_smx8) == 8 * sizeof(block_znq4_sm), "wrong znq4_smx8 size");
+
+struct block_znq5_smx8 {
+    uint8_t header[40];
+    uint8_t qs[128];
+};
+
+static_assert(sizeof(block_znq5_smx8) == 8 * sizeof(block_znq5_sm), "wrong znq5_smx8 size");
+
+struct block_znq6_smx8 {
+    uint8_t header[40];
+    uint8_t qs[160];
+};
+
+static_assert(sizeof(block_znq6_smx8) == 8 * sizeof(block_znq6_sm), "wrong znq6_smx8 size");
+
+struct block_znq7_smx8 {
+    uint8_t header[40];
+    uint8_t qs[192];
+};
+
+static_assert(sizeof(block_znq7_smx8) == 8 * sizeof(block_znq7_sm), "wrong znq7_smx8 size");
+
 struct block_znq2_mx8 {
     uint8_t d[8];
     uint8_t books[8];
@@ -310,19 +360,19 @@ bool ggml_gemm_znq_prepared(int n, float * s, size_t bs, const void * vx, const 
         int nr, int nc, ggml_type type, const int32_t * sums);
 // Optional corrections are row-major [nr][n/QK_ZNQ], with 128 times each Q8 block sum.
 void ggml_gemv_znq_local(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc, int group,
-        const int32_t * prepared_sums = nullptr, int index_bits = 2);
+        const int32_t * prepared_sums = nullptr, int index_bits = 2, int selector_bits = 0);
 void ggml_gemv_znq_local_moe(int n, float * s, size_t bs1, size_t bs2, const int32_t * map,
-        const void * vx, const void * vy, int nr, int nc, int group, const int32_t * sums, int index_bits);
+        const void * vx, const void * vy, int nr, int nc, int group, const int32_t * sums, int index_bits, int selector_bits = 0);
 void ggml_gemm_znq_local(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc,
-        int group, const int32_t * map, size_t bs1, size_t bs2, const int32_t * prepared_sums = nullptr, int index_bits = 2);
+        int group, const int32_t * map, size_t bs1, size_t bs2, const int32_t * prepared_sums = nullptr, int index_bits = 2, int selector_bits = 0);
 void ggml_znq_local_prepare_sums(int n, int nr, bool packed, const void * vy, int32_t * sums);
 
 void ggml_gemm_znq_panel_generic(const ggml_znq_gemm_panel * panel, const void * activations, const int32_t * sums,
         int sum_stride, int count, bool accumulate, int width, float * out0, float * out1, float * out2, float * out3);
 void ggml_gemv_znq_local_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc, int group,
-        const int32_t * prepared_sums, int index_bits);
+        const int32_t * prepared_sums, int index_bits, int selector_bits);
 void ggml_gemm_znq_local_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc,
-        int group, const int32_t * map, size_t bs1, size_t bs2, const int32_t * prepared_sums, int index_bits);
+        int group, const int32_t * map, size_t bs1, size_t bs2, const int32_t * prepared_sums, int index_bits, int selector_bits);
 
 #endif
 

@@ -191,16 +191,16 @@ static int test_vec_dot_q(bool verbose) {
         if (qfns_cpu->from_float && qfns->to_float) {
             const float total_error = total_quantization_error(qfns, qfns_cpu, test_size, test_data.data());
             const float max_quantization_error =
-                type == GGML_TYPE_Q1_0    ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
+                (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_ZNQ2_S || type == GGML_TYPE_ZNQ2_SM) ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
                 type == GGML_TYPE_TQ1_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_TQ2_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_Q2_0    ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_Q2_K    ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_IQ2_S   ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
-                (type == GGML_TYPE_ZNQ2_M || type == GGML_TYPE_ZNQ2_L || type == GGML_TYPE_ZNQ3_S) ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
+                (type == GGML_TYPE_ZNQ2_M || type == GGML_TYPE_ZNQ2_L || type == GGML_TYPE_ZNQ3_S || type == GGML_TYPE_ZNQ3_SM) ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_S   ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
-                (type == GGML_TYPE_ZNQ3_M || type == GGML_TYPE_ZNQ3_L || type == GGML_TYPE_ZNQ4_S) ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
+                (type == GGML_TYPE_ZNQ3_M || type == GGML_TYPE_ZNQ3_L || type == GGML_TYPE_ZNQ4_S || type == GGML_TYPE_ZNQ4_SM) ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_XXS ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS :
                 type == GGML_TYPE_NVFP4   ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 : MAX_QUANTIZATION_TOTAL_ERROR;
             bool failed = !(total_error < max_quantization_error);
@@ -218,15 +218,15 @@ static int test_vec_dot_q(bool verbose) {
 
             const float vec_dot_error = dot_product_error(qfns_cpu, type, test_size, test_data.data(), test_data2.data(), nullptr, nullptr, 1);
             const float max_allowed_error = type == GGML_TYPE_Q2_K || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_XXS ||
-                type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_ZNQ3_M || type == GGML_TYPE_ZNQ3_L || type == GGML_TYPE_ZNQ4_S
+                type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_ZNQ3_M || type == GGML_TYPE_ZNQ3_L || type == GGML_TYPE_ZNQ4_S || type == GGML_TYPE_ZNQ4_SM
                 ? MAX_DOT_PRODUCT_ERROR_LOWBIT
-                : type == GGML_TYPE_Q1_0
+                : type == GGML_TYPE_Q1_0 || type == GGML_TYPE_ZNQ2_S || type == GGML_TYPE_ZNQ2_SM
                 ? MAX_DOT_PRODUCT_ERROR_BINARY
                 : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0
                 ? MAX_DOT_PRODUCT_ERROR_TERNARY
                 : type == GGML_TYPE_NVFP4
                 ? MAX_DOT_PRODUCT_ERROR_FP4
-                : (type == GGML_TYPE_ZNQ2_M || type == GGML_TYPE_ZNQ2_L || type == GGML_TYPE_ZNQ3_S)
+                : (type == GGML_TYPE_ZNQ2_M || type == GGML_TYPE_ZNQ2_L || type == GGML_TYPE_ZNQ3_S || type == GGML_TYPE_ZNQ3_SM)
                 ? MAX_DOT_PRODUCT_ERROR_ZNQ2_M
                 : MAX_DOT_PRODUCT_ERROR;
             failed = !(vec_dot_error < max_allowed_error);
@@ -250,11 +250,144 @@ static int test_vec_dot_q(bool verbose) {
     return num_failed;
 }
 
+// Fixed endpoints test the wire contract independently of quantization and dot kernels.
+static int test_znq_new_layouts(bool verbose) {
+    struct fixture {
+        ggml_type type;
+        int bits;
+        int sbits;
+        int8_t lo[16];
+        int8_t hi[16];
+    };
+    const fixture cases[] = {
+        {GGML_TYPE_ZNQ2_S, 1, 3,
+            {-98, -61, -28, -16, -127, 31, -43, 0},
+            {127, 63, 28, 18, -36, 127, 0, 57}},
+        {GGML_TYPE_ZNQ2_SM, 1, 4,
+            {-98, -61, -28, -16, -127, 31, -43, 0, -123, -28, -77, -104, 35, -85, -26, -127},
+            {127, 63, 28, 18, -36, 127, 0, 57, 33, 127, -37, 82, 83, 5, 84, 0}},
+        {GGML_TYPE_ZNQ3_SM, 2, 4,
+            {-61, -104, -51, -80, -40, -93, -127, -62, -98, -123, -32, -91, -38, -69, -94, -73},
+            {63, 82, 121, 49, 36, 82, 57, 92, 127, 33, 104, 76, 68, 83, 60, 119}},
+        {GGML_TYPE_ZNQ4_SM, 3, 4,
+            {-98, -109, -127, -76, -65, -127, -93, -89, -127, -127, -117, -100, -112, -75, -76, -125},
+            {113, 84, 127, 70, 56, 101, 96, 127, 127, 97, 65, 127, 106, 115, 127, 80}},
+        {GGML_TYPE_ZNQ5_SM, 4, 4,
+            {-122, -127, -108, -108, -127, -121, -127, -115, -70, -127, -127, -111, -97, -122, -111, -118},
+            {119, 117, 127, 108, 123, 127, 127, 112, 77, 126, 103, 118, 95, 122, 123, 127}},
+        {GGML_TYPE_ZNQ6_SM, 5, 4,
+            {-124, -116, -127, -108, -127, -125, -122, -118, -74, -102, -124, -124, -108, -125, -115, -124},
+            {122, 123, 127, 126, 122, 117, 125, 118, 77, 100, 124, 109, 108, 122, 112, 126}},
+        {GGML_TYPE_ZNQ7_SM, 6, 4,
+            {-124, -125, -125, -116, -125, -122, -124, -118, -74, -102, -124, -108, -115, -108, -124, -125},
+            {125, 123, 126, 123, 122, 125, 124, 118, 77, 100, 109, 125, 112, 108, 123, 117}},
+    };
+    int num_failed = 0;
+    for (const auto & f : cases) {
+        const int nbooks = 1 << f.sbits;
+        const size_t size = 1 + f.sbits + 4 * f.bits;
+        bool failed = ggml_blck_size(f.type) != 32 || ggml_type_size(f.type) != size;
+        for (int base = 0; base < nbooks; ++base) {
+            for (int scale : {0, 1, 7, 8, 120, 255}) {
+                // Exactly one unaligned block: no padded payload or selector reads are valid.
+                std::vector<uint8_t> bytes(size + 1, 0);
+                auto * b = bytes.data() + 1;
+                b[0] = scale;
+                for (int g = 0; g < 8; ++g) {
+                    const int book = (base + g) % nbooks;
+                    for (int k = 0; k < f.sbits; ++k) {
+                        const int bit = f.sbits * g + k;
+                        b[1 + bit / 8] |= ((book >> k) & 1) << (bit % 8);
+                    }
+                }
+                for (int j = 0; j < 32; ++j) {
+                    if (j % 2) {
+                        for (int k = 0; k < f.bits; ++k) {
+                            const int bit = f.bits * j + k;
+                            b[1 + f.sbits + bit / 8] |= 1 << (bit % 8);
+                        }
+                    }
+                }
+                float actual[32];
+                ggml_get_type_traits(f.type)->to_float(b, actual, 32);
+                const float d = scale < 8 ? std::ldexp(float(scale), -17) :
+                    std::ldexp(1.0f + float(scale % 8) / 8.0f, scale / 8 - 15);
+                for (int j = 0; j < 32; ++j) {
+                    const int book = (base + j / 4) % nbooks;
+                    failed |= actual[j] != d * (j % 2 ? f.hi[book] : f.lo[book]);
+                }
+            }
+        }
+        num_failed += failed;
+        if (failed || verbose) {
+            printf("%s wire selectors/endpoints/scales: %s\n", ggml_type_name(f.type), RESULT_STR[failed]);
+        }
+    }
+    return num_failed;
+}
+
+static int test_znq_sm_error(bool verbose) {
+    const ggml_type pairs[][2] = {
+        {GGML_TYPE_ZNQ2_S, GGML_TYPE_ZNQ2_SM}, {GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_SM},
+        {GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_SM}, {GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_SM},
+        {GGML_TYPE_ZNQ6_S, GGML_TYPE_ZNQ6_SM}, {GGML_TYPE_ZNQ7_S, GGML_TYPE_ZNQ7_SM},
+    };
+    int num_failed = 0;
+    for (const auto & pair : pairs) {
+        for (int n : {32, 96, 544}) {
+            std::vector<float> x(n), importance(n), decoded[2];
+            for (int pattern = 0; pattern < 4; ++pattern) {
+                for (int j = 0; j < n; ++j) {
+                    const float value = std::sin(float(17 * j + 31 * pattern));
+                    x[j] = pattern == 0 ? value : pattern == 1 ? value * std::ldexp(1.0f, (j / 32) % 15 - 7) :
+                           pattern == 2 ? (j % 9 == 0 ? 9.0f * value : 0.02f * value) : (j / 4 % 3 == 0 ? 0 : value + 2);
+                }
+                for (int mode = 0; mode < 4; ++mode) {
+                    for (int j = 0; j < n; ++j) {
+                        importance[j] = mode == 3 || (mode == 2 && j % 3 != 0) ? 0 : 0.25f * (1 + j % 13);
+                    }
+                    const float * imatrix = mode ? importance.data() : nullptr;
+                    for (int v = 0; v < 2; ++v) {
+                        std::vector<uint8_t> bytes(ggml_row_size(pair[v], n));
+                        decoded[v].resize(n);
+                        ggml_quantize_chunk(pair[v], x.data(), bytes.data(), 0, 1, n, imatrix);
+                        ggml_get_type_traits(pair[v])->to_float(bytes.data(), decoded[v].data(), n);
+                    }
+                    bool failed = false;
+                    for (int b = 0; b < n; b += 32) {
+                        float sigma2 = 0;
+                        for (int j = 0; j < 32; ++j) {
+                            sigma2 += x[b + j] * x[b + j];
+                        }
+                        sigma2 *= 2.0f / 32;
+                        double error[2] = {0, 0};
+                        for (int j = 0; j < 32; ++j) {
+                            const float w = imatrix ? importance[b + j] * std::sqrt(sigma2 + x[b + j] * x[b + j]) : 1;
+                            for (int v = 0; v < 2; ++v) {
+                                const double diff = double(x[b + j]) - decoded[v][b + j];
+                                error[v] += w * diff * diff;
+                            }
+                        }
+                        // SM retains every S book and explicitly evaluates the S scale.
+                        failed |= !(error[1] <= error[0] * (1.0 + 1e-6) + 1e-20);
+                    }
+                    num_failed += failed;
+                    if (failed || verbose) {
+                        printf("%s retains S objective n=%d pattern=%d imatrix=%d: %s\n",
+                               ggml_type_name(pair[1]), n, pattern, mode, RESULT_STR[failed]);
+                    }
+                }
+            }
+        }
+    }
+    return num_failed;
+}
+
 static int test_quantize_znq_rows(bool verbose) {
     int num_failed = 0;
     const int nrows = 3;
 
-    for (ggml_type type : {GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L,
+    for (ggml_type type : {GGML_TYPE_ZNQ2_S, GGML_TYPE_ZNQ2_SM, GGML_TYPE_ZNQ3_SM, GGML_TYPE_ZNQ4_SM, GGML_TYPE_ZNQ5_SM, GGML_TYPE_ZNQ6_SM, GGML_TYPE_ZNQ7_SM, GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L,
                           GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M,
                           GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_S, GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S,
                           GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L}) {
@@ -302,7 +435,7 @@ static int test_vec_dot_znq(bool verbose) {
     const auto * activations = ggml_get_type_traits(GGML_TYPE_Q8_0);
     int num_failed = 0;
 
-    for (ggml_type type : {GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M,
+    for (ggml_type type : {GGML_TYPE_ZNQ2_S, GGML_TYPE_ZNQ2_SM, GGML_TYPE_ZNQ3_SM, GGML_TYPE_ZNQ4_SM, GGML_TYPE_ZNQ5_SM, GGML_TYPE_ZNQ6_SM, GGML_TYPE_ZNQ7_SM, GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M,
                           GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L,
                           GGML_TYPE_ZNQ6_S, GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S,
                           GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L}) {
@@ -395,7 +528,7 @@ static int test_mul_mat_znq(bool verbose) {
     const auto * q8 = ggml_get_type_traits(GGML_TYPE_Q8_0);
     const auto quantize_input = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0)->from_float;
 
-    for (ggml_type type : {GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M,
+    for (ggml_type type : {GGML_TYPE_ZNQ2_S, GGML_TYPE_ZNQ2_SM, GGML_TYPE_ZNQ3_SM, GGML_TYPE_ZNQ4_SM, GGML_TYPE_ZNQ5_SM, GGML_TYPE_ZNQ6_SM, GGML_TYPE_ZNQ7_SM, GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M,
                           GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L,
                           GGML_TYPE_ZNQ6_S, GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S,
                           GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L}) {
@@ -533,7 +666,7 @@ static int test_repack(bool verbose, ggml_type weight_type, ggml_type input_type
     };
     for (const auto & shape : shapes) {
         const int k = shape[0], m = shape[1], n = shape[2];
-        if (n >= 20 && (!dense || (weight_type != GGML_TYPE_ZNQ2_M && weight_type != GGML_TYPE_ZNQ2_L &&
+        if (n >= 20 && (!dense || (weight_type != GGML_TYPE_ZNQ2_S && weight_type != GGML_TYPE_ZNQ2_SM && weight_type != GGML_TYPE_ZNQ3_SM && weight_type != GGML_TYPE_ZNQ4_SM && weight_type != GGML_TYPE_ZNQ5_SM && weight_type != GGML_TYPE_ZNQ6_SM && weight_type != GGML_TYPE_ZNQ7_SM && weight_type != GGML_TYPE_ZNQ2_M && weight_type != GGML_TYPE_ZNQ2_L &&
             weight_type != GGML_TYPE_ZNQ3_S && weight_type != GGML_TYPE_ZNQ3_M && weight_type != GGML_TYPE_ZNQ3_L && weight_type != GGML_TYPE_ZNQ4_S && weight_type != GGML_TYPE_ZNQ4_M && weight_type != GGML_TYPE_ZNQ4_L && weight_type != GGML_TYPE_ZNQ5_S && weight_type != GGML_TYPE_ZNQ5_M && weight_type != GGML_TYPE_ZNQ5_L && weight_type != GGML_TYPE_ZNQ6_S && weight_type != GGML_TYPE_ZNQ6_M && weight_type != GGML_TYPE_ZNQ6_L && weight_type != GGML_TYPE_ZNQ7_S && weight_type != GGML_TYPE_ZNQ7_M && weight_type != GGML_TYPE_ZNQ7_L))) {
             continue;
         }
@@ -665,7 +798,7 @@ static int test_quantize_imatrix_degenerate(bool verbose) {
     int num_failed = 0;
 
     printf("Testing degenerate imatrix:\n");
-    for (ggml_type type : {GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_S, GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S, GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L, GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_1, GGML_TYPE_Q5_1}) {
+    for (ggml_type type : {GGML_TYPE_ZNQ2_S, GGML_TYPE_ZNQ2_SM, GGML_TYPE_ZNQ3_SM, GGML_TYPE_ZNQ4_SM, GGML_TYPE_ZNQ5_SM, GGML_TYPE_ZNQ6_SM, GGML_TYPE_ZNQ7_SM, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_S, GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S, GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L, GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_1, GGML_TYPE_Q5_1}) {
         const int64_t group = type == GGML_TYPE_Q2_K ? 16 : 32;
         for (int64_t i = 0; i < n; ++i) {
             const int64_t g = i / group;
@@ -712,20 +845,22 @@ int main(int argc, char * argv[]) {
 
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_vec_dot_q(verbose);
+    num_failed += test_znq_new_layouts(verbose);
+    num_failed += test_znq_sm_error(verbose);
     num_failed += test_quantize_znq_rows(verbose);
     num_failed += test_vec_dot_znq(verbose);
     num_failed += test_mul_mat_znq(verbose);
     for (ggml_type type : { GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ4_M }) {
         num_failed += test_repack(verbose, type, GGML_TYPE_F32);
     }
-    for (ggml_type type : {GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_S, GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S, GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L}) {
+    for (ggml_type type : {GGML_TYPE_ZNQ2_S, GGML_TYPE_ZNQ2_SM, GGML_TYPE_ZNQ3_SM, GGML_TYPE_ZNQ4_SM, GGML_TYPE_ZNQ5_SM, GGML_TYPE_ZNQ6_SM, GGML_TYPE_ZNQ7_SM, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_S, GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S, GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L}) {
         num_failed += test_repack(verbose, type, GGML_TYPE_F32);
         num_failed += test_repack(verbose, type, GGML_TYPE_F32, true);
         // Shared sums must cover every plane, including Q8 tails and strided input rows.
         num_failed += test_repack(verbose, type, GGML_TYPE_F32, true, 3);
         num_failed += test_repack(verbose, type, GGML_TYPE_Q8_0, true, 3);
     }
-    for (ggml_type type : {GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_S, GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S, GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L, GGML_TYPE_Q4_0,
+    for (ggml_type type : {GGML_TYPE_ZNQ2_S, GGML_TYPE_ZNQ2_SM, GGML_TYPE_ZNQ3_SM, GGML_TYPE_ZNQ4_SM, GGML_TYPE_ZNQ5_SM, GGML_TYPE_ZNQ6_SM, GGML_TYPE_ZNQ7_SM, GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_S, GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S, GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L, GGML_TYPE_Q4_0,
                            GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
         const ggml_type input_type = ggml_get_type_traits_cpu(type)->vec_dot_type;
         num_failed += test_repack(verbose, type, input_type);

@@ -474,7 +474,7 @@ static void test_expert_cache_unpack(ggml_backend_dev_t dev) {
             GGML_TYPE_ZNQ4_M, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S,
             GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_S,
             GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S,
-            GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L }) {
+            GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L, GGML_TYPE_ZNQ2_S, GGML_TYPE_ZNQ2_SM, GGML_TYPE_ZNQ3_SM, GGML_TYPE_ZNQ4_SM, GGML_TYPE_ZNQ5_SM, GGML_TYPE_ZNQ6_SM, GGML_TYPE_ZNQ7_SM }) {
         int cases = 0;
         for (int columns : { 32, 96, 544 }) {
             for (int rows : { 8, 24 }) {
@@ -534,7 +534,7 @@ static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel, ggml_
     auto memory = (ggml_backend_cpu_expert_cache_memory_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_expert_cache_memory");
     auto hits = (ggml_backend_cpu_expert_cache_hits_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_expert_cache_hits");
     GGML_ASSERT(create && free_cache && add_device && register_weights && set_cache && prepare && copy && cache_device && offload_device && memory && hits);
-    const bool repacked = type == GGML_TYPE_ZNQ2_M || type == GGML_TYPE_ZNQ2_L || type == GGML_TYPE_ZNQ3_S || type == GGML_TYPE_ZNQ3_M || type == GGML_TYPE_ZNQ3_L || type == GGML_TYPE_ZNQ4_S || type == GGML_TYPE_ZNQ4_M || type == GGML_TYPE_ZNQ4_L || type == GGML_TYPE_ZNQ5_S || type == GGML_TYPE_ZNQ5_M || type == GGML_TYPE_ZNQ5_L || type == GGML_TYPE_ZNQ6_S || type == GGML_TYPE_ZNQ6_M || type == GGML_TYPE_ZNQ6_L || type == GGML_TYPE_ZNQ7_S || type == GGML_TYPE_ZNQ7_M || type == GGML_TYPE_ZNQ7_L;
+    const bool repacked = type == GGML_TYPE_ZNQ2_M || type == GGML_TYPE_ZNQ2_L || type == GGML_TYPE_ZNQ3_S || type == GGML_TYPE_ZNQ3_M || type == GGML_TYPE_ZNQ3_L || type == GGML_TYPE_ZNQ4_S || type == GGML_TYPE_ZNQ4_M || type == GGML_TYPE_ZNQ4_L || type == GGML_TYPE_ZNQ5_S || type == GGML_TYPE_ZNQ5_M || type == GGML_TYPE_ZNQ5_L || type == GGML_TYPE_ZNQ6_S || type == GGML_TYPE_ZNQ6_M || type == GGML_TYPE_ZNQ6_L || type == GGML_TYPE_ZNQ7_S || type == GGML_TYPE_ZNQ7_M || type == GGML_TYPE_ZNQ7_L || type == GGML_TYPE_ZNQ2_S || type == GGML_TYPE_ZNQ2_SM || type == GGML_TYPE_ZNQ3_SM || type == GGML_TYPE_ZNQ4_SM || type == GGML_TYPE_ZNQ5_SM || type == GGML_TYPE_ZNQ6_SM || type == GGML_TYPE_ZNQ7_SM;
     auto buft = ggml_backend_cpu_buffer_type();
     if (repacked) {
         buft = nullptr;
@@ -905,7 +905,7 @@ int main(int argc, char ** argv) {
             for (ggml_type type : {
                     GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16,
                     GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
-                    GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_S, GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S, GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L }) {
+                    GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_S, GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S, GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L, GGML_TYPE_ZNQ2_S, GGML_TYPE_ZNQ2_SM, GGML_TYPE_ZNQ3_SM, GGML_TYPE_ZNQ4_SM, GGML_TYPE_ZNQ5_SM, GGML_TYPE_ZNQ6_SM, GGML_TYPE_ZNQ7_SM }) {
                 test_expert_cache_reuse(dev, parallel, type, false);
                 test_expert_cache_reuse(dev, parallel, type, true);
             }

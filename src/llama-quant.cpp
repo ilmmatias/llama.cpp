@@ -892,6 +892,9 @@ static bool tensor_requires_imatrix(const char * tensor_name, const ggml_type ds
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ1_M:
         case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_ZNQ2_S:
+        case GGML_TYPE_ZNQ2_SM:
+        case GGML_TYPE_ZNQ3_SM:
         case GGML_TYPE_ZNQ2_M:
         case GGML_TYPE_ZNQ2_L:
         case GGML_TYPE_ZNQ3_S:
@@ -967,6 +970,13 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_ZNQ7_S: return GGML_TYPE_ZNQ7_S;
         case LLAMA_FTYPE_MOSTLY_ZNQ7_M: return GGML_TYPE_ZNQ7_M;
         case LLAMA_FTYPE_MOSTLY_ZNQ7_L: return GGML_TYPE_ZNQ7_L;
+        case LLAMA_FTYPE_MOSTLY_ZNQ2_S: return GGML_TYPE_ZNQ2_S;
+        case LLAMA_FTYPE_MOSTLY_ZNQ2_SM: return GGML_TYPE_ZNQ2_SM;
+        case LLAMA_FTYPE_MOSTLY_ZNQ3_SM: return GGML_TYPE_ZNQ3_SM;
+        case LLAMA_FTYPE_MOSTLY_ZNQ4_SM: return GGML_TYPE_ZNQ4_SM;
+        case LLAMA_FTYPE_MOSTLY_ZNQ5_SM: return GGML_TYPE_ZNQ5_SM;
+        case LLAMA_FTYPE_MOSTLY_ZNQ6_SM: return GGML_TYPE_ZNQ6_SM;
+        case LLAMA_FTYPE_MOSTLY_ZNQ7_SM: return GGML_TYPE_ZNQ7_SM;
         default: return GGML_TYPE_COUNT;
     }
 }
