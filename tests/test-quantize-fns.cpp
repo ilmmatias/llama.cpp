@@ -259,11 +259,13 @@ static int test_quantize_znq_rows(bool verbose) {
                           GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_S, GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S,
                           GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L}) {
         const auto * traits = ggml_get_type_traits(type);
-        for (int n : {32, 96}) {
-            std::vector<float> x((nrows + 2) * n), importance(n);
+        for (int n : {32, 96, 544}) {
+            std::vector<float> x((nrows + 2) * n), importance(n), zero_importance(n, 0.0f);
             for (int row = 0; row < nrows + 2; ++row) {
                 for (int j = 0; j < n; ++j) {
-                    x[row*n + j] = row == 2 ? 0.0f : float((37*j + 19*row) % 257 - 128) * (row == 1 ? 0.00001f : 0.125f);
+                    const float value = float((37*j + 19*row) % 513 - 256) * 0.5f;
+                    const float nearby = j % 3 == 0 ? std::nextafter(value, -INFINITY) : j % 3 == 1 ? value : std::nextafter(value, INFINITY);
+                    x[row*n + j] = row == 2 ? 0.0f : nearby * (row == 1 ? 0.000001f : 0.125f);
                 }
             }
             for (int j = 0; j < n; ++j) {
@@ -271,14 +273,14 @@ static int test_quantize_znq_rows(bool verbose) {
             }
 
             const size_t row_size = ggml_row_size(type, n);
-            for (bool weighted : {false, true}) {
+            for (int weighting : {0, 1, 2}) {
                 // Leave guard rows around the chunk and use an unaligned output pointer.
                 std::vector<uint8_t> actual((nrows + 2) * row_size + 2, 0xa5);
                 std::vector<uint8_t> expected = actual;
-                const float * imatrix = weighted ? importance.data() : nullptr;
+                const float * imatrix = weighting == 1 ? importance.data() : weighting == 2 ? zero_importance.data() : nullptr;
                 const size_t size = ggml_quantize_chunk(type, x.data(), actual.data() + 1, n, nrows, n, imatrix);
                 for (int row = 1; row <= nrows; ++row) {
-                    if (weighted) {
+                    if (imatrix) {
                         ggml_quantize_chunk(type, x.data(), expected.data() + 1, row*n, 1, n, imatrix);
                     } else {
                         traits->from_float_ref(x.data() + row*n, expected.data() + 1 + row*row_size, n);
@@ -288,7 +290,7 @@ static int test_quantize_znq_rows(bool verbose) {
                 const bool failed = size != nrows * row_size || actual != expected;
                 num_failed += failed;
                 if (failed || verbose) {
-                    printf("%s quantize rows=%d n=%d imatrix=%d: %s\n", ggml_type_name(type), nrows, n, weighted, RESULT_STR[failed]);
+                    printf("%s quantize rows=%d n=%d imatrix=%d: %s\n", ggml_type_name(type), nrows, n, weighting, RESULT_STR[failed]);
                 }
             }
         }
