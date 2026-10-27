@@ -3331,13 +3331,31 @@ static int ggml_cpu_try_fuse_ops(
         const struct ggml_compute_params * params,
         const struct ggml_cplan * cplan) {
 
-    if (ggml_cpu_disable_fusion || cplan->use_ref) {
+    if (ggml_cpu_disable_fusion || cplan->use_ref || cplan->abort_callback) {
         return 0;
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
 
     if (node->op == GGML_OP_RMS_NORM) {
+        const enum ggml_op affine_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
+        if (ggml_can_fuse(cgraph, node_n, affine_ops, 3)) {
+            struct ggml_tensor * mul = cgraph->nodes[node_n + 1];
+            struct ggml_tensor * add = cgraph->nodes[node_n + 2];
+            const struct ggml_tensor * weight = mul->src[0] == node ? mul->src[1] : mul->src[0];
+            const struct ggml_tensor * bias = add->src[0] == mul ? add->src[1] : add->src[0];
+            if ((mul->src[0] == node || mul->src[1] == node) &&
+                (add->src[0] == mul || add->src[1] == mul) &&
+                node->src[0]->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 &&
+                weight->type == GGML_TYPE_F32 && bias->type == GGML_TYPE_F32 &&
+                weight->ne[0] == node->ne[0] && bias->ne[0] == node->ne[0] &&
+                weight->nb[0] == sizeof(float) && bias->nb[0] == sizeof(float) &&
+                ggml_are_same_shape(node, mul) && ggml_are_same_shape(node, add)) {
+                ggml_compute_forward_rms_norm_mul_add_fused(params, node, mul, add);
+                return 2;
+            }
+        }
+
         // RMS_NORM + MUL fusion
         const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
         if (ggml_can_fuse(cgraph, node_n, fuse_ops, 2)) {

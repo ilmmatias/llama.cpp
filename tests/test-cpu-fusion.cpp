@@ -47,6 +47,9 @@ static void equal(const float * actual, const std::vector<float> & expected) {
         } else if (expected[i] == 0 || std::isinf(expected[i])) {
             REQUIRE(actual[i] == expected[i] && std::signbit(actual[i]) == std::signbit(expected[i]));
         } else {
+            if (std::fabs(actual[i] - expected[i]) > 2e-6f * std::max(1.0f, std::fabs(expected[i]))) {
+                std::fprintf(stderr, "element %zu: actual %.9g, expected %.9g\n", i, actual[i], expected[i]);
+            }
             REQUIRE(std::fabs(actual[i] - expected[i]) <= 2e-6f * std::max(1.0f, std::fabs(expected[i])));
         }
     }
@@ -430,6 +433,82 @@ static void test_backend_allocation() {
     ggml_gallocr_free(allocator);
 }
 
+static void test_rms_affine(int64_t columns, int layout, int captured, int threads) {
+    auto ctx = make_context(16 * 1024 * 1024);
+    auto * a = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, columns, 1, 7, 2);
+    ggml_tensor * weight;
+    ggml_tensor * bias;
+    if (layout == 0) {
+        weight = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, columns);
+        bias = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, columns);
+    } else if (layout == 1) {
+        weight = ggml_dup_tensor(ctx.get(), a);
+        bias = ggml_dup_tensor(ctx.get(), a);
+    } else {
+        const size_t pitch = (columns + 3) * sizeof(float);
+        auto * w = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, (columns + 3) * 7);
+        auto * b = ggml_dup_tensor(ctx.get(), w);
+        weight = ggml_view_4d(ctx.get(), w, columns, 1, 7, 1, pitch, pitch, pitch * 7, 0);
+        bias = ggml_view_4d(ctx.get(), b, columns, 1, 7, 1, pitch, pitch, pitch * 7, 0);
+    }
+    for (auto * tensor : {a, weight, bias}) {
+        for (int64_t i = 0; i < ggml_nelements(tensor); ++i) {
+            int64_t coordinate = i;
+            size_t offset = 0;
+            for (int d = 0; d < 4; ++d) {
+                offset += size_t(coordinate % tensor->ne[d]) * tensor->nb[d];
+                coordinate /= tensor->ne[d];
+            }
+            const float value = std::ldexp(float(i % 37 - 18), int(i / 37 % 17) - 8);
+            std::memcpy(static_cast<char *>(tensor->data) + offset, &value, sizeof(value));
+        }
+    }
+
+    auto * norm = ggml_rms_norm(ctx.get(), a, 1e-6f);
+    auto * product = ggml_mul(ctx.get(), norm, weight);
+    auto * out = ggml_add(ctx.get(), product, bias);
+    if (captured == 1) {
+        ggml_set_output(norm);
+    } else if (captured == 2) {
+        ggml_set_output(product);
+    }
+    auto * graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, weight);
+    ggml_build_forward_expand(graph, bias);
+    ggml_build_forward_expand(graph, out);
+    compute(graph, threads, true);
+    const auto * reference = static_cast<const float *>(out->data);
+    const std::vector<float> expected(reference, reference + ggml_nelements(out));
+    std::vector<float> intermediate;
+    auto * observed = captured == 1 ? norm : product;
+    if (captured) {
+        const auto * data = static_cast<const float *>(observed->data);
+        intermediate.assign(data, data + ggml_nelements(observed));
+    }
+    ggml_set_f32(norm, -1000);
+    ggml_set_f32(product, -1000);
+    ggml_set_f32(out, -1000);
+    compute(graph, threads);
+    equal(static_cast<const float *>(out->data), expected);
+    if (captured) {
+        equal(static_cast<const float *>(observed->data), intermediate);
+    } else {
+        // The three-node fusion must not materialize either intermediate.
+        REQUIRE(static_cast<const float *>(norm->data)[0] == -1000);
+        REQUIRE(static_cast<const float *>(product->data)[0] == -1000);
+    }
+
+    ggml_set_f32(out, -1000);
+    auto plan = ggml_graph_plan(graph, threads, nullptr);
+    std::vector<uint8_t> work(plan.work_size);
+    plan.work_data = work.data();
+    int calls = 0;
+    plan.abort_callback = [](void * data) { return ++*static_cast<int *>(data) == 1; };
+    plan.abort_callback_data = &calls;
+    REQUIRE(ggml_graph_compute(graph, &plan) == GGML_STATUS_ABORTED);
+    REQUIRE(calls == 1 && static_cast<const float *>(out->data)[0] == -1000);
+}
+
 static void benchmark(bool indexed) {
     const int64_t columns = indexed ? 1009 : 1024;
     const int64_t rows = 1024;
@@ -519,6 +598,16 @@ int main(int argc, char ** argv) {
 
     first.join();
     second.join();
+
+    for (int64_t columns : {1, 7, 8, 9, 31, 32, 33, 127, 128, 129, 513, 1025, 4096}) {
+        for (int layout : {0, 1, 2}) {
+            for (int captured : {0, 1, 2}) {
+                for (int threads : {1, 4}) {
+                    test_rms_affine(columns, layout, captured, threads);
+                }
+            }
+        }
+    }
 
     std::puts("CPU fusion tests passed");
 }

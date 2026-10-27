@@ -4142,26 +4142,38 @@ void ggml_compute_forward_norm(
 
 // ggml_compute_forward_group_rms_norm
 
-// fusion kinds that can be combined with the rms_norm computation in a single pass.
-// extend this enum when adding new fused variants (e.g. FUSE_ADD, FUSE_MUL_ADD, ...).
 enum ggml_rms_norm_fuse_op {
     GGML_RMS_NORM_FUSE_OP_NONE,
     GGML_RMS_NORM_FUSE_OP_MUL,
+    GGML_RMS_NORM_FUSE_OP_MUL_ADD,
 };
 
 template <ggml_rms_norm_fuse_op FUSE_OP>
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("fp-contract=off")))
+#endif
 static void ggml_compute_forward_rms_norm_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst_rms_norm,
-        ggml_tensor * dst_fused = nullptr) {
+        ggml_tensor * dst_fused = nullptr,
+        ggml_tensor * dst_add = nullptr) {
+#if defined(__clang__)
+    #pragma clang fp contract(off)
+#endif
+    // Preserve the rounding between the separate MUL and ADD operations.
 
     const ggml_tensor * src0 = dst_rms_norm->src[0];
     const ggml_tensor * src1 = nullptr;
+    const ggml_tensor * bias = nullptr;
     ggml_tensor       * dst  = dst_rms_norm;
 
-    if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL) {
+    if constexpr (FUSE_OP != GGML_RMS_NORM_FUSE_OP_NONE) {
         src1 = (dst_fused->src[0] == dst_rms_norm) ? dst_fused->src[1] : dst_fused->src[0];
         dst  = dst_fused;
+    }
+    if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL_ADD) {
+        bias = (dst_add->src[0] == dst_fused) ? dst_add->src[1] : dst_add->src[0];
+        dst = dst_add;
     }
 
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
@@ -4177,39 +4189,64 @@ static void ggml_compute_forward_rms_norm_f32(
     memcpy(&eps, dst_rms_norm->op_params, sizeof(float));
     GGML_ASSERT(eps >= 0.0f);
 
-    // TODO: optimize
-    for (int64_t i03 = 0; i03 < ne03; i03++) {
-        for (int64_t i02 = 0; i02 < ne02; i02++) {
-            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
-                const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+    // Include every row dimension and unravel only the first row per thread.
+    const int64_t rows = ggml_nrows(src0);
+    const int64_t chunk = rows / nth;
+    const int64_t extra = rows % nth;
+    const int64_t begin = chunk * ith + std::min(int64_t(ith), extra);
+    const int64_t end = begin + chunk + (ith < extra);
+    if (begin == end) {
+        return;
+    }
+    int64_t i01 = begin % ne01;
+    int64_t i02 = (begin / ne01) % ne02;
+    int64_t i03 = begin / (ne01 * ne02);
+    for (int64_t row = begin; row < end; ++row) {
+        const float * x = (const float *) ((const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
-                ggml_float sum = 0.0;
-                // worth switching to explicit SIMD?
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    sum += (ggml_float)(x[i00] * x[i00]);
+        ggml_float sum = 0.0;
+        if (params->use_ref) {
+            for (int64_t i00 = 0; i00 < ne00; ++i00) {
+                sum += (ggml_float) (x[i00] * x[i00]);
+            }
+        } else {
+            sum = ggml_vec_sqr_sum_f32(ne00, x);
+        }
+
+        const float mean  = sum/ne00;
+        const float scale = 1.0f/sqrtf(mean + eps);
+
+        // if you hit this, likely you got an inf somewhere earlier
+        assert(scale > 0.0f);
+
+        float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+
+        if constexpr (FUSE_OP != GGML_RMS_NORM_FUSE_OP_NONE) {
+            const int64_t i11 = i01 % ne11;
+            const int64_t i12 = i02 % ne12;
+            const int64_t i13 = i03 % ne13;
+            const float * w = (const float *) ((const char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
+
+            if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL_ADD) {
+                const float * b = (const float *) ((const char *) bias->data +
+                    (i01 % bias->ne[1])*bias->nb[1] + (i02 % bias->ne[2])*bias->nb[2] + (i03 % bias->ne[3])*bias->nb[3]);
+                for (int64_t i00 = 0; i00 < ne00; ++i00) {
+                    y[i00] = (x[i00] * scale) * w[i00] + b[i00];
                 }
-
-                const float mean  = sum/ne00;
-                const float scale = 1.0f/sqrtf(mean + eps);
-
-                // if you hit this, likely you got an inf somewhere earlier
-                assert(scale > 0.0f);
-
-                float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
-
-                if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL) {
-                    const int64_t i11 = i01 % ne11;
-                    const int64_t i12 = i02 % ne12;
-                    const int64_t i13 = i03 % ne13;
-                    const float * w = (float *) ((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
-
-                    for (int64_t i00 = 0; i00 < ne00; i00++) {
-                        y[i00] = x[i00] * scale * w[i00];
-                    }
-                } else {
-                    memcpy(y, x, ne00 * sizeof(float));
-                    ggml_vec_scale_f32(ne00, y, scale);
+            } else {
+                for (int64_t i00 = 0; i00 < ne00; ++i00) {
+                    y[i00] = x[i00] * scale * w[i00];
                 }
+            }
+        } else {
+            memcpy(y, x, ne00 * sizeof(float));
+            ggml_vec_scale_f32(ne00, y, scale);
+        }
+        if (++i01 == ne01) {
+            i01 = 0;
+            if (++i02 == ne02) {
+                i02 = 0;
+                ++i03;
             }
         }
     }
@@ -4255,6 +4292,16 @@ void ggml_compute_forward_rms_norm_mul_fused(
                 GGML_ABORT("fatal error");
             }
     }
+}
+
+void ggml_compute_forward_rms_norm_mul_add_fused(
+        const ggml_compute_params * params,
+        ggml_tensor * dst_rms_norm,
+        ggml_tensor * dst_mul,
+        ggml_tensor * dst_add) {
+    GGML_ASSERT(dst_mul->src[0] == dst_rms_norm || dst_mul->src[1] == dst_rms_norm);
+    GGML_ASSERT(dst_add->src[0] == dst_mul || dst_add->src[1] == dst_mul);
+    ggml_compute_forward_rms_norm_f32<GGML_RMS_NORM_FUSE_OP_MUL_ADD>(params, dst_rms_norm, dst_mul, dst_add);
 }
 
 static void ggml_compute_forward_rms_norm_back_f32(

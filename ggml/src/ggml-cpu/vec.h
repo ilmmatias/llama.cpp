@@ -14,6 +14,45 @@
 // floating point type used to accumulate sums
 typedef double ggml_float;
 
+// Match the RMS kernel's F32 products and F64 accumulation.
+inline static ggml_float ggml_vec_sqr_sum_f32(const int64_t n, const float * x) {
+    int64_t i = 0;
+    ggml_float sum = 0.0;
+#if defined(__AVX512F__)
+    __m512d acc[4] = { _mm512_setzero_pd(), _mm512_setzero_pd(), _mm512_setzero_pd(), _mm512_setzero_pd() };
+    for (; i + 32 <= n; i += 32) {
+        for (int j = 0; j < 4; ++j) {
+            const __m256 v = _mm256_loadu_ps(x + i + 8*j);
+            acc[j] = _mm512_add_pd(acc[j], _mm512_cvtps_pd(_mm256_mul_ps(v, v)));
+        }
+    }
+    for (; i + 8 <= n; i += 8) {
+        const __m256 v = _mm256_loadu_ps(x + i);
+        acc[0] = _mm512_add_pd(acc[0], _mm512_cvtps_pd(_mm256_mul_ps(v, v)));
+    }
+    sum = _mm512_reduce_add_pd(_mm512_add_pd(_mm512_add_pd(acc[0], acc[1]), _mm512_add_pd(acc[2], acc[3])));
+#elif defined(__AVX__)
+    __m256d acc[4] = { _mm256_setzero_pd(), _mm256_setzero_pd(), _mm256_setzero_pd(), _mm256_setzero_pd() };
+    for (; i + 16 <= n; i += 16) {
+        for (int j = 0; j < 4; ++j) {
+            const __m128 v = _mm_loadu_ps(x + i + 4*j);
+            acc[j] = _mm256_add_pd(acc[j], _mm256_cvtps_pd(_mm_mul_ps(v, v)));
+        }
+    }
+    for (; i + 4 <= n; i += 4) {
+        const __m128 v = _mm_loadu_ps(x + i);
+        acc[0] = _mm256_add_pd(acc[0], _mm256_cvtps_pd(_mm_mul_ps(v, v)));
+    }
+    const __m256d total = _mm256_add_pd(_mm256_add_pd(acc[0], acc[1]), _mm256_add_pd(acc[2], acc[3]));
+    const __m128d pair = _mm_add_pd(_mm256_castpd256_pd128(total), _mm256_extractf128_pd(total, 1));
+    sum = _mm_cvtsd_f64(_mm_add_sd(pair, _mm_unpackhi_pd(pair, pair)));
+#endif
+    for (; i < n; ++i) {
+        sum += (ggml_float) (x[i] * x[i]);
+    }
+    return sum;
+}
+
 #if defined(__ARM_FEATURE_SVE)
 inline static void ggml_sve_f16_fma_widened(
         svfloat32_t * acc_lo,
