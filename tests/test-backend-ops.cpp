@@ -11843,6 +11843,17 @@ static void add_test_cases_mul_mat_znq(std::vector<std::unique_ptr<test_case>> &
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, shape[0], shape[1], shape[2], {1, 1}, {1, 1}));
         }
 
+        if (perf && (type == GGML_TYPE_ZNQ6_S || type == GGML_TYPE_ZNQ6_M || type == GGML_TYPE_ZNQ6_L)) {
+            for (const auto & shape : {
+                    std::array<int64_t, 2>{2048, 4096}, {4096, 4096}, {12288, 4096}, {4096, 12288}}) {
+                if (shape != std::array<int64_t, 2>{4096, 4096}) {
+                    test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, shape[0], 1, shape[1], {1, 1}, {1, 1}));
+                }
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, shape[0], shape[1],
+                    false, 1, 1, false, false, true, false, {1, 1}));
+            }
+        }
+
         if (!perf) {
             for (const auto & shape : {
                     std::array<int64_t, 3>{1023, 1, 32}, {1024, 1, 96}, {1025, 1, 128}, {1027, 1, 160},
@@ -11857,6 +11868,8 @@ static void add_test_cases_mul_mat_znq(std::vector<std::unique_ptr<test_case>> &
                 test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 1025, 96,
                     false, 1, 1, false, true, with_gate, false, {2, 2}));
             }
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 17, 160,
+                false, 1, 1, false, true, true, false, {1, 1}));
             if (type == GGML_TYPE_ZNQ4_L || type == GGML_TYPE_ZNQ6_M) {
                 for (int64_t m : {4095, 4097}) {
                     test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, 1, 4096, {1, 1}, {1, 1}));

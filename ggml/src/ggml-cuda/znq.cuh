@@ -117,13 +117,20 @@ static __device__ __forceinline__ int znq_pack4_cuda(const uint8_t * block, int 
         codes = (uint32_t(block[znq_header_cuda<bits, group>() + offset / 8]) | (uint32_t(block[znq_header_cuda<bits, group>() + 1 + offset / 8]) << 8)) >> (offset % 8);
     } else if constexpr (bits >= 5) {
         const int offset = bits * j;
+#if defined(GGML_USE_HIP)
+        // Keep the final word inside the payload, including an unpadded last block.
+        const int last_word = 4*bits - int(sizeof(codes));
+        const int word_offset = offset/8 < last_word ? offset/8 : last_word;
+        memcpy(&codes, block + znq_header_cuda<bits, group>() + word_offset, sizeof(codes));
+        codes >>= offset - 8*word_offset;
+#else
         const uint8_t * qs = block + znq_header_cuda<bits, group>() + offset / 8;
         codes = uint32_t(qs[0]) | (uint32_t(qs[1]) << 8) | (uint32_t(qs[2]) << 16);
         if constexpr (bits == 7) {
             codes |= uint32_t(qs[3]) << 24;
         }
-
         codes >>= offset % 8;
+#endif
     } else {
         codes = uint32_t(block[znq_header_cuda<bits, group>() + j / 2]) | (uint32_t(block[znq_header_cuda<bits, group>() + 1 + j / 2]) << 8);
     }
