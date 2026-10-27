@@ -267,41 +267,22 @@ struct fusion_builder {
     }
 };
 
-static bool fusion_connected(const ggml_cgraph * graph, int start, int count) {
-    bool reached[GGML_FUSION_MAX_VALUES] = {};
-    reached[0] = true;
-
-    for (int pass = 0; pass < count; ++pass) {
+static bool fusion_connected(const uint32_t * connections, int count) {
+    static_assert(GGML_FUSION_MAX_VALUES < 32, "fusion connectivity needs one bit per value");
+    const uint32_t mask = (UINT32_C(1) << count) - 1;
+    uint32_t reached = 1;
+    uint32_t pending = 1;
+    while (pending && reached != mask) {
+        uint32_t next = 0;
         for (int i = 0; i < count; ++i) {
-            if (!reached[i]) {
-                continue;
-            }
-
-            const auto * a = graph->nodes[start + i];
-            for (int j = 0; j < count; ++j) {
-                const auto * b = graph->nodes[start + j];
-                for (int s = 0; s < fusion_sources(a); ++s) {
-                    if (a->src[s] == b) {
-                        reached[j] = true;
-                    }
-
-                    for (int t = 0; t < fusion_sources(b); ++t) {
-                        if (b->src[t] == a || b->src[t] == a->src[s]) {
-                            reached[j] = true;
-                        }
-                    }
-                }
+            if (pending & (UINT32_C(1) << i)) {
+                next |= connections[i];
             }
         }
+        pending = next & mask & ~reached;
+        reached |= pending;
     }
-
-    for (int i = 0; i < count; ++i) {
-        if (!reached[i]) {
-            return false;
-        }
-    }
-
-    return true;
+    return reached == mask;
 }
 
 static bool fusion_liveness(const ggml_fusion_program & program) {
@@ -425,9 +406,42 @@ bool ggml_fusion_build(const ggml_cgraph * graph, int start, ggml_fusion_region 
         ops[count++] = node->op;
     }
 
+    // Reuse topology while shorter prefixes are tried; excluded nodes cannot connect a prefix.
+    const int candidates = count;
+    uint32_t connections[GGML_FUSION_MAX_VALUES] = {};
+    int uses[GGML_FUSION_MAX_VALUES] = {};
+    for (int i = 0; i < candidates; ++i) {
+        const auto * a = graph->nodes[start + i];
+        for (int j = 0; j < i; ++j) {
+            const auto * b = graph->nodes[start + j];
+            bool connected = false;
+            for (int s = 0; s < fusion_sources(a); ++s) {
+                if (a->src[s] == b) {
+                    ++uses[j];
+                    connected = true;
+                }
+                for (int t = 0; t < fusion_sources(b); ++t) {
+                    connected |= b->src[t] == a || b->src[t] == a->src[s];
+                }
+            }
+            if (connected) {
+                connections[i] |= UINT32_C(1) << j;
+                connections[j] |= UINT32_C(1) << i;
+            }
+        }
+    }
+
     for (; count >= 2; --count) {
+        if (count < candidates) {
+            const auto * removed = graph->nodes[start + count];
+            for (int i = 0; i < count; ++i) {
+                for (int s = 0; s < fusion_sources(removed); ++s) {
+                    uses[i] -= removed->src[s] == graph->nodes[start + i];
+                }
+            }
+        }
         const int last = start + count - 1;
-        if (!fusion_connected(graph, start, count)) {
+        if (!fusion_connected(connections, count)) {
             continue;
         }
 
@@ -436,18 +450,12 @@ bool ggml_fusion_build(const ggml_cgraph * graph, int start, ggml_fusion_region 
         region.count = count;
         for (int i = 0; i < count; ++i) {
             region.members[i] = start + i;
+            region.uses[i] = uses[i];
         }
 
         bool valid = true;
         for (int i = 0; i < count; ++i) {
             const auto * node = graph->nodes[start + i];
-            for (int j = i + 1; j < count; ++j) {
-                const auto * consumer = graph->nodes[start + j];
-                for (int s = 0; s < fusion_sources(consumer); ++s) {
-                    region.uses[i] += consumer->src[s] == node;
-                }
-            }
-
             if ((node->flags & GGML_TENSOR_FLAG_OUTPUT) || (node->view_src && node->op == GGML_OP_RMS_NORM) ||
                 ggml_node_get_use_count(graph, start + i) > region.uses[i] || region.uses[i] == 0) {
                 if (program.outputs == GGML_FUSION_MAX_OUTPUTS) {

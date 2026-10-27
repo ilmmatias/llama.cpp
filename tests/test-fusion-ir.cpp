@@ -89,6 +89,51 @@ static void test_dependencies_and_keys(ggml_context * ctx, ggml_tensor * a, ggml
     REQUIRE(!ggml_fusion_build(disconnected, 0, region, program));
 }
 
+static void test_candidate_prefixes(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b) {
+    ggml_fusion_region region;
+    ggml_fusion_program program;
+
+    auto * repeated = ggml_new_graph_custom(ctx, GGML_FUSION_MAX_VALUES + 1, false);
+    auto * value = ggml_sqr(ctx, a);
+    ggml_set_output(value);
+    for (int i = 1; i < GGML_FUSION_MAX_VALUES; ++i) {
+        value = ggml_add(ctx, value, value);
+        ggml_set_output(value);
+    }
+    ggml_build_forward_expand(repeated, value);
+    REQUIRE(ggml_fusion_build(repeated, 0, region, program));
+    REQUIRE(region.count == GGML_FUSION_MAX_OUTPUTS && program.outputs == GGML_FUSION_MAX_OUTPUTS);
+    for (int i = 0; i < region.count; ++i) {
+        REQUIRE(region.uses[i] == (i + 1 < region.count ? 2 : 0));
+        REQUIRE(region.outputs[i] == repeated->nodes[i]);
+    }
+
+    auto * left = ggml_neg(ctx, ggml_sqr(ctx, a));
+    auto * right = ggml_sqr(ctx, b);
+    for (int i = 1; i < GGML_FUSION_MAX_OUTPUTS; ++i) {
+        right = ggml_sqr(ctx, right);
+    }
+    auto * joined = ggml_new_graph_custom(ctx, GGML_FUSION_MAX_VALUES + 1, false);
+    ggml_build_forward_expand(joined, ggml_add(ctx, left, right));
+    for (int i = 0; i < joined->n_nodes; ++i) {
+        ggml_set_output(joined->nodes[i]);
+    }
+    REQUIRE(ggml_fusion_build(joined, 0, region, program));
+    REQUIRE(region.count == 2 && program.outputs == 2);
+    REQUIRE(region.outputs[1] == left);
+
+    auto * siblings = ggml_new_graph_custom(ctx, GGML_FUSION_MAX_VALUES + 1, false);
+    for (int i = 0; i < GGML_FUSION_MAX_OUTPUTS + 2; ++i) {
+        ggml_build_forward_expand(siblings, ggml_neg(ctx, a));
+    }
+    REQUIRE(ggml_fusion_build(siblings, 0, region, program));
+    REQUIRE(region.count == GGML_FUSION_MAX_OUTPUTS && program.outputs == GGML_FUSION_MAX_OUTPUTS);
+    REQUIRE(program.inputs == 1 && region.inputs[0] == a);
+    for (int i = 0; i < region.count; ++i) {
+        REQUIRE(region.uses[i] == 0);
+    }
+}
+
 static void test_indexed_layouts(ggml_context * ctx) {
     ggml_fusion_region region;
     ggml_fusion_program program;
@@ -183,6 +228,7 @@ int main() {
 
     test_materialization_and_extents(ctx, a, b);
     test_dependencies_and_keys(ctx, a, b);
+    test_candidate_prefixes(ctx, a, b);
     test_indexed_layouts(ctx);
     test_reduction_boundaries(ctx);
 
