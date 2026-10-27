@@ -525,7 +525,7 @@ static int test_repack(bool verbose, ggml_type weight_type, ggml_type input_type
     // Short batches, GEMM tails, output tiles, and shared gate/up inputs.
     const int shapes[][4] = {
         {32, 56, 2, 2}, {640, 24, 7, 2}, {256, 280, 3, 2}, {256, 56, 6, 2}, {4128, 56, 7, 2},
-        {32, 56, 1, 4}, {256, 24, 2, 4}, {256, 56, 3, 4},
+        {32, 56, 1, 4}, {256, 24, 2, 4}, {256, 56, 3, 4}, {96, 24, 5, 4},
         {256, 280, 4, 8}, {256, 280, 6, 8}, {4128, 56, 7, 8},
         {32, 8, 20, 2}, {640, 24, 25, 2}, {640, 40, 20, 2}, {4128, 56, 25, 2}, {256, 280, 64, 2},
     };
@@ -564,7 +564,7 @@ static int test_repack(bool verbose, ggml_type weight_type, ggml_type input_type
             const int slots = dense ? n : (broadcast ? 1 : n_used);
             const int planes = dense ? dense_planes : n;
             const size_t row_size = ggml_row_size(input_type, k);
-            const int stride = input_type == GGML_TYPE_F32 ? 1 : 2;
+            const int stride = input_type == GGML_TYPE_F32 && dense ? 1 : 2;
             auto * storage = ggml_new_tensor_3d(ctx.get(), input_type, k, stride*slots, planes);
             auto * input = ggml_view_3d(ctx.get(), storage, k, slots, planes, stride*row_size, stride*slots*row_size, 0);
             auto * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_used, n);
@@ -713,7 +713,9 @@ int main(int argc, char * argv[]) {
     num_failed += test_quantize_znq_rows(verbose);
     num_failed += test_vec_dot_znq(verbose);
     num_failed += test_mul_mat_znq(verbose);
-    num_failed += test_repack(verbose, GGML_TYPE_ZNQ3_M, GGML_TYPE_F32);
+    for (ggml_type type : { GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ4_M }) {
+        num_failed += test_repack(verbose, type, GGML_TYPE_F32);
+    }
     for (ggml_type type : {GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_S, GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S, GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L}) {
         num_failed += test_repack(verbose, type, GGML_TYPE_F32);
         num_failed += test_repack(verbose, type, GGML_TYPE_F32, true);

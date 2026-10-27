@@ -311,6 +311,8 @@ bool ggml_gemm_znq_prepared(int n, float * s, size_t bs, const void * vx, const 
 // Optional corrections are row-major [nr][n/QK_ZNQ], with 128 times each Q8 block sum.
 void ggml_gemv_znq_local(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc, int group,
         const int32_t * prepared_sums = nullptr, int index_bits = 2);
+void ggml_gemv_znq_local_moe(int n, float * s, size_t bs1, size_t bs2, const int32_t * map,
+        const void * vx, const void * vy, int nr, int nc, int group, const int32_t * sums, int index_bits);
 void ggml_gemm_znq_local(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc,
         int group, const int32_t * map, size_t bs1, size_t bs2, const int32_t * prepared_sums = nullptr, int index_bits = 2);
 void ggml_znq_local_prepare_sums(int n, int nr, bool packed, const void * vy, int32_t * sums);

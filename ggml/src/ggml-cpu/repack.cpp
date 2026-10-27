@@ -5985,6 +5985,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     // ZNQ MoE stores routed activation rows in expert order.
                     size_t activation_size = op->src[1]->type == PARAM_TYPE ? 0 :
                         ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
+                    size_t sums_size = 0;
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
                     if constexpr (PARAM_TYPE == GGML_TYPE_Q8_0 && INTER_SIZE == 8 && NB_COLS == 8) {
@@ -5996,14 +5997,19 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                             const size_t row_size = ggml_row_size(PARAM_TYPE, op->src[1]->ne[0]);
                             const size_t routed_size = row_size * (size_t) n_ids * (size_t) ne12;
                             activation_size = MAX(activation_size, routed_size);
-                            if (src0_type == GGML_TYPE_ZNQ3_M && op->src[1]->type == GGML_TYPE_F32 && op->src[1]->ne[1] == 1 && n_ids >= 4) {
+                            const bool reuse_input = op->src[1]->type == GGML_TYPE_F32 && op->src[1]->ne[1] == 1 && n_ids >= 4;
+                            if (reuse_input) {
                                 activation_size += row_size * (size_t) ne12;
+                            }
+                            if constexpr (local_znq) {
+                                sums_size = sizeof(int32_t) * (op->src[1]->ne[0] / QK_ZNQ) *
+                                    (size_t) ne12 * ((size_t) n_ids + (reuse_input ? 1 : 0));
                             }
                         }
                     }
 #endif
 
-                    size = GGML_PAD(activation_size, sizeof(int64_t)); // + padding for next block.
+                    size = GGML_PAD(GGML_PAD(activation_size, sizeof(int32_t)) + sums_size, sizeof(int64_t));
 
                     const size_t sizeof_mmid_row_mapping = sizeof(int64_t);
 
@@ -6096,7 +6102,19 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 }
             }
         }
-        for (int iter = nrows - (nrows % 4); iter < nrows; iter++) {
+        const int tail_start = nrows - nrows % 4;
+        if constexpr (local_znq) {
+            if (nrows % 4 > 1 && (src1->type != PARAM_TYPE || nb11 == src1_col_stride)) {
+                const void * row = src1->type == PARAM_TYPE
+                    ? (const char *) src1->data + (i11 + tail_start)*nb11 + i12*nb12
+                    : src1_ptr + src1_col_stride*tail_start;
+                ggml_gemv_znq_local(ne00, (float *) (dst_ptr + tail_start*nb1) + src0_start, nb1 / nb0,
+                                    src0_ptr + src0_start*nb01, row, nrows % 4, ncols,
+                                    local_group, sums + tail_start*(ne10/QK_ZNQ), local_bits);
+                return;
+            }
+        }
+        for (int iter = tail_start; iter < nrows; iter++) {
             const void * row = src1->type == PARAM_TYPE
                 ? (const char *) src1->data + (i11 + iter)*nb11 + i12*nb12
                 : src1_ptr + src1_col_stride*iter;
@@ -6339,19 +6357,25 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         // Reserve the expert-grouped activation stream separately from the row map.
         const size_t routed_q8_size = nbw1 * (size_t) n_ids * (size_t) ne12;
-        const bool reuse_znq3_m_input = use_znq_moe && src1->type == GGML_TYPE_F32 &&
-                                     src0->type == GGML_TYPE_ZNQ3_M && ne11 == 1 && n_ids >= 4;
+        const bool reuse_znq_input = use_znq_moe && src1->type == GGML_TYPE_F32 && ne11 == 1 && n_ids >= 4;
         const size_t activation_size = (use_znq_moe ? MAX(nbw3, routed_q8_size) :
                                        src1->type == PARAM_TYPE ? 0 : nbw3) +
-                                      (reuse_znq3_m_input ? nbw3 : 0);
+                                      (reuse_znq_input ? nbw3 : 0);
+        const size_t sums_stride = ne10 / QK_ZNQ;
+        const size_t sums_size = local_znq && use_znq_moe ?
+            sizeof(int32_t) * sums_stride * (size_t) ne12 * ((size_t) n_ids + (reuse_znq_input ? 1 : 0)) : 0;
+        const size_t sums_offset = GGML_PAD(activation_size, sizeof(int32_t));
+        const size_t mapping_offset = GGML_PAD(sums_offset + sums_size, sizeof(int64_t));
 
         GGML_ASSERT(params->wsize >=
-                (GGML_PAD(activation_size, sizeof(int64_t)) +
+                (mapping_offset +
                  n_as*(ne12 + 1)*sizeof(mmid_row_mapping) + (n_as + 1)*sizeof(int32_t))
                 );
 
         auto * wdata          = (char *)params->wdata;
-        auto * wdata_src1_end = (char *)wdata + GGML_PAD(activation_size, sizeof(int64_t));
+        auto * wdata_src1_end = wdata + mapping_offset;
+        auto * routed_sums = sums_size ? (int32_t *) (wdata + sums_offset) : nullptr;
+        auto * shared_sums = routed_sums && reuse_znq_input ? routed_sums + (size_t) n_ids * ne12 * sums_stride : nullptr;
 
         // total of [n_as][ne12 + 1] elements of type mmid_row_mapping (2*int32_t = int64_t)
         auto * matrix_row_counts = (int64_t *) (wdata_src1_end);                                        // [n_as]
@@ -6360,11 +6384,14 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         auto * active_experts = (int32_t *) (matrix_rows + n_as*ne12); // [n_as], followed by count
 
         // Broadcast gate/up inputs are shared by all selected experts.
-        char * shared_q8 = reuse_znq3_m_input ? wdata + routed_q8_size : nullptr;
-        if (reuse_znq3_m_input) {
+        char * shared_q8 = reuse_znq_input ? wdata + routed_q8_size : nullptr;
+        if (reuse_znq_input) {
             for (int64_t i12 = ith; i12 < ne12; i12 += nth) {
                 from_float((const float *) ((const char *) src1->data + i12*nb12),
                            shared_q8 + i12*nbw1, ne10);
+                if (shared_sums) {
+                    ggml_znq_local_prepare_sums(ne10, 1, false, shared_q8 + i12*nbw1, shared_sums + i12*sums_stride);
+                }
             }
         }
 
@@ -6448,11 +6475,15 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                         continue;
                     }
 
-                    if (reuse_znq3_m_input) {
+                    if (reuse_znq_input) {
                         const void * rows[4];
                         for (int r = 0; r < 4; ++r) {
                             const mmid_row_mapping row = MMID_MATRIX_ROW(cur_a, ir1 + r);
                             rows[r] = shared_q8 + row.i2*nbw1;
+                            if (routed_sums) {
+                                memcpy(routed_sums + (expert_row_base + ir1 + r)*sums_stride,
+                                       shared_sums + row.i2*sums_stride, sums_stride*sizeof(int32_t));
+                            }
                         }
                         ggml_repack_q8_0_4x8(rows, wdata + (expert_row_base + ir1)*nbw1, ne10);
                         continue;
@@ -6465,6 +6496,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                             rows[r] = (const char *) src1->data + row.i2*nb12 + (row.i1 % ne11)*nb11;
                         }
                         repack_activation_rows<INTER_SIZE, PARAM_TYPE>(rows, wdata + (expert_row_base + ir1)*nbw1, ne10);
+                        if (routed_sums) {
+                            ggml_znq_local_prepare_sums(ne10, 4, true, wdata + (expert_row_base + ir1)*nbw1,
+                                                       routed_sums + (expert_row_base + ir1)*sums_stride);
+                        }
                         continue;
                     }
 
@@ -6478,9 +6513,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     ggml_quantize_mat_znq4_m_q8_0_4x8(
                         xr[0], xr[1], xr[2], xr[3],
                         wdata + (expert_row_base + ir1)*nbw1, ne10);
+                    if (routed_sums) {
+                        ggml_znq_local_prepare_sums(ne10, 4, true, wdata + (expert_row_base + ir1)*nbw1,
+                                                   routed_sums + (expert_row_base + ir1)*sums_stride);
+                    }
                 }
                 // Shared-input tails are read directly by GEMV.
-                for (; !reuse_znq3_m_input && ir1 < cne1; ++ir1) {
+                for (; !reuse_znq_input && ir1 < cne1; ++ir1) {
                     const int64_t task = qtask++;
                     if (task % nth != ith) {
                         continue;
@@ -6493,6 +6532,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                         memcpy(wdata + (expert_row_base + ir1)*nbw1, row_data, nbw1);
                     } else {
                         from_float((const float *) row_data, wdata + (expert_row_base + ir1)*nbw1, ne10);
+                    }
+                    if (routed_sums) {
+                        ggml_znq_local_prepare_sums(ne10, 1, false, wdata + (expert_row_base + ir1)*nbw1,
+                                                   routed_sums + (expert_row_base + ir1)*sums_stride);
                     }
                 }
                 expert_row_base += cne1;
@@ -6507,61 +6550,24 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
         auto znq_moe_gemm = [&](int n, float * out, size_t dst_bs1, size_t dst_bs2,
                                 const int32_t * row_map, const void * weights,
-                                const void * activations, int nr, int nc) {
-            switch (src0->type) {
-                case GGML_TYPE_ZNQ2_M:
-                    ggml_gemm_znq2_m_8x8_q8_0_moe(n, out, dst_bs1, dst_bs2, row_map, weights, activations, nr, nc);
-                    break;
-                case GGML_TYPE_ZNQ2_L:
-                    ggml_gemm_znq_local(n, out, 0, weights, activations, nr, nc, 8, row_map, dst_bs1, dst_bs2);
-                    break;
-                case GGML_TYPE_ZNQ3_S:
-                    ggml_gemm_znq_local(n, out, 0, weights, activations, nr, nc, 4, row_map, dst_bs1, dst_bs2);
-                    break;
-                case GGML_TYPE_ZNQ3_M:
-                    ggml_gemm_znq3_m_8x8_q8_0_moe(n, out, dst_bs1, dst_bs2, row_map, weights, activations, nr, nc);
-                    break;
-                case GGML_TYPE_ZNQ3_L:
-                    ggml_gemm_znq_local(n, out, 0, weights, activations, nr, nc, 8, row_map, dst_bs1, dst_bs2, nullptr, 3);
-                    break;
-                case GGML_TYPE_ZNQ4_S:
-                    ggml_gemm_znq_local(n, out, 0, weights, activations, nr, nc, 4, row_map, dst_bs1, dst_bs2, nullptr, 3);
-                    break;
-                case GGML_TYPE_ZNQ4_M:
-                    ggml_gemm_znq4_m_8x8_q8_0_moe(n, out, dst_bs1, dst_bs2, row_map, weights, activations, nr, nc);
-                    break;
-                case GGML_TYPE_ZNQ4_L:
-                    ggml_gemm_znq_local(n, out, 0, weights, activations, nr, nc, 8, row_map, dst_bs1, dst_bs2, nullptr, 4);
-                    break;
-                case GGML_TYPE_ZNQ5_S:
-                    ggml_gemm_znq_local(n, out, 0, weights, activations, nr, nc, 4, row_map, dst_bs1, dst_bs2, nullptr, 4);
-                    break;
-                case GGML_TYPE_ZNQ5_M:
-                    ggml_gemm_znq_local(n, out, 0, weights, activations, nr, nc, 16, row_map, dst_bs1, dst_bs2, nullptr, 5);
-                    break;
-                case GGML_TYPE_ZNQ5_L:
-                    ggml_gemm_znq_local(n, out, 0, weights, activations, nr, nc, 8, row_map, dst_bs1, dst_bs2, nullptr, 5);
-                    break;
-                case GGML_TYPE_ZNQ6_S:
-                    ggml_gemm_znq_local(n, out, 0, weights, activations, nr, nc, 4, row_map, dst_bs1, dst_bs2, nullptr, 5);
-                    break;
-                case GGML_TYPE_ZNQ6_M:
-                    ggml_gemm_znq_local(n, out, 0, weights, activations, nr, nc, 16, row_map, dst_bs1, dst_bs2, nullptr, 6);
-                    break;
-                case GGML_TYPE_ZNQ6_L:
-                    ggml_gemm_znq_local(n, out, 0, weights, activations, nr, nc, 8, row_map, dst_bs1, dst_bs2, nullptr, 6);
-                    break;
-                case GGML_TYPE_ZNQ7_S:
-                    ggml_gemm_znq_local(n, out, 0, weights, activations, nr, nc, 4, row_map, dst_bs1, dst_bs2, nullptr, 6);
-                    break;
-                case GGML_TYPE_ZNQ7_M:
-                    ggml_gemm_znq_local(n, out, 0, weights, activations, nr, nc, 16, row_map, dst_bs1, dst_bs2, nullptr, 7);
-                    break;
-                case GGML_TYPE_ZNQ7_L:
-                    ggml_gemm_znq_local(n, out, 0, weights, activations, nr, nc, 8, row_map, dst_bs1, dst_bs2, nullptr, 7);
-                    break;
-                default:
-                    GGML_ABORT("invalid ZNQ MoE type");
+                                const void * activations, int nr, int nc, const int32_t * sums) {
+            if constexpr (local_znq) {
+                ggml_gemm_znq_local(n, out, 0, weights, activations, nr, nc,
+                                    local_group, row_map, dst_bs1, dst_bs2, sums, local_bits);
+            } else {
+                switch (src0->type) {
+                    case GGML_TYPE_ZNQ2_M:
+                        ggml_gemm_znq2_m_8x8_q8_0_moe(n, out, dst_bs1, dst_bs2, row_map, weights, activations, nr, nc);
+                        break;
+                    case GGML_TYPE_ZNQ3_M:
+                        ggml_gemm_znq3_m_8x8_q8_0_moe(n, out, dst_bs1, dst_bs2, row_map, weights, activations, nr, nc);
+                        break;
+                    case GGML_TYPE_ZNQ4_M:
+                        ggml_gemm_znq4_m_8x8_q8_0_moe(n, out, dst_bs1, dst_bs2, row_map, weights, activations, nr, nc);
+                        break;
+                    default:
+                        GGML_ABORT("invalid ZNQ MoE type");
+                }
             }
         };
 
@@ -6627,23 +6633,38 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                             reinterpret_cast<const int32_t *>(&MMID_MATRIX_ROW(cur_a, 0));
                         znq_moe_gemm(
                             ne00, (float *) dst->data + col, dst_bs1, dst_bs2, row_map,
-                            src0_cur + col*nb01, expert_q8, (int) gemm_rows, tile);
+                            src0_cur + col*nb01, expert_q8, (int) gemm_rows, tile,
+                            routed_sums ? routed_sums + expert_row_begin*sums_stride : nullptr);
                     }
 
-                    // Reuse ZNQ3_M weight decode across the unpacked two/three-row tail.
+                    // Reuse weight decoding across the unpacked two/three-row tail.
                     int64_t ir1 = gemm_rows;
-                    if (reuse_znq3_m_input && ir1 < nr1) {
+                    if constexpr (local_znq) {
+                        if (reuse_znq_input && ir1 < nr1) {
+                            const int32_t * row_map =
+                                reinterpret_cast<const int32_t *>(&MMID_MATRIX_ROW(cur_a, ir1));
+                            ggml_gemv_znq_local_moe(ne00, (float *) dst->data + col, dst_bs1, dst_bs2, row_map,
+                                src0_cur + col*nb01, shared_q8, nr1 - ir1, tile, local_group, shared_sums, local_bits);
+                            ir1 = nr1;
+                        }
+                    }
+                    if (src0->type == GGML_TYPE_ZNQ3_M && reuse_znq_input && ir1 < nr1) {
                         const int32_t * row_map =
                             reinterpret_cast<const int32_t *>(&MMID_MATRIX_ROW(cur_a, ir1));
                         ggml_gemv_znq3_m_8x8_q8_0_moe(
                             ne00, (float *) dst->data + col, dst_bs1, dst_bs2, row_map,
                             src0_cur + col*nb01, shared_q8, (int) (nr1 - ir1), tile);
                         ir1 = nr1;
-                    } else if (src0->type == GGML_TYPE_ZNQ3_M && nr1 - ir1 > 1 && tile >= 16) {
+                    } else if ((local_znq || src0->type == GGML_TYPE_ZNQ3_M) && nr1 - ir1 > 1 && tile >= 16) {
                         float tail[3 * znq_moe_task_cols];
                         const int tail_rows = (int) (nr1 - ir1);
-                        ggml_gemv_znq3_m_8x8_q8_0(
-                            ne00, tail, tile, src0_cur + col*nb01, expert_q8 + ir1*nbw1, tail_rows, tile);
+                        if constexpr (local_znq) {
+                            ggml_gemv_znq_local(ne00, tail, tile, src0_cur + col*nb01, expert_q8 + ir1*nbw1,
+                                tail_rows, tile, local_group, routed_sums + (expert_row_begin + ir1)*sums_stride, local_bits);
+                        } else {
+                            ggml_gemv_znq3_m_8x8_q8_0(
+                                ne00, tail, tile, src0_cur + col*nb01, expert_q8 + ir1*nbw1, tail_rows, tile);
+                        }
                         for (int r = 0; r < tail_rows; ++r) {
                             const mmid_row_mapping row = MMID_MATRIX_ROW(cur_a, ir1 + r);
                             float * out = (float *) ((char *) dst->data + row.i1*nb1 + row.i2*nb2);
@@ -6655,11 +6676,18 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     // Up to three rows remain outside block_q8_0x4.
                     for (; ir1 < nr1; ++ir1) {
                         const mmid_row_mapping row = MMID_MATRIX_ROW(cur_a, ir1);
-                        const char * src1_col = expert_q8 + ir1*nbw1;
+                        const char * src1_col = reuse_znq_input ? shared_q8 + row.i2*nbw1 : expert_q8 + ir1*nbw1;
                         float * out = (float *) ((char *) dst->data + row.i1*nb1 + row.i2*nb2);
-                        gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
-                            ne00, out + col, ne01,
-                            src0_cur + col*nb01, src1_col, 1, tile);
+                        if constexpr (local_znq) {
+                            const int32_t * sums = reuse_znq_input ? shared_sums + row.i2*sums_stride :
+                                routed_sums + (expert_row_begin + ir1)*sums_stride;
+                            ggml_gemv_znq_local(ne00, out + col, ne01, src0_cur + col*nb01, src1_col,
+                                                1, tile, local_group, sums, local_bits);
+                        } else {
+                            gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                                ne00, out + col, ne01,
+                                src0_cur + col*nb01, src1_col, 1, tile);
+                        }
                     }
                 }
 
@@ -6722,7 +6750,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
                         znq_moe_gemm(
                             ne00, (float *) dst->data + col, dst_bs1, dst_bs2, row_map,
-                            src0_cur + col*nb01, expert_q8, (int) gemm_rows, tile);
+                            src0_cur + col*nb01, expert_q8, (int) gemm_rows, tile, nullptr);
                         col += tile;
                     }
                     ir1 = gemm_rows;

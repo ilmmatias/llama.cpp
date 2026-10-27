@@ -8705,9 +8705,9 @@ static inline __m128i znq7_dot_rows4(__m256i a, __m256i b, __m256i c, __m256i d)
     return _mm_add_epi32(_mm256_castsi256_si128(sums), _mm256_extracti128_si256(sums, 1));
 }
 
-template<int group>
+template<int group, int nrows>
 static void znq7_gemv(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc,
-        const int32_t * prepared_sums) {
+        const int32_t * prepared_sums, const int32_t * map, size_t bs1, size_t bs2) {
     const int nb = n / QK_ZNQ;
     constexpr int stride = 8 * (28 + (group == 16 ? 2 : 3));
     const auto * x = (const uint8_t *) vx;
@@ -8716,44 +8716,107 @@ static void znq7_gemv(int n, float * s, size_t bs, const void * vx, const void *
     int32_t * fallback_sums = nullptr;
 
     if (!prepared_sums) {
-        fallback_sums = (int32_t *) znq_scratch.get(size_t(nb) * sizeof(int32_t));
+        fallback_sums = (int32_t *) znq_scratch.get(size_t(nb) * nrows * sizeof(int32_t));
         if (!fallback_sums) {
-            ggml_gemv_znq_local_generic(n, s, bs, vx, vy, nr, nc, group, nullptr, 7);
+            for (int row = 0; row < nr; ++row) {
+                const int input_row = map ? map[2*row + 1] : row;
+                ggml_gemv_znq_local_generic(n, znq_local_dst(s, bs, map, bs1, bs2, row), bs, vx,
+                    y + size_t(input_row)*nb, 1, nc, group, nullptr, 7);
+            }
             return;
         }
     }
 
-    for (int row = 0; row < nr; ++row) {
-        const block_q8_0 * yr = y + size_t(row) * nb;
-        if (!prepared_sums) {
-            ggml_znq_local_prepare_sums(n, 1, false, yr, fallback_sums);
-        }
-
-        const int32_t * sums = prepared_sums ? prepared_sums + size_t(row) * nb : fallback_sums;
-
-        for (int col = 0; col < nc; col += 8) {
-            const uint8_t * blocks = x + size_t(col / 8) * nb * stride;
-            __m256 acc = _mm256_setzero_ps();
-
-            for (int ib = 0; ib < nb; ++ib) {
-                const uint8_t * block = blocks + ib * stride;
-                const __m256i activation = _mm256_loadu_si256((const __m256i *) yr[ib].qs);
-                __m256i dot[8];
-
-                for (int r = 0; r < 8; ++r) {
-                    dot[r] = _mm256_dpbusd_epi32(_mm256_setzero_si256(), znq7_decode_row<group>(block, r, values), activation);
-                }
-
-                const __m128i lo = znq7_dot_rows4(dot[0], dot[1], dot[2], dot[3]);
-                const __m128i hi = znq7_dot_rows4(dot[4], dot[5], dot[6], dot[7]);
-                const __m256i corrected = _mm256_sub_epi32(
-                        _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1), _mm256_set1_epi32(sums[ib]));
-                const __m256 scales = _mm512_castps512_ps256(znq4_mx8_ufp8x16_to_fp32(block, block));
-                const __m256 d = _mm256_mul_ps(scales, _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(yr[ib].d)));
-                acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(corrected), d, acc);
+    if constexpr (nrows == 1) {
+        for (int row = 0; row < nr; ++row) {
+            const int input_row = map ? map[2*row + 1] : row;
+            const block_q8_0 * yr = y + size_t(input_row) * nb;
+            if (!prepared_sums) {
+                ggml_znq_local_prepare_sums(n, 1, false, yr, fallback_sums);
             }
 
-            _mm256_storeu_ps(s + size_t(row) * bs + col, acc);
+            const int32_t * sums = prepared_sums ? prepared_sums + size_t(input_row) * nb : fallback_sums;
+
+            for (int col = 0; col < nc; col += 8) {
+                const uint8_t * blocks = x + size_t(col / 8) * nb * stride;
+                __m256 acc = _mm256_setzero_ps();
+
+                for (int ib = 0; ib < nb; ++ib) {
+                    const uint8_t * block = blocks + ib * stride;
+                    const __m256i activation = _mm256_loadu_si256((const __m256i *) yr[ib].qs);
+                    __m256i dot[8];
+
+                    for (int r = 0; r < 8; ++r) {
+                        dot[r] = _mm256_dpbusd_epi32(_mm256_setzero_si256(), znq7_decode_row<group>(block, r, values), activation);
+                    }
+
+                    const __m128i lo = znq7_dot_rows4(dot[0], dot[1], dot[2], dot[3]);
+                    const __m128i hi = znq7_dot_rows4(dot[4], dot[5], dot[6], dot[7]);
+                    const __m256i corrected = _mm256_sub_epi32(
+                            _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1), _mm256_set1_epi32(sums[ib]));
+                    const __m256 scales = _mm512_castps512_ps256(znq4_mx8_ufp8x16_to_fp32(block, block));
+                    const __m256 d = _mm256_mul_ps(scales, _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(yr[ib].d)));
+                    acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(corrected), d, acc);
+                }
+
+                _mm256_storeu_ps(znq_local_dst(s, bs, map, bs1, bs2, row) + col, acc);
+            }
+        }
+        return;
+    }
+
+    for (int row = 0; row < nr; row += nrows) {
+        const block_q8_0 * yr[nrows];
+        const int32_t * sums[nrows];
+        float * out[nrows];
+        for (int r = 0; r < nrows; ++r) {
+            const int input_row = map ? map[2*(row + r) + 1] : row + r;
+            yr[r] = y + size_t(input_row)*nb;
+            out[r] = znq_local_dst(s, bs, map, bs1, bs2, row + r);
+            if (!prepared_sums) {
+                ggml_znq_local_prepare_sums(n, 1, false, yr[r], fallback_sums + size_t(r)*nb);
+            }
+            sums[r] = prepared_sums ? prepared_sums + size_t(input_row)*nb : fallback_sums + size_t(r)*nb;
+        }
+
+        for (int col = 0; col < nc; col += 8) {
+            const uint8_t * blocks = x + size_t(col / 8)*nb*stride;
+            __m256 acc[nrows];
+            for (int r = 0; r < nrows; ++r) {
+                acc[r] = _mm256_setzero_ps();
+            }
+
+            for (int ib = 0; ib < nb; ++ib) {
+                const uint8_t * block = blocks + ib*stride;
+                __m256i activation[nrows], total[nrows];
+                for (int r = 0; r < nrows; ++r) {
+                    activation[r] = _mm256_loadu_si256((const __m256i *) yr[r][ib].qs);
+                }
+                for (int h = 0; h < 2; ++h) {
+                    __m256i dot[nrows][4];
+                    for (int c = 0; c < 4; ++c) {
+                        const __m256i w = znq7_decode_row<group>(block, 4*h + c, values);
+                        for (int r = 0; r < nrows; ++r) {
+                            dot[r][c] = _mm256_dpbusd_epi32(_mm256_setzero_si256(), w, activation[r]);
+                        }
+                    }
+                    for (int r = 0; r < nrows; ++r) {
+                        const __m128i half = znq7_dot_rows4(dot[r][0], dot[r][1], dot[r][2], dot[r][3]);
+                        total[r] = h == 0 ? _mm256_castsi128_si256(half) : _mm256_inserti128_si256(total[r], half, 1);
+                    }
+                }
+
+                const __m256 scales = _mm512_castps512_ps256(znq4_mx8_ufp8x16_to_fp32(block, block));
+                for (int r = 0; r < nrows; ++r) {
+                    const __m256i corrected = _mm256_sub_epi32(total[r], _mm256_set1_epi32(sums[r][ib]));
+                    const __m256 d = _mm256_mul_ps(scales, _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(yr[r][ib].d)));
+                    acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(corrected), d, acc[r]);
+                }
+            }
+
+            for (int r = 0; r < nrows; ++r) {
+                _mm256_storeu_ps(out[r] + col, acc[r]);
+            }
         }
     }
 }
@@ -8804,8 +8867,9 @@ static inline void znq7_decode_panel(const uint8_t * a, const uint8_t * b, const
     }
 }
 
-template<int group, int index_bits = 2>
-static void znq_local_gemv(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc, const int32_t * prepared_sums) {
+template<int group, int index_bits = 2, int nrows = 1>
+static void znq_local_gemv(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc, const int32_t * prepared_sums,
+        const int32_t * map, size_t bs1, size_t bs2) {
     const int nb = n / QK_ZNQ;
     constexpr int stride = 8 * (4 * index_bits + (group == 16 ? 2 : group == 8 ? 3 : 4));
     const auto * x = (const uint8_t *) vx;
@@ -8861,32 +8925,93 @@ static void znq_local_gemv(int n, float * s, size_t bs, const void * vx, const v
 
     int32_t * fallback_sums = nullptr;
     if (!prepared_sums) {
-        fallback_sums = (int32_t *) znq_scratch.get(size_t(nb) * sizeof(int32_t));
+        fallback_sums = (int32_t *) znq_scratch.get(size_t(nb) * nrows * sizeof(int32_t));
         if (!fallback_sums) {
-            ggml_gemv_znq_local_generic(n, s, bs, vx, vy, nr, nc, group, nullptr, index_bits);
+            for (int row = 0; row < nr; ++row) {
+                const int input_row = map ? map[2*row + 1] : row;
+                ggml_gemv_znq_local_generic(n, znq_local_dst(s, bs, map, bs1, bs2, row), bs, vx,
+                    y + size_t(input_row)*nb, 1, nc, group, nullptr, index_bits);
+            }
             return;
         }
     }
 
-    for (int row = 0; row < nr; ++row) {
-        const block_q8_0 * yr = y + size_t(row) * nb;
-        if (!prepared_sums) {
-            ggml_znq_local_prepare_sums(n, 1, false, yr, fallback_sums);
-        }
+    if constexpr (nrows == 1) {
+        for (int row = 0; row < nr; ++row) {
+            const int input_row = map ? map[2*row + 1] : row;
+            const block_q8_0 * yr = y + size_t(input_row) * nb;
+            if (!prepared_sums) {
+                ggml_znq_local_prepare_sums(n, 1, false, yr, fallback_sums);
+            }
 
-        const int32_t * sums = prepared_sums ? prepared_sums + size_t(row) * nb : fallback_sums;
+            const int32_t * sums = prepared_sums ? prepared_sums + size_t(input_row) * nb : fallback_sums;
+
+            for (int col = 0; col < nc; col += 16) {
+                const int width = std::min(16, nc - col);
+                const uint8_t * a0 = x + size_t(col / 8) * nb * stride;
+                const uint8_t * b0 = width == 16 ? a0 + size_t(nb) * stride : a0;
+                __m512 acc = _mm512_setzero_ps();
+
+                for (int ib = 0; ib < nb; ++ib) {
+                    const uint8_t * a = a0 + ib * stride;
+                    const uint8_t * b = b0 + ib * stride;
+                    const __m512i header = znq_local_header<group>(a, b);
+                    __m512i dot = _mm512_setzero_si512();
+                    __m512i books = _mm512_setzero_si512();
+                    __mmask64 high = 0;
+                    __mmask64 high1 = 0;
+
+                    for (int q = 0; q < 8; ++q) {
+                        if (q % (group / 4) == 0) {
+                            books = znq_local_book_indices<group, index_bits>(header, q, high, high1);
+                        }
+
+                        const __m512i w = znq_local_weights<group, index_bits>(a, b, q, books, high, high1, table, table1, table2, table3, table4, table5, table6, table7, table8, table9, table10, table11, table12, table13, table14, table15);
+                        dot = _mm512_dpbusd_epi32(dot, w, _mm512_set1_epi32((int) znq4_mx8_load_u32(yr[ib].qs + q * 4)));
+                    }
+
+                    dot = _mm512_sub_epi32(dot, _mm512_set1_epi32(sums[ib]));
+                    const __m512 d = _mm512_mul_ps(znq_local_scales<group>(a, b, header), _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(yr[ib].d)));
+                    acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dot), d, acc);
+                }
+
+                _mm512_mask_storeu_ps(znq_local_dst(s, bs, map, bs1, bs2, row) + col, width == 16 ? 0xffff : 0xff, acc);
+            }
+        }
+        return;
+    }
+
+    for (int row = 0; row < nr; row += nrows) {
+        const block_q8_0 * yr[nrows];
+        const int32_t * sums[nrows];
+        float * out[nrows];
+        for (int r = 0; r < nrows; ++r) {
+            const int input_row = map ? map[2*(row + r) + 1] : row + r;
+            yr[r] = y + size_t(input_row)*nb;
+            out[r] = znq_local_dst(s, bs, map, bs1, bs2, row + r);
+            if (!prepared_sums) {
+                ggml_znq_local_prepare_sums(n, 1, false, yr[r], fallback_sums + size_t(r)*nb);
+            }
+            sums[r] = prepared_sums ? prepared_sums + size_t(input_row)*nb : fallback_sums + size_t(r)*nb;
+        }
 
         for (int col = 0; col < nc; col += 16) {
             const int width = std::min(16, nc - col);
             const uint8_t * a0 = x + size_t(col / 8) * nb * stride;
             const uint8_t * b0 = width == 16 ? a0 + size_t(nb) * stride : a0;
-            __m512 acc = _mm512_setzero_ps();
+            __m512 acc[nrows];
+            for (int r = 0; r < nrows; ++r) {
+                acc[r] = _mm512_setzero_ps();
+            }
 
             for (int ib = 0; ib < nb; ++ib) {
                 const uint8_t * a = a0 + ib * stride;
                 const uint8_t * b = b0 + ib * stride;
                 const __m512i header = znq_local_header<group>(a, b);
-                __m512i dot = _mm512_setzero_si512();
+                __m512i dot[nrows];
+                for (int r = 0; r < nrows; ++r) {
+                    dot[r] = _mm512_sub_epi32(_mm512_setzero_si512(), _mm512_set1_epi32(sums[r][ib]));
+                }
                 __m512i books = _mm512_setzero_si512();
                 __mmask64 high = 0;
                 __mmask64 high1 = 0;
@@ -8897,15 +9022,21 @@ static void znq_local_gemv(int n, float * s, size_t bs, const void * vx, const v
                     }
 
                     const __m512i w = znq_local_weights<group, index_bits>(a, b, q, books, high, high1, table, table1, table2, table3, table4, table5, table6, table7, table8, table9, table10, table11, table12, table13, table14, table15);
-                    dot = _mm512_dpbusd_epi32(dot, w, _mm512_set1_epi32((int) znq4_mx8_load_u32(yr[ib].qs + q * 4)));
+                    for (int r = 0; r < nrows; ++r) {
+                        dot[r] = _mm512_dpbusd_epi32(dot[r], w, _mm512_set1_epi32((int) znq4_mx8_load_u32(yr[r][ib].qs + q * 4)));
+                    }
                 }
 
-                dot = _mm512_sub_epi32(dot, _mm512_set1_epi32(sums[ib]));
-                const __m512 d = _mm512_mul_ps(znq_local_scales<group>(a, b, header), _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(yr[ib].d)));
-                acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dot), d, acc);
+                const __m512 wd = znq_local_scales<group>(a, b, header);
+                for (int r = 0; r < nrows; ++r) {
+                    const __m512 d = _mm512_mul_ps(wd, _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(yr[r][ib].d)));
+                    acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dot[r]), d, acc[r]);
+                }
             }
 
-            _mm512_mask_storeu_ps(s + size_t(row) * bs + col, width == 16 ? 0xffff : 0xff, acc);
+            for (int r = 0; r < nrows; ++r) {
+                _mm512_mask_storeu_ps(out[r] + col, width == 16 ? 0xffff : 0xff, acc[r]);
+            }
         }
     }
 }
@@ -9133,53 +9264,84 @@ void ggml_gemm_znq_panel(const ggml_znq_gemm_panel * panel, const void * activat
 #endif
 }
 
-void ggml_gemv_znq_local(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc, int group, const int32_t * prepared_sums, int index_bits) {
+template<int nrows>
+static void ggml_gemv_znq_local_impl(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc, int group, const int32_t * prepared_sums, int index_bits,
+        const int32_t * map, size_t bs1, size_t bs2) {
     GGML_ASSERT(n % QK_ZNQ == 0 && nc % 8 == 0 && (group == 4 || group == 8 || (group == 16 && index_bits >= 5)) && (index_bits >= 2 && index_bits <= 7) && (index_bits != 7 || group != 4));
 #if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
     if (index_bits == 7) {
         if (group == 16) {
-            znq7_gemv<16>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+            znq7_gemv<16, nrows>(n, s, bs, vx, vy, nr, nc, prepared_sums, map, bs1, bs2);
         } else {
-            znq7_gemv<8>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+            znq7_gemv<8, nrows>(n, s, bs, vx, vy, nr, nc, prepared_sums, map, bs1, bs2);
         }
     } else if (index_bits == 6) {
         if (group == 16) {
-            znq_local_gemv<16, 6>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+            znq_local_gemv<16, 6, nrows>(n, s, bs, vx, vy, nr, nc, prepared_sums, map, bs1, bs2);
         } else if (group == 8) {
-            znq_local_gemv<8, 6>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+            znq_local_gemv<8, 6, nrows>(n, s, bs, vx, vy, nr, nc, prepared_sums, map, bs1, bs2);
         } else {
-            znq_local_gemv<4, 6>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+            znq_local_gemv<4, 6, nrows>(n, s, bs, vx, vy, nr, nc, prepared_sums, map, bs1, bs2);
         }
     } else if (index_bits == 5) {
         if (group == 16) {
-            znq_local_gemv<16, 5>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+            znq_local_gemv<16, 5, nrows>(n, s, bs, vx, vy, nr, nc, prepared_sums, map, bs1, bs2);
         } else if (group == 8) {
-            znq_local_gemv<8, 5>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+            znq_local_gemv<8, 5, nrows>(n, s, bs, vx, vy, nr, nc, prepared_sums, map, bs1, bs2);
         } else {
-            znq_local_gemv<4, 5>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+            znq_local_gemv<4, 5, nrows>(n, s, bs, vx, vy, nr, nc, prepared_sums, map, bs1, bs2);
         }
     } else if (index_bits == 4) {
         if (group == 4) {
-            znq_local_gemv<4, 4>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+            znq_local_gemv<4, 4, nrows>(n, s, bs, vx, vy, nr, nc, prepared_sums, map, bs1, bs2);
         } else {
-            znq_local_gemv<8, 4>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+            znq_local_gemv<8, 4, nrows>(n, s, bs, vx, vy, nr, nc, prepared_sums, map, bs1, bs2);
         }
     } else if (index_bits == 3) {
         if (group == 4) {
-            znq_local_gemv<4, 3>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+            znq_local_gemv<4, 3, nrows>(n, s, bs, vx, vy, nr, nc, prepared_sums, map, bs1, bs2);
         } else {
-            znq_local_gemv<8, 3>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+            znq_local_gemv<8, 3, nrows>(n, s, bs, vx, vy, nr, nc, prepared_sums, map, bs1, bs2);
         }
     } else {
         if (group == 4) {
-            znq_local_gemv<4>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+            znq_local_gemv<4, 2, nrows>(n, s, bs, vx, vy, nr, nc, prepared_sums, map, bs1, bs2);
         } else {
-            znq_local_gemv<8>(n, s, bs, vx, vy, nr, nc, prepared_sums);
+            znq_local_gemv<8, 2, nrows>(n, s, bs, vx, vy, nr, nc, prepared_sums, map, bs1, bs2);
         }
     }
 #else
-    ggml_gemv_znq_local_generic(n, s, bs, vx, vy, nr, nc, group, prepared_sums, index_bits);
+    for (int row = 0; row < nr; ++row) {
+        const int input_row = map ? map[2*row + 1] : row;
+        const auto * y = (const block_q8_0 *) vy + size_t(input_row)*(n/QK_ZNQ);
+        float * out = map ? s + size_t(map[2*row])*bs1 + size_t(map[2*row + 1])*bs2 : s + size_t(row)*bs;
+        const int32_t * sums = prepared_sums ? prepared_sums + size_t(input_row)*(n/QK_ZNQ) : nullptr;
+        ggml_gemv_znq_local_generic(n, out, bs, vx, y, 1, nc, group, sums, index_bits);
+    }
 #endif
+}
+
+void ggml_gemv_znq_local(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc, int group,
+        const int32_t * prepared_sums, int index_bits) {
+    if (nr == 2) {
+        ggml_gemv_znq_local_impl<2>(n, s, bs, vx, vy, nr, nc, group, prepared_sums, index_bits, nullptr, 0, 0);
+    } else if (nr == 3) {
+        ggml_gemv_znq_local_impl<3>(n, s, bs, vx, vy, nr, nc, group, prepared_sums, index_bits, nullptr, 0, 0);
+    } else {
+        ggml_gemv_znq_local_impl<1>(n, s, bs, vx, vy, nr, nc, group, prepared_sums, index_bits, nullptr, 0, 0);
+    }
+}
+
+void ggml_gemv_znq_local_moe(int n, float * s, size_t bs1, size_t bs2, const int32_t * map,
+        const void * vx, const void * vy, int nr, int nc, int group, const int32_t * sums, int index_bits) {
+    GGML_ASSERT(map != nullptr && nr >= 1 && nr <= 3);
+    if (nr == 2) {
+        ggml_gemv_znq_local_impl<2>(n, s, 0, vx, vy, nr, nc, group, sums, index_bits, map, bs1, bs2);
+    } else if (nr == 3) {
+        ggml_gemv_znq_local_impl<3>(n, s, 0, vx, vy, nr, nc, group, sums, index_bits, map, bs1, bs2);
+    } else {
+        ggml_gemv_znq_local_impl<1>(n, s, 0, vx, vy, nr, nc, group, sums, index_bits, map, bs1, bs2);
+    }
 }
 
 void ggml_gemm_znq_local(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc,
