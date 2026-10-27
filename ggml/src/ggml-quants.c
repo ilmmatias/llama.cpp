@@ -5387,16 +5387,14 @@ static void znq_local_errors_avx512(const float * x, const float * w, int group,
 #pragma clang fp contract(off)
 #endif
     const __m512d d = _mm512_set1_pd(scale);
-    const __m256i base = _mm256_setr_epi32(0, 512, 1024, 1536, 2048, 2560, 3072, 3584);
 
     for (int first = 0; first < QK_ZNQ; first += group) {
         for (int book = 0; book < nbooks; book += 8) {
             __m512d error = _mm512_setzero_pd();
 
             for (int j = first; j < first + group; ++j) {
-                const __m256i offsets = _mm256_add_epi32(base, _mm256_set1_epi32(512 * book + indices[j]));
-                const __m256i packed = _mm256_i32gather_epi32((const int *) nearest, offsets, 1);
-                const __m256i level = _mm256_srai_epi32(_mm256_slli_epi32(packed, 24), 24);
+                const __m128i packed = _mm_loadl_epi64((const __m128i *) (nearest + 16 * indices[j] + book));
+                const __m256i level = _mm256_cvtepi8_epi32(packed);
                 const __m512d delta = _mm512_sub_pd(_mm512_set1_pd((double) x[j]), _mm512_mul_pd(d, _mm512_cvtepi32_pd(level)));
                 const __m512d weighted = _mm512_mul_pd(_mm512_set1_pd((double) w[j]), delta);
                 error = _mm512_add_pd(error, _mm512_mul_pd(weighted, delta));
@@ -5434,7 +5432,7 @@ static double znq_local_assign(const float * x, const float * w, int group, int 
                 double error = 0.0;
 
                 for (int j = first; j < first + group; ++j) {
-                    const double delta = (double) x[j] - scale * nearest[512 * book + indices[j]];
+                    const double delta = (double) x[j] - scale * nearest[16 * indices[j] + book];
                     error += (double) w[j] * delta * delta;
                 }
 
@@ -5464,7 +5462,7 @@ static double znq_local_assign(const float * x, const float * w, int group, int 
 
         if (q) {
             for (int j = first; j < first + group; ++j) {
-                q[j] = nearest[512 * selected + indices[j]];
+                q[j] = nearest[16 * indices[j] + selected];
             }
         }
 
@@ -5547,25 +5545,16 @@ static uint8_t znq_local_scale(const float * x, const float * w, int group, int 
     return best_sc;
 }
 
-static void quantize_row_znq_local(const float * x, void * vy, int64_t k, int group, int bits, const float * importance) {
-    GGML_ASSERT(k % QK_ZNQ == 0);
+static const int8_t * znq_local_values(int group, int bits) {
+    return bits == 2 ? (group == 4 ? kvalues_znq3_s : kvalues_znq2_l) :
+           bits == 3 ? (group == 4 ? kvalues_znq4_s : kvalues_znq3_l) :
+           bits == 4 ? (group == 4 ? kvalues_znq5_s : kvalues_znq4_l) :
+           bits == 5 ? (group == 16 ? kvalues_znq5_m : group == 8 ? kvalues_znq5_l : kvalues_znq6_s) :
+           bits == 6 ? (group == 16 ? kvalues_znq6_m : group == 8 ? kvalues_znq6_l : kvalues_znq7_s) :
+           (group == 16 ? kvalues_znq7_m : kvalues_znq7_l);
+}
 
-    const int sbits = group == 4 ? 3 : 4;
-    const int header = 1 + (32 / group) * sbits / 8;
-    const int stride = header + 4 * bits;
-    const int8_t * values = bits == 2 ? (group == 4 ? kvalues_znq3_s : kvalues_znq2_l) :
-                           bits == 3 ? (group == 4 ? kvalues_znq4_s : kvalues_znq3_l) :
-                           bits == 4 ? (group == 4 ? kvalues_znq5_s : kvalues_znq4_l) :
-                           bits == 5 ? (group == 16 ? kvalues_znq5_m : group == 8 ? kvalues_znq5_l : kvalues_znq6_s) :
-                           bits == 6 ? (group == 16 ? kvalues_znq6_m : group == 8 ? kvalues_znq6_l : kvalues_znq7_s) :
-                           (group == 16 ? kvalues_znq7_m : kvalues_znq7_l);
-    const int nlevels = 1 << bits;
-    const int nbooks = group == 4 ? 8 : 16;
-    uint8_t * y = (uint8_t *) vy;
-
-    // Pad the final lookup for the four-byte SIMD gather.
-    int8_t nearest[16 * 512 + 3] = {0};
-
+static void znq_local_init(int nbooks, int nlevels, const int8_t * values, int8_t * nearest) {
     for (int book = 0; book < nbooks; ++book) {
         int code = 0;
 
@@ -5574,9 +5563,22 @@ static void quantize_row_znq_local(const float * x, void * vy, int64_t k, int gr
                 ++code;
             }
 
-            nearest[512 * book + i] = values[nlevels * book + code];
+            // Keep all books for one bin contiguous for SIMD error accumulation.
+            nearest[16 * i + book] = values[nlevels * book + code];
         }
     }
+}
+
+static void quantize_row_znq_local_impl(const float * x, void * vy, int64_t k, int group, int bits,
+        const float * importance, const int8_t * values, const int8_t * nearest) {
+    GGML_ASSERT(k % QK_ZNQ == 0);
+
+    const int sbits = group == 4 ? 3 : 4;
+    const int header = 1 + (QK_ZNQ / group) * sbits / 8;
+    const int stride = header + bits * QK_ZNQ / 8;
+    const int nlevels = 1 << bits;
+    const int nbooks = group == 4 ? 8 : 16;
+    uint8_t * y = (uint8_t *) vy;
 
     for (int64_t ib = 0; ib < k / QK_ZNQ; ++ib) {
         const float * xb = x + QK_ZNQ * ib;
@@ -5631,17 +5633,19 @@ static void quantize_row_znq_local(const float * x, void * vy, int64_t k, int gr
     }
 }
 
+static void quantize_row_znq_local(const float * x, void * vy, int64_t k, int group, int bits, const float * importance) {
+    const int8_t * values = znq_local_values(group, bits);
+    int8_t nearest[512 * 16];
+    znq_local_init(group == 4 ? 8 : 16, 1 << bits, values, nearest);
+    quantize_row_znq_local_impl(x, vy, k, group, bits, importance, values, nearest);
+}
+
 static void dequantize_row_znq_local(const void * vx, float * y, int64_t k, int group, int bits) {
     GGML_ASSERT(k % QK_ZNQ == 0);
 
     const int sbits = group == 4 ? 3 : 4;
     const int header = 1 + (32 / group) * sbits / 8;
-    const int8_t * values = bits == 2 ? (group == 4 ? kvalues_znq3_s : kvalues_znq2_l) :
-                           bits == 3 ? (group == 4 ? kvalues_znq4_s : kvalues_znq3_l) :
-                           bits == 4 ? (group == 4 ? kvalues_znq5_s : kvalues_znq4_l) :
-                           bits == 5 ? (group == 16 ? kvalues_znq5_m : group == 8 ? kvalues_znq5_l : kvalues_znq6_s) :
-                           bits == 6 ? (group == 16 ? kvalues_znq6_m : group == 8 ? kvalues_znq6_l : kvalues_znq7_s) :
-                           (group == 16 ? kvalues_znq7_m : kvalues_znq7_l);
+    const int8_t * values = znq_local_values(group, bits);
     const int nlevels = 1 << bits;
     const uint8_t * x = (const uint8_t *) vx;
 
@@ -5663,11 +5667,15 @@ static void dequantize_row_znq_local(const void * vx, float * y, int64_t k, int 
 }
 
 static size_t quantize_znq_local(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, int group, int bits, const float * imatrix) {
+    GGML_ASSERT(n_per_row % QK_ZNQ == 0);
     const size_t block_size = (group == 16 ? 2 : group == 8 ? 3 : 4) + 4 * bits;
     const size_t row_size = (size_t) (n_per_row / QK_ZNQ) * block_size;
+    const int8_t * values = znq_local_values(group, bits);
+    int8_t nearest[512 * 16];
+    znq_local_init(group == 4 ? 8 : 16, 1 << bits, values, nearest);
 
     for (int64_t row = 0; row < nrow; ++row) {
-        quantize_row_znq_local(src + row * n_per_row, (uint8_t *) dst + row * row_size, n_per_row, group, bits, imatrix);
+        quantize_row_znq_local_impl(src + row * n_per_row, (uint8_t *) dst + row * row_size, n_per_row, group, bits, imatrix, values, nearest);
     }
 
     return nrow * row_size;
