@@ -698,6 +698,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_expert_cache_create") == 0) {
         return (void *) ggml_backend_cpu_expert_cache_create;
     }
+    if (strcmp(name, "ggml_cpu_expert_cache_unpack") == 0) {
+        return (void *) ggml_cpu_expert_cache_unpack;
+    }
     if (strcmp(name, "ggml_backend_cpu_expert_cache_free") == 0) {
         return (void *) ggml_backend_cpu_expert_cache_free;
     }

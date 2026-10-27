@@ -447,7 +447,76 @@ struct expert_cache_result {
     uint64_t copies = 0;
 };
 
-static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel, ggml_type type, bool relu_squared) {
+static void test_expert_cache_unpack(ggml_backend_dev_t dev) {
+    auto reg = ggml_backend_dev_backend_reg(dev);
+    auto extras = (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    using unpack_t = bool (*)(const ggml_tensor *, int32_t, void *, size_t);
+    auto unpack = (unpack_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_expert_cache_unpack");
+    GGML_ASSERT(unpack);
+    ggml_backend_buffer_type_t buft = nullptr;
+    if (extras) {
+        for (auto p = extras(dev); p && *p; ++p) {
+            if (strcmp(ggml_backend_buft_name(*p), "CPU_REPACK") == 0) {
+                buft = *p;
+                break;
+            }
+        }
+    }
+    if (!buft) {
+        printf("%s: expert cache native layout SKIP (CPU_REPACK unavailable)\n", ggml_backend_dev_name(dev));
+        return;
+    }
+
+    std::mt19937 rng(1234);
+    for (ggml_type type : {
+            GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S,
+            GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S,
+            GGML_TYPE_ZNQ4_M, GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S,
+            GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L, GGML_TYPE_ZNQ6_S,
+            GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S,
+            GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L }) {
+        int cases = 0;
+        for (int columns : { 32, 96, 544 }) {
+            for (int rows : { 8, 24 }) {
+                auto ctx = ggml_init({ ggml_tensor_overhead(), nullptr, true });
+                auto tensor = ggml_new_tensor_3d(ctx, type, columns, rows, 3);
+                auto buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+                GGML_ASSERT(buffer);
+                if (tensor->extra != nullptr) {
+                    const size_t bytes = tensor->nb[2];
+                    std::vector<uint8_t> native(ggml_nbytes(tensor));
+                    std::vector<uint8_t> restored(bytes + 64, 0xa5);
+                    auto * dst = restored.data() + 32;
+                    for (int pattern = 0; pattern < 4; ++pattern) {
+                        for (size_t i = 0; i < native.size(); ++i) {
+                            native[i] = pattern == 0 ? 0 : pattern == 1 ? 0xff : pattern == 2 ? (1u << (i % 8)) : rng();
+                        }
+                        ggml_backend_tensor_set(tensor, native.data(), 0, native.size());
+                        for (int expert = 0; expert < 3; ++expert) {
+                            GGML_ASSERT(unpack(tensor, expert, dst, bytes));
+                            GGML_ASSERT(memcmp(dst, native.data() + expert * bytes, bytes) == 0);
+                            for (size_t i = 0; i < 32; ++i) {
+                                GGML_ASSERT(restored[i] == 0xa5 && restored[bytes + 32 + i] == 0xa5);
+                            }
+                            ++cases;
+                        }
+                    }
+                    GGML_ASSERT(!unpack(tensor, -1, dst, bytes));
+                    GGML_ASSERT(!unpack(tensor, 3, dst, bytes));
+                    GGML_ASSERT(!unpack(tensor, 0, dst, bytes - 1));
+                    GGML_ASSERT(!unpack(tensor, 0, dst, bytes + 1));
+                    GGML_ASSERT(!unpack(tensor, 0, nullptr, bytes));
+                }
+                ggml_backend_buffer_free(buffer);
+                ggml_free(ctx);
+            }
+        }
+        printf("%s: expert cache native layout type=%s %s (%d byte-exact expert checks)\n",
+                ggml_backend_dev_name(dev), ggml_type_name(type), cases ? "PASS" : "SKIP (unsupported CPU ISA)", cases);
+    }
+}
+
+static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel, ggml_type type, bool relu_squared, int gate_up_layout = 0) {
     auto cpu = ggml_backend_cpu_init();
     GGML_ASSERT(cpu);
     auto cpu_dev = ggml_backend_get_device(cpu);
@@ -487,6 +556,7 @@ static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel, ggml_
     GGML_ASSERT(gpu);
     ggml_backend_cpu_set_n_threads(cpu, 4);
     constexpr int dim = 256, experts = 4, used = 2, layers = 2;
+    GGML_ASSERT(!relu_squared || gate_up_layout == 0);
     const int first_part = relu_squared ? 1 : 0;
     ggml_context * weights[3] = {};
     ggml_backend_buffer_t weight_buffers[3] = {};
@@ -496,12 +566,17 @@ static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel, ggml_
     std::mt19937 rng(1234);
     std::uniform_real_distribution<float> distribution(-0.02f, 0.02f);
     for (int part = first_part; part < 3; ++part) {
+        if (gate_up_layout != 0 && part == 1) {
+            continue;
+        }
+        const int rows = gate_up_layout != 0 && part == 0 ? 2 * dim : dim;
+        values.resize(dim * rows * experts);
         // Registration must join a layer even when its projections have different host buffers.
         weights[part] = ggml_init({ layers*ggml_tensor_overhead(), nullptr, true });
         for (int layer = 0; layer < layers; ++layer) {
-            w[layer][part] = ggml_new_tensor_3d(weights[part], type, dim, dim, experts);
+            w[layer][part] = ggml_new_tensor_3d(weights[part], type, dim, rows, experts);
             char name[64];
-            snprintf(name, sizeof(name), "blk.%d.ffn_%s_exps.weight", layer, parts[part]);
+            snprintf(name, sizeof(name), "blk.%d.ffn_%s_exps.weight", layer, gate_up_layout != 0 && part == 0 ? "gate_up" : parts[part]);
             ggml_set_name(w[layer][part], name);
         }
         weight_buffers[part] = ggml_backend_alloc_ctx_tensors_from_buft(weights[part], buft);
@@ -515,7 +590,7 @@ static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel, ggml_
                 ggml_backend_tensor_set(w[layer][part], values.data(), 0, ggml_nbytes(w[layer][part]));
             } else {
                 std::vector<unsigned char> quant(ggml_nbytes(w[layer][part]));
-                GGML_ASSERT(ggml_quantize_chunk(type, values.data(), quant.data(), 0, dim*experts, dim, importance.data()) == quant.size());
+                GGML_ASSERT(ggml_quantize_chunk(type, values.data(), quant.data(), 0, rows*experts, dim, importance.data()) == quant.size());
                 ggml_backend_tensor_set(w[layer][part], quant.data(), 0, quant.size());
             }
         }
@@ -527,7 +602,9 @@ static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel, ggml_
         GGML_ASSERT(add_device(cache, 2, 0, type == GGML_TYPE_ZNQ3_M ? 2 : 1, dev));
         for (int layer = 0; layer < layers; ++layer) {
             for (int part = first_part; part < 3; ++part) {
-                register_weights(cache, dev, w[layer][part]);
+                if (w[layer][part]) {
+                    register_weights(cache, dev, w[layer][part]);
+                }
             }
         }
         GGML_ASSERT(memory(cache, dev) == 0);
@@ -559,7 +636,21 @@ static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel, ggml_
         ggml_tensor * down_ops[layers];
         ggml_tensor * up_ops[layers];
         for (int layer = 0; layer < layers; ++layer) {
-            auto up = ggml_mul_mat_id(ctx, w[layer][1], x, ids);
+            ggml_tensor * gate = nullptr;
+            ggml_tensor * up = nullptr;
+            if (gate_up_layout != 0) {
+                auto gate_up = ggml_mul_mat_id(ctx, w[layer][0], x, ids);
+                ggml_backend_sched_set_tensor_backend(sched, gate_up, cpu_backend);
+                const size_t half = dim * gate_up->nb[0];
+                gate = ggml_view_3d(ctx, gate_up, dim, used, tokens, gate_up->nb[1], gate_up->nb[2], gate_up_layout == 2 ? half : 0);
+                up = ggml_view_3d(ctx, gate_up, dim, used, tokens, gate_up->nb[1], gate_up->nb[2], gate_up_layout == 1 ? half : 0);
+            } else {
+                up = ggml_mul_mat_id(ctx, w[layer][1], x, ids);
+                if (!relu_squared) {
+                    gate = ggml_mul_mat_id(ctx, w[layer][0], x, ids);
+                    ggml_backend_sched_set_tensor_backend(sched, gate, cpu_backend);
+                }
+            }
             up_ops[layer] = up;
             ggml_backend_sched_set_tensor_backend(sched, up, cpu_backend);
             ggml_tensor * act;
@@ -568,8 +659,6 @@ static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel, ggml_
                 ggml_backend_sched_set_tensor_backend(sched, relu, cpu_backend);
                 act = ggml_sqr(ctx, relu);
             } else {
-                auto gate = ggml_mul_mat_id(ctx, w[layer][0], x, ids);
-                ggml_backend_sched_set_tensor_backend(sched, gate, cpu_backend);
                 act = ggml_glu_split(ctx, gate, up, GGML_GLU_OP_SWIGLU);
             }
             // Down consumes a different activation for each selected expert, not broadcast input.
@@ -629,8 +718,18 @@ static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel, ggml_
             if (mode == 2) {
                 for (int layer = 0; layer < layers; ++layer) {
                     const size_t offset = 2*(iteration*layers + layer)*dim*used*tokens;
-                    ggml_backend_tensor_get_async(cpu_backend, up_ops[layer],
-                            result.observed.data() + offset, 0, ggml_nbytes(up_ops[layer]));
+                    if (ggml_is_contiguous(up_ops[layer])) {
+                        ggml_backend_tensor_get_async(cpu_backend, up_ops[layer],
+                                result.observed.data() + offset, 0, ggml_nbytes(up_ops[layer]));
+                    } else {
+                        for (int token = 0; token < tokens; ++token) {
+                            for (int expert = 0; expert < used; ++expert) {
+                                ggml_backend_tensor_get_async(cpu_backend, up_ops[layer],
+                                        result.observed.data() + offset + (token * used + expert) * dim,
+                                        token * up_ops[layer]->nb[2] + expert * up_ops[layer]->nb[1], dim * sizeof(float));
+                            }
+                        }
+                    }
                     ggml_backend_tensor_get_async(cpu_backend, down_ops[layer],
                             result.observed.data() + offset + dim*used*tokens, 0, ggml_nbytes(down_ops[layer]));
                 }
@@ -748,8 +847,8 @@ static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel, ggml_
     stop_cache(other_cpu, second_cache);
     ggml_backend_free(other_cpu);
 
-    printf("%s: expert cache reuse parallel=%d type=%s activation=%s PASS (maximum nmse %g, GPU hits %llu, cached copies %llu)\n",
-            ggml_backend_dev_name(dev), parallel, ggml_type_name(type), relu_squared ? "relu_squared" : "swiglu",
+    printf("%s: expert cache reuse parallel=%d type=%s activation=%s gate_up_layout=%d PASS (maximum nmse %g, GPU hits %llu, cached copies %llu)\n",
+            ggml_backend_dev_name(dev), parallel, ggml_type_name(type), relu_squared ? "relu_squared" : "swiglu", gate_up_layout,
             worst, (unsigned long long) verified_hits, (unsigned long long) cached_copies);
     for (int part = first_part; part < 3; ++part) {
         ggml_backend_buffer_free(weight_buffers[part]);
@@ -758,14 +857,41 @@ static void test_expert_cache_reuse(ggml_backend_dev_t dev, bool parallel, ggml_
     ggml_backend_free(gpu);
 }
 
-int main() {
+int main(int argc, char ** argv) {
+    bool cpu_only = false;
+    const char * backend_filter = nullptr;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--cpu-only") == 0) {
+            cpu_only = true;
+        } else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
+            backend_filter = argv[++i];
+        } else {
+            fprintf(stderr, "Usage: %s [--cpu-only] [-b GPU-backend]\n", argv[0]);
+            return strcmp(argv[i], "--help") == 0 ? 0 : 1;
+        }
+    }
+    if (cpu_only && backend_filter != nullptr) {
+        fprintf(stderr, "--cpu-only and -b cannot be combined\n");
+        return 1;
+    }
     ggml_backend_load_all();
 
+    auto cpu = ggml_backend_cpu_init();
+    GGML_ASSERT(cpu);
+    test_expert_cache_unpack(ggml_backend_get_device(cpu));
+    ggml_backend_free(cpu);
+    if (cpu_only) {
+        return 0;
+    }
+
+    bool backend_found = false;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU ||
+            (backend_filter != nullptr && strcmp(backend_filter, ggml_backend_dev_name(dev)) != 0)) {
             continue;
         }
+        backend_found = true;
 
         for (bool parallel : { false, true }) {
             test_round_trip(dev, parallel, false, 2048);
@@ -783,8 +909,15 @@ int main() {
                 test_expert_cache_reuse(dev, parallel, type, false);
                 test_expert_cache_reuse(dev, parallel, type, true);
             }
+            for (int layout : { 1, 2, 3 }) {
+                test_expert_cache_reuse(dev, parallel, GGML_TYPE_F32, false, layout);
+            }
         }
     }
 
+    if (backend_filter != nullptr && !backend_found) {
+        fprintf(stderr, "Requested GPU backend '%s' is not available\n", backend_filter);
+        return 1;
+    }
     return 0;
 }
