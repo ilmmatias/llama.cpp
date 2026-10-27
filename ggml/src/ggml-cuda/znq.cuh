@@ -2,6 +2,46 @@
 
 #include "common.cuh"
 
+static __host__ __device__ constexpr int znq_bits_cuda(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_ZNQ2_M:
+        case GGML_TYPE_ZNQ2_L:
+        case GGML_TYPE_ZNQ3_S: return 2;
+        case GGML_TYPE_ZNQ3_M:
+        case GGML_TYPE_ZNQ3_L:
+        case GGML_TYPE_ZNQ4_S: return 3;
+        case GGML_TYPE_ZNQ4_M:
+        case GGML_TYPE_ZNQ4_L:
+        case GGML_TYPE_ZNQ5_S: return 4;
+        case GGML_TYPE_ZNQ5_M:
+        case GGML_TYPE_ZNQ5_L:
+        case GGML_TYPE_ZNQ6_S: return 5;
+        case GGML_TYPE_ZNQ6_M:
+        case GGML_TYPE_ZNQ6_L:
+        case GGML_TYPE_ZNQ7_S: return 6;
+        case GGML_TYPE_ZNQ7_M:
+        case GGML_TYPE_ZNQ7_L: return 7;
+        default: return 0;
+    }
+}
+
+static __host__ __device__ constexpr int znq_group_cuda(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_ZNQ2_L:
+        case GGML_TYPE_ZNQ3_L:
+        case GGML_TYPE_ZNQ4_L:
+        case GGML_TYPE_ZNQ5_L:
+        case GGML_TYPE_ZNQ6_L:
+        case GGML_TYPE_ZNQ7_L: return 8;
+        case GGML_TYPE_ZNQ3_S:
+        case GGML_TYPE_ZNQ4_S:
+        case GGML_TYPE_ZNQ5_S:
+        case GGML_TYPE_ZNQ6_S:
+        case GGML_TYPE_ZNQ7_S: return 4;
+        default: return 16;
+    }
+}
+
 static __device__ __forceinline__ float znq_scale_cuda(uint8_t code) {
     const uint32_t e = code >> 3;
     const uint32_t m = code & 7;
@@ -92,11 +132,11 @@ static __device__ __forceinline__ int znq_pack4_cuda(const uint8_t * block, int 
 
 #if defined(GGML_USE_HIP)
     // Larger books pay off when one lane decodes several quads from the same book.
-    if constexpr (bits == 2 || (reuse_book && bits < 6 && (bits != 5 || group != 4))) {
+    if constexpr (bits <= 3 || (reuse_book && bits < 6 && (bits != 5 || group != 4))) {
         uint32_t indices = 0;
         if constexpr (bits == 4) {
             // Selectors 0, 4, 1, 5 put the four nibble codes in separate bytes.
-            indices = __builtin_amdgcn_perm(codes >> 4, codes, 0x05010400) & 0x0f0f0f0f;
+            indices = ggml_hip_perm(codes >> 4, codes, 0x05010400) & 0x0f0f0f0f;
         } else if constexpr (bits == 5) {
             indices = (codes & 0x000003ff) | ((codes & 0x000ffc00) << 6);
             indices = (indices & 0x001f001f) | ((indices & 0x03e003e0) << 3);
@@ -114,28 +154,28 @@ static __device__ __forceinline__ int znq_pack4_cuda(const uint8_t * block, int 
         if constexpr (bits == 2) {
             const uint32_t * table = (const uint32_t *) (znq_values_cuda<bits, group>() + 4 * book);
 
-            return __builtin_amdgcn_perm(0, table[0], indices);
+            return ggml_hip_perm(0, table[0], indices);
         } else if constexpr (bits == 3) {
             const uint32_t * table = (const uint32_t *) (znq_values_cuda<bits, group>() + 8 * book);
 
-            return __builtin_amdgcn_perm(table[1], table[0], indices);
+            return ggml_hip_perm(table[1], table[0], indices);
         } else if constexpr (bits == 5) {
             const uint32_t * table = (const uint32_t *) (znq_values_cuda<bits, group>() + 32 * book);
             const uint32_t select = 0x03020100 | ((indices & 0x08080808) >> 1);
-            const uint32_t lo0 = __builtin_amdgcn_perm(table[1], table[0], indices & 0x07070707);
-            const uint32_t lo1 = __builtin_amdgcn_perm(table[3], table[2], indices & 0x07070707);
-            const uint32_t hi0 = __builtin_amdgcn_perm(table[5], table[4], indices & 0x07070707);
-            const uint32_t hi1 = __builtin_amdgcn_perm(table[7], table[6], indices & 0x07070707);
-            const uint32_t lo = __builtin_amdgcn_perm(lo1, lo0, select);
-            const uint32_t hi = __builtin_amdgcn_perm(hi1, hi0, select);
+            const uint32_t lo0 = ggml_hip_perm(table[1], table[0], indices & 0x07070707);
+            const uint32_t lo1 = ggml_hip_perm(table[3], table[2], indices & 0x07070707);
+            const uint32_t hi0 = ggml_hip_perm(table[5], table[4], indices & 0x07070707);
+            const uint32_t hi1 = ggml_hip_perm(table[7], table[6], indices & 0x07070707);
+            const uint32_t lo = ggml_hip_perm(lo1, lo0, select);
+            const uint32_t hi = ggml_hip_perm(hi1, hi0, select);
 
-            return __builtin_amdgcn_perm(hi, lo, 0x03020100 | ((indices & 0x10101010) >> 2));
+            return ggml_hip_perm(hi, lo, 0x03020100 | ((indices & 0x10101010) >> 2));
         } else {
             const uint32_t * table = (const uint32_t *) (znq_values_cuda<bits, group>() + 16 * book);
-            const uint32_t lo = __builtin_amdgcn_perm(table[1], table[0], indices & 0x07070707);
-            const uint32_t hi = __builtin_amdgcn_perm(table[3], table[2], indices & 0x07070707);
+            const uint32_t lo = ggml_hip_perm(table[1], table[0], indices & 0x07070707);
+            const uint32_t hi = ggml_hip_perm(table[3], table[2], indices & 0x07070707);
 
-            return __builtin_amdgcn_perm(hi, lo, 0x03020100 | ((indices & 0x08080808) >> 1));
+            return ggml_hip_perm(hi, lo, 0x03020100 | ((indices & 0x08080808) >> 1));
         }
     }
 #endif

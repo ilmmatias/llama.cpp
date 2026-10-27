@@ -554,8 +554,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 template <ggml_type type, int J, bool fallback, int bits> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_znq(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
-    constexpr int group = (type == GGML_TYPE_ZNQ2_L || type == GGML_TYPE_ZNQ3_L || type == GGML_TYPE_ZNQ4_L || type == GGML_TYPE_ZNQ5_L || type == GGML_TYPE_ZNQ6_L || type == GGML_TYPE_ZNQ7_L) ? 8 :
-                          (type == GGML_TYPE_ZNQ3_S || type == GGML_TYPE_ZNQ4_S || type == GGML_TYPE_ZNQ5_S || type == GGML_TYPE_ZNQ6_S || type == GGML_TYPE_ZNQ7_S) ? 4 : 16;
+    constexpr int group = znq_group_cuda(type);
     constexpr int block_size = znq_header_cuda<bits, group>() + 4 * bits;
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;

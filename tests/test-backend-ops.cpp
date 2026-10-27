@@ -11838,7 +11838,25 @@ static void add_test_cases_mul_mat_znq(std::vector<std::unique_ptr<test_case>> &
             }
         }
 
+        for (const auto & shape : {
+                std::array<int64_t, 3>{1025, 1, 96}, {33, 2, 544}, {33, 4, 544}, {33, 8, 544}}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, shape[0], shape[1], shape[2], {1, 1}, {1, 1}));
+        }
+
         if (!perf) {
+            for (const auto & shape : {
+                    std::array<int64_t, 3>{1023, 1, 32}, {1024, 1, 96}, {1025, 1, 128}, {1027, 1, 160},
+                    {1028, 1, 256}, {1029, 1, 288}, {1031, 1, 512}, {1032, 1, 544},
+                    {5, 2, 160}, {17, 4, 288}}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, shape[0], shape[1], shape[2], {1, 1}, {1, 1}));
+            }
+            for (int64_t n : {2, 4, 8}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 17, n, 160, {2, 1}, {2, 1}));
+            }
+            for (bool with_gate : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 1025, 96,
+                    false, 1, 1, false, true, with_gate, false, {2, 2}));
+            }
             if (type == GGML_TYPE_ZNQ4_L || type == GGML_TYPE_ZNQ6_M) {
                 for (int64_t m : {4095, 4097}) {
                     test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, 1, 4096, {1, 1}, {1, 1}));

@@ -1448,6 +1448,41 @@ static __device__ __forceinline__ float vec_dot_znq_q8_1(
     return znq_scale_cuda(block[0]) * __low2float(y->ds) * (sum0 + sum1);
 }
 
+template <ggml_type type, int vdr, int ncols>
+static __device__ __forceinline__ void vec_dot_znq_q8_1_multi(
+        const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const int kbx, const int iqs,
+        const uint32_t stride_col_y, float (&dst)[ncols]) {
+    constexpr int bits = znq_bits_cuda(type);
+    constexpr int group = znq_group_cuda(type);
+    static_assert(bits != 0, "ZNQ decoder requires a ZNQ type");
+    const uint8_t * block = (const uint8_t *) vx + kbx*(znq_header_cuda<bits, group>() + 4*bits);
+    constexpr int step = bits >= 6 ? 2 : 1;
+    int sum0[ncols] = {0};
+    int sum1[ncols] = {0};
+#pragma unroll
+    for (int l = 0; l < vdr; l += step) {
+        const int q0 = znq_pack4_cuda<bits, (vdr > 1), group>(block, 4*(iqs + l));
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            sum0[j] = ggml_cuda_dp4a(q0, get_int_b2(y[j*stride_col_y].qs, iqs + l), sum0[j]);
+        }
+        if constexpr (bits >= 6) {
+            if (l + 1 < vdr) {
+                const int q1 = znq_pack4_cuda<bits, (vdr > 1), group>(block, 4*(iqs + l + 1));
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+                    sum1[j] = ggml_cuda_dp4a(q1, get_int_b2(y[j*stride_col_y].qs, iqs + l + 1), sum1[j]);
+                }
+            }
+        }
+    }
+    const float d = znq_scale_cuda(block[0]);
+#pragma unroll
+    for (int j = 0; j < ncols; ++j) {
+        dst[j] = d * __low2float(y[j*stride_col_y].ds) * (sum0[j] + sum1[j]);
+    }
+}
+
 #define VDR_IQ4_NL_Q8_1_MMVQ 2
 #define VDR_IQ4_NL_Q8_1_MMQ  4
 
