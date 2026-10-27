@@ -185,18 +185,34 @@ static __device__ __forceinline__ int znq_pack4_cuda(const uint8_t * block, int 
             // Spread four 3-bit codes into separate byte selectors.
             indices = (codes | (codes << 10)) & 0x003f003f;
             indices = (indices | (indices << 5)) & 0x07070707;
+        } else if constexpr (bits == 2) {
+            indices = (codes | (codes << 12)) & 0x000f000f;
+            indices = (indices | (indices << 6)) & 0x03030303;
         } else {
-#pragma unroll
-            for (int k = 0; k < 4; ++k) {
-                indices |= ((codes >> (bits * k)) & ((1u << bits) - 1)) << (8 * k);
-            }
+            // Spread the payload nibble into the low bit of each byte.
+            indices = ((codes & 0x0f) * 0x00204081u) & 0x01010101;
         }
 
         if constexpr (bits == 1) {
-            // A one-bit book contains exactly two bytes; the last book is not padded.
-            uint16_t values;
-            memcpy(&values, znq_values_cuda<bits, group, selector_bits>() + 2*book, sizeof(values));
-            return ggml_hip_perm(0, uint32_t(values), indices);
+            if constexpr (selector_bits == 3) {
+                // The complete 16-byte table fits in four constant registers.
+                const int8_t * table = znq_values_cuda<bits, group, selector_bits>();
+                uint32_t words[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    memcpy(&words[i], table + 4*i, sizeof(words[i]));
+                }
+                const uint32_t all_indices = indices | (book * 0x02020202u);
+                const uint32_t in_octet = all_indices & 0x07070707;
+                const uint32_t lo = ggml_hip_perm(words[1], words[0], in_octet);
+                const uint32_t hi = ggml_hip_perm(words[3], words[2], in_octet);
+                return ggml_hip_perm(hi, lo, 0x03020100 | ((all_indices & 0x08080808) >> 1));
+            } else {
+                // Load only the two selected bytes, including the unpadded final book.
+                uint16_t values;
+                memcpy(&values, znq_values_cuda<bits, group, selector_bits>() + 2*book, sizeof(values));
+                return ggml_hip_perm(0, uint32_t(values), indices);
+            }
         } else if constexpr (bits == 2) {
             const uint32_t * table = (const uint32_t *) (znq_values_cuda<bits, group, selector_bits>() + 4 * book);
 

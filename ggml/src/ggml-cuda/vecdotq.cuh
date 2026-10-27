@@ -1457,8 +1457,9 @@ static __device__ __forceinline__ void vec_dot_znq_q8_1_multi(
     constexpr int selector_bits = znq_selector_bits_cuda(type);
     static_assert(bits != 0, "ZNQ decoder requires a ZNQ type");
     const uint8_t * block = (const uint8_t *) vx + kbx*(znq_header_cuda<bits, group, selector_bits>() + 4*bits);
-    // Keep eight-column SM decoding within the register budget for per-quad 4-bit books.
-    constexpr bool reuse_book = vdr > 1 && !(bits == 4 && group == 4 && selector_bits == 4 && ncols >= 8);
+    // Wide output tiles need the registers for activations and accumulators.
+    constexpr int book_bytes_per_quad = (1 << bits)*4/group;
+    constexpr bool reuse_book = vdr > 1 && !(ncols >= 8 && book_bytes_per_quad >= 16);
     constexpr int step = bits >= 6 ? 2 : 1;
     int sum0[ncols] = {0};
     int sum1[ncols] = {0};

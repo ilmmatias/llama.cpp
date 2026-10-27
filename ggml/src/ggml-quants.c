@@ -5392,6 +5392,23 @@ static void dequantize_row_znq_impl(const void * GGML_RESTRICT vx, float * GGML_
 }
 
 // Local book codecs share the assignment and scale search across bit widths.
+struct znq_local_assignment {
+    double error;
+    int8_t q[QK_ZNQ];
+    uint8_t selectors[8];
+};
+
+struct znq_local_cache {
+    const float * x;
+    const float * w;
+    const int8_t * nearest;
+    int group;
+    int nbooks;
+    uint64_t valid[4];
+    struct znq_local_assignment main[256];
+    struct znq_local_assignment seed[256];
+};
+
 #if defined(GGML_HAS_X86_INTRINSICS) && (defined(__GNUC__) || defined(__clang__)) && !defined(__FMA__) && !defined(__FAST_MATH__)
 #if defined(__clang__)
 __attribute__((target("avx2,avx512f")))
@@ -5399,7 +5416,7 @@ __attribute__((target("avx2,avx512f")))
 __attribute__((target("avx2,avx512f"), optimize("fp-contract=off")))
 #endif
 static void znq_local_errors_avx512(const float * x, const float * w, int group, int nbooks,
-        const int8_t * nearest, int * indices, double * norm, double scale, double errors[8][16]) {
+        const int8_t * nearest, int * indices, double scale, double errors[8][16], double seed_errors[2][16]) {
 #if defined(__clang__)
 #pragma clang fp contract(off)
 #endif
@@ -5415,11 +5432,11 @@ static void znq_local_errors_avx512(const float * x, const float * w, int group,
         __m512i selected = _mm512_maskz_mov_epi32(finite_bin, _mm512_castsi256_si512(bin));
         selected = _mm512_mask_set1_epi32(selected, upper, 511);
         _mm256_storeu_si256((__m256i *) (indices + j), _mm512_castsi512_si256(selected));
-        _mm512_storeu_pd(norm + j, value);
     }
 
-    for (int first = 0; first < QK_ZNQ; first += group) {
-        for (int book = 0; book < nbooks; book += 8) {
+    for (int book = 0; book < nbooks; book += 8) {
+        __m512d extended = _mm512_setzero_pd();
+        for (int first = 0; first < QK_ZNQ; first += group) {
             __m512d error = _mm512_setzero_pd();
 
             for (int j = first; j < first + group; ++j) {
@@ -5427,55 +5444,43 @@ static void znq_local_errors_avx512(const float * x, const float * w, int group,
                 const __m256i level = _mm256_cvtepi8_epi32(packed);
                 const __m512d delta = _mm512_sub_pd(_mm512_set1_pd((double) x[j]), _mm512_mul_pd(d, _mm512_cvtepi32_pd(level)));
                 const __m512d weighted = _mm512_mul_pd(_mm512_set1_pd((double) w[j]), delta);
-                error = _mm512_add_pd(error, _mm512_mul_pd(weighted, delta));
+                const __m512d term = _mm512_mul_pd(weighted, delta);
+                error = _mm512_add_pd(error, term);
+                if (group == 8) {
+                    extended = _mm512_add_pd(extended, term);
+                }
             }
 
             _mm512_storeu_pd(errors[first / group] + book, error);
+            if (group == 8 && first % 16 == 8) {
+                _mm512_storeu_pd(seed_errors[first / 16] + book, extended);
+                extended = _mm512_setzero_pd();
+            }
         }
     }
 }
 #endif
 
-static double znq_local_assign(const float * x, const float * w, int group, int nbooks, int nlevels,
-        const int8_t * values, const int8_t * nearest, uint8_t sc, int8_t * q, uint8_t * selectors, uint8_t * codes) {
-    const double scale = (double) znq_ufp8_to_fp32(sc);
-    double norm[QK_ZNQ];
-    int indices[QK_ZNQ];
-
-    double errors[8][16];
-    bool vectorized = false;
-#if defined(GGML_HAS_X86_INTRINSICS) && (defined(__GNUC__) || defined(__clang__)) && !defined(__FMA__) && !defined(__FAST_MATH__)
-    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("avx512f")) {
-        znq_local_errors_avx512(x, w, group, nbooks, nearest, indices, norm, scale, errors);
-        vectorized = true;
-    }
-#endif
-    if (!vectorized) {
-        // Half-integer bins preserve the midpoint comparisons, including exact ties.
-        for (int j = 0; j < QK_ZNQ; ++j) {
-            norm[j] = (double) x[j] / scale;
-            indices[j] = norm[j] >= 127.5 ? 511 : norm[j] >= -128.0 ? (int) floor(2.0 * norm[j]) + 256 : 0;
-        }
-        for (int first = 0; first < QK_ZNQ; first += group) {
-            for (int book = 0; book < nbooks; ++book) {
-                double error = 0.0;
-
-                for (int j = first; j < first + group; ++j) {
-                    const double delta = (double) x[j] - scale * nearest[16 * indices[j] + book];
-                    error += (double) w[j] * delta * delta;
-                }
-
-                errors[first / group][book] = error;
+static void znq_local_errors_scalar(const float * x, const float * w, const int8_t * nearest,
+        const int * indices, double scale, int group, int nbooks, double errors[][16]) {
+    for (int first = 0; first < QK_ZNQ; first += group) {
+        for (int book = 0; book < nbooks; ++book) {
+            double error = 0.0;
+            for (int j = first; j < first + group; ++j) {
+                const double delta = (double) x[j] - scale * nearest[16 * indices[j] + book];
+                error += (double) w[j] * delta * delta;
             }
+            errors[first / group][book] = error;
         }
     }
+}
 
-    double total = 0.0;
-
+static void znq_local_select(const int8_t * nearest, const int * indices, double errors[][16],
+        int group, int nbooks, struct znq_local_assignment * result) {
+    result->error = 0.0;
     for (int first = 0; first < QK_ZNQ; first += group) {
         double best = DBL_MAX;
         int selected = 0;
-
         for (int book = 0; book < nbooks; ++book) {
             const double error = errors[first / group][book];
             if (error < best) {
@@ -5483,87 +5488,99 @@ static double znq_local_assign(const float * x, const float * w, int group, int 
                 selected = book;
             }
         }
-
-        total += best;
-        if (selectors) {
-            selectors[first / group] = (uint8_t) selected;
-        }
-
-        if (q) {
-            for (int j = first; j < first + group; ++j) {
-                q[j] = nearest[16 * indices[j] + selected];
-            }
-        }
-
-        if (codes) {
-            for (int j = first; j < first + group; ++j) {
-                int lo = 0, hi = nlevels - 1;
-                while (lo < hi) {
-                    const int mid = (lo + hi) / 2;
-                    if (norm[j] >= 0.5 * (values[nlevels * selected + mid] + values[nlevels * selected + mid + 1])) {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-
-                codes[j] = (uint8_t) lo;
-            }
+        result->error += best;
+        result->selectors[first / group] = (uint8_t) selected;
+        for (int j = first; j < first + group; ++j) {
+            result->q[j] = nearest[16 * indices[j] + selected];
         }
     }
-
-    return total;
 }
 
-static uint8_t znq_local_scale(const float * x, const float * w, int group, int nbooks, int nlevels,
-        const int8_t * values, const int8_t * nearest, uint8_t initial, int seed) {
-    int8_t q[QK_ZNQ];
+static const struct znq_local_assignment * znq_local_assign(struct znq_local_cache * cache, uint8_t sc, bool seed) {
+    const uint64_t bit = UINT64_C(1) << (sc % 64);
+    if (!(cache->valid[sc / 64] & bit)) {
+        const double scale = (double) znq_ufp8_to_fp32(sc);
+        const float * x = cache->x;
+        const float * w = cache->w;
+        const int8_t * nearest = cache->nearest;
+        const int group = cache->group;
+        const int nbooks = cache->nbooks;
+        int indices[QK_ZNQ];
+        double errors[8][16], seed_errors[2][16];
+        bool vectorized = false;
+#if defined(GGML_HAS_X86_INTRINSICS) && (defined(__GNUC__) || defined(__clang__)) && !defined(__FMA__) && !defined(__FAST_MATH__)
+        if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("avx512f")) {
+            znq_local_errors_avx512(x, w, group, nbooks, nearest, indices, scale, errors, seed_errors);
+            vectorized = true;
+        }
+#endif
+        if (!vectorized) {
+            for (int j = 0; j < QK_ZNQ; ++j) {
+                const double norm = (double) x[j] / scale;
+                indices[j] = norm >= 127.5 ? 511 : norm >= -128.0 ? (int) floor(2.0 * norm) + 256 : 0;
+            }
+            // Keep the original scalar expression so global FMA flags retain their contraction behavior.
+            znq_local_errors_scalar(x, w, nearest, indices, scale, group, nbooks, errors);
+            if (group == 8) {
+                znq_local_errors_scalar(x, w, nearest, indices, scale, 16, nbooks, seed_errors);
+            }
+        }
+
+        znq_local_select(nearest, indices, errors, group, nbooks, &cache->main[sc]);
+        if (group == 8) {
+            // Preserve the ordered 16-term sum; adding two 8-term errors rounds differently.
+            znq_local_select(nearest, indices, seed_errors, 16, nbooks, &cache->seed[sc]);
+        } else if (group == 4 && nbooks == 16) {
+            znq_local_select(nearest, indices, errors, group, 8, &cache->seed[sc]);
+        }
+        cache->valid[sc / 64] |= bit;
+    }
+    return seed ? &cache->seed[sc] : &cache->main[sc];
+}
+
+static uint8_t znq_local_scale(struct znq_local_cache * cache, uint8_t initial, int seed, bool seed_search) {
+    const float * x = cache->x;
+    const float * w = cache->w;
     uint64_t evaluated[4] = {0};
     evaluated[initial / 64] |= UINT64_C(1) << (initial % 64);
     uint8_t best_sc = initial;
-    double best = znq_local_assign(x, w, group, nbooks, nlevels, values, nearest, initial, q, NULL, NULL);
+    const struct znq_local_assignment * current_q = znq_local_assign(cache, initial, seed_search);
+    double best = current_q->error;
     if (seed > 0 && seed != initial) {
         evaluated[seed / 64] |= UINT64_C(1) << (seed % 64);
-        int8_t seed_q[QK_ZNQ];
-        const double error = znq_local_assign(x, w, group, nbooks, nlevels, values, nearest, (uint8_t) seed, seed_q, NULL, NULL);
-        if (error < best) {
-            best = error;
+        const struct znq_local_assignment * seed_q = znq_local_assign(cache, (uint8_t) seed, seed_search);
+        if (seed_q->error < best) {
+            best = seed_q->error;
             best_sc = (uint8_t) seed;
-            memcpy(q, seed_q, sizeof(q));
+            current_q = seed_q;
         }
     }
 
     uint8_t current = best_sc;
-
     for (int it = 0; it < 4; ++it) {
         double num = 0.0, den = 0.0;
-
         for (int j = 0; j < QK_ZNQ; ++j) {
-            num += (double) w[j] * (double) x[j] * q[j];
-            den += (double) w[j] * q[j] * q[j];
+            num += (double) w[j] * (double) x[j] * current_q->q[j];
+            den += (double) w[j] * current_q->q[j] * current_q->q[j];
         }
-
         int next = den > 0 ? znq_fp32_to_ufp8(MAX(num / den, 0.0)) : current;
         if (next == 0) {
             next = 1;
         }
-
         if (next == current) {
             break;
         }
 
         evaluated[next / 64] |= UINT64_C(1) << (next % 64);
-        const double error = znq_local_assign(x, w, group, nbooks, nlevels, values, nearest, (uint8_t) next, q, NULL, NULL);
-        if (error < best) {
-            best = error;
+        current_q = znq_local_assign(cache, (uint8_t) next, seed_search);
+        if (current_q->error < best) {
+            best = current_q->error;
             best_sc = (uint8_t) next;
         }
-
         current = (uint8_t) next;
     }
 
     const int center = best_sc;
-
     for (int delta = 1; delta <= 8; ++delta) {
         for (int sign = -1; sign <= 1; sign += 2) {
             const uint8_t candidate = (uint8_t) MAX(1, MIN(255, center + sign * delta));
@@ -5572,14 +5589,13 @@ static uint8_t znq_local_scale(const float * x, const float * w, int group, int 
                 continue;
             }
             evaluated[candidate / 64] |= bit;
-            const double error = znq_local_assign(x, w, group, nbooks, nlevels, values, nearest, candidate, NULL, NULL, NULL);
+            const double error = znq_local_assign(cache, candidate, seed_search)->error;
             if (error < best) {
                 best = error;
                 best_sc = candidate;
             }
         }
     }
-
     return best_sc;
 }
 
@@ -5623,6 +5639,10 @@ static void quantize_row_znq_local_impl(const float * x, void * vy, int64_t k, i
     const int nlevels = 1 << bits;
     const int nbooks = 1 << sbits;
     uint8_t * y = (uint8_t *) vy;
+    struct znq_local_cache cache;
+    cache.nearest = nearest;
+    cache.group = group;
+    cache.nbooks = nbooks;
 
     for (int64_t ib = 0; ib < k / QK_ZNQ; ++ib) {
         const float * xb = x + QK_ZNQ * ib;
@@ -5645,13 +5665,14 @@ static void quantize_row_znq_local_impl(const float * x, void * vy, int64_t k, i
             weight[j] = importance ? importance[QK_ZNQ * ib + j] * sqrtf(sigma2 + xb[j] * xb[j]) : 1.0f;
         }
 
+        cache.x = xb;
+        cache.w = weight;
+        memset(cache.valid, 0, sizeof(cache.valid));
         const uint8_t initial = (uint8_t) MAX(1, znq_fp32_to_ufp8((double) amax / 127.0));
-        const int seed = group == 8 ? znq_local_scale(xb, weight, 16, nbooks, nlevels, values, nearest, initial, 0) :
-                         group == 4 && sbits == 4 ? znq_local_scale(xb, weight, group, 8, nlevels, values, nearest, initial, 0) : 0;
-        const uint8_t sc = znq_local_scale(xb, weight, group, nbooks, nlevels, values, nearest, initial, seed);
-        uint8_t selectors[8], codes[QK_ZNQ];
-        int8_t q[QK_ZNQ];
-        const double error = znq_local_assign(xb, weight, group, nbooks, nlevels, values, nearest, sc, q, selectors, codes);
+        const int seed = group == 8 || (group == 4 && sbits == 4) ? znq_local_scale(&cache, initial, 0, true) : 0;
+        const uint8_t sc = znq_local_scale(&cache, initial, seed, false);
+        const struct znq_local_assignment * result = znq_local_assign(&cache, sc, false);
+        const double error = result->error;
         if (bits >= 4) {
             double zero_error = 0.0;
 
@@ -5665,6 +5686,22 @@ static void quantize_row_znq_local_impl(const float * x, void * vy, int64_t k, i
         }
 
         out[0] = sc;
+        const uint8_t * selectors = result->selectors;
+        uint8_t codes[QK_ZNQ];
+        // Each book is strictly increasing, so the selected level identifies its original code.
+        for (int j = 0; j < QK_ZNQ; ++j) {
+            const int8_t * levels = values + nlevels * selectors[j / group];
+            int lo = 0, hi = nlevels - 1;
+            while (lo < hi) {
+                const int mid = (lo + hi) / 2;
+                if (levels[mid] < result->q[j]) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            codes[j] = (uint8_t) lo;
+        }
 
         for (int g = 0; g < QK_ZNQ / group; ++g) {
             const int shift = sbits * g;

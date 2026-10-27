@@ -1290,8 +1290,15 @@ GGML_TABLE_BEGIN(int8_t, kvalues_iq4nl, 16)
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 GGML_TABLE_END()
 
+// Keep power-of-two HIP codebooks on their natural boundaries across linked table layouts.
+#if defined(GGML_COMMON_IMPL_HIP)
+#define GGML_ZNQ_TABLE_ALIGN alignas(128)
+#else
+#define GGML_ZNQ_TABLE_ALIGN
+#endif
+
 // Frozen seed books derived from existing ZNQ levels; see docs/znq-format-seeds.md.
-GGML_TABLE_BEGIN(int8_t, kvalues_znq2_s, 16)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq2_s, 16)
     -98, 127,
     -61, 63,
     -28, 28,
@@ -1302,7 +1309,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq2_s, 16)
     0, 57,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq2_sm, 32)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq2_sm, 32)
     -98, 127,
     -61, 63,
     -28, 28,
@@ -1321,7 +1328,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq2_sm, 32)
     -127, 0,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq3_sm, 64)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq3_sm, 64)
     -61, -16, 24, 63,
     -104, -44, 23, 82,
     -51, -3, 45, 121,
@@ -1340,7 +1347,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq3_sm, 64)
     -73, -3, 53, 119,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq4_sm, 128)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq4_sm, 128)
     -98, -76, -45, -18, 14, 31, 80, 113,
     -109, -61, -34, -13, 7, 27, 54, 84,
     -127, -79, -41, -22, -1, 29, 58, 127,
@@ -1359,7 +1366,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq4_sm, 128)
     -125, -70, -43, -23, -1, 24, 49, 80,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq5_sm, 256)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq5_sm, 256)
     -122, -100, -77, -61, -47, -32, -19, -7, 5, 18, 31, 45, 60, 76, 99, 119,
     -127, -86, -68, -50, -36, -24, -14, -4, 5, 14, 24, 36, 54, 67, 92, 117,
     -108, -80, -61, -44, -32, -21, -12, -4, 4, 12, 21, 31, 44, 61, 86, 127,
@@ -1378,7 +1385,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq5_sm, 256)
     -118, -92, -71, -54, -35, -23, -14, -5, 3, 10, 20, 36, 48, 66, 81, 127,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq6_sm, 512)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq6_sm, 512)
     -124, -112, -101, -90, -78, -70, -63, -55, -48, -41, -34, -28, -22, -16, -10, -4, 2, 8, 14, 21, 27, 33, 40, 47, 54, 62, 69, 77, 89, 100, 111, 122,
     -116, -106, -96, -86, -76, -68, -60, -52, -44, -37, -31, -25, -19, -14, -8, -3, 2, 8, 14, 19, 24, 30, 37, 44, 51, 59, 69, 78, 86, 95, 109, 123,
     -127, -101, -78, -67, -58, -50, -43, -36, -31, -25, -21, -16, -13, -9, -6, -2, 1, 5, 9, 13, 16, 21, 25, 30, 36, 41, 49, 57, 67, 81, 103, 127,
@@ -1397,7 +1404,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq6_sm, 512)
     -124, -109, -93, -83, -72, -63, -55, -48, -41, -34, -28, -22, -17, -12, -7, -2, 2, 7, 12, 17, 22, 27, 33, 40, 46, 53, 62, 71, 79, 88, 107, 126,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq7_sm, 1024)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq7_sm, 1024)
     -124, -116, -109, -101, -94, -88, -83, -78, -73, -68, -64, -60, -56, -52, -48, -45, -42, -38, -35, -32, -29, -26, -23, -21, -18, -16, -13, -11, -8, -6, -4, -1, 1, 4, 6, 8, 11, 13, 15, 18, 20, 23, 25, 28, 31, 34, 37, 40, 44, 47, 50, 54, 58, 63, 67, 72, 76, 80, 84, 89, 98, 107, 116, 125,
     -125, -118, -110, -103, -95, -90, -85, -80, -75, -70, -66, -62, -58, -54, -50, -46, -43, -39, -36, -33, -30, -27, -24, -22, -19, -17, -14, -11, -9, -6, -4, -1, 1, 4, 6, 9, 11, 14, 17, 19, 22, 24, 27, 30, 33, 36, 39, 43, 46, 50, 54, 57, 61, 64, 68, 73, 79, 86, 93, 99, 105, 111, 117, 123,
     -125, -113, -102, -90, -78, -72, -68, -63, -59, -55, -51, -47, -43, -40, -37, -34, -31, -29, -26, -24, -21, -19, -17, -15, -13, -11, -10, -8, -6, -5, -3, -1, 0, 2, 4, 6, 8, 9, 11, 13, 15, 17, 19, 21, 24, 26, 29, 31, 34, 36, 39, 42, 46, 49, 53, 57, 63, 69, 74, 81, 92, 104, 115, 126,
@@ -1416,7 +1423,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq7_sm, 1024)
     -125, -116, -107, -98, -89, -83, -79, -74, -70, -65, -61, -57, -53, -49, -45, -42, -39, -35, -33, -30, -27, -24, -22, -19, -17, -14, -12, -10, -7, -5, -3, -1, 2, 4, 6, 8, 10, 12, 14, 17, 19, 22, 24, 27, 30, 33, 35, 39, 43, 47, 51, 55, 58, 62, 65, 69, 75, 81, 86, 92, 98, 105, 111, 117,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq2_m, 64)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq2_m, 64)
     -47, -16, 11, 42,
     -42, -7, 25, 65,
     -66, -16, 21, 61,
@@ -1435,7 +1442,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq2_m, 64)
     -98, -22, 39, 127,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq2_l, 64)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq2_l, 64)
     -46, -18, 9, 40,
     -38, -5, 29, 68,
     -65, -16, 18, 58,
@@ -1454,7 +1461,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq2_l, 64)
     -98, -28, 28, 127,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq3_s, 64)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq3_s, 64)
     -61, -16, 24, 63,
     -104, -44, 23, 82,
     -51, -3, 45, 121,
@@ -1473,7 +1480,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq3_s, 64)
     0, 0, 0, 0,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq3_m, 128)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq3_m, 128)
     -64, -40, -20, -5, 10, 23, 38, 56,
     -83, -58, -30, -12, 4, 24, 43, 69,
     -92, -48, -28, -9, 6, 22, 42, 91,
@@ -1492,7 +1499,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq3_m, 128)
     -127, -83, -42, -13, 17, 51, 85, 127,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq3_l, 128)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq3_l, 128)
     -62, -37, -22, -9, 7, 22, 38, 61,
     -74, -46, -26, -5, 10, 28, 48, 77,
     -92, -51, -27, -10, 5, 27, 53, 97,
@@ -1511,7 +1518,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq3_l, 128)
     -127, -82, -50, -18, 18, 52, 85, 119,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq4_s, 64)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq4_s, 64)
     -98, -76, -45, -18, 14, 31, 80, 113,
     -109, -61, -34, -13, 7, 27, 54, 84,
     -127, -79, -41, -22, -1, 29, 58, 127,
@@ -1522,7 +1529,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq4_s, 64)
     -89, -64, -37, -5, 14, 43, 70, 127,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq4_m, 256)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq4_m, 256)
     -65, -52, -44, -34, -25, -15, -8, -1, 4, 10, 16, 24, 31, 39, 54, 81,
     -97, -65, -49, -34, -22, -15, -10, -5, 2, 9, 17, 25, 36, 53, 65, 95,
     -113, -67, -53, -37, -28, -18, -9, -1, 5, 11, 19, 30, 38, 49, 73, 106,
@@ -1541,7 +1548,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq4_m, 256)
     -127, -107, -85, -64, -49, -35, -16, -3, 9, 23, 38, 51, 67, 84, 102, 123,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq4_l, 256)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq4_l, 256)
     -70, -51, -39, -28, -20, -13, -8, -2, 3, 8, 14, 21, 30, 40, 54, 77,
     -102, -67, -48, -34, -24, -16, -9, -3, 3, 10, 17, 25, 35, 48, 65, 100,
     -108, -72, -51, -37, -26, -17, -10, -3, 3, 10, 17, 26, 37, 51, 73, 108,
@@ -1560,7 +1567,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq4_l, 256)
     -124, -105, -85, -68, -52, -37, -22, -7, 8, 23, 38, 53, 68, 84, 105, 124,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq5_s, 128)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq5_s, 128)
     -122, -100, -77, -61, -47, -32, -19, -7, 5, 18, 31, 45, 60, 76, 99, 119,
     -127, -86, -68, -50, -36, -24, -14, -4, 5, 14, 24, 36, 54, 67, 92, 117,
     -108, -80, -61, -44, -32, -21, -12, -4, 4, 12, 21, 31, 44, 61, 86, 127,
@@ -1571,7 +1578,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq5_s, 128)
     -115, -93, -65, -49, -35, -23, -13, -4, 5, 14, 23, 35, 47, 64, 88, 112,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq5_m, 512)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq5_m, 512)
     -74, -63, -53, -46, -40, -34, -29, -25, -21, -18, -14, -11, -9, -6, -3, -1, 2, 4, 7, 9, 12, 15, 19, 22, 27, 31, 36, 41, 48, 55, 66, 77,
     -102, -85, -68, -58, -49, -42, -35, -30, -25, -21, -17, -14, -10, -7, -4, -1, 1, 5, 8, 11, 15, 18, 22, 26, 31, 36, 43, 49, 58, 67, 84, 100,
     -108, -91, -73, -63, -52, -45, -38, -33, -27, -23, -18, -15, -11, -8, -5, -1, 1, 5, 8, 11, 15, 18, 23, 27, 33, 38, 45, 52, 63, 74, 91, 108,
@@ -1590,7 +1597,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq5_m, 512)
     -124, -115, -106, -96, -86, -78, -70, -62, -54, -47, -39, -32, -25, -18, -10, -3, 4, 11, 19, 26, 33, 40, 48, 55, 62, 70, 77, 85, 96, 106, 115, 124,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq5_l, 512)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq5_l, 512)
     -74, -63, -53, -46, -40, -34, -29, -25, -21, -18, -14, -11, -9, -6, -3, -1, 2, 4, 7, 9, 12, 15, 19, 22, 27, 31, 36, 41, 48, 55, 66, 77,
     -102, -85, -68, -58, -49, -42, -35, -30, -25, -21, -17, -14, -10, -7, -4, -1, 1, 5, 8, 11, 15, 18, 22, 26, 31, 36, 43, 49, 58, 67, 84, 100,
     -108, -91, -73, -63, -52, -45, -38, -33, -27, -23, -18, -15, -11, -8, -5, -1, 1, 5, 8, 11, 15, 18, 23, 27, 33, 38, 45, 52, 63, 74, 91, 108,
@@ -1609,7 +1616,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq5_l, 512)
     -124, -115, -106, -96, -86, -78, -70, -62, -54, -47, -39, -32, -25, -18, -10, -3, 4, 11, 19, 26, 33, 40, 48, 55, 62, 70, 77, 85, 96, 106, 115, 124,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq6_s, 256)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq6_s, 256)
     -124, -112, -101, -90, -78, -70, -63, -55, -48, -41, -34, -28, -22, -16, -10, -4, 2, 8, 14, 21, 27, 33, 40, 47, 54, 62, 69, 77, 89, 100, 111, 122,
     -116, -106, -96, -86, -76, -68, -60, -52, -44, -37, -31, -25, -19, -14, -8, -3, 2, 8, 14, 19, 24, 30, 37, 44, 51, 59, 69, 78, 86, 95, 109, 123,
     -127, -101, -78, -67, -58, -50, -43, -36, -31, -25, -21, -16, -13, -9, -6, -2, 1, 5, 9, 13, 16, 21, 25, 30, 36, 41, 49, 57, 67, 81, 103, 127,
@@ -1620,7 +1627,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq6_s, 256)
     -118, -98, -78, -67, -56, -48, -41, -35, -29, -24, -20, -16, -12, -9, -6, -2, 1, 5, 8, 12, 15, 19, 24, 29, 34, 40, 47, 54, 63, 73, 96, 118,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq6_m, 1024)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq6_m, 1024)
     -74, -69, -64, -58, -53, -50, -46, -43, -40, -37, -35, -32, -30, -27, -25, -23,
     -22, -20, -18, -16, -15, -13, -12, -11, -9, -8, -7, -5, -4, -3, -1, 0,
     1, 2, 3, 5, 6, 7, 8, 10, 11, 13, 14, 16, 17, 19, 21, 23,
@@ -1687,7 +1694,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq6_m, 1024)
     59, 63, 67, 70, 74, 78, 82, 86, 91, 96, 101, 106, 110, 115, 119, 124,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq6_l, 1024)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq6_l, 1024)
     -74, -69, -64, -58, -53, -50, -46, -43, -40, -37, -35, -32, -30, -27, -25, -23,
     -22, -20, -18, -16, -15, -13, -12, -11, -9, -8, -7, -5, -4, -3, -1, 0,
     1, 2, 3, 5, 6, 7, 8, 10, 11, 13, 14, 16, 17, 19, 21, 23,
@@ -1754,7 +1761,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq6_l, 1024)
     59, 63, 67, 70, 74, 78, 82, 86, 91, 96, 101, 106, 110, 115, 119, 124,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq7_s, 512)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq7_s, 512)
     -124, -116, -109, -101, -94, -88, -83, -78, -73, -68, -64, -60, -56, -52, -48, -45,
     -42, -38, -35, -32, -29, -26, -23, -21, -18, -16, -13, -11, -8, -6, -4, -1,
     1, 4, 6, 8, 11, 13, 15, 18, 20, 23, 25, 28, 31, 34, 37, 40,
@@ -1789,7 +1796,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq7_s, 512)
     32, 35, 38, 41, 44, 48, 51, 55, 59, 64, 68, 74, 85, 96, 107, 118,
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq7_m, 2051)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq7_m, 2051)
     -74, -71, -69, -66, -64, -61, -58, -56, -53, -51, -50, -48, -47, -45, -44, -42,
     -40, -39, -38, -36, -35, -34, -32, -31, -30, -29, -27, -26, -25, -24, -23, -22,
     -21, -20, -19, -18, -17, -16, -15, -14, -13, -12, -11, -10, -9, -8, -7, -6,
@@ -1921,7 +1928,7 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq7_m, 2051)
     0, 0, 0, // Pad for four-byte CPU gathers.
 GGML_TABLE_END()
 
-GGML_TABLE_BEGIN(int8_t, kvalues_znq7_l, 2051)
+GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq7_l, 2051)
     -74, -71, -69, -66, -64, -61, -58, -56, -53, -51, -50, -48, -47, -45, -44, -42,
     -40, -39, -38, -36, -35, -34, -32, -31, -30, -29, -27, -26, -25, -24, -23, -22,
     -21, -20, -19, -18, -17, -16, -15, -14, -13, -12, -11, -10, -9, -8, -7, -6,
@@ -2052,6 +2059,8 @@ GGML_TABLE_BEGIN(int8_t, kvalues_znq7_l, 2051)
     89, 91, 94, 96, 99, 101, 104, 106, 108, 111, 113, 115, 117, 120, 122, 124,
     0, 0, 0, // Pad for four-byte CPU gathers.
 GGML_TABLE_END()
+
+#undef GGML_ZNQ_TABLE_ALIGN
 
 // e2m1 values (doubled), shared by MXFP4 and NVFP4
 // ref: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf

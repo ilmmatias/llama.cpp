@@ -319,6 +319,50 @@ static void test_indexed_aliases() {
     out->data = saved;
 }
 
+static void test_broadcast_extents() {
+    // More batch shapes than the executable-cache capacity must share the same code.
+    for (int rows = 2; rows < 146; ++rows) {
+        for (int mode = 0; mode < 4; ++mode) {
+            auto ctx = make_context();
+            const int64_t columns = 33;
+            auto * a = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, columns, rows, 2, rows % 2 + 1);
+            const int64_t period = mode == 0 ? 1 : mode == 1 ? 11 : columns;
+            auto * storage = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 2 * period);
+            auto * b = mode == 3 ? ggml_transpose(ctx.get(), ggml_reshape_2d(ctx.get(), storage, 2, period)) :
+                ggml_view_1d(ctx.get(), storage, period, 0);
+            if (mode == 3) {
+                b = ggml_view_4d(ctx.get(), b, period, 1, 1, 1, b->nb[1], b->nb[2], b->nb[3], 0);
+                b->nb[0] = 2 * sizeof(float);
+            }
+            for (int64_t i = 0; i < ggml_nelements(a); ++i) {
+                static_cast<float *>(a->data)[i] = float(i % 37 - 18) * 0.125f;
+            }
+            for (int64_t i = 0; i < 2 * period; ++i) {
+                static_cast<float *>(storage->data)[i] = float(i % 17 - 8) * 0.25f;
+            }
+            auto * sum = ggml_add(ctx.get(), a, b);
+            auto * out = ggml_sqr(ctx.get(), sum);
+            auto * graph = ggml_new_graph(ctx.get());
+            ggml_build_forward_expand(graph, out);
+            int first = 0;
+            while (graph->nodes[first] != sum) {
+                ++first;
+            }
+            fusion_ptr fusion(ggml_cpu_fusion_plan_create(graph), ggml_cpu_fusion_plan_free);
+            REQUIRE(fusion);
+            const int threads = rows % 3 + 1;
+            for (int ith = 0; ith < threads; ++ith) {
+                REQUIRE(ggml_cpu_fusion_compute(fusion.get(), first, ith, threads) == 1);
+            }
+            for (int64_t i = 0; i < ggml_nelements(a); ++i) {
+                const float x = static_cast<const float *>(a->data)[i];
+                const float y = static_cast<const float *>(storage->data)[(i % period) * (mode == 3 ? 2 : 1)];
+                REQUIRE(static_cast<const float *>(out->data)[i] == (x + y) * (x + y));
+            }
+        }
+    }
+}
+
 static void test_boundaries_and_aliases() {
     auto ctx = make_context();
 
@@ -571,8 +615,10 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
+    test_broadcast_extents();
+
     for (int threads : {1, 4}) {
-        for (int64_t n : {1, 7, 8, 9, 31, 513, 4096}) {
+        for (int64_t n : {1, 7, 8, 9, 15, 16, 17, 31, 513, 4096}) {
             test_chain(n, threads);
         }
     }

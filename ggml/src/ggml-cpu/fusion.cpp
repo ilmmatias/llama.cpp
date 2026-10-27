@@ -140,6 +140,42 @@ bool fusion_flat_access(const ggml_fusion_access & access) {
     return access.repeat == 0;
 }
 
+ggml_fusion_program fusion_kernel_program(const ggml_fusion_program & program) {
+    bool periodic = false;
+    for (int i = 0; i < program.inputs; ++i) {
+        const auto & access = program.accesses[i];
+        if (fusion_flat_access(access)) {
+            continue;
+        }
+        if (access.ne[1] != 1 || access.ne[2] != 1 || access.ne[3] != 1) {
+            return program;
+        }
+        periodic |= access.ne[0] > 1;
+    }
+
+    // Flat, scalar and repeated-row addressing does not depend on the number of rows.
+    // Bindings are checked against the original layouts before this code-only normalization.
+    auto normalized = program;
+    normalized.indexed = periodic;
+    normalized.ne[0] = periodic ? program.ne[0] : 1;
+    for (int d = 1; d < 4; ++d) {
+        normalized.ne[d] = 1;
+    }
+    for (int i = 0; i < program.inputs; ++i) {
+        const auto & source = program.accesses[i];
+        auto & access = normalized.accesses[i];
+        const bool flat = fusion_flat_access(source);
+        access.repeat = flat ? 0 : 1;
+        access.ne[0] = flat ? 1 : source.ne[0];
+        access.nb[0] = flat || source.ne[0] == 1 ? sizeof(float) : source.nb[0];
+        for (int d = 1; d < 4; ++d) {
+            access.ne[d] = 1;
+            access.nb[d] = sizeof(float);
+        }
+    }
+    return normalized;
+}
+
 std::pair<uint64_t, size_t> fusion_linear_access(const ggml_fusion_access & access, const int64_t * ne) {
     uint64_t span = 1;
     size_t step = 0;
@@ -527,13 +563,14 @@ public:
     }
 
     fusion_kernel get(const ggml_fusion_program & program) {
+        const auto normalized = fusion_kernel_program(program);
         ggml_fusion_schedule schedule;
-        schedule.kind    = program.indexed ? GGML_FUSION_SCHEDULE_POINTWISE_INDEXED : GGML_FUSION_SCHEDULE_POINTWISE_FLAT;
+        schedule.kind    = normalized.indexed ? GGML_FUSION_SCHEDULE_POINTWISE_INDEXED : GGML_FUSION_SCHEDULE_POINTWISE_FLAT;
         schedule.threads = 1;
         schedule.tile    = fusion_width;
 
         ggml_fusion_cache_key key;
-        if (!ggml_fusion_make_key(program, schedule, key)) {
+        if (!ggml_fusion_make_key(normalized, schedule, key)) {
             return nullptr;
         }
 
@@ -552,7 +589,7 @@ public:
 
         auto inserted = kernels.emplace(std::move(bytes), nullptr).first;
         auto context  = std::make_unique<llvm::LLVMContext>();
-        auto module   = fusion_module(program, *context, jit->getDataLayout(), "ggml_cpu_fusion");
+        auto module   = fusion_module(normalized, *context, jit->getDataLayout(), "ggml_cpu_fusion");
 #if LLVM_VERSION_MAJOR >= 21
         module->setTargetTriple(jit->getTargetTriple());
 #else
