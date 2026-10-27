@@ -254,7 +254,7 @@ static int test_vec_dot_znq(bool verbose) {
     const auto * activations = ggml_get_type_traits(GGML_TYPE_Q8_0);
     int num_failed = 0;
 
-    for (ggml_type type : {GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S,
+    for (ggml_type type : {GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M,
                           GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L,
                           GGML_TYPE_ZNQ6_S, GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S,
                           GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L}) {
@@ -263,7 +263,7 @@ static int test_vec_dot_znq(bool verbose) {
         assert(cpu->vec_dot_type == GGML_TYPE_Q8_0);
         ggml_quantize_init(type);
 
-        for (int n : {32, 96, 10240}) {
+        for (int n : {32, 64, 96, 160, 10240}) {
             std::vector<float> x(n), y(n), dx(n), dy(n);
             std::vector<uint8_t> qx(ggml_row_size(type, n) + 1);
             std::vector<uint8_t> qy(ggml_row_size(GGML_TYPE_Q8_0, n));
@@ -347,7 +347,7 @@ static int test_mul_mat_znq(bool verbose) {
     const auto * q8 = ggml_get_type_traits(GGML_TYPE_Q8_0);
     const auto quantize_input = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0)->from_float;
 
-    for (ggml_type type : {GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S,
+    for (ggml_type type : {GGML_TYPE_ZNQ2_M, GGML_TYPE_ZNQ2_L, GGML_TYPE_ZNQ3_S, GGML_TYPE_ZNQ3_M, GGML_TYPE_ZNQ3_L, GGML_TYPE_ZNQ4_S, GGML_TYPE_ZNQ4_M,
                           GGML_TYPE_ZNQ4_L, GGML_TYPE_ZNQ5_S, GGML_TYPE_ZNQ5_M, GGML_TYPE_ZNQ5_L,
                           GGML_TYPE_ZNQ6_S, GGML_TYPE_ZNQ6_M, GGML_TYPE_ZNQ6_L, GGML_TYPE_ZNQ7_S,
                           GGML_TYPE_ZNQ7_M, GGML_TYPE_ZNQ7_L}) {
