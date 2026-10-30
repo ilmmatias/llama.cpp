@@ -1297,35 +1297,34 @@ GGML_TABLE_END()
 #define GGML_ZNQ_TABLE_ALIGN
 #endif
 
-// Frozen seed books derived from existing ZNQ levels; see docs/znq-format-seeds.md.
 GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq2_s, 16)
-    -98, 127,
-    -61, 63,
-    -28, 28,
-    -16, 18,
-    -127, -36,
-    31, 127,
-    -43, 0,
-    0, 57,
+    -40, 99,
+    -90, 40,
+    -47, 50,
+    -23, 25,
+    -109, -2,
+    6, 113,
+    -55, 8,
+    -9, 60,
 GGML_TABLE_END()
 
 GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq2_sm, 32)
-    -98, 127,
-    -61, 63,
-    -28, 28,
-    -16, 18,
-    -127, -36,
-    31, 127,
-    -43, 0,
-    0, 57,
-    -123, 33,
-    -28, 127,
-    -77, -37,
-    -104, 82,
-    35, 83,
-    -85, 5,
-    -26, 84,
-    -127, 0,
+    -40, 99,
+    -90, 40,
+    -47, 50,
+    -23, 25,
+    -109, -2,
+    6, 113,
+    -55, 8,
+    -9, 60,
+    -127, 24,
+    -20, 127,
+    -68, -13,
+    -80, 81,
+    18, 72,
+    -60, 30,
+    -30, 67,
+    -127, -27,
 GGML_TABLE_END()
 
 GGML_ZNQ_TABLE_ALIGN GGML_TABLE_BEGIN(int8_t, kvalues_znq3_sm, 64)
