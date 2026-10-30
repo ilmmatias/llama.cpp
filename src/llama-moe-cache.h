@@ -12,7 +12,7 @@ struct llama_model;
 class llama_moe_cache {
 public:
     llama_moe_cache(
-            const llama_model & model,
+            const llama_model & model, bool no_alloc,
             const std::vector<ggml_backend_t> & backends,
             uint32_t slots, uint32_t admit_window, uint32_t workers, size_t size);
     llama_moe_cache(const llama_moe_cache & cache, ggml_backend_t backend_cpu);

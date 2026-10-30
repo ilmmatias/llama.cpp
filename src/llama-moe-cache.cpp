@@ -52,10 +52,10 @@ struct llama_moe_cache::impl {
     ggml_backend_cpu_expert_cache_memory_t cache_memory = nullptr;
     std::unique_ptr<ggml_backend_cpu_expert_cache, ggml_backend_cpu_expert_cache_free_t> root{nullptr, nullptr};
 
-    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, ggml_backend_t backend_cpu,
+    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, ggml_backend_t backend_cpu,
             uint32_t slots, uint32_t admit_window, uint32_t workers, size_t size) {
         // Fit estimation reserves the cache separately and must not start workers or allocate GPU buffers.
-        if (model.hparams.no_alloc) {
+        if (no_alloc) {
             return;
         }
         if (slots != 0 && size != 0) {
@@ -169,10 +169,10 @@ struct llama_moe_cache::impl {
 };
 
 llama_moe_cache::llama_moe_cache(
-        const llama_model & model, const std::vector<ggml_backend_t> & backends,
+        const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends,
         uint32_t slots, uint32_t admit_window, uint32_t workers, size_t size) :
     backend_cpu(llama_moe_cache_cpu_backend(backends)),
-    pimpl(std::make_shared<impl>(model, backends, backend_cpu, slots, admit_window, workers, size)) {
+    pimpl(std::make_shared<impl>(model, no_alloc, backends, backend_cpu, slots, admit_window, workers, size)) {
     if (pimpl->root) {
         pimpl->set_cache(backend_cpu, pimpl->root.get());
     }

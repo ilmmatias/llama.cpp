@@ -49,8 +49,8 @@ struct fixture {
         hp.n_head_arr[0] = hp.n_head_kv_arr[0] = 1;
         hp.indexer_head_size = 32;
         hp.dsv4_compress_ratios[0] = 4;
-        mem.reset(new llama_memory_hybrid_idx(*model,
-                type, type, false, 512, 1, 0, LLAMA_SWA_TYPE_NONE,
+        mem.reset(new llama_memory_hybrid_idx(*model, false,
+                type, type, false, 512, 0, LLAMA_SWA_TYPE_NONE,
                 GGML_TYPE_F32, GGML_TYPE_F32, 2, 2, 0, false, unified,
                 [](uint32_t) { return true; }, [](uint32_t) { return false; }, [](uint32_t) { return true; }));
     }
