@@ -265,22 +265,30 @@ bool load_state_replay_last(llama_context * ctx, const std::string & path, const
     return true;
 }
 
-bool blobs_equal(const std::vector<uint8_t> & a, const std::vector<uint8_t> & b) {
-    if (a.size() == b.size() && (a.empty() || memcmp(a.data(), b.data(), a.size()) == 0)) {
+static bool blobs_equal_impl(const uint8_t * a_data, size_t a_size, const uint8_t * b_data, size_t b_size) {
+    if (a_size == b_size && (a_size == 0 || memcmp(a_data, b_data, a_size) == 0)) {
         return true;
     }
 
     size_t i = 0;
-    while (i < a.size() && i < b.size() && a[i] == b[i]) {
+    while (i < a_size && i < b_size && a_data[i] == b_data[i]) {
         ++i;
     }
 
-    TLOG_ERR("%s: %zu bytes -> %zu bytes, first difference at byte %zu (%02x -> %02x)\n",
-            __func__, a.size(), b.size(), i,
-            i < a.size() ? a[i] : 0,
-            i < b.size() ? b[i] : 0);
+    TLOG_ERR("blobs_equal: %zu bytes -> %zu bytes, first difference at byte %zu (%02x -> %02x)\n",
+            a_size, b_size, i,
+            i < a_size ? a_data[i] : 0,
+            i < b_size ? b_data[i] : 0);
 
     return false;
+}
+
+bool blobs_equal(const std::vector<uint8_t> & a, const std::vector<uint8_t> & b) {
+    return blobs_equal_impl(a.data(), a.size(), b.data(), b.size());
+}
+
+bool blobs_equal(const common_state_data & a, const common_state_data & b) {
+    return blobs_equal_impl(a.data(), a.size(), b.data(), b.size());
 }
 
 bool corrupt_state(std::vector<uint8_t> & data) {

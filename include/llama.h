@@ -427,6 +427,7 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         size_t moe_cache_size; // alternative expert cache budget in bytes, split by host expert placement; mutually exclusive with expert_cache_slots [EXPERIMENTAL]
+        float  moe_cache_cpu_share; // share of the MoE cache misses computed on the CPU instead of uploaded, 0 = all uploaded [EXPERIMENTAL]
         uint32_t expert_cache_slots;        // cached experts per host-resident layer, 0 = disabled [EXPERIMENTAL]
         uint32_t expert_cache_admit_window; // repeat-admission window in evaluated tokens, 0 = admit every miss [EXPERIMENTAL]
         uint32_t expert_cache_workers;      // asynchronous admission workers per device [EXPERIMENTAL]

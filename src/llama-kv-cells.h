@@ -9,7 +9,15 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
+#include <limits>
 #include <vector>
+
+#if defined(__GNUC__)
+#    define LLAMA_ATTRIBUTE_NOINLINE __attribute__((noinline))
+#else
+#    define LLAMA_ATTRIBUTE_NOINLINE
+#endif
 
 #if defined(_MSC_VER)
 #  include <intrin.h>
@@ -85,6 +93,11 @@ inline int countl_zero64(uint64_t x) {
 
 } // namespace llama_bits
 
+// index of the lowest set bit, x != 0
+static inline int ctz64(uint64_t x) {
+    return llama_bits::countr_zero64(x);
+}
+
 struct llama_kv_cell_ext {
     // 2D spatial positions, typically used for M-RoPE
     llama_pos x = 0;
@@ -106,6 +119,14 @@ struct llama_kv_cell_ext {
     }
 };
 
+// the data of one slice of a ubatch, used to build the cell rows of the kv_rows attention (see ggml_flash_attn_ext_rows)
+struct llama_kv_rows_slice {
+    std::vector<llama_seq_id> seq_ids; // the sequences whose cells form the list of the slice
+
+    // min position of the cells that are not masked by the SWA (-1 if all cells are kept)
+    llama_pos p_min = -1;
+};
+
 // meta information about KV cells that can be part of multiple sequences at the same time
 // TODO: add unit tests
 class llama_kv_cells {
@@ -125,6 +146,7 @@ public:
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
+            std::fill(seq_bits[s].begin(), seq_bits[s].end(), 0);
         }
 
         seq_cells_ok.reset();
@@ -150,6 +172,10 @@ public:
 
         used_bits.assign((n + 63) / 64, 0);
         used_cnt = 0;
+
+        for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            seq_bits[s].clear();
+        }
 
         reset();
     }
@@ -449,6 +475,66 @@ public:
         return res;
     }
 
+    // number of cells that contain seq_id at a position >= p_min
+    uint32_t seq_n_cells(llama_seq_id seq_id, llama_pos p_min) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        const auto & v = seq_pos[seq_id];
+        if (v.total == 0 || p_min > v.max()) {
+            return 0;
+        }
+        if (p_min <= v.min()) {
+            return v.total;
+        }
+
+        uint32_t n = 0;
+        const uint32_t start_idx = (uint32_t)(p_min - v.base);
+        for (uint32_t idx = start_idx; idx <= v.tail; ++idx) {
+            n += v.cnt[idx];
+        }
+        return n;
+    }
+
+    // get the lists of the cells that contain any of the sequences of each slice, in cell order
+    // one list of max `n_per_seq` for each slice, padded with -1
+    // the cells of slice s at a position below slices[s].p_min are skipped
+    LLAMA_ATTRIBUTE_NOINLINE
+    void get_seq_cells(const std::vector<llama_kv_rows_slice> & slices, int32_t * data, int64_t n_per_seq) const {
+        assert(slices.size() >= 1);
+
+        const int64_t n_slices = (int64_t) slices.size();
+
+        const uint32_t n_words = (used_max_p1() + 63)/64;
+
+        for (int64_t s = 0; s < n_slices; ++s) {
+            const llama_pos pm = slices[s].p_min;
+
+            int32_t * dst = data + s*n_per_seq;
+            int32_t * end = dst + n_per_seq;
+
+            for (uint32_t w = 0; w < n_words; ++w) {
+                uint64_t word = 0;
+                for (const llama_seq_id seq_id : slices[s].seq_ids) {
+                    const auto & bits = seq_bits[seq_id];
+                    if (w < bits.size()) {
+                        word |= bits[w];
+                    }
+                }
+
+                for (uint64_t b = word; b != 0; b &= b - 1) {
+                    const int32_t i = 64*w + ctz64(b);
+                    if (pos[i] >= pm) {
+                        GGML_ASSERT(dst < end);
+                        *dst++ = i;
+                    }
+                }
+            }
+
+            std::fill(dst, end, -1);
+        }
+    }
+
     // the minimum position of sequence seq_id currently present in any of the cells
     // return -1 if the sequence is not present
     llama_pos seq_pos_min(llama_seq_id seq_id) const {
@@ -680,6 +766,9 @@ public:
     // Cache each sequence's physical rows without replacing the position index.
     mutable std::vector<int32_t> seq_cells_list[LLAMA_MAX_SEQ];
     mutable std::bitset<LLAMA_MAX_SEQ> seq_cells_ok;
+
+    // bit i of seq_bits[s] is set if cell i carries sequence s (the transpose of `seq`), used to build the cell lists
+    std::vector<uint64_t> seq_bits[LLAMA_MAX_SEQ];
 
     void used_insert(uint32_t i) {
         assert(i < pos.size());

@@ -2484,10 +2484,10 @@ int llama_bench(int argc, char ** argv) {
                                         std::vector<size_t> & reserves, size_t & n_gpu_devices) {
         const auto log_level = params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR;
         std::vector<ggml_backend_dev_t> devs;
-        uint32_t ngl = 0, nct = 0, nex = 0, nxu = 0;
+        uint32_t ngl = 0, ngl_skip = 0, nct = 0, nex = 0, nxu = 0;
         size_t workspace_bytes = 0, cache_bytes = 0;
         common_get_device_memory_data(inst.model.c_str(), &mparams, &cparams,
-            devs, ngl, nct, nex, nxu, log_level, &workspace_bytes, cache_dev, nullptr, &cache_bytes);
+            devs, ngl, ngl_skip, nct, nex, nxu, log_level, &workspace_bytes, cache_dev, nullptr, &cache_bytes);
         if (nex == 0) {
             throw std::runtime_error("expert cache requested for a model without routed experts");
         }
@@ -2505,7 +2505,7 @@ int llama_bench(int argc, char ** argv) {
             if (devs[i] != cache_dev) {
                 std::vector<ggml_backend_dev_t> devs_unused;
                 common_get_device_memory_data(inst.model.c_str(), &mparams, &cparams,
-                    devs_unused, ngl, nct, nex, nxu, log_level, &device_workspace_bytes, devs[i], nullptr, &device_cache_bytes);
+                    devs_unused, ngl, ngl_skip, nct, nex, nxu, log_level, &device_workspace_bytes, devs[i], nullptr, &device_cache_bytes);
             }
             if (device_cache_bytes == 0) {
                 continue;

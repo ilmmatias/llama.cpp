@@ -97,6 +97,7 @@ bool load_state_replay_last(llama_context * ctx, const std::string & path, const
 
 // false when the sizes differ or any byte differs, the first difference is logged
 bool blobs_equal(const std::vector<uint8_t> & a, const std::vector<uint8_t> & b);
+bool blobs_equal(const common_state_data & a, const common_state_data & b);
 
 // overwrite the tensor data with 0xff bytes (NaN when read as f16/f32), so that the restore fails
 bool corrupt_state(std::vector<uint8_t> & data);

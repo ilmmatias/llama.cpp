@@ -62,11 +62,13 @@ struct llama_cparams {
     bool training;           // set by llama_opt_init()
 
     size_t moe_cache_size;
+    float  moe_cache_cpu_share;
     uint32_t expert_cache_slots;
     uint32_t expert_cache_admit_window;
     uint32_t expert_cache_workers;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+    bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host
 
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;
