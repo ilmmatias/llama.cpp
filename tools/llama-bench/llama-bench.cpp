@@ -514,6 +514,9 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "bf16") {
         return GGML_TYPE_BF16;
     }
+    if (s == "f8_e4m3") {
+        return GGML_TYPE_F8_E4M3;
+    }
     if (s == "q8_0") {
         return GGML_TYPE_Q8_0;
     }
@@ -2486,7 +2489,7 @@ int llama_bench(int argc, char ** argv) {
         std::vector<ggml_backend_dev_t> devs;
         uint32_t ngl = 0, ngl_skip = 0, nct = 0, nex = 0, nxu = 0;
         size_t workspace_bytes = 0, cache_bytes = 0;
-        common_get_device_memory_data(inst.model.c_str(), &mparams, &cparams,
+        common_get_device_memory_data({ inst.model }, &mparams, &cparams,
             devs, ngl, ngl_skip, nct, nex, nxu, log_level, &workspace_bytes, cache_dev, nullptr, &cache_bytes);
         if (nex == 0) {
             throw std::runtime_error("expert cache requested for a model without routed experts");
@@ -2504,7 +2507,7 @@ int llama_bench(int argc, char ** argv) {
             size_t device_cache_bytes = cache_bytes;
             if (devs[i] != cache_dev) {
                 std::vector<ggml_backend_dev_t> devs_unused;
-                common_get_device_memory_data(inst.model.c_str(), &mparams, &cparams,
+                common_get_device_memory_data({ inst.model }, &mparams, &cparams,
                     devs_unused, ngl, ngl_skip, nct, nex, nxu, log_level, &device_workspace_bytes, devs[i], nullptr, &device_cache_bytes);
             }
             if (device_cache_bytes == 0) {
@@ -2606,7 +2609,7 @@ int llama_bench(int argc, char ** argv) {
                 for (size_t i = 0; i < margins.size(); ++i) {
                     margins[i] = inst.fit_target * 1024 * 1024 + (cache_reserves.empty() ? 0 : cache_reserves[i]);
                 }
-                const auto status = common_fit_params(inst.model.c_str(), &mparams, &cparams,
+                const auto status = common_fit_params({ inst.model }, &mparams, &cparams,
                     fit_tensor_split.data(),
                     fit_overrides.data(),
                     margins.data(),

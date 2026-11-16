@@ -41,9 +41,6 @@ struct llama_cparams {
     bool auto_fa;
     bool qsa_compact_mask = false;
     bool mtp_qsa = false;
-    bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
-    bool fused_gdn_ch;       // use fused gated delta net (chunked)
-    bool auto_fgdn;
     bool fused_lid;          // use fused lightning indexer
     bool auto_flid;
     bool fused_dsv4_hc_pre;
@@ -55,7 +52,6 @@ struct llama_cparams {
     bool fused_top_k_mask;   // use fused top-k sparse attention mask
     bool auto_ftkm;
     bool no_perf;
-    bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
@@ -69,6 +65,7 @@ struct llama_cparams {
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
     bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host
+    bool embeddings_nextn_dev;     // write the unmasked h_nextn rows to a device buffer instead of host, see llama_set_embeddings_nextn_dev()
 
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;
@@ -78,4 +75,7 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+
+    // context whose h_nextn device buffer holds the state rows of a batch, see llama_set_ctx_state_src()
+    llama_context * ctx_state_src;
 };

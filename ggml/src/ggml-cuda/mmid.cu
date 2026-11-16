@@ -62,7 +62,7 @@ static __global__ void mm_ids_helper(
                 const bool match = iex < n_expert_used && ids[it*si1 + iex] == expert;
 
                 const int match_prefix = warp_prefix_inclusive_sum<int, warp_size>(match ? 1 : 0);
-                const int match_count  = __shfl_sync(0xffffffff, match_prefix, warp_size - 1, warp_size);
+                const int match_count  = __shfl_sync(GGML_CUDA_FULL_THREAD_MASK, match_prefix, warp_size - 1, warp_size);
 
                 if (match) {
                     const int compact = nex_prev + it_compact + match_prefix - 1;
@@ -91,7 +91,7 @@ static __global__ void mm_ids_helper(
             // flattened (token, route-slot) ordering as the generic path.
 
             const int match_prefix = warp_prefix_inclusive_sum<int, warp_size>(match ? 1 : 0);
-            const int match_count  = __shfl_sync(0xffffffff, match_prefix, warp_size - 1, warp_size);
+            const int match_count  = __shfl_sync(GGML_CUDA_FULL_THREAD_MASK, match_prefix, warp_size - 1, warp_size);
 
             if (match) {
                 const int compact = nex_prev + it_compact + match_prefix - 1;

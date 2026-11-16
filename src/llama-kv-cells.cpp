@@ -40,7 +40,10 @@ void llama_kv_cells::compact(llama_seq_id s) {
     v.tail  = t - h;
 }
 
-uint32_t llama_kv_cells::nextHead(int32_t seq_id, llama_pos p0, llama_pos p1) {
+uint32_t llama_kv_cells::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    assert(seq_id >= 0);
+    assert(seq_id < LLAMA_MAX_SEQ);
+
     uint32_t new_head = size();
 
     for (size_t w = 0; w < used_bits.size(); ++w) {

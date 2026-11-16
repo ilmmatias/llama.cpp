@@ -1,5 +1,5 @@
 #include "fusion-rtc.h"
-#include "common.cuh"
+#include "graph.cuh"
 #include "ggml-fusion.h"
 #include "ggml-backend-impl.h"
 #include <hip/hiprtc.h>

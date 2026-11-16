@@ -1,5 +1,4 @@
 #include "llama.h"
-#include "../src/llama-ext.h"
 
 #include "arg.h"
 #include "common.h"
@@ -7,6 +6,8 @@
 #include "imatrix-loader.h"
 #include "log.h"
 #include "speculative.h"
+
+#include "../../src/llama-ext.h" // staging API for MTP
 
 #include <chrono>
 #include <climits>

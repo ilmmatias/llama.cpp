@@ -301,6 +301,10 @@ public:
         return false;
     }
 
+    // remove seq_id from its cells at positions in [p0, p1)
+    // return the lowest index of a cell that becomes empty, or size() if none does
+    uint32_t seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+
     // return true if the cell becomes empty (i.e. it did not contain seq_id before the call)
     bool seq_keep(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
@@ -687,7 +691,6 @@ public:
     const llama_pos * pos_data() const { return pos.data(); }
     void seqS_add(uint32_t i, int32_t n, llama_seq_id *_seq);
     void compact(llama_seq_id s);
-    uint32_t nextHead(int32_t seq_id, llama_pos p0, llama_pos p1);
   private:
     bool has_shift = false;
 

@@ -45,7 +45,7 @@ static __device__ __forceinline__ float qsa_shuffle_xor(float x) {
         return swapped;
     }
 #else
-    return __shfl_xor_sync(0xffffffff, x, mask, 32);
+    return __shfl_xor_sync(GGML_CUDA_FULL_THREAD_MASK, x, mask, 32);
 #endif
 }
 

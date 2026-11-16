@@ -4,7 +4,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
-#include "common.cuh"
+#include "graph.cuh"
 #include "fusion-rtc.h"
 #include "ggml-fusion.h"
 #include "ggml-cpu.h"
@@ -3111,7 +3111,9 @@ static void split_streams_case(bool tail) {
 #ifdef USE_CUDA_GRAPH
         if (repeat == 4) {
             auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
-            cuda_ctx->evict_cuda_graphs(ggml_time_us() + 11'000'000);
+            const int64_t now = ggml_time_us();
+            cuda_ctx->evict_cuda_graphs(now + 5'000'000);
+            cuda_ctx->evict_cuda_graphs(now + 11'000'000);
         }
 #endif
 

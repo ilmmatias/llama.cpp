@@ -814,7 +814,7 @@ static void test_next_head(testing & t) {
         cells.pos_set(3, 8);
         cells.seq_add(3, 0); // outside the range
 
-        t.assert_equal(0u, cells.nextHead(0, 5, 8));
+        t.assert_equal(0u, cells.seq_rm(0, 5, 8));
 
         t.assert_true(cells.is_empty(0));
         t.assert_equal(1, cells.seq_count(1)); // shared cell kept seq 1
@@ -838,7 +838,7 @@ static void test_next_head(testing & t) {
         cells.seq_add(4, 0);
 
         // both cells are freed; the lowest index is returned
-        t.assert_equal(2u, cells.nextHead(0, 0, 100));
+        t.assert_equal(2u, cells.seq_rm(0, 0, 100));
 
         t.assert_true(cells.is_empty(2));
         t.assert_true(cells.is_empty(4));
@@ -857,10 +857,10 @@ static void test_next_head(testing & t) {
         cells.seq_add(1, 1);
 
         // ranges do not cover any seq-0 cell
-        t.assert_equal(cells.size(), cells.nextHead(0, 0, 5));
-        t.assert_equal(cells.size(), cells.nextHead(0, 8, 100));
+        t.assert_equal(cells.size(), cells.seq_rm(0, 0, 5));
+        t.assert_equal(cells.size(), cells.seq_rm(0, 8, 100));
         // no cell has seq 2
-        t.assert_equal(cells.size(), cells.nextHead(2, 0, 100));
+        t.assert_equal(cells.size(), cells.seq_rm(2, 0, 100));
         t.assert_equal(2u, cells.get_used());
         t.assert_equal(5, cells.seq_pos_min(0));
         t.assert_equal(7, cells.seq_pos_min(1));
@@ -1106,7 +1106,7 @@ static void test_random(testing & t) {
                     }
                 } break;
 
-                case 9: { // nextHead
+                case 9: { // seq_rm
                     const llama_pos p0 = (llama_pos) ((int) (rng() % 40) - 10);
                     const llama_pos p1 = p0 + (llama_pos) (rng() % 60);
 
@@ -1127,7 +1127,7 @@ static void test_random(testing & t) {
                         }
                     }
 
-                    t.assert_equal(new_head, cells.nextHead(s, p0, p1));
+                    t.assert_equal(new_head, cells.seq_rm(s, p0, p1));
                 } break;
 
                 case 10: { // reset_shift

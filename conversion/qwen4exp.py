@@ -43,8 +43,6 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self._ple_shards: dict[int, str] = {}
         self._ple_row_dim: int | None = None
         self._mtp_fc: dict[str, Tensor] = {}
-        # halves of the merged weights, keyed by (bid, merged tensor), see _merge_shared_input
-        self._merge_parts: dict[tuple[int, gguf.MODEL_TENSOR], dict[int, Tensor]] = {}
 
     @classmethod
     def filter_tensors(cls, item):
@@ -177,32 +175,9 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             yield (self.map_tensor_name(name), data_torch.squeeze())
             return
 
-        for new_name, data in super().modify_tensors(data_torch, name, bid):
-            yield from self._merge_shared_input(new_name, data, bid)
+        yield from super().modify_tensors(data_torch, name, bid)
 
-    def _merge_shared_input(self, name: str, data: Tensor, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        # Pre-quantized checkpoints can carry independent scales for each projection.
-        if bid is None or self.hparams.get("quantization_config"):
-            yield (name, data)
-            return
-
-        layer_types = self.hparams.get("layer_types") or []
-        is_linear = bid < len(layer_types) and layer_types[bid] == "linear_attention"
-        for merged, parts, linear_only in gguf.QWEN4EXP_SHARED_INPUT_MERGES:
-            if linear_only and not is_linear:
-                continue
-            for idx, part in enumerate(parts):
-                if not self.match_model_tensor_name(name, part, bid):
-                    continue
-                halves = self._merge_parts.setdefault((bid, merged), {})
-                if idx in halves:
-                    raise ValueError(f"duplicate projection for {name}")
-                halves[idx] = data
-                if len(halves) == 2:
-                    del self._merge_parts[(bid, merged)]
-                    yield (self.format_tensor_name(merged, bid), torch.cat([halves[0], halves[1]], dim=0))
-                return
-        yield (name, data)
+    _SHARED_INPUT_MERGES = gguf.QWEN4EXP_SHARED_INPUT_MERGES
 
     # the shards concatenate into a tensor of well over 100 GB
     # use LazyChunkedTensor here, a single shard resident at a time
@@ -248,8 +223,6 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         super().prepare_tensors()
         if self._mtp_fc:
             raise ValueError(f"MTP projection missing its other half: {sorted(self._mtp_fc)}")
-        if self._merge_parts:
-            raise ValueError(f"merged weights missing a half: {sorted((bid, t.name) for bid, t in self._merge_parts)}")
         n_parts = self.hparams.get("split_ngram_parts", 0)
         if self._ple_shards and len(self._ple_shards) != n_parts:
             raise ValueError(
