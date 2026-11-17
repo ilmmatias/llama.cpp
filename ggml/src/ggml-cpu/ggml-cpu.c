@@ -2767,10 +2767,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_GET_ROWS:
             {
-                // FIXME: get_rows can use additional threads, but the cost of launching additional threads
-                // decreases performance with GPU offloading
-                //n_tasks = n_threads;
-                n_tasks = 1;
+                const int64_t nr = ggml_nelements(node->src[1]);
+                n_tasks = nr >= 512 ? MIN(n_threads, (int)(nr / 64)) : 1;
             } break;
         case GGML_OP_SCALE:
             {

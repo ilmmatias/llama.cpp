@@ -5328,9 +5328,9 @@ static void ggml_compute_forward_get_rows_q(
             if (i01 == last_i01 && last_dst_ptr != nullptr) {
                 memcpy(dst_ptr, last_dst_ptr, nc * sizeof(float));
             } else {
-                // Prefetch next row
-                if (i + 1 < ir1) {
-                    const int64_t next_i01 = *(const int32_t *)(src1_ptr + src1_step);
+                // Prefetch ahead to hide DRAM latency on scattered row gathers (e.g. PLE).
+                if (i + 4 < ir1) {
+                    const int64_t next_i01 = *(const int32_t *)(src1_ptr + 4 * src1_step);
                     const char * next_src0_row = (const char *) src0->data + next_i01 * nb01;
                     __builtin_prefetch(next_src0_row, 0, 1);
                     __builtin_prefetch(next_src0_row + 64, 0, 1);
@@ -12103,24 +12103,111 @@ void ggml_compute_forward_moe_reduce(
     const int64_t n_embd   = experts->ne[0];
     const int64_t n_used   = experts->ne[1];
     const int64_t n_tokens = experts->ne[2];
-    const int64_t dr = (n_tokens + params->nth - 1) / params->nth;
-    const int64_t t0 = dr * params->ith;
-    const int64_t t1 = std::min(t0 + dr, n_tokens);
 
-    for (int64_t t = t0; t < t1; ++t) {
-        const float * src = (const float *) experts->data + t*n_used*n_embd;
-        const float * w   = (const float *) weights->data + t*n_used;
-        float * out = (float *) dst->data + t*n_embd;
-
-        for (int64_t i = 0; i < n_embd; ++i) {
-            out[i] = src[i] * w[0];
+    const auto reduce_slice = [n_embd, n_used](const float * src, const float * w, float * out, int64_t i0, int64_t i1) {
+        int64_t i = i0;
+        const float w0 = w[0];
+#if defined(__AVX512F__)
+        const __m512 w0v = _mm512_set1_ps(w0);
+        for (; i + 64 <= i1; i += 64) {
+            __m512 a0 = _mm512_mul_ps(_mm512_loadu_ps(src + i +  0), w0v);
+            __m512 a1 = _mm512_mul_ps(_mm512_loadu_ps(src + i + 16), w0v);
+            __m512 a2 = _mm512_mul_ps(_mm512_loadu_ps(src + i + 32), w0v);
+            __m512 a3 = _mm512_mul_ps(_mm512_loadu_ps(src + i + 48), w0v);
+            for (int64_t e = 1; e < n_used; ++e) {
+                const float * row = src + e * n_embd + i;
+                const __m512 we = _mm512_set1_ps(w[e]);
+                a0 = _mm512_fmadd_ps(_mm512_loadu_ps(row +  0), we, a0);
+                a1 = _mm512_fmadd_ps(_mm512_loadu_ps(row + 16), we, a1);
+                a2 = _mm512_fmadd_ps(_mm512_loadu_ps(row + 32), we, a2);
+                a3 = _mm512_fmadd_ps(_mm512_loadu_ps(row + 48), we, a3);
+            }
+            _mm512_storeu_ps(out + i +  0, a0);
+            _mm512_storeu_ps(out + i + 16, a1);
+            _mm512_storeu_ps(out + i + 32, a2);
+            _mm512_storeu_ps(out + i + 48, a3);
         }
-        for (int64_t e = 1; e < n_used; ++e) {
-            const float * row = src + e*n_embd;
-            for (int64_t i = 0; i < n_embd; ++i) {
-                out[i] += row[i] * w[e];
+#elif defined(__AVX2__) && defined(__FMA__)
+        const __m256 w0v = _mm256_set1_ps(w0);
+        for (; i + 32 <= i1; i += 32) {
+            __m256 a0 = _mm256_mul_ps(_mm256_loadu_ps(src + i +  0), w0v);
+            __m256 a1 = _mm256_mul_ps(_mm256_loadu_ps(src + i +  8), w0v);
+            __m256 a2 = _mm256_mul_ps(_mm256_loadu_ps(src + i + 16), w0v);
+            __m256 a3 = _mm256_mul_ps(_mm256_loadu_ps(src + i + 24), w0v);
+            for (int64_t e = 1; e < n_used; ++e) {
+                const float * row = src + e * n_embd + i;
+                const __m256 we = _mm256_set1_ps(w[e]);
+                a0 = _mm256_fmadd_ps(_mm256_loadu_ps(row +  0), we, a0);
+                a1 = _mm256_fmadd_ps(_mm256_loadu_ps(row +  8), we, a1);
+                a2 = _mm256_fmadd_ps(_mm256_loadu_ps(row + 16), we, a2);
+                a3 = _mm256_fmadd_ps(_mm256_loadu_ps(row + 24), we, a3);
+            }
+            _mm256_storeu_ps(out + i +  0, a0);
+            _mm256_storeu_ps(out + i +  8, a1);
+            _mm256_storeu_ps(out + i + 16, a2);
+            _mm256_storeu_ps(out + i + 24, a3);
+        }
+#endif
+        constexpr int64_t k_tile = 64;
+        for (; i + k_tile <= i1; i += k_tile) {
+            float acc[k_tile];
+            for (int64_t j = 0; j < k_tile; ++j) {
+                acc[j] = src[i + j] * w0;
+            }
+            for (int64_t e = 1; e < n_used; ++e) {
+                const float * row = src + e * n_embd + i;
+                const float we = w[e];
+                for (int64_t j = 0; j < k_tile; ++j) {
+                    acc[j] += row[j] * we;
+                }
+            }
+            memcpy(out + i, acc, sizeof(acc));
+        }
+        if (i < i1) {
+            for (int64_t j = i; j < i1; ++j) {
+                out[j] = src[j] * w0;
+            }
+            for (int64_t e = 1; e < n_used; ++e) {
+                const float * row = src + e * n_embd;
+                const float we = w[e];
+                for (int64_t j = i; j < i1; ++j) {
+                    out[j] += row[j] * we;
+                }
             }
         }
+    };
+
+    if (n_tokens >= params->nth) {
+        const int64_t dr = (n_tokens + params->nth - 1) / params->nth;
+        const int64_t t0 = dr * params->ith;
+        const int64_t t1 = std::min(t0 + dr, n_tokens);
+
+        for (int64_t t = t0; t < t1; ++t) {
+            const float * src = (const float *) experts->data + t * n_used * n_embd;
+            const float * w   = (const float *) weights->data + t * n_used;
+            float * out       = (float *) dst->data + t * n_embd;
+            reduce_slice(src, w, out, 0, n_embd);
+        }
+        return;
+    }
+
+    // Parallelize across feature chunks when few tokens are active (e.g. TG or small batches).
+    constexpr int64_t chunk_elems = 64;
+    const int64_t n_chunks = (n_embd + chunk_elems - 1) / chunk_elems;
+    const int64_t total_chunks = n_tokens * n_chunks;
+    const int64_t dc = (total_chunks + params->nth - 1) / params->nth;
+    const int64_t c0 = dc * params->ith;
+    const int64_t c1 = std::min(c0 + dc, total_chunks);
+
+    for (int64_t c = c0; c < c1; ++c) {
+        const int64_t t  = c / n_chunks;
+        const int64_t ic = c - t * n_chunks;
+        const int64_t i0 = ic * chunk_elems;
+        const int64_t i1 = std::min(i0 + chunk_elems, n_embd);
+        const float * src = (const float *) experts->data + t * n_used * n_embd;
+        const float * w   = (const float *) weights->data + t * n_used;
+        float * out       = (float *) dst->data + t * n_embd;
+        reduce_slice(src, w, out, i0, i1);
     }
 }
 
