@@ -1080,47 +1080,14 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     vh[0] = qh[0] >> bq8_offset;
     vh[1] = qh[4] >> bq8_offset;
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
-    // Same latency-hiding exception as Q4_K.
-    const uint16_t * scales = (const uint16_t *)bq5_K->scales;
     uint16_t aux[2];
-    const int j = bq8_offset/2;
-    if (j < 2) {
-        aux[0] = scales[j+0] & 0x3f3f;
-        aux[1] = scales[j+2] & 0x3f3f;
-    } else {
-        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
-        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
-    }
-#else
-    const uint16_t * scales = (const uint16_t *)bq5_K->scales;
-    const int j  = bq8_offset/2;
-    const int jm = j & 1;
+    vec_dot_q45_K_unpack_scales_q8<QR5_K>(bq5_K->scales, bq8_1, bq8_offset, iqs, aux, u, d8, s8);
 
-    const uint32_t s0 = scales[jm + 0];
-    const uint32_t s2 = scales[jm + 2];
-    const uint32_t s4 = scales[jm + 4];
-
-    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
-
-    uint16_t aux[2];
-    aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
-    aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
-#endif
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
+    const bool add_m = (iqs & 6) == 0;
 
-#pragma unroll
-    for (int i = 0; i < QR5_K; ++i) {
-        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
-        d8[i] = __low2float(bq8i->ds);
-
-        const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
-        u[2*i+0] = q8[0];
-        u[2*i+1] = q8[4];
-    }
-
-    return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
+    return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8, s8, add_m);
 }
 
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
@@ -1445,28 +1412,48 @@ static __device__ __forceinline__ float vec_dot_iq1_m_q8_1(
 #define VDR_ZNQ_Q8_1_MMVQ 8
 
 template <int bits, int vdr, int group = 16, int selector_bits = group == 4 ? 3 : 4>
-static __device__ __forceinline__ float vec_dot_znq_q8_1(
-        const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const int & kbx, const int & iqs) {
+static __device__ __forceinline__ float vec_dot_znq_q8_1_lds(
+        const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const int & kbx, const int & iqs,
+        const int8_t * table_lds) {
     const uint8_t * block = (const uint8_t *) vx + kbx*(znq_header_cuda<bits, group, selector_bits>() + 4*bits);
-    constexpr int step = bits >= 6 ? 2 : 1;
     int sum0 = 0;
     int sum1 = 0;
+    if constexpr (bits == 6 && (vdr == 4 || vdr == 8)) {
+        const uint32_t books = znq6_load_books_cuda<group, selector_bits>(block);
 #pragma unroll
-    for (int l = 0; l < vdr; l += step) {
-        sum0 = ggml_cuda_dp4a(znq_pack4_cuda<bits, (vdr > 1), group, selector_bits>(block, 4*(iqs + l)), get_int_b2(y->qs, iqs + l), sum0);
-        if constexpr (bits >= 6) {
-            if (l + 1 < vdr) {
-                sum1 = ggml_cuda_dp4a(znq_pack4_cuda<bits, (vdr > 1), group, selector_bits>(block, 4*(iqs + l + 1)), get_int_b2(y->qs, iqs + l + 1), sum1);
+        for (int h = 0; h < vdr; h += 4) {
+            int qs[4];
+            znq6_decode_4quads_cuda<group, selector_bits>(block, books, iqs + h, table_lds, qs);
+            sum0 = ggml_cuda_dp4a(qs[0], get_int_b2(y->qs, iqs + h + 0), sum0);
+            sum1 = ggml_cuda_dp4a(qs[1], get_int_b2(y->qs, iqs + h + 1), sum1);
+            sum0 = ggml_cuda_dp4a(qs[2], get_int_b2(y->qs, iqs + h + 2), sum0);
+            sum1 = ggml_cuda_dp4a(qs[3], get_int_b2(y->qs, iqs + h + 3), sum1);
+        }
+    } else {
+        constexpr int step = bits >= 6 ? 2 : 1;
+#pragma unroll
+        for (int l = 0; l < vdr; l += step) {
+            sum0 = ggml_cuda_dp4a(znq_pack4_cuda<bits, (vdr > 1), group, selector_bits>(block, 4*(iqs + l), table_lds), get_int_b2(y->qs, iqs + l), sum0);
+            if constexpr (bits >= 6) {
+                if (l + 1 < vdr) {
+                    sum1 = ggml_cuda_dp4a(znq_pack4_cuda<bits, (vdr > 1), group, selector_bits>(block, 4*(iqs + l + 1), table_lds), get_int_b2(y->qs, iqs + l + 1), sum1);
+                }
             }
         }
     }
     return znq_scale_cuda(block[0]) * __low2float(y->ds) * (sum0 + sum1);
 }
 
+template <int bits, int vdr, int group = 16, int selector_bits = group == 4 ? 3 : 4>
+static __device__ __forceinline__ float vec_dot_znq_q8_1(
+        const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const int & kbx, const int & iqs) {
+    return vec_dot_znq_q8_1_lds<bits, vdr, group, selector_bits>(vx, y, kbx, iqs, nullptr);
+}
+
 template <ggml_type type, int vdr, int ncols>
 static __device__ __forceinline__ void vec_dot_znq_q8_1_multi(
         const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const int kbx, const int iqs,
-        const uint32_t stride_col_y, float (&dst)[ncols]) {
+        const uint32_t stride_col_y, float (&dst)[ncols], const int8_t * table_lds = nullptr) {
     constexpr int bits = znq_bits_cuda(type);
     constexpr int group = znq_group_cuda(type);
     constexpr int selector_bits = znq_selector_bits_cuda(type);
@@ -1475,22 +1462,38 @@ static __device__ __forceinline__ void vec_dot_znq_q8_1_multi(
     // Wide output tiles need the registers for activations and accumulators.
     constexpr int book_bytes_per_quad = (1 << bits)*4/group;
     constexpr bool reuse_book = vdr > 1 && !(ncols >= 8 && book_bytes_per_quad >= 16);
-    constexpr int step = bits >= 6 ? 2 : 1;
     int sum0[ncols] = {0};
     int sum1[ncols] = {0};
+    if constexpr (bits == 6 && (vdr == 4 || vdr == 8)) {
+        const uint32_t books = znq6_load_books_cuda<group, selector_bits>(block);
 #pragma unroll
-    for (int l = 0; l < vdr; l += step) {
-        const int q0 = znq_pack4_cuda<bits, reuse_book, group, selector_bits>(block, 4*(iqs + l));
+        for (int h = 0; h < vdr; h += 4) {
+            int qs[4];
+            znq6_decode_4quads_cuda<group, selector_bits>(block, books, iqs + h, table_lds, qs);
 #pragma unroll
-        for (int j = 0; j < ncols; ++j) {
-            sum0[j] = ggml_cuda_dp4a(q0, get_int_b2(y[j*stride_col_y].qs, iqs + l), sum0[j]);
+            for (int j = 0; j < ncols; ++j) {
+                sum0[j] = ggml_cuda_dp4a(qs[0], get_int_b2(y[j*stride_col_y].qs, iqs + h + 0), sum0[j]);
+                sum1[j] = ggml_cuda_dp4a(qs[1], get_int_b2(y[j*stride_col_y].qs, iqs + h + 1), sum1[j]);
+                sum0[j] = ggml_cuda_dp4a(qs[2], get_int_b2(y[j*stride_col_y].qs, iqs + h + 2), sum0[j]);
+                sum1[j] = ggml_cuda_dp4a(qs[3], get_int_b2(y[j*stride_col_y].qs, iqs + h + 3), sum1[j]);
+            }
         }
-        if constexpr (bits >= 6) {
-            if (l + 1 < vdr) {
-                const int q1 = znq_pack4_cuda<bits, reuse_book, group, selector_bits>(block, 4*(iqs + l + 1));
+    } else {
+        constexpr int step = bits >= 6 ? 2 : 1;
 #pragma unroll
-                for (int j = 0; j < ncols; ++j) {
-                    sum1[j] = ggml_cuda_dp4a(q1, get_int_b2(y[j*stride_col_y].qs, iqs + l + 1), sum1[j]);
+        for (int l = 0; l < vdr; l += step) {
+            const int q0 = znq_pack4_cuda<bits, reuse_book, group, selector_bits>(block, 4*(iqs + l), table_lds);
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                sum0[j] = ggml_cuda_dp4a(q0, get_int_b2(y[j*stride_col_y].qs, iqs + l), sum0[j]);
+            }
+            if constexpr (bits >= 6) {
+                if (l + 1 < vdr) {
+                    const int q1 = znq_pack4_cuda<bits, reuse_book, group, selector_bits>(block, 4*(iqs + l + 1), table_lds);
+#pragma unroll
+                    for (int j = 0; j < ncols; ++j) {
+                        sum1[j] = ggml_cuda_dp4a(q1, get_int_b2(y[j*stride_col_y].qs, iqs + l + 1), sum1[j]);
+                    }
                 }
             }
         }

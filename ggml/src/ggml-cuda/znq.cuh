@@ -80,6 +80,18 @@ static __host__ __device__ constexpr int znq_header_cuda() {
     return 1 + (QK_ZNQ/group)*selector_bits/8;
 }
 
+static __host__ __device__ constexpr int znq_lds_table_nbytes_cuda(ggml_type type) {
+#if defined(GGML_USE_HIP)
+    const int bits = znq_bits_cuda(type);
+    if (bits == 5 || bits == 6) {
+        return (1 << znq_selector_bits_cuda(type)) << bits;
+    }
+#else
+    GGML_UNUSED(type);
+#endif
+    return 0;
+}
+
 template <int bits, int group, int selector_bits = group == 4 ? 3 : 4>
 static __device__ __forceinline__ const int8_t * znq_values_cuda() {
     if constexpr (group == 4 && selector_bits == 4) {
@@ -137,7 +149,8 @@ static __device__ __forceinline__ int znq_value_cuda(const uint8_t * block, int 
 }
 
 template <int bits, bool reuse_book = false, int group = 16, int selector_bits = group == 4 ? 3 : 4>
-static __device__ __forceinline__ int znq_pack4_cuda(const uint8_t * block, int j) {
+static __device__ __forceinline__ int znq_pack4_cuda(
+        const uint8_t * block, int j, const int8_t * table_lds = nullptr) {
     uint32_t codes;
     if constexpr (bits == 1) {
         // Four-aligned indices select one nibble of a one-bit payload byte.
@@ -249,10 +262,87 @@ static __device__ __forceinline__ int znq_pack4_cuda(const uint8_t * block, int 
             packed |= uint32_t(uint8_t(znq_values_cuda<bits, group, selector_bits>()[book * 4 + code])) << (8 * k);
         } else if constexpr (bits == 3) {
             packed |= uint32_t(uint8_t(znq_values_cuda<bits, group, selector_bits>()[book * 8 + code])) << (8 * k);
+        } else if (table_lds) {
+            packed |= uint32_t(uint8_t(table_lds[book * (1 << bits) + code])) << (8 * k);
         } else {
             packed |= uint32_t(uint8_t(znq_values_cuda<bits, group, selector_bits>()[book * (1 << bits) + code])) << (8 * k);
         }
     }
 
     return int(packed);
+}
+
+template <ggml_type type>
+static __device__ __forceinline__ void znq_load_table_lds_cuda(int8_t * dst_lds, int tid, int nthreads) {
+    constexpr int bits = znq_bits_cuda(type);
+    constexpr int group = znq_group_cuda(type);
+    constexpr int selector_bits = znq_selector_bits_cuda(type);
+    constexpr int nwords = ((1 << selector_bits) << bits) / int(sizeof(uint32_t));
+    const uint32_t * src = (const uint32_t *) znq_values_cuda<bits, group, selector_bits>();
+    uint32_t * dst = (uint32_t *) dst_lds;
+    for (int i = tid; i < nwords; i += nthreads) {
+        dst[i] = src[i];
+    }
+}
+
+template <int group, int selector_bits>
+static __device__ __forceinline__ uint32_t znq6_load_books_cuda(const uint8_t * block) {
+    if constexpr (group == 16) {
+        return block[1];
+    } else if constexpr (group == 8) {
+        return uint32_t(block[1]) | (uint32_t(block[2]) << 8);
+    } else if constexpr (selector_bits == 4) {
+        uint32_t books;
+        memcpy(&books, block + 1, sizeof(books));
+        return books;
+    } else {
+        uint32_t hdr;
+        memcpy(&hdr, block, sizeof(hdr));
+        return hdr >> 8;
+    }
+}
+
+template <int group, int selector_bits>
+static __device__ __forceinline__ int znq6_select_book_cuda(uint32_t books, int q) {
+    if constexpr (group == 16) {
+        return (books >> (4 * (q >> 2))) & 15;
+    } else if constexpr (group == 8) {
+        return (books >> (4 * (q >> 1))) & 15;
+    } else if constexpr (selector_bits == 4) {
+        return (books >> (4 * q)) & 15;
+    } else {
+        return (books >> (3 * q)) & 7;
+    }
+}
+
+template <int group, int selector_bits>
+static __device__ __forceinline__ int znq6_pack4_codes_cuda(
+        uint32_t codes, int book, const int8_t * table_lds) {
+    uint32_t packed = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int code = (codes >> (6 * k)) & 63;
+        if (table_lds) {
+            packed |= uint32_t(uint8_t(table_lds[(book << 6) + code])) << (8 * k);
+        } else {
+            packed |= uint32_t(uint8_t(znq_values_cuda<6, group, selector_bits>()[(book << 6) + code])) << (8 * k);
+        }
+    }
+    return int(packed);
+}
+
+// Decode four consecutive 6-bit quads starting at quad index q0 (0 or 4) from 3 uint32 payload words.
+template <int group, int selector_bits>
+static __device__ __forceinline__ void znq6_decode_4quads_cuda(
+        const uint8_t * block, uint32_t books, int q0, const int8_t * table_lds, int (&out)[4]) {
+    uint32_t w[3];
+    memcpy(w, block + znq_header_cuda<6, group, selector_bits>() + 3 * q0, sizeof(w));
+    const uint32_t c0 = w[0];
+    const uint32_t c1 = (w[0] >> 24) | (w[1] << 8);
+    const uint32_t c2 = (w[1] >> 16) | (w[2] << 16);
+    const uint32_t c3 = w[2] >> 8;
+    out[0] = znq6_pack4_codes_cuda<group, selector_bits>(c0, znq6_select_book_cuda<group, selector_bits>(books, q0 + 0), table_lds);
+    out[1] = znq6_pack4_codes_cuda<group, selector_bits>(c1, znq6_select_book_cuda<group, selector_bits>(books, q0 + 1), table_lds);
+    out[2] = znq6_pack4_codes_cuda<group, selector_bits>(c2, znq6_select_book_cuda<group, selector_bits>(books, q0 + 2), table_lds);
+    out[3] = znq6_pack4_codes_cuda<group, selector_bits>(c3, znq6_select_book_cuda<group, selector_bits>(books, q0 + 3), table_lds);
 }

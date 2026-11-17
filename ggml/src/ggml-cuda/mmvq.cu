@@ -37,7 +37,7 @@ typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_
 // RDNA2 local-book formats use different dot widths to balance unpacking and register pressure.
 static constexpr __host__ __device__ int get_vdr_znq_rdna2(ggml_type type, int fallback = VDR_ZNQ_Q8_1_MMVQ) {
     switch (type) {
-        case GGML_TYPE_ZNQ6_M: return 2;
+        case GGML_TYPE_ZNQ6_M: return 8;
         case GGML_TYPE_ZNQ6_L: return 4;
         default: return fallback;
     }
@@ -708,8 +708,35 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     return 1;
 }
 
+template <ggml_type type, int ncols_dst = 1>
+static __device__ __forceinline__ const int8_t * mmvq_init_znq_lds(int8_t * znq_table_lds) {
+#if defined(GGML_USE_HIP)
+    if constexpr (ncols_dst > 1 && znq_lds_table_nbytes_cuda(type) > 0) {
+        znq_load_table_lds_cuda<type>(
+            znq_table_lds, threadIdx.y * blockDim.x + threadIdx.x, blockDim.y * blockDim.x);
+        __syncthreads();
+        return znq_table_lds;
+    }
+#endif
+    GGML_UNUSED(znq_table_lds);
+    return nullptr;
+}
+
+template <ggml_type type, int vdr>
+static __device__ __forceinline__ float mmvq_vec_dot(
+        vec_dot_q_cuda_t vec_dot_q_cuda, const void * __restrict__ vx, const block_q8_1 * __restrict__ y,
+        const int kbx, const int kqs, const int8_t * znq_table) {
+    if constexpr (znq_bits_cuda(type) != 0) {
+        return vec_dot_znq_q8_1_lds<znq_bits_cuda(type), vdr, znq_group_cuda(type), znq_selector_bits_cuda(type)>(
+            vx, y, kbx, kqs, znq_table);
+    } else {
+        GGML_UNUSED(znq_table);
+        return vec_dot_q_cuda(vx, y, kbx, kqs);
+    }
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int rows_override = 0, int subgroups = 1, int vdr_override = 0>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
+__launch_bounds__(((get_device_table_id() == MMVQ_PARAMETERS_RDNA2 && subgroups > 1) ? 1 : calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters))*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -727,7 +754,7 @@ static __global__ void mul_mat_vec_q(
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int rows_per_warp = table_id == MMVQ_PARAMETERS_RDNA2 ? subgroups : 1;
     constexpr int vdr = vdr_override ? vdr_override : get_vdr_mmvq(type);
-    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+    constexpr int nwarps = rows_per_warp > 1 ? 1 : calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
     constexpr int rows_per_thread = rows_per_warp > 1 ? 1 : rows_override ? rows_override : calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size() / rows_per_warp;
     static_assert(rows_per_warp == 1 || (nwarps == 1 && ncols_dst == 1), "subgroup rows require one physical wave and one column");
@@ -737,6 +764,10 @@ static __global__ void mul_mat_vec_q(
     constexpr bool supports_gate = ncols_dst == 1;
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda<type, vdr>();
+
+    constexpr int znq_lds_bytes = ncols_dst > 1 ? znq_lds_table_nbytes_cuda(type) : 0;
+    __shared__ alignas(4) int8_t znq_table_lds[znq_lds_bytes > 0 ? znq_lds_bytes : 1];
+    const int8_t * znq_table = mmvq_init_znq_lds<type, ncols_dst>(znq_table_lds);
 
     const     int lane = threadIdx.x % warp_size;
     const     int tid = warp_size*threadIdx.y + lane;
@@ -880,7 +911,7 @@ static __global__ void mul_mat_vec_q(
                     continue;
                 }
                 float sums[ncols_dst];
-                vec_dot_znq_q8_1_multi<type, vdr>(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs, stride_col_y, sums);
+                vec_dot_znq_q8_1_multi<type, vdr>(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs, stride_col_y, sums, znq_table);
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
                     tmp[j][i] += sums[j];
@@ -894,12 +925,12 @@ static __global__ void mul_mat_vec_q(
                     if (rows_per_thread > 1 && uint32_t(row0 + i) >= nrows_x) {
                         continue;
                     }
-                    tmp[j][i] += vec_dot_q_cuda(
-                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    tmp[j][i] += mmvq_vec_dot<type, vdr>(
+                        vec_dot_q_cuda, vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs, znq_table);
                     if constexpr (has_fusion && supports_gate) {
                         if (use_gate) {
-                            tmp_gate[j][i] += vec_dot_q_cuda(
-                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                            tmp_gate[j][i] += mmvq_vec_dot<type, vdr>(
+                                vec_dot_q_cuda, vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs, znq_table);
                         }
                     }
                 }
@@ -1030,6 +1061,10 @@ static __global__ void mul_mat_vec_q_moe(
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
+    constexpr int znq_lds_bytes = znq_lds_table_nbytes_cuda(type);
+    __shared__ alignas(4) int8_t znq_table_lds[znq_lds_bytes > 0 ? znq_lds_bytes : 1];
+    const int8_t * znq_table = mmvq_init_znq_lds<type, 2>(znq_table_lds);
+
     const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
     if (shared_expert) {
         vx = fusion.shared_up;
@@ -1091,10 +1126,10 @@ static __global__ void mul_mat_vec_q_moe(
             if (c_rows_per_block > 1 && uint32_t(row0 + i) >= nrows_x) {
                 continue;
             }
-            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            tmp[i] += mmvq_vec_dot<type, vdr>(vec_dot_q_cuda, vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs, znq_table);
             if constexpr (has_fusion) {
                 if (use_gate) {
-                    tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    tmp_gate[i] += mmvq_vec_dot<type, vdr>(vec_dot_q_cuda, vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs, znq_table);
                 }
             }
         }
@@ -1169,8 +1204,8 @@ static __global__ void mul_mat_vec_q_moe(
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
-        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false, const int rows_override = 0) {
-    const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false, const int rows_override = 0, const bool force_1warp = false) {
+    const int nwarps = force_1warp ? 1 : calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
     const int rpb = rows_override ? rows_override : calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
@@ -1285,7 +1320,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             // Four-row groups need enough output rows to populate the device.
             return nrows_x >= 4096 && ncols_x >= (type == GGML_TYPE_ZNQ6_M ? 2048 : 4096);
         }
-        if (table_id == MMVQ_PARAMETERS_RDNA2 && c_ncols_dst == 1 && calc_nwarps(type, c_ncols_dst, table_id) > 1) {
+        if (table_id == MMVQ_PARAMETERS_RDNA2 && c_ncols_dst == 1 && type == GGML_TYPE_Q8_0) {
             // Group medium-K rows only when enough rows remain to populate the device.
             const int grouped_k_limit = nrows_x >= 128 ? 16 : 4;
             return nrows_x >= 1024 || blocks_per_row_x < grouped_k_limit * blocks_per_iter_1warp;
@@ -1365,9 +1400,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
 #if defined(GGML_USE_HIP)
     if constexpr (znq_bits_cuda(type) != 0) {
-        // ZNQ6_M dense decode benefits from four quads per lane without grouping output rows.
-        // Keep the existing dot width for routed experts and multi-token projections.
-        constexpr int dense_vdr = type == GGML_TYPE_ZNQ6_M ? 4 : get_vdr_znq_rdna2(type);
+        // ZNQ6_M benefits from full-block (vdr=8) 4-quad decode per lane on RDNA2.
+        constexpr int dense_vdr = get_vdr_znq_rdna2(type);
         const bool dense_rdna2 = table_id == MMVQ_PARAMETERS_RDNA2 && ncols_dst == 1 && !has_ids && !fusion.shared_up;
 
         // Developer overrides isolate row grouping and dot width in the same binary.
@@ -1423,7 +1457,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         constexpr int subgroups = 4;
         const int dense_blocks_per_iter = dense_vdr * warp_size / qi;
         if (dense_rdna2 && nrows_x >= 1024 && blocks_per_row_x <= dense_blocks_per_iter / 2) {
-            const auto dims = calc_launch_params<type>(1, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, false, subgroups);
+            const auto dims = calc_launch_params<type>(1, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, false, subgroups, true);
             constexpr int subgroup_vdr = type == GGML_TYPE_ZNQ6_M ? dense_vdr : 0;
             mul_mat_vec_q_switch_fusion<type, 1, false, false, 0, subgroups, subgroup_vdr>(
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1434,7 +1468,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
         if constexpr (type == GGML_TYPE_ZNQ6_M) {
             if (dense_rdna2) {
-                const auto dims = calc_launch_params<type>(1, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, false, 1);
+                const auto dims = calc_launch_params<type>(1, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, true, 1);
                 mul_mat_vec_q_switch_fusion<type, 1, false, false, 1, 1, dense_vdr>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
@@ -2190,6 +2224,10 @@ static __global__ void mul_mat_vec_q_glu_q8_1(
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
+    constexpr int znq_lds_bytes = znq_lds_table_nbytes_cuda(type);
+    __shared__ alignas(4) int8_t znq_table_lds[znq_lds_bytes > 0 ? znq_lds_bytes : 1];
+    const int8_t * znq_table = mmvq_init_znq_lds<type, 2>(znq_table_lds);
+
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
     const int route = blockIdx.y;
@@ -2216,8 +2254,8 @@ static __global__ void mul_mat_vec_q_glu_q8_1(
         for (int kbx = lane / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
             const int kby = kbx * (qk / QK8_1);
             const int kqs = vdr * (lane % (qi / vdr));
-            tmp_up += vec_dot_q_cuda(up, &y_token[kby], kbx_offset + kbx, kqs);
-            tmp_gate += vec_dot_q_cuda(gate, &y_token[kby], kbx_offset + kbx, kqs);
+            tmp_up   += mmvq_vec_dot<type, vdr>(vec_dot_q_cuda, up,   &y_token[kby], kbx_offset + kbx, kqs, znq_table);
+            tmp_gate += mmvq_vec_dot<type, vdr>(vec_dot_q_cuda, gate, &y_token[kby], kbx_offset + kbx, kqs, znq_table);
         }
 
         tmp_up   = warp_reduce_sum<warp_size>(tmp_up);
