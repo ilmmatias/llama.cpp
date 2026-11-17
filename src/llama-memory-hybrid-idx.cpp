@@ -931,10 +931,13 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
 
     // one pass per stream: cell j is a different token in each, so no mapping is shared
-    std::vector<int32_t> blk_of(n_kv);
+    const bool need_blk_of = dst_cell_blk != nullptr || !blk_bias;
+    std::vector<int32_t> blk_of(need_blk_of ? n_kv : 0);
     std::vector<int32_t> filled(n_blocks);
 
     std::vector<int32_t> cur_blk_cells(r*n_blocks);
+    std::vector<uint32_t> blk_cells(r);
+    std::vector<float> base_blk_bias(blk_bias ? n_blocks : 0);
 
     std::vector<int32_t> order;
     std::vector<int32_t> rank;
@@ -971,7 +974,9 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         auto group_cells = [&]() {
             // an incomplete block cannot be pooled; the bias below forces those tail cells in
             // -1 means no usable block, and block 0 only keeps the gather in range
-            std::fill(blk_of.begin(),  blk_of.end(),  -1);
+            if (need_blk_of) {
+                std::fill(blk_of.begin(), blk_of.end(), -1);
+            }
             std::fill(filled.begin(),  filled.end(),   0);
             std::fill(cur_blk_cells.begin(), cur_blk_cells.end(), -1);
 
@@ -996,7 +1001,9 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 const bool slot_filled = cur_blk_cells[slot] >= 0;
                 dup |= slot_filled;
 
-                blk_of[j] = (int32_t) b;
+                if (need_blk_of) {
+                    blk_of[j] = (int32_t) b;
+                }
                 cur_blk_cells[slot] = (int32_t) j;
                 // Shared sequences can have distinct cells at the same position.
                 // A pool is complete only when every position has a source cell.
@@ -1079,18 +1086,18 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 sec_pos[3] = p;
             }
 
-            llama_memory_hybrid_idx::qsa_block now;
-            now.cells.resize(r);
             for (int64_t ir = 0; ir < r; ++ir) {
                 const int64_t global_src = stream_off + cur_blk_cells[b*r + ir];
                 GGML_ASSERT(global_src <= std::numeric_limits<int32_t>::max());
-                now.cells[ir] = (uint32_t) global_src;
+                blk_cells[ir] = (uint32_t) global_src;
             }
 
             bool refresh = false;
-            if (!cached[b].valid || cached[b].cells != now.cells) {
+            if (!cached[b].valid || cached[b].cells != blk_cells) {
                 mem->qsa_release_slot(ratio, cached[b]);
 
+                llama_memory_hybrid_idx::qsa_block now;
+                now.cells = blk_cells;
                 bool is_new = false;
                 now.cache_slot = mem->qsa_acquire_slot(ratio, now.cells, is_new);
                 now.valid = true;
@@ -1141,12 +1148,20 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
         // per-block mode keeps an unpooled cell's real block, so the block's own -inf reaches it
         // per-cell mode carries that -inf itself and only needs the gather in range
-        for (int64_t j = 0; j < n_kv; ++j) {
-            if (blk_of[j] >= 0 && filled[blk_of[j]] < r && !blk_bias) {
-                blk_of[j] = -1;
+        if (need_blk_of) {
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (blk_of[j] >= 0 && filled[blk_of[j]] < r && !blk_bias) {
+                    blk_of[j] = -1;
+                }
+                if (cur_cell_blk != nullptr) {
+                    cur_cell_blk[j] = blk_of[j] < 0 ? 0 : blk_of[j];
+                }
             }
-            if (cur_cell_blk != nullptr) {
-                cur_cell_blk[j] = blk_of[j] < 0 ? 0 : blk_of[j];
+        }
+
+        if (blk_bias) {
+            for (int64_t b = 0; b < n_blocks; ++b) {
+                base_blk_bias[b] = filled[b] < r ? -INFINITY : 0.0f;
             }
         }
 
@@ -1189,16 +1204,21 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 // The legacy expanded path still gets its future masking before token top-k.
                 float * cur_blk_bias = dst_bias + i*n_blocks;
 
-                for (int64_t b = 0; b < n_blocks; ++b) {
-                    const int64_t b0 = b*r;
-                    if (dst_block_cells != nullptr && b0 > q) {
-                        cur_blk_bias[b] = -INFINITY;
-                    } else if (b0 >= tail_start) {
-                        // finite, so it can never meet a -inf and produce a nan
-                        cur_blk_bias[b] = 1e9f;
-                    } else {
-                        cur_blk_bias[b] = filled[b] < r ? -INFINITY : 0.0f;
-                    }
+                const int64_t past_blk = dst_block_cells != nullptr ?
+                    (q >= 0 ? std::min(n_blocks, q/r + 1) : 0) : n_blocks;
+                const int64_t tail_blk = tail_start <= 0 ? 0 :
+                    std::min(n_blocks, (tail_start + r - 1)/r);
+                const int64_t n_base = std::min(tail_blk, past_blk);
+                const int64_t n_tail = std::max(n_base, past_blk);
+
+                if (n_base > 0) {
+                    std::memcpy(cur_blk_bias, base_blk_bias.data(), (size_t) n_base * sizeof(float));
+                }
+                if (n_tail > n_base) {
+                    std::fill(cur_blk_bias + n_base, cur_blk_bias + n_tail, 1e9f);
+                }
+                if (n_tail < n_blocks) {
+                    std::fill(cur_blk_bias + n_tail, cur_blk_bias + n_blocks, -INFINITY);
                 }
 
                 continue;
