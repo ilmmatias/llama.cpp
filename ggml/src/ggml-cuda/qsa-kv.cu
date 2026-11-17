@@ -310,6 +310,12 @@ static __global__ void resolve_pages(
 
     // Admit only as many misses as can fit without evicting selected hits.
     const int need       = min(n_misses, state.n_slots - n_protected);
+    if (need <= 0) {
+        if (threadIdx.x == 0) {
+            state.control[1] = 0;
+        }
+        return;
+    }
     const int scan_width = min(resolve_threads, state.n_slots);
     const int lane       = threadIdx.x % WARP_SIZE;
     const int warp       = threadIdx.x / WARP_SIZE;
@@ -519,16 +525,17 @@ void ggml_cuda_qsa_kv_prepare(
 
     // K and V have independent page tables. Resolve and fill them in parallel
     // rather than serializing two otherwise identical launch sequences.
+    const int copy_blocks = n_indices <= 4096 ? 32 : 96;
     resolve_pages<<<n_caches, resolve_threads, 0, ctx.stream()>>>(
             *state_k, *state_v, indices, n_indices, offset_k, offset_v, K->nb[1], V->nb[1]);
-    copy_pages<<<dim3(96, n_caches), 128, 0, ctx.stream()>>>(*state_k, *state_v);
+    copy_pages<<<dim3(copy_blocks, n_caches), 256, 0, ctx.stream()>>>(*state_k, *state_v);
 
     // Aliased views must not update the same table concurrently. A second
     // selection can evict K pages safely: unmapped reads fall back to RAM.
     if (n_caches == 1 && (offset_k != offset_v || K->nb[1] != V->nb[1])) {
         resolve_pages<<<1, resolve_threads, 0, ctx.stream()>>>(
                 *state_v, *state_v, indices, n_indices, offset_v, offset_v, V->nb[1], V->nb[1]);
-        copy_pages<<<96, 128, 0, ctx.stream()>>>(*state_v, *state_v);
+        copy_pages<<<copy_blocks, 256, 0, ctx.stream()>>>(*state_v, *state_v);
     }
 
     CUDA_CHECK(cudaGetLastError());
