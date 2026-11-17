@@ -3391,6 +3391,27 @@ static bool ggml_cuda_graph_debug_enabled() {
 }
 
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+    int n_compute_ops = 0;
+    bool has_moe_split_op = false;
+    bool has_non_moe_split_op = false;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const enum ggml_op op = cgraph->nodes[i]->op;
+        if (op != GGML_OP_NONE && op != GGML_OP_RESHAPE && op != GGML_OP_VIEW &&
+                op != GGML_OP_PERMUTE && op != GGML_OP_TRANSPOSE) {
+            n_compute_ops++;
+            if (op == GGML_OP_MUL_MAT_ID || op == GGML_OP_GET_ROWS) {
+                has_moe_split_op = true;
+            } else if (op != GGML_OP_GLU) {
+                has_non_moe_split_op = true;
+            }
+            if (n_compute_ops > 4 || has_non_moe_split_op) {
+                break;
+            }
+        }
+    }
+    if (has_moe_split_op && !has_non_moe_split_op && n_compute_ops <= 4) {
+        return false;
+    }
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
@@ -3535,7 +3556,7 @@ static std::vector<ggml_cuda_graph_cluster> ggml_cuda_graph_get_clusters(cudaGra
 }
 #endif // USE_CUDA_GRAPH_CLUSTER_CHECK
 
-static void ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instance, cudaGraph_t cuda_graph, int device) {
+static bool ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instance, cudaGraph_t cuda_graph, int device) {
 #ifdef USE_CUDA_GRAPH_CLUSTER_CHECK
     std::vector<ggml_cuda_graph_cluster> clusters = ggml_cuda_graph_get_clusters(cuda_graph, device);
     if (instance.clusters != clusters) {
@@ -3545,7 +3566,7 @@ static void ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instanc
         CUDA_CHECK(cudaGraphExecDestroy(instance));
         CUDA_CHECK(cudaGraphInstantiate(&instance.handle, cuda_graph, nullptr, nullptr, 0));
         instance.clusters = std::move(clusters);
-        return;
+        return true;
     }
 #else
     GGML_UNUSED(device);
@@ -3556,6 +3577,7 @@ static void ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instanc
     CUDA_CHECK(cudaGraphExecDestroy(instance.handle));
     instance.handle = nullptr;
     CUDA_CHECK(cudaGraphInstantiate(&instance.handle, cuda_graph, nullptr, nullptr, 0));
+    return true;
 #else
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
@@ -3577,9 +3599,11 @@ static void ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instanc
         CUDA_CHECK(cudaGraphExecDestroy(instance));
         instance.handle = nullptr;
         CUDA_CHECK(cudaGraphInstantiate(&instance.handle, cuda_graph, nullptr, nullptr, 0));
+        return true;
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
+    return false;
 #endif // GGML_USE_HIP
 }
 
@@ -3598,7 +3622,10 @@ static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, g
     CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &cuda_graph));
 
     if (idx < graph->instances.size()) {
-        ggml_cuda_graph_update_executable(graph->instances[idx], cuda_graph, cuda_ctx->device);
+        const bool reinstantiated = ggml_cuda_graph_update_executable(graph->instances[idx], cuda_graph, cuda_ctx->device);
+        if (reinstantiated && idx == 0) {
+            graph->reinstantiate_streak++;
+        }
     } else {
         GGML_ASSERT(idx == graph->instances.size());
         graph->instances.emplace_back();
@@ -6597,8 +6624,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph) || ggml_cuda_graph_pool_flushed(graph);
 
             if (!graph->warmup_complete) {
-                // Warmup: need at least 2 calls with no property change on the 2nd call
-                if (!properties_changed) {
+                if (graph->reinstantiate_streak >= 2) {
+                    graph->disable_due_to_dynamic = true;
+                    graph->reset();
+                } else if (!properties_changed) {
+                    // Warmup: need at least 2 calls with no property change on the 2nd call
                     graph->warmup_complete = true;
                     if (ggml_cuda_graph_debug_enabled()) {
                         GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
@@ -6616,6 +6646,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                         GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                     }
                 } else {
+                    if (!graph->instances.empty()) {
+                        graph->reinstantiate_streak = 0;
+                    }
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instances.empty();
                 }
