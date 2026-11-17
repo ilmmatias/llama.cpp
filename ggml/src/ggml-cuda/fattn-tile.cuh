@@ -733,7 +733,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     // Apply logit softcap + mask, update KQ_max:
 #pragma unroll
     for (int jc0 = 0; jc0 < cpw; ++jc0) {
-        const int j = fastmodulo(col_Q_0 + (jc0 + (threadIdx.y / np)*cpw)/ncols2, ne01);
+        const int j_local = (jc0 + (threadIdx.y / np)*cpw)/ncols2;
+        const int j = fastmodulo(col_Q_0 + j_local, ne01);
 
 #pragma unroll
         for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
@@ -753,13 +754,30 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 
             if (!oob_check || i_KQ < k_VKQ_sup) {
                 const int row = use_sparse ? indices[k_VKQ_0 + i_KQ] : k_VKQ_0 + i_KQ;
-                const int source_row = visibility.row_map ? visibility.row_map[row] : row;
-                const float mask_val = visibility.positions ?
-                    (ggml_qsa_is_visible(visibility.positions, visibility.n_kv, source_row + visibility.row_offset, j) ? 0.0f : -INFINITY) :
-                    (mask ? __half2float(mask[int64_t(j)*stride_mask + source_row]) : 0.0f);
-                if (use_sparse && !isfinite(mask_val)) {
-                    KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] = -INFINITY;
+                if constexpr (use_sparse) {
+                    if (visibility.sparse_qmask) {
+                        if (!((visibility.sparse_qmask[k_VKQ_0 + i_KQ] >> j_local) & 1u)) {
+                            KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] = -INFINITY;
+                        } else if (!visibility.positions && mask) {
+                            const int source_row = visibility.row_map ? visibility.row_map[row] : row;
+                            KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += slope * __half2float(mask[int64_t(j)*stride_mask + source_row]);
+                        }
+                    } else {
+                        const int source_row = visibility.row_map ? visibility.row_map[row] : row;
+                        const float mask_val = visibility.positions ?
+                            (ggml_qsa_is_visible(visibility.positions, visibility.n_kv, source_row + visibility.row_offset, j) ? 0.0f : -INFINITY) :
+                            (mask ? __half2float(mask[int64_t(j)*stride_mask + source_row]) : 0.0f);
+                        if (!isfinite(mask_val)) {
+                            KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] = -INFINITY;
+                        } else {
+                            KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += slope*mask_val;
+                        }
+                    }
                 } else {
+                    const int source_row = visibility.row_map ? visibility.row_map[row] : row;
+                    const float mask_val = visibility.positions ?
+                        (ggml_qsa_is_visible(visibility.positions, visibility.n_kv, source_row + visibility.row_offset, j) ? 0.0f : -INFINITY) :
+                        (mask ? __half2float(mask[int64_t(j)*stride_mask + source_row]) : 0.0f);
                     KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += slope*mask_val;
                 }
 
@@ -902,9 +920,17 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 }
 
 static constexpr __host__ __device__ int flash_attn_tile_native_nbatch(
-        int DKQ, int ncols, bool bf16, int nbatch_fa) {
-    // The 320/256 GQA32 query tile leaves less than 24 KiB for FP32 KV and probabilities.
-    return bf16 && DKQ == 320 && ncols == 32 ? 32 : nbatch_fa;
+        int DKQ, int ncols, bool bf16, bool use_sparse, int nbatch_fa) {
+    // FP32 query/KV/probability tiles leave too little LDS on RDNA when ncols == 32.
+    if (bf16 && ncols == 32) {
+        if (DKQ == 320 || (use_sparse && DKQ == 256)) {
+            return nbatch_fa < 32 ? nbatch_fa : 32;
+        }
+        if (use_sparse && DKQ == 128) {
+            return nbatch_fa < 64 ? nbatch_fa : 64;
+        }
+    }
+    return nbatch_fa;
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, ggml_type type_K, ggml_type type_V,
@@ -968,7 +994,7 @@ static __global__ void flash_attn_tile(
     constexpr int warp_size = 32;
     constexpr int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, ncols1*ncols2) / warp_size;
     constexpr int nbatch_fa = flash_attn_tile_native_nbatch(DKQ, ncols,
-        type_K == GGML_TYPE_BF16 || type_V == GGML_TYPE_BF16,
+        type_K == GGML_TYPE_BF16 || type_V == GGML_TYPE_BF16, use_sparse,
         ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols));
     constexpr int nbatch_K  = ggml_cuda_fattn_tile_get_nbatch_K (DKQ, DV, ncols1*ncols2);
 
@@ -1083,11 +1109,15 @@ static __global__ void flash_attn_tile(
     // Main loop over KV cache:
     const int32_t * indices = nullptr;
     int k_VKQ_max;
+    ggml_cuda_fattn_visibility tile_visibility = visibility;
     if constexpr (use_sparse) {
         const int64_t list = int64_t(sequence % ne33)*gridDim.x + blockIdx.x;
         indices = KV_max + list*ne11;
         const int32_t * counts = KV_max + int64_t(ne33)*gridDim.x*ne11;
         k_VKQ_max = counts[list];
+        if (tile_visibility.sparse_qmask) {
+            tile_visibility.sparse_qmask += list*ne11;
+        }
     } else {
         indices = use_kv_rows ? KV_rows_ptr + int64_t(sequence)*ne11 : nullptr;
         k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
@@ -1100,7 +1130,7 @@ static __global__ void flash_attn_tile(
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_K, type_V, use_sparse, use_kv_rows>
                 (Q_tmp, K_data, V_data, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 nb11, nb21, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, indices,
-                use_paged ? K_cache : ggml_cuda_qsa_kv_view{}, use_paged ? V_cache : ggml_cuda_qsa_kv_view{}, visibility);
+                use_paged ? K_cache : ggml_cuda_qsa_kv_view{}, use_paged ? V_cache : ggml_cuda_qsa_kv_view{}, tile_visibility);
             k_VKQ_0 += gridDim.y*nbatch_fa;
         }
         if (k_VKQ_0 < k_VKQ_max) {
@@ -1108,7 +1138,7 @@ static __global__ void flash_attn_tile(
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_K, type_V, use_sparse, use_kv_rows>
                 (Q_tmp, K_data, V_data, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 nb11, nb21, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, indices,
-                use_paged ? K_cache : ggml_cuda_qsa_kv_view{}, use_paged ? V_cache : ggml_cuda_qsa_kv_view{}, visibility);
+                use_paged ? K_cache : ggml_cuda_qsa_kv_view{}, use_paged ? V_cache : ggml_cuda_qsa_kv_view{}, tile_visibility);
         }
     } else {
         // Branch without out-of-bounds checks.
@@ -1117,7 +1147,7 @@ static __global__ void flash_attn_tile(
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_K, type_V, use_sparse, use_kv_rows>
                 (Q_tmp, K_data, V_data, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 nb11, nb21, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, indices,
-                use_paged ? K_cache : ggml_cuda_qsa_kv_view{}, use_paged ? V_cache : ggml_cuda_qsa_kv_view{}, visibility);
+                use_paged ? K_cache : ggml_cuda_qsa_kv_view{}, use_paged ? V_cache : ggml_cuda_qsa_kv_view{}, tile_visibility);
         }
     }
 
@@ -1266,7 +1296,7 @@ static bool ggml_cuda_flash_attn_ext_tile_shall_use_sparse(const ggml_tensor * d
     }
 
     if (dst->src[5]) {
-        return !ggml_cuda_fattn_dense_mask(dst) && ncols1 == 1 &&
+        return !ggml_cuda_fattn_dense_mask(dst) && ncols1 <= 8 &&
             ggml_cuda_flash_attn_ext_tile_supported_type(K->type) &&
             ggml_cuda_flash_attn_ext_tile_supported_type(V->type) &&
             (mask != nullptr || dst->src[6] != nullptr);
@@ -1308,7 +1338,8 @@ static void launch_fattn_tile_case(
     bool use_q8_0_KV = false;
     fattn_kernel_t fattn_kernel;
 
-    if constexpr (ncols1 == 1 || (ncols1 == 2 && ncols2 == 1)) {
+    if constexpr (ncols1 == 1 || (ncols1 == 2 && ncols2 == 1 && DKQ != 320 && DKQ != 576) ||
+            (ncols1 <= 8 && DKQ <= 256 && DV <= 256 && ncols1*ncols2 <= 8)) {
         if (ggml_cuda_flash_attn_ext_tile_shall_use_sparse(dst, ncols1)) {
             if constexpr (DKQ == 256 && DV == 256) {
                 if (ggml_cuda_fattn_use_paged(dst)) {
@@ -1317,7 +1348,7 @@ static void launch_fattn_tile_case(
                         fattn_kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap,
                                 GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true, true>;
                         const int native_nbatch = flash_attn_tile_native_nbatch(
-                                DKQ, ncols1*ncols2, false, nbatch_fa);
+                                DKQ, ncols1*ncols2, false, true, nbatch_fa);
                         launch_fattn<DV, ncols1, ncols2>
                             (ctx, dst, fattn_kernel, nwarps, nbytes_shared, native_nbatch, false, false, false, true, warp_size, true);
                         return;
@@ -1353,7 +1384,7 @@ static void launch_fattn_tile_case(
                     GGML_ABORT("unsupported sparse K cache type");
             }
             const int native_nbatch = flash_attn_tile_native_nbatch(DKQ, ncols1*ncols2,
-                dst->src[1]->type == GGML_TYPE_BF16 || dst->src[2]->type == GGML_TYPE_BF16, nbatch_fa);
+                dst->src[1]->type == GGML_TYPE_BF16 || dst->src[2]->type == GGML_TYPE_BF16, true, nbatch_fa);
             launch_fattn<DV, ncols1, ncols2>
                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, native_nbatch, false, false, false, true, warp_size);
             return;
@@ -1411,12 +1442,36 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     const int cc        = ggml_cuda_info().devices[id].cc;
     const int warp_size = 32;
 
-    // Direct indices are per query; sharing a union would lose each query's selection mask.
+    // Share one deduplicated index union per ncols1-query tile without inflating register pressure.
     if (dst->src[5] && !ggml_cuda_fattn_dense_mask(dst)) {
-        const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, ncols2, cc) / warp_size;
-        const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols2, cc);
-        launch_fattn_tile_case<DKQ, DV, 1, ncols2, use_logit_softcap>
-            (ctx, dst, nwarps, nbatch_fa, warp_size);
+        int sparse_c1 = 1;
+        if constexpr (DKQ <= 256 && DV <= 256) {
+            const int max_c1 = Q->ne[1] >= 16 ? 8 : (Q->ne[1] >= 8 ? 4 : (Q->ne[1] >= 4 ? 2 : 1));
+            for (int c1 = max_c1; c1 >= 2; c1 >>= 1) {
+                if (c1 * ncols2 <= 8 && ggml_cuda_fattn_tile_get_config(DKQ, DV, c1 * ncols2, cc) != 0) {
+                    sparse_c1 = c1;
+                    break;
+                }
+            }
+        }
+        auto launch_sparse = [&](auto c1_tag) {
+            constexpr int c1 = decltype(c1_tag)::value;
+            constexpr int cols_per_block = c1 * ncols2;
+            const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+            const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+            launch_fattn_tile_case<DKQ, DV, c1, ncols2, use_logit_softcap>
+                (ctx, dst, nwarps, nbatch_fa, warp_size);
+        };
+        if constexpr (2 * ncols2 <= 8) {
+            if (sparse_c1 == 2) { launch_sparse(std::integral_constant<int, 2>{}); return; }
+        }
+        if constexpr (4 * ncols2 <= 8) {
+            if (sparse_c1 == 4) { launch_sparse(std::integral_constant<int, 4>{}); return; }
+        }
+        if constexpr (8 * ncols2 <= 8) {
+            if (sparse_c1 == 8) { launch_sparse(std::integral_constant<int, 8>{}); return; }
+        }
+        launch_sparse(std::integral_constant<int, 1>{});
         return;
     }
 

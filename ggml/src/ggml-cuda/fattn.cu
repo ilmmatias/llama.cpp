@@ -232,6 +232,141 @@ static __global__ void flash_attn_unique_selected_indices(
     }
 }
 
+template <int shift>
+__launch_bounds__(256, 2)
+static __global__ void flash_attn_merge_sparse_pairs(
+        const int32_t * __restrict__ in_idx,
+        const uint8_t * __restrict__ in_qmask,
+        const int32_t * __restrict__ in_counts,
+        int32_t * __restrict__ out_idx,
+        uint8_t * __restrict__ out_qmask,
+        int32_t * __restrict__ out_counts,
+        const int n_in_per_stream,
+        const int n_out_per_stream,
+        const int in_width,
+        const int out_width) {
+    ggml_cuda_pdl_sync();
+
+    using scan_t = fattn_cub::BlockScan<int, 256>;
+    __shared__ typename scan_t::TempStorage scan_temp;
+    __shared__ int32_t sA[256];
+    __shared__ int32_t sB[256];
+    __shared__ uint8_t sMA[256];
+    __shared__ uint8_t sMB[256];
+    __shared__ int32_t s_val[256];
+    __shared__ uint8_t s_mask[256];
+    __shared__ int     tile_adv_a;
+    __shared__ int     tile_adv_b;
+    __shared__ int32_t next_prev_val;
+
+    const int tid   = threadIdx.x;
+    const int out_q = blockIdx.x;
+    const int s     = blockIdx.y;
+
+    const int64_t list_a = int64_t(s) * n_in_per_stream + 2 * out_q;
+    const int64_t list_b = list_a + 1;
+    const bool    has_b  = 2 * out_q + 1 < n_in_per_stream;
+
+    const int len_a = in_counts[list_a];
+    const int len_b = has_b ? in_counts[list_b] : 0;
+
+    const int32_t * ptr_a  = in_idx + list_a * in_width;
+    const int32_t * ptr_b  = has_b ? in_idx + list_b * in_width : nullptr;
+    const uint8_t * mask_a = in_qmask ? in_qmask + list_a * in_width : nullptr;
+    const uint8_t * mask_b = (in_qmask && has_b) ? in_qmask + list_b * in_width : nullptr;
+
+    const int64_t out_list = int64_t(s) * n_out_per_stream + out_q;
+    int32_t * dst_idx  = out_idx + out_list * out_width;
+    uint8_t * dst_mask = out_qmask + out_list * out_width;
+
+    int a0 = 0;
+    int b0 = 0;
+    int written = 0;
+    int32_t prev_tile_val = -1;
+
+    while (a0 < len_a || b0 < len_b) {
+        const int rem_a  = min(256, len_a - a0);
+        const int rem_b  = min(256, len_b - b0);
+        const int n_tile = min(256, rem_a + rem_b);
+
+        if (tid < rem_a) {
+            sA[tid]  = ptr_a[a0 + tid];
+            sMA[tid] = mask_a ? mask_a[a0 + tid] : uint8_t(1);
+        }
+        if (tid < rem_b) {
+            sB[tid]  = ptr_b[b0 + tid];
+            sMB[tid] = mask_b ? uint8_t(mask_b[b0 + tid] << shift) : uint8_t(1u << shift);
+        }
+        __syncthreads();
+
+        int32_t my_val  = INT_MAX;
+        uint8_t my_mask = 0;
+        if (tid < n_tile) {
+            int lo = max(0, tid - rem_b);
+            int hi = min(tid, rem_a);
+            while (lo < hi) {
+                const int mid = (lo + hi) >> 1;
+                const int j = tid - 1 - mid;
+                if (sA[mid] <= sB[j]) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            const int ia = lo;
+            const int ib = tid - lo;
+            const bool take_a = (ia < rem_a) && (ib >= rem_b || sA[ia] <= sB[ib]);
+            my_val  = take_a ? sA[ia]  : sB[ib];
+            my_mask = take_a ? sMA[ia] : sMB[ib];
+            s_val[tid]  = my_val;
+            s_mask[tid] = my_mask;
+            if (tid == n_tile - 1) {
+                tile_adv_a    = ia + (take_a ? 1 : 0);
+                tile_adv_b    = ib + (take_a ? 0 : 1);
+                next_prev_val = my_val;
+            }
+        }
+        __syncthreads();
+
+        int keep = 0;
+        if (tid < n_tile) {
+            const bool dup_of_prev =
+                (tid > 0 && my_val == s_val[tid - 1]) ||
+                (tid == 0 && my_val == prev_tile_val);
+            if (dup_of_prev) {
+                if (tid == 0) {
+                    dst_mask[written - 1] |= my_mask;
+                }
+            } else {
+                if (tid + 1 < n_tile && my_val == s_val[tid + 1]) {
+                    my_mask |= s_mask[tid + 1];
+                }
+                keep = 1;
+            }
+        }
+
+        int offset, total;
+        scan_t(scan_temp).ExclusiveSum(keep, offset, total);
+        if (keep) {
+            dst_idx[written + offset]  = my_val;
+            dst_mask[written + offset] = my_mask;
+        }
+        written += total;
+        a0 += tile_adv_a;
+        b0 += tile_adv_b;
+        prev_tile_val = next_prev_val;
+        __syncthreads();
+    }
+
+    for (int i = written + tid; i < out_width; i += 256) {
+        dst_idx[i]  = -1;
+        dst_mask[i] = 0;
+    }
+    if (tid == 0) {
+        out_counts[out_list] = written;
+    }
+}
+
 template <typename index_t>
 static void ggml_cuda_flash_attn_ext_prepare_indices_t(
         ggml_cuda_pool & pool, const ggml_tensor * mask, const ggml_tensor * selected,
@@ -289,20 +424,97 @@ static void ggml_cuda_flash_attn_ext_prepare_indices_t(
         CUDA_CHECK(cudaGetLastError());
     }
 }
+template <typename index_t>
+static void ggml_cuda_flash_attn_ext_prepare_indices_dispatch(
+        ggml_cuda_pool & pool, const ggml_tensor * mask, const ggml_tensor * selected,
+        int32_t * indices, int32_t * counts, uint8_t * qmask,
+        const int32_t n_queries, const int32_t ncols1, cudaStream_t stream) {
+    if (ncols1 == 1) {
+        ggml_cuda_flash_attn_ext_prepare_indices_t<index_t>(pool, mask, selected, indices, counts, n_queries, stream);
+        return;
+    }
+
+    GGML_ASSERT(ncols1 == 2 || ncols1 == 4 || ncols1 == 8);
+    GGML_ASSERT(qmask != nullptr);
+
+    const bool compact = mask->type == GGML_TYPE_I32;
+    const int n_selected = selected->ne[0];
+    const int n_kv       = compact ? mask->ne[1] - n_queries : mask->ne[0];
+    const int n_stream   = compact ? 1 : mask->ne[3];
+
+    ggml_cuda_pool_alloc<int32_t> q_indices(pool, size_t(n_queries) * n_stream * n_selected);
+    ggml_cuda_pool_alloc<int32_t> q_counts(pool, size_t(n_queries) * n_stream);
+    ggml_cuda_flash_attn_ext_prepare_indices_t<index_t>(
+        pool, mask, selected, q_indices.ptr, q_counts.ptr, n_queries, stream);
+
+    const int n_stages = ncols1 == 2 ? 1 : (ncols1 == 4 ? 2 : 3);
+    ggml_cuda_pool_alloc<int32_t> buf_idx[2];
+    ggml_cuda_pool_alloc<uint8_t> buf_qmask[2];
+    ggml_cuda_pool_alloc<int32_t> buf_cnt[2];
+
+    const int32_t * cur_idx   = q_indices.ptr;
+    const uint8_t * cur_qmask = nullptr;
+    const int32_t * cur_cnt   = q_counts.ptr;
+    int cur_per_stream = n_queries;
+    int cur_width      = n_selected;
+
+    for (int stage = 0; stage < n_stages; ++stage) {
+        const int shift          = 1 << stage;
+        const int nxt_per_stream = (cur_per_stream + 1) / 2;
+        const int nxt_width      = std::min<int64_t>(n_kv, int64_t(1 << (stage + 1)) * n_selected);
+        const bool is_last       = stage + 1 == n_stages;
+
+        int32_t * dst_idx   = indices;
+        uint8_t * dst_qmask = qmask;
+        int32_t * dst_cnt   = counts;
+        if (!is_last) {
+            const int b = stage & 1;
+            const size_t n_elems = size_t(nxt_per_stream) * n_stream * nxt_width;
+            buf_idx[b].alloc(pool, n_elems);
+            buf_qmask[b].alloc(pool, n_elems);
+            buf_cnt[b].alloc(pool, size_t(nxt_per_stream) * n_stream);
+            dst_idx   = buf_idx[b].ptr;
+            dst_qmask = buf_qmask[b].ptr;
+            dst_cnt   = buf_cnt[b].ptr;
+        }
+
+        const ggml_cuda_kernel_launch_params merge_params(dim3(nxt_per_stream, n_stream, 1), dim3(256, 1, 1), 0, stream);
+        if (shift == 1) {
+            ggml_cuda_kernel_launch(flash_attn_merge_sparse_pairs<1>, merge_params,
+                cur_idx, cur_qmask, cur_cnt, dst_idx, dst_qmask, dst_cnt,
+                cur_per_stream, nxt_per_stream, cur_width, nxt_width);
+        } else if (shift == 2) {
+            ggml_cuda_kernel_launch(flash_attn_merge_sparse_pairs<2>, merge_params,
+                cur_idx, cur_qmask, cur_cnt, dst_idx, dst_qmask, dst_cnt,
+                cur_per_stream, nxt_per_stream, cur_width, nxt_width);
+        } else {
+            ggml_cuda_kernel_launch(flash_attn_merge_sparse_pairs<4>, merge_params,
+                cur_idx, cur_qmask, cur_cnt, dst_idx, dst_qmask, dst_cnt,
+                cur_per_stream, nxt_per_stream, cur_width, nxt_width);
+        }
+        CUDA_CHECK(cudaGetLastError());
+
+        cur_idx        = dst_idx;
+        cur_qmask      = dst_qmask;
+        cur_cnt        = dst_cnt;
+        cur_per_stream = nxt_per_stream;
+        cur_width      = nxt_width;
+    }
+}
 #endif // GGML_USE_HIP || GGML_CUDA_USE_CUB
 
 void ggml_cuda_flash_attn_ext_prepare_indices(
         ggml_cuda_pool & pool, const ggml_tensor * mask, const ggml_tensor * selected,
-        int32_t * indices, int32_t * counts, int32_t n_queries, cudaStream_t stream) {
+        int32_t * indices, int32_t * counts, uint8_t * qmask, int32_t n_queries, int32_t ncols1, cudaStream_t stream) {
 #if defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
     if (selected->type == GGML_TYPE_I64) {
-        ggml_cuda_flash_attn_ext_prepare_indices_t<int64_t>(pool, mask, selected, indices, counts, n_queries, stream);
+        ggml_cuda_flash_attn_ext_prepare_indices_dispatch<int64_t>(pool, mask, selected, indices, counts, qmask, n_queries, ncols1, stream);
     } else {
         GGML_ASSERT(selected->type == GGML_TYPE_I32);
-        ggml_cuda_flash_attn_ext_prepare_indices_t<int32_t>(pool, mask, selected, indices, counts, n_queries, stream);
+        ggml_cuda_flash_attn_ext_prepare_indices_dispatch<int32_t>(pool, mask, selected, indices, counts, qmask, n_queries, ncols1, stream);
     }
 #else
-    GGML_UNUSED_VARS(pool, mask, selected, indices, counts, n_queries, stream);
+    GGML_UNUSED_VARS(pool, mask, selected, indices, counts, qmask, n_queries, ncols1, stream);
     GGML_ABORT("direct sparse attention indices require CUB or hipCUB");
 #endif // GGML_USE_HIP || GGML_CUDA_USE_CUB
 }
