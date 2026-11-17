@@ -126,10 +126,16 @@ struct expert_cache_merge {
     ggml_tensor * ids = nullptr;
     ggml_tensor * misses = nullptr;
     ggml_tensor * output = nullptr;
+    ggml_tensor * direct_output = nullptr;
+    size_t miss_route_begin = 0;
+    size_t miss_route_end = 0;
     bool all_cached = false;
 
     void build(int64_t output_dim, int64_t n_expert_used, int64_t n_tokens) {
         ggml_reset(ctx);
+        direct_output = nullptr;
+        miss_route_begin = 0;
+        miss_route_end = 0;
         const int64_t rows = n_expert_used * n_tokens;
         packed = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, output_dim, 2 * rows);
         ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rows);
@@ -1125,17 +1131,29 @@ public:
 
         GGML_ASSERT(merge != nullptr);
         auto & m = *merge;
-        if (!m.all_cached) {
-            ggml_backend_tensor_set_async(compute_backend, m.misses, src->data, 0, ggml_nbytes(src));
+        if (m.direct_output != nullptr && ggml_nbytes(m.direct_output) == ggml_nbytes(dst) && ggml_is_contiguous(dst)) {
+            ggml_backend_tensor_copy_async(compute_backend, compute_backend, m.direct_output, dst);
+        } else {
+            if (!m.all_cached && m.miss_route_begin < m.miss_route_end) {
+                const size_t row_bytes = (size_t) m.output->ne[0] * sizeof(float);
+                if (ggml_is_contiguous(src) && ggml_nbytes(src) == (size_t) m.ids->ne[0] * row_bytes) {
+                    const size_t offset = m.miss_route_begin * row_bytes;
+                    const size_t bytes  = (m.miss_route_end - m.miss_route_begin) * row_bytes;
+                    ggml_backend_tensor_set_async(compute_backend, m.misses, (const uint8_t *) src->data + offset, offset, bytes);
+                } else {
+                    ggml_backend_tensor_set_async(compute_backend, m.misses, src->data, 0, ggml_nbytes(src));
+                }
+            }
+
+            const auto status = ggml_backend_graph_compute_async(compute_backend, m.graph);
+            GGML_ASSERT(status == GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_copy_async(compute_backend, compute_backend, m.output, dst);
         }
 
-        const auto status = ggml_backend_graph_compute_async(compute_backend, m.graph);
-        GGML_ASSERT(status == GGML_STATUS_SUCCESS);
-        ggml_backend_tensor_copy_async(compute_backend, compute_backend, m.output, dst);
-
-        // Copy on the compute stream before reusing the shared output.
+        // Copy on the compute stream before reusing the shared output or template workspace.
         ggml_backend_event_record(m.copied, compute_backend);
         ggml_backend_event_wait(backend, m.copied);
+        m.direct_output = nullptr;
         pending_output = nullptr;
         return true;
     }
@@ -1874,6 +1892,25 @@ private:
             }
         }
         m.all_cached = (size_t) layer.active_hits == rows;
+        m.miss_route_begin = rows;
+        m.miss_route_end = 0;
+        if (!m.all_cached) {
+            for (size_t i = 0; i < rows; ++i) {
+                if (layer.merge_routes[i] >= (int32_t) rows) {
+                    m.miss_route_begin = std::min(m.miss_route_begin, i);
+                    m.miss_route_end = i + 1;
+                }
+            }
+        }
+        m.direct_output = nullptr;
+        if (m.all_cached && layer.active_batches.size() == 1) {
+            auto * out = layer.active_batches[0].t->output;
+            if (out != nullptr && out->ne[0] == layer.output_dim &&
+                out->ne[1] == layer.n_expert_used && out->ne[2] == ids->ne[1] &&
+                ggml_is_contiguous(out)) {
+                m.direct_output = out;
+            }
+        }
 
         return true;
     }
@@ -2089,7 +2126,8 @@ private:
         }
 
         // Templates and host buffers are complete before any asynchronous use.
-        if (layer.active_deferred) {
+        const bool direct_deferred = layer.active_deferred && merge->direct_output != nullptr;
+        if (layer.active_deferred && !direct_deferred) {
             ggml_backend_tensor_set_async(compute_backend, merge->ids,
                     layer.merge_routes.data(), 0, ggml_nbytes(merge->ids));
         }
@@ -2107,10 +2145,12 @@ private:
             }
 
             if (layer.active_deferred) {
-                auto slice = *t->output;
-                slice.buffer = merge->packed->buffer;
-                slice.data = (uint8_t *) merge->packed->data + batch.route_offset * output_row_bytes;
-                ggml_backend_tensor_copy_async(compute_backend, compute_backend, t->output, &slice);
+                if (!direct_deferred) {
+                    auto slice = *t->output;
+                    slice.buffer = merge->packed->buffer;
+                    slice.data = (uint8_t *) merge->packed->data + batch.route_offset * output_row_bytes;
+                    ggml_backend_tensor_copy_async(compute_backend, compute_backend, t->output, &slice);
+                }
             } else {
                 ggml_backend_tensor_get_async(compute_backend, t->output,
                         (uint8_t *) output_ptr + batch.route_offset * output_row_bytes, 0, ggml_nbytes(t->output));

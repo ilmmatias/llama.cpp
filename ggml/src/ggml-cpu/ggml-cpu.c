@@ -1867,7 +1867,7 @@ static void ggml_compute_forward_mul_mat_id(
                     (const char *) src0->data + cur_a*nb02, NULL, row_size, src1_cont, src1_q, &direct);
             }
         }
-        if (params->expert_cache != NULL) {
+        if (params->expert_cache != NULL && cached_route_masks != NULL) {
             ggml_barrier(params->threadpool);
             if (ith == 0) {
                 ggml_backend_cpu_expert_cache_end(params->expert_cache, dst);
