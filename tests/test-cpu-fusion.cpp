@@ -331,7 +331,7 @@ static void test_broadcast_extents() {
             auto * b = mode == 3 ? ggml_transpose(ctx.get(), ggml_reshape_2d(ctx.get(), storage, 2, period)) :
                 ggml_view_1d(ctx.get(), storage, period, 0);
             if (mode == 3) {
-                b = ggml_view_4d(ctx.get(), b, period, 1, 1, 1, b->nb[1], b->nb[2], b->nb[3], 0);
+                b = ggml_view_1d(ctx.get(), b, period, 0);
                 b->nb[0] = 2 * sizeof(float);
             }
             for (int64_t i = 0; i < ggml_nelements(a); ++i) {

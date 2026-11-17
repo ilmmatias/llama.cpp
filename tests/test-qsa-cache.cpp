@@ -45,6 +45,7 @@ struct fixture {
         model(llama_model_create(LLM_ARCH_QWEN4EXP, llama_model_default_params())) {
         auto & hp = model->hparams;
         hp.n_layer_all = 1;
+        model->layers.resize(1);
         hp.n_embd = hp.n_embd_head_k_full = hp.n_embd_head_v_full = 32;
         hp.n_head_arr[0] = hp.n_head_kv_arr[0] = 1;
         hp.indexer_head_size = 32;
