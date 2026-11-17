@@ -311,8 +311,8 @@ static void get_rows_cuda_float(
         constexpr int VEC = 16 / sizeof(dst_t);
         const int64_t ne00v = ne00 / VEC;
         const int64_t vec_block_num_y = (ne00v + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
-        const bool enough_blocks = vec_block_num_y * ne10 * ne11 * ne12 >= 128;
-        const bool can_vec = VEC > 1 && enough_blocks &&
+        const bool enough_work = ne00v >= 64 && (vec_block_num_y * ne10 * ne11 * ne12 >= 16 || ne00v >= 256);
+        const bool can_vec = VEC > 1 && enough_work &&
             (ne00 % VEC == 0) &&
             (nb01 % 16 == 0) && (nb02 % 16 == 0) && (nb03 % 16 == 0) &&
             (nb1  % 16 == 0) && (nb2  % 16 == 0) && (nb3  % 16 == 0) &&
