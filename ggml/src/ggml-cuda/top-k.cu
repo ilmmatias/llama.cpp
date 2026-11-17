@@ -549,6 +549,160 @@ static __global__ void top_k_one_last_cuda(const int2 * __restrict__ src_pairs,
     }
 }
 
+template<int BLOCK_SIZE, int ITEMS_PER_THREAD>
+static __global__ void top_k_radix_select_cached_cuda(
+        const float * __restrict__ src,
+        int * __restrict__ dst,
+        int ncols,
+        int nrows,
+        int k) {
+    constexpr int RADIX_BITS = 8;
+    constexpr int RADIX_SIZE = 1 << RADIX_BITS;
+    constexpr int warp_size  = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps     = BLOCK_SIZE / warp_size;
+    static_assert(ITEMS_PER_THREAD <= 32, "ITEMS_PER_THREAD exceeds 32-bit mask");
+
+    const auto popc = [](const ggml_cuda_thread_mask_t mask) -> uint32_t {
+        if constexpr (warp_size == 64) {
+            return (uint32_t) __popcll(mask);
+        } else {
+            return (uint32_t) __popc(mask);
+        }
+    };
+
+    const int tid        = threadIdx.x;
+    const int warp       = tid / warp_size;
+    const int lane       = tid % warp_size;
+    const int warp_begin = warp * ITEMS_PER_THREAD * warp_size;
+    const ggml_cuda_thread_mask_t below_lane = ((ggml_cuda_thread_mask_t) 1 << lane) - 1;
+
+    __shared__ uint32_t histogram[RADIX_SIZE];
+    __shared__ uint32_t selected_bucket;
+    __shared__ uint32_t count_above;
+    __shared__ uint32_t warp_gt_off[nwarps];
+    __shared__ uint32_t warp_eq_off[nwarps];
+
+    for (int row = blockIdx.x; row < nrows; row += gridDim.x) {
+        const float * row_src = src + (size_t) row * ncols;
+        int * row_dst = dst + (size_t) row * k;
+
+        uint32_t keys[ITEMS_PER_THREAD];
+#pragma unroll
+        for (int j = 0; j < ITEMS_PER_THREAD; ++j) {
+            const int col = warp_begin + j * warp_size + lane;
+            keys[j] = col < ncols ? top_k_float_to_ordered(row_src[col]) : 0U;
+        }
+
+        uint32_t prefix  = 0;
+        uint32_t desired = (uint32_t) k;
+
+#pragma unroll
+        for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
+            if (tid < RADIX_SIZE) {
+                histogram[tid] = 0;
+            }
+            __syncthreads();
+
+            const uint32_t high_mask   = shift == 32 - RADIX_BITS ? 0 : 0xffffffffU << (shift + RADIX_BITS);
+            const uint32_t prefix_high = prefix & high_mask;
+#pragma unroll
+            for (int j = 0; j < ITEMS_PER_THREAD; ++j) {
+                const int col = warp_begin + j * warp_size + lane;
+                if (col < ncols && (keys[j] & high_mask) == prefix_high) {
+                    atomicAdd(&histogram[(keys[j] >> shift) & (RADIX_SIZE - 1)], 1U);
+                }
+            }
+            __syncthreads();
+
+            if (tid == 0) {
+                uint32_t above  = 0;
+                uint32_t bucket = 0;
+                for (int bin = RADIX_SIZE - 1; bin >= 0; --bin) {
+                    const uint32_t count = histogram[bin];
+                    if (above + count >= desired) {
+                        bucket = bin;
+                        break;
+                    }
+                    above += count;
+                }
+                selected_bucket = bucket;
+                count_above = above;
+            }
+            __syncthreads();
+
+            prefix  |= selected_bucket << shift;
+            desired -= count_above;
+        }
+
+        const uint32_t ties_needed = desired;
+        const uint32_t total_gt    = (uint32_t) k - ties_needed;
+
+        uint32_t gt_mask  = 0;
+        uint32_t eq_mask  = 0;
+        uint32_t gt_count = 0;
+        uint32_t eq_count = 0;
+#pragma unroll
+        for (int j = 0; j < ITEMS_PER_THREAD; ++j) {
+            const int col = warp_begin + j * warp_size + lane;
+            if (col < ncols) {
+                const bool is_gt = keys[j] > prefix;
+                const bool is_eq = keys[j] == prefix;
+                gt_mask  |= uint32_t(is_gt) << j;
+                eq_mask  |= uint32_t(is_eq) << j;
+                gt_count += is_gt;
+                eq_count += is_eq;
+            }
+        }
+
+        const uint32_t gt_warp = (uint32_t) warp_reduce_sum<warp_size>((int) gt_count);
+        const uint32_t eq_warp = (uint32_t) warp_reduce_sum<warp_size>((int) eq_count);
+        if (lane == 0) {
+            warp_gt_off[warp] = gt_warp;
+            warp_eq_off[warp] = eq_warp;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            uint32_t gt_acc = 0;
+            uint32_t eq_acc = 0;
+            for (int w = 0; w < nwarps; ++w) {
+                const uint32_t gw = warp_gt_off[w];
+                const uint32_t ew = warp_eq_off[w];
+                warp_gt_off[w] = gt_acc;
+                warp_eq_off[w] = eq_acc;
+                gt_acc += gw;
+                eq_acc += ew;
+            }
+        }
+        __syncthreads();
+
+        uint32_t pos_gt = warp_gt_off[warp];
+        uint32_t pos_eq = warp_eq_off[warp];
+#pragma unroll
+        for (int j = 0; j < ITEMS_PER_THREAD; ++j) {
+            const int col = warp_begin + j * warp_size + lane;
+
+            const bool is_gt = (gt_mask >> j) & 1U;
+            const ggml_cuda_thread_mask_t gt_ballot = ggml_cuda_ballot(is_gt);
+            if (is_gt) {
+                row_dst[pos_gt + popc(gt_ballot & below_lane)] = col;
+            }
+            pos_gt += popc(gt_ballot);
+
+            if (pos_eq < ties_needed) {
+                const bool is_eq = (eq_mask >> j) & 1U;
+                const ggml_cuda_thread_mask_t eq_ballot = ggml_cuda_ballot(is_eq);
+                const uint32_t out_eq = pos_eq + popc(eq_ballot & below_lane);
+                if (is_eq && out_eq < ties_needed) {
+                    row_dst[total_gt + out_eq] = col;
+                }
+                pos_eq += popc(eq_ballot);
+            }
+        }
+        __syncthreads();
+    }
+}
+
 template<int BLOCK_SIZE>
 static __global__ void top_k_radix_select_cuda(
         const float * __restrict__ src,
@@ -635,9 +789,19 @@ static __global__ void top_k_radix_select_cuda(
 
 static void top_k_radix_select_cuda(
         const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
-    constexpr int BLOCK_SIZE = 1024;
     const int grid_size = std::min(nrows, 65535);
-    top_k_radix_select_cuda<BLOCK_SIZE><<<grid_size, BLOCK_SIZE, 0, stream>>>(src, dst, ncols, nrows, k);
+    if (ncols <= 4096) {
+        top_k_radix_select_cached_cuda<512, 8><<<grid_size, 512, 0, stream>>>(src, dst, ncols, nrows, k);
+    } else if (ncols <= 4608) {
+        top_k_radix_select_cached_cuda<512, 9><<<grid_size, 512, 0, stream>>>(src, dst, ncols, nrows, k);
+    } else if (ncols <= 8192) {
+        top_k_radix_select_cached_cuda<512, 16><<<grid_size, 512, 0, stream>>>(src, dst, ncols, nrows, k);
+    } else if (ncols <= 16384) {
+        top_k_radix_select_cached_cuda<512, 32><<<grid_size, 512, 0, stream>>>(src, dst, ncols, nrows, k);
+    } else {
+        constexpr int BLOCK_SIZE = 1024;
+        top_k_radix_select_cuda<BLOCK_SIZE><<<grid_size, BLOCK_SIZE, 0, stream>>>(src, dst, ncols, nrows, k);
+    }
 }
 
 static int top_k_floor_log2(int value) {
@@ -1185,7 +1349,9 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_pool & pool  = ctx.pool();
 
 #if defined(GGML_USE_HIP)
-    if (top_k_use_small_kernel(ncols, nrows, k)) {
+    if (k > 1 && ncols > 1024 && ncols <= 16384 && (nrows <= 4 || nrows >= 40)) {
+        top_k_radix_select_cuda(src0_d, dst_d, ncols, nrows, k, stream);
+    } else if (top_k_use_small_kernel(ncols, nrows, k)) {
         top_k_small_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
     } else if (ncols > 1024) {
         top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
