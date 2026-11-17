@@ -1109,10 +1109,14 @@ enum common_params_fit_status common_fit_params(
         common_params_fit_impl(paths_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, keep_moe_cpu, extra, log_level, out_device_surplus);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
-        LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
+        if (log_level < GGML_LOG_LEVEL_CONT) {
+            LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
+        }
         status = COMMON_PARAMS_FIT_STATUS_FAILURE;
     } catch (const std::runtime_error & e) {
-        LOG_ERR("%s: encountered an error while trying to fit params to free device memory: %s\n", __func__, e.what());
+        if (log_level < GGML_LOG_LEVEL_CONT) {
+            LOG_ERR("%s: encountered an error while trying to fit params to free device memory: %s\n", __func__, e.what());
+        }
         status = COMMON_PARAMS_FIT_STATUS_ERROR;
     }
     const int64_t t1_us = llama_time_us();

@@ -1454,7 +1454,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         if (!cache_auto && n_cache_gpu_devices > 1) {
             tensor_split_base.assign(std::begin(params.tensor_split), std::end(params.tensor_split));
         }
-        const auto fit_with_cache_reserve = [&](uint32_t cache_slots, llama_model_params & mparams_o, llama_context_params & cparams_o, std::vector<int64_t> * surplus_out) {
+        const auto fit_with_cache_reserve = [&](uint32_t cache_slots, llama_model_params & mparams_o, llama_context_params & cparams_o, std::vector<int64_t> * surplus_out, ggml_log_level log_level) {
             std::vector<size_t> reserves(fit_targets.size(), 0);
             bool first_pass = true;
             for (;;) {
@@ -1501,7 +1501,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
                     targets_i.data(),
                     params.fit_params_min_ctx,
                     has_draft || spec_mtp ? &extra_i : nullptr,
-                    fit_log_level,
+                    log_level,
                     true,
                     surplus_out != nullptr ? surplus_out->data() : nullptr);
 
@@ -1521,7 +1521,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
 
         if (!cache_auto) {
             if (cache_fixed || cache_bytes) {
-                fit_with_cache_reserve((uint32_t) params.expert_cache_slots, mparams, cparams, nullptr);
+                fit_with_cache_reserve((uint32_t) params.expert_cache_slots, mparams, cparams, nullptr, fit_log_level);
             } else {
                 common_fit_params(params.model.get_paths(), &mparams, &cparams,
                     params.tensor_split,
@@ -1547,7 +1547,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
             if (!params.fit_prefer_cache) {
                 // default: offload as many layers as the fit can place, then cache whatever the fit leaves free
                 std::vector<int64_t> surplus(fit_targets.size(), 0);
-                fit_with_cache_reserve(0, mparams_f, cparams_f, &surplus);
+                fit_with_cache_reserve(0, mparams_f, cparams_f, &surplus, fit_log_level);
 
                 slots = cache_devices.empty() ? 0 : slot_cap;
                 const common_expert_cache_fit_device * limiting_device = nullptr;
@@ -1569,10 +1569,11 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
                     }
                 } else {
                     // refit with the cache footprint reserved so that KV and scratch buffers do not claim it
-                    fit_with_cache_reserve(slots, mparams_f, cparams_f, nullptr);
+                    fit_with_cache_reserve(slots, mparams_f, cparams_f, nullptr, fit_log_level);
                 }
             } else {
                 // Maximize cache slots first: binary-search the largest count that keeps the fit feasible.
+                const ggml_log_level probe_log_level = params.verbosity >= LOG_LEVEL_DEBUG ? fit_log_level : GGML_LOG_LEVEL_CONT;
                 uint32_t lo = 0;
                 uint32_t hi = slot_cap + 1;
 
@@ -1583,7 +1584,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
                     llama_context_params cparams_i;
                     std::vector<int64_t>   surplus_i(fit_targets.size(), 0);
 
-                    const auto status_i = fit_with_cache_reserve(mid, mparams_i, cparams_i, &surplus_i);
+                    const auto status_i = fit_with_cache_reserve(mid, mparams_i, cparams_i, &surplus_i, probe_log_level);
 
                     if (status_i == COMMON_PARAMS_FIT_STATUS_SUCCESS && !cache_devices.empty() &&
                         std::all_of(cache_devices.begin(), cache_devices.end(), [&](const common_expert_cache_fit_device & device) {
@@ -1601,7 +1602,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
                 }
 
                 // commit the search result with the cache footprint reserved on every cache device
-                fit_with_cache_reserve(slots, mparams_f, cparams_f, nullptr);
+                fit_with_cache_reserve(slots, mparams_f, cparams_f, nullptr, fit_log_level);
             }
 
             mparams = mparams_f;
