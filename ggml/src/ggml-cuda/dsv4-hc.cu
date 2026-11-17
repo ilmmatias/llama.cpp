@@ -77,28 +77,28 @@ static __global__ void dsv4_hc_comb_f32_wave(
     }
 
     // Softmax over destination lanes (idx bits 0..1).
-    float vmax = fmaxf(v, __shfl_xor_sync(GGML_CUDA_FULL_THREAD_MASK, v, 1, shuffle_width));
-    vmax = fmaxf(vmax, __shfl_xor_sync(GGML_CUDA_FULL_THREAD_MASK, vmax, 2, shuffle_width));
+    float vmax = fmaxf(v, ggml_cuda_shfl_xor_sync<shuffle_width>(v, 1));
+    vmax = fmaxf(vmax, ggml_cuda_shfl_xor_sync<shuffle_width>(vmax, 2));
     v = expf(v - vmax);
 
-    float sum = v + __shfl_xor_sync(GGML_CUDA_FULL_THREAD_MASK, v, 1, shuffle_width);
-    sum += __shfl_xor_sync(GGML_CUDA_FULL_THREAD_MASK, sum, 2, shuffle_width);
+    float sum = v + ggml_cuda_shfl_xor_sync<shuffle_width>(v, 1);
+    sum += ggml_cuda_shfl_xor_sync<shuffle_width>(sum, 2);
     v = v / sum + eps;
 
     // Normalize columns (same idst, isrc differs: xor 4 and 8).
-    sum = v + __shfl_xor_sync(GGML_CUDA_FULL_THREAD_MASK, v, 4, shuffle_width);
-    sum += __shfl_xor_sync(GGML_CUDA_FULL_THREAD_MASK, sum, 8, shuffle_width);
+    sum = v + ggml_cuda_shfl_xor_sync<shuffle_width>(v, 4);
+    sum += ggml_cuda_shfl_xor_sync<shuffle_width>(sum, 8);
     v /= sum + eps;
 
     for (int32_t i = 1; i < n_iter; ++i) {
         // Normalize rows.
-        sum = v + __shfl_xor_sync(GGML_CUDA_FULL_THREAD_MASK, v, 1, shuffle_width);
-        sum += __shfl_xor_sync(GGML_CUDA_FULL_THREAD_MASK, sum, 2, shuffle_width);
+        sum = v + ggml_cuda_shfl_xor_sync<shuffle_width>(v, 1);
+        sum += ggml_cuda_shfl_xor_sync<shuffle_width>(sum, 2);
         v /= sum + eps;
 
         // Normalize columns.
-        sum = v + __shfl_xor_sync(GGML_CUDA_FULL_THREAD_MASK, v, 4, shuffle_width);
-        sum += __shfl_xor_sync(GGML_CUDA_FULL_THREAD_MASK, sum, 8, shuffle_width);
+        sum = v + ggml_cuda_shfl_xor_sync<shuffle_width>(v, 4);
+        sum += ggml_cuda_shfl_xor_sync<shuffle_width>(sum, 8);
         v /= sum + eps;
     }
 

@@ -444,14 +444,22 @@ static __device__ __forceinline__ T ggml_cuda_shfl_xor_sync(T x, int offset) {
 // clang (v20) will not unroll loops with just the plain `offset` in switch
 #if defined(GGML_USE_HIP)
  #if defined(RDNA)
-    // row_xor_mask is only available on GFX10+.
-    switch (~offset) {
-        // subgroups (width) should not make a difference for a butterfly shuffle pattern
-        case ~1: return hip_update_dpp<0x160 + 1>(x);  // row_xor_mask: offset
-        case ~2: return hip_update_dpp<0x160 + 2>(x);
-        case ~4: return hip_update_dpp<0x160 + 4>(x);
-        case ~8: return hip_update_dpp<0x160 + 8>(x);
-        default: return __shfl_xor_sync(GGML_CUDA_FULL_THREAD_MASK, x, offset, width);
+    if constexpr (sizeof(T) == sizeof(int)) {
+        // row_xor_mask is only available on GFX10+; use permlanex16 for offset == 16 to avoid ds_bpermute.
+        switch (~offset) {
+            // subgroups (width) should not make a difference for a butterfly shuffle pattern
+            case ~1:  return hip_update_dpp<0x160 + 1>(x);  // row_xor_mask: offset
+            case ~2:  return hip_update_dpp<0x160 + 2>(x);
+            case ~4:  return hip_update_dpp<0x160 + 4>(x);
+            case ~8:  return hip_update_dpp<0x160 + 8>(x);
+            case ~16: {
+                const int xi = __builtin_bit_cast(int, x);
+                return __builtin_bit_cast(T, __builtin_amdgcn_permlanex16(xi, xi, 0x76543210, 0xFEDCBA98, true, false));
+            }
+            default: return __shfl_xor_sync(GGML_CUDA_FULL_THREAD_MASK, x, offset, width);
+        }
+    } else {
+        return __shfl_xor_sync(GGML_CUDA_FULL_THREAD_MASK, x, offset, width);
     }
  #else // GCN and CDNA use the older DPP permutations.
     // For the power-of-two butterfly reductions used here, offset < width and offset is a single bit. Therefore XOR(offset) never leaves the
@@ -505,6 +513,11 @@ static __device__ __forceinline__ T ggml_cuda_shfl_up(T value, unsigned delta, i
 
 template <typename T>
 static __device__ __forceinline__ T ggml_cuda_shfl_xor(T value, int lane_mask, int width = ggml_cuda_get_physical_warp_size(), ggml_cuda_thread_mask_t mask = GGML_CUDA_FULL_THREAD_MASK) {
+#if defined(GGML_USE_HIP)
+    if (mask == GGML_CUDA_FULL_THREAD_MASK) {
+        return ggml_cuda_shfl_xor_sync<ggml_cuda_get_physical_warp_size()>(value, lane_mask);
+    }
+#endif
     return __shfl_xor_sync(mask, value, lane_mask, width);
 }
 

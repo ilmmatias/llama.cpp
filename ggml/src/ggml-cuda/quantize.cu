@@ -595,10 +595,7 @@ static __global__ void quantize_mmq_q8_1_swiglu(
     amax = fmaxf(amax, fabsf(xi.y));
     amax = fmaxf(amax, fabsf(xi.z));
     amax = fmaxf(amax, fabsf(xi.w));
-#pragma unroll
-    for (int offset = 4; offset > 0; offset >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(GGML_CUDA_FULL_THREAD_MASK, amax, offset, WARP_SIZE));
-    }
+    amax = warp_reduce_max<8>(amax);
 
     const float d_inv = 127.0f / amax;
     char4 q;
