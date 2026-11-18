@@ -94,7 +94,9 @@ llama_kv_cache::llama_kv_cache(
     attn_rot_bufs(no_alloc), swa_type(swa_type), ctxs_bufs(no_alloc),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
-    v_cells(*v_cells_impl) {
+    v_cells(*v_cells_impl),
+    compact_states_impl(other ? other->compact_states_impl : std::make_shared<compact_states_vec>()),
+    compact_states(*compact_states_impl) {
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -150,6 +152,9 @@ llama_kv_cache::llama_kv_cache(
     v_cells.resize(n_stream);
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].resize(kv_size);
+    }
+    if (!other) {
+        compact_states.resize(n_stream);
     }
 
     // by default, all sequence ids are mapped to the 0th stream
@@ -523,6 +528,7 @@ void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
+        compact_states[s].invalidate();
     }
 
     if (data) {
@@ -550,10 +556,12 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     }
 
     if (seq_id >= 0) {
-        auto & cells = v_cells[seq_to_stream[seq_id]];
-        auto & head  = v_heads[seq_to_stream[seq_id]];
+        const uint32_t strm = seq_to_stream[seq_id];
+        auto & cells = v_cells[strm];
+        auto & head  = v_heads[strm];
 
         const uint32_t new_head = cells.seq_rm(seq_id, p0, p1);
+        compact_states[strm].invalidate();
 
         // If we freed up a slot, set head to it so searching can start there.
         if (new_head != cells.size() && new_head < head) {
@@ -578,6 +586,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                     new_head = i;
                 }
             }
+
+            compact_states[s].invalidate();
 
             // If we freed up a slot, set head to it so searching can start there.
             if (new_head != cells.size() && new_head < head) {
@@ -629,6 +639,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
             }
         }
 
+        compact_states[s0].invalidate();
         return;
     }
 
@@ -675,6 +686,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     }
 
     v_heads[s1] = v_heads[s0];
+    compact_states[s1].invalidate();
 
     //for (uint32_t s = 0; s < n_stream; ++s) {
     //    LLAMA_LOG_WARN("%s: seq %d: min = %d, max = %d\n", __func__, s, v_cells[s].seq_pos_min(s), v_cells[s].seq_pos_max(s));
@@ -701,6 +713,8 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
             }
         }
     }
+
+    compact_states[seq_to_stream[seq_id]].invalidate();
 
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != cells.size() && new_head < head) {
@@ -753,6 +767,8 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         }
     }
 
+    compact_states[seq_to_stream[seq_id]].invalidate();
+
     // If we freed up a slot, set head to it so searching can start there.
     // Otherwise we just start the next search from the beginning.
     head = new_head != cells.size() ? new_head : 0;
@@ -795,6 +811,8 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
             cells.pos_div(i, d);
         }
     }
+
+    compact_states[seq_to_stream[seq_id]].invalidate();
 }
 
 llama_pos llama_kv_cache::seq_pos_min(llama_seq_id seq_id) const {
@@ -1302,6 +1320,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 cells.ext_set(idx, ext);
             }
             cells.seqS_add(idx, ubatch.n_seq_id[i], ubatch.seq_id[i]);
+            compact_states[sinfo.strm[s]].mark_dirty(idx);
         }
     }
 
@@ -1325,6 +1344,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         } else {
             cells.compact(s); // compact after seq_rm
         }
+
+        compact_states[seq_to_stream[s]].invalidate();
     }
 
     // move the head at the end of the slot
@@ -2017,6 +2038,15 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
     }
 }
 
+static inline void fill_compact_mask_row(
+        int32_t * row, const llama_kv_cells & cells, uint32_t i, llama_seq_id seq_id, bool is_2d) {
+    const bool valid = !cells.is_empty(i) && cells.seq_has(i, seq_id);
+    row[0] = valid ? cells.pos_get(i) : -1;
+    row[1] = valid && is_2d ? cells.ext_get(i).x : 0;
+    row[2] = valid && is_2d ? cells.ext_get(i).y : 0;
+    row[3] = 0;
+}
+
 void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const {
     // fill the cell rows of each slice
     if (attn_mask.rows && attn_mask.rows->buffer) {
@@ -2044,18 +2074,40 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const 
 
             const int64_t n_kv = dst->ne[1] - n_tokens;
             const llama_seq_id seq_id = ubatch->seq_id[0][0];
-            const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+            const uint32_t strm = seq_to_stream[seq_id];
+            const auto & cells = v_cells.at(strm);
+            auto & cs = (*compact_states_impl).at(strm);
             const bool is_2d = ubatch->is_pos_2d();
             int32_t * data = (int32_t *) dst->data;
 
-            for (int64_t i = 0; i < n_kv; ++i) {
-                const bool valid = !cells.is_empty(i) && cells.seq_has(i, seq_id);
-                int32_t * row = data + 4*i;
+            if (cs.valid && cs.seq_id == seq_id && cs.is_2d == is_2d) {
+                if (n_kv > cs.n_kv) {
+                    cs.data.resize((size_t) n_kv * 4);
+                    for (int64_t i = cs.n_kv; i < n_kv; ++i) {
+                        fill_compact_mask_row(cs.data.data() + 4*i, cells, (uint32_t) i, seq_id, is_2d);
+                    }
+                    cs.n_kv = n_kv;
+                }
+                for (const uint32_t cell : cs.dirty_cells) {
+                    if ((int64_t) cell < cs.n_kv) {
+                        fill_compact_mask_row(cs.data.data() + 4*cell, cells, cell, seq_id, is_2d);
+                    }
+                }
+                cs.dirty_cells.clear();
+            } else {
+                cs.data.resize((size_t) n_kv * 4);
+                for (int64_t i = 0; i < n_kv; ++i) {
+                    fill_compact_mask_row(cs.data.data() + 4*i, cells, (uint32_t) i, seq_id, is_2d);
+                }
+                cs.valid  = true;
+                cs.seq_id = seq_id;
+                cs.is_2d  = is_2d;
+                cs.n_kv   = n_kv;
+                cs.dirty_cells.clear();
+            }
 
-                row[0] = valid ? cells.pos_get(i) : -1;
-                row[1] = valid && is_2d ? cells.ext_get(i).x : 0;
-                row[2] = valid && is_2d ? cells.ext_get(i).y : 0;
-                row[3] = 0;
+            if (n_kv > 0) {
+                std::memcpy(data, cs.data.data(), (size_t) n_kv * 4 * sizeof(int32_t));
             }
 
             if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
@@ -3087,6 +3139,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         head = 0;
     }
 
+    compact_states[strm].invalidate();
     return true;
 }
 

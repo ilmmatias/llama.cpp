@@ -336,6 +336,36 @@ private:
 
     llama_kv_cells_vec & v_cells;
 
+    struct compact_mask_state {
+        bool                  valid  = false;
+        llama_seq_id          seq_id = -1;
+        bool                  is_2d  = false;
+        int64_t               n_kv   = 0;
+        std::vector<int32_t>  data;
+        std::vector<uint32_t> dirty_cells;
+
+        void invalidate() {
+            valid = false;
+            n_kv  = 0;
+            dirty_cells.clear();
+        }
+
+        void mark_dirty(uint32_t cell) {
+            if (!valid) {
+                return;
+            }
+            if (dirty_cells.size() >= 4096) {
+                invalidate();
+                return;
+            }
+            dirty_cells.push_back(cell);
+        }
+    };
+
+    using compact_states_vec = std::vector<compact_mask_state>;
+    std::shared_ptr<compact_states_vec> compact_states_impl;
+    compact_states_vec & compact_states;
+
     // maps from a sequence id to a stream id
     std::vector<uint32_t> seq_to_stream;
 
