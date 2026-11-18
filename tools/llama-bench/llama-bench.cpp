@@ -336,6 +336,7 @@ static std::vector<int> parse_int_range(const std::string & s, bool allow_negati
 
 struct cmd_params {
     std::vector<std::string>         model;
+    std::vector<std::string>         shards;
     std::vector<std::string>         hf_repo;
     std::vector<std::string>         hf_file;
     std::string                      hf_token;
@@ -386,6 +387,7 @@ struct cmd_params {
 
 static const cmd_params cmd_params_defaults = {
     /* model                */ { "models/7B/ggml-model-q4_0.gguf" },
+    /* shards               */ {},
     /* hf_repo              */ {},
     /* hf_file              */ {},
     /* hf_token             */ "",
@@ -458,6 +460,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("\n");
     printf("test parameters:\n");
     printf("  -m, --model <filename>                            (default: %s)\n", join(cmd_params_defaults.model, ",").c_str());
+    printf("  --ple, --shard <filename>,...                     extra GGUF shards for the model, comma separated; may be given more than once\n");
+    printf("                                                    --ple is an alias for --shard\n");
     printf("  -hf, -hfr, --hf-repo <user>/<model>[:quant]       Hugging Face model repository; quant is optional, case-insensitive\n");
     printf("                                                    default to Q4_K_M, or falls back to the first file in the repo if Q4_K_M doesn't exist.\n");
     printf("                                                    example: ggml-org/GLM-4.7-Flash-GGUF:Q4_K_M\n");
@@ -581,6 +585,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<std::string>(argv[i], split_delim);
                 params.model.insert(params.model.end(), p.begin(), p.end());
+            } else if (arg == "--ple" || arg == "--shard") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                params.shards.insert(params.shards.end(), p.begin(), p.end());
             } else if (arg == "-hf" || arg == "-hfr" || arg == "--hf-repo") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1267,6 +1278,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
 
 struct cmd_params_instance {
     std::string        model;
+    std::vector<std::string> shards;
     int                n_prompt;
     int                n_gen;
     int                n_depth;
@@ -1355,8 +1367,16 @@ struct cmd_params_instance {
         return mparams;
     }
 
+    std::vector<std::string> model_paths() const {
+        std::vector<std::string> paths;
+        paths.reserve(1 + shards.size());
+        paths.push_back(model);
+        paths.insert(paths.end(), shards.begin(), shards.end());
+        return paths;
+    }
+
     bool equal_mparams(const cmd_params_instance & other) const {
-        return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
+        return model == other.model && shards == other.shards && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
                // when enabled, the expert cache forces the routed experts to CPU when loading the model
                (expert_cache_slots > 0) == (other.expert_cache_slots > 0) &&
                split_mode == other.split_mode &&
@@ -1429,6 +1449,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
             }
             cmd_params_instance instance = {
                 /* .model                 = */ m,
+                /* .shards                = */ params.shards,
                 /* .n_prompt              = */ n_prompt,
                 /* .n_gen                 = */ 0,
                 /* .n_depth               = */ nd,
@@ -1471,6 +1492,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
             }
             cmd_params_instance instance = {
                 /* .model                 = */ m,
+                /* .shards                = */ params.shards,
                 /* .n_prompt              = */ 0,
                 /* .n_gen                 = */ n_gen,
                 /* .n_depth               = */ nd,
@@ -1513,6 +1535,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
             }
             cmd_params_instance instance = {
                 /* .model                 = */ m,
+                /* .shards                = */ params.shards,
                 /* .n_prompt              = */ n_pg.first,
                 /* .n_gen                 = */ n_pg.second,
                 /* .n_depth               = */ nd,
@@ -2489,7 +2512,7 @@ int llama_bench(int argc, char ** argv) {
         std::vector<ggml_backend_dev_t> devs;
         uint32_t ngl = 0, ngl_skip = 0, nct = 0, nex = 0, nxu = 0;
         size_t workspace_bytes = 0, cache_bytes = 0;
-        common_get_device_memory_data({ inst.model }, &mparams, &cparams,
+        common_get_device_memory_data(inst.model_paths(), &mparams, &cparams,
             devs, ngl, ngl_skip, nct, nex, nxu, log_level, &workspace_bytes, cache_dev, nullptr, &cache_bytes);
         if (nex == 0) {
             throw std::runtime_error("expert cache requested for a model without routed experts");
@@ -2507,7 +2530,7 @@ int llama_bench(int argc, char ** argv) {
             size_t device_cache_bytes = cache_bytes;
             if (devs[i] != cache_dev) {
                 std::vector<ggml_backend_dev_t> devs_unused;
-                common_get_device_memory_data({ inst.model }, &mparams, &cparams,
+                common_get_device_memory_data(inst.model_paths(), &mparams, &cparams,
                     devs_unused, ngl, ngl_skip, nct, nex, nxu, log_level, &device_workspace_bytes, devs[i], nullptr, &device_cache_bytes);
             }
             if (device_cache_bytes == 0) {
@@ -2609,7 +2632,7 @@ int llama_bench(int argc, char ** argv) {
                 for (size_t i = 0; i < margins.size(); ++i) {
                     margins[i] = inst.fit_target * 1024 * 1024 + (cache_reserves.empty() ? 0 : cache_reserves[i]);
                 }
-                const auto status = common_fit_params({ inst.model }, &mparams, &cparams,
+                const auto status = common_fit_params(inst.model_paths(), &mparams, &cparams,
                     fit_tensor_split.data(),
                     fit_overrides.data(),
                     margins.data(),
@@ -2630,7 +2653,7 @@ int llama_bench(int argc, char ** argv) {
                 llama_model_free(lmodel);
             }
 
-            lmodel = llama_model_load_from_file(inst.model.c_str(), mparams);
+            lmodel = common_model_load(inst.model_paths(), mparams);
             if (lmodel == NULL) {
                 fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, inst.model.c_str());
                 return 1;
