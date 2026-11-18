@@ -388,14 +388,68 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
 void llama_memory_hybrid_idx::qsa_reset(uint32_t ratio) const {
     if (ratio != 0) {
         qsa_blocks.erase(ratio);
+        qsa_dirty_counts.erase(ratio);
         qsa_slots.erase(ratio);
+        qsa_incr.erase(ratio);
         return;
     }
     qsa_blocks.clear();
+    qsa_dirty_counts.clear();
     qsa_slots.clear();
+    qsa_incr.clear();
+}
+
+void llama_memory_hybrid_idx::qsa_incr_invalidate(uint32_t ratio) const {
+    if (ratio != 0) {
+        const auto it = qsa_incr.find(ratio);
+        if (it != qsa_incr.end()) {
+            it->second.valid = false;
+            it->second.pending_cells.clear();
+        }
+        return;
+    }
+    for (auto & [r, st] : qsa_incr) {
+        GGML_UNUSED(r);
+        st.valid = false;
+        st.pending_cells.clear();
+    }
+}
+
+void llama_memory_hybrid_idx::qsa_incr_record_apply(const llama_kv_cache::slot_info & sinfo) const {
+    if (qsa_incr.empty()) {
+        return;
+    }
+    if (sinfo.n_stream() != 1) {
+        qsa_incr_invalidate();
+        return;
+    }
+    for (auto & [r, st] : qsa_incr) {
+        GGML_UNUSED(r);
+        if (!st.valid) {
+            continue;
+        }
+        const auto & idxs = sinfo.idxs[0];
+        st.pending_cells.insert(st.pending_cells.end(), idxs.begin(), idxs.end());
+    }
+}
+
+void llama_memory_hybrid_idx::qsa_set_block_dirty(
+        uint32_t ratio, llama_seq_id seq_id, qsa_block & block, bool dirty) const {
+    if (block.dirty == dirty) {
+        return;
+    }
+    block.dirty = dirty;
+    auto & cnt = qsa_dirty_counts[ratio][seq_id];
+    if (dirty) {
+        ++cnt;
+    } else {
+        GGML_ASSERT(cnt > 0);
+        --cnt;
+    }
 }
 
 void llama_memory_hybrid_idx::qsa_trim(llama_seq_id seq_id, llama_pos p0) const {
+    qsa_incr_invalidate();
     const auto & cells = mem_idx->get_cells(seq_id);
     const uint32_t size = mem_idx->get_size();
     for (auto & [ratio, by_seq] : qsa_blocks) {
@@ -418,9 +472,11 @@ void llama_memory_hybrid_idx::qsa_trim(llama_seq_id seq_id, llama_pos p0) const 
             }
         }
         for (size_t b = keep; b < blocks.size(); ++b) {
+            qsa_set_block_dirty(ratio, seq_id, blocks[b], false);
             qsa_release_slot(ratio, blocks[b]);
         }
         blocks.resize(keep);
+        qsa_incr_invalidate(ratio);
     }
 }
 
@@ -453,14 +509,16 @@ void llama_memory_hybrid_idx::qsa_invalidate_rows(const llama_kv_cache::slot_inf
                 }
                 for (const uint32_t row : block.cells) {
                     if (std::binary_search(rows.begin(), rows.end(), row)) {
+                        qsa_set_block_dirty(ratio, seq_id, block, false);
                         qsa_release_slot(ratio, block);
-                        block.dirty = true;
+                        qsa_set_block_dirty(ratio, seq_id, block, true);
                         break;
                     }
                 }
             }
         }
     }
+    qsa_incr_invalidate();
 }
 
 uint32_t llama_memory_hybrid_idx::qsa_acquire_slot(
@@ -552,10 +610,13 @@ uint32_t llama_memory_hybrid_idx::get_qsa_update_capacity(
         // During steady decode each active stream can complete at most one extra block
         // beyond the obvious n_tokens/ratio quotient.
         result = (uint64_t) ubatch.n_tokens/ratio + std::max(1u, ubatch.n_seqs_unq);
-        const auto & by_seq = qsa_blocks.at(ratio);
-        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
-            for (const auto & block : by_seq.at(ubatch.seq_id_unq[s])) {
-                result += block.dirty;
+        const auto dirty_it = qsa_dirty_counts.find(ratio);
+        if (dirty_it != qsa_dirty_counts.end()) {
+            for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+                const auto seq_it = dirty_it->second.find(ubatch.seq_id_unq[s]);
+                if (seq_it != dirty_it->second.end()) {
+                    result += seq_it->second;
+                }
             }
         }
     }
@@ -797,6 +858,13 @@ bool llama_memory_hybrid_idx_context::apply() {
 
     if (ctx_idx) {
         res = res & ctx_idx->apply();
+        if (res && mem != nullptr && mem->mem_qsa_blocks != nullptr) {
+            if (!sinfos_kpool.empty()) {
+                mem->qsa_incr_record_apply(sinfos_kpool[i_cur]);
+            } else {
+                mem->qsa_incr_invalidate();
+            }
+        }
     }
 
     // Extend the pool layout with this ubatch's cells, then pick what it must re-pool.
@@ -924,29 +992,270 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     int32_t * dst_update_pos     = (int32_t *) update_pos->data;
     int64_t * dst_update_idxs    = (int64_t *) update_idxs->data;
 
+    int64_t n_update = 0;
+
+    auto emit_update = [&](int64_t cache_slot, const uint32_t * blk_cells_ptr, const int32_t sec_pos[4]) {
+        GGML_ASSERT(n_update < n_updates);
+        for (int64_t ir = 0; ir < r; ++ir) {
+            dst_update_cells[n_update*r + ir] = (int32_t) blk_cells_ptr[ir];
+        }
+        for (int64_t sec = 0; sec < 4; ++sec) {
+            dst_update_pos[sec*n_updates + n_update] = sec_pos[sec];
+        }
+        dst_update_idxs[n_update++] = cache_slot;
+    };
+
+    auto fill_blk_bias = [&](int64_t i, int64_t q, const float * base_bias_ptr) {
+        // the tail is an incomplete block and is always visible, as in the reference
+        const int64_t tail_start = (q + 1)/r*r;
+        float * cur_blk_bias = dst_bias + i*n_blocks;
+
+        const int64_t past_blk = dst_block_cells != nullptr ?
+            (q >= 0 ? std::min(n_blocks, q/r + 1) : 0) : n_blocks;
+        const int64_t tail_blk = tail_start <= 0 ? 0 :
+            std::min(n_blocks, (tail_start + r - 1)/r);
+        const int64_t n_base = std::min(tail_blk, past_blk);
+        const int64_t n_tail = std::max(n_base, past_blk);
+
+        if (n_base > 0) {
+            std::memcpy(cur_blk_bias, base_bias_ptr, (size_t) n_base * sizeof(float));
+        }
+        if (n_tail > n_base) {
+            std::fill(cur_blk_bias + n_base, cur_blk_bias + n_tail, 1e9f);
+        }
+        if (n_tail < n_blocks) {
+            std::fill(cur_blk_bias + n_tail, cur_blk_bias + n_blocks, -INFINITY);
+        }
+    };
+
+    auto finish_updates = [&](bool have_fb, int64_t fb_idx, const int32_t * fb_cells, const int32_t fb_pos[4]) {
+        if (n_update == 0) {
+            for (int64_t ir = 0; ir < r; ++ir) {
+                dst_update_cells[ir] = have_fb ? fb_cells[ir] : 0;
+            }
+            for (int64_t sec = 0; sec < 4; ++sec) {
+                dst_update_pos[sec*n_updates] = have_fb ? fb_pos[sec] : 0;
+            }
+            dst_update_idxs[0] = have_fb ? fb_idx : 0;
+            n_update = 1;
+        }
+        while (n_update < n_updates) {
+            for (int64_t ir = 0; ir < r; ++ir) {
+                dst_update_cells[n_update*r + ir] = dst_update_cells[ir];
+            }
+            for (int64_t sec = 0; sec < 4; ++sec) {
+                dst_update_pos[sec*n_updates + n_update] = dst_update_pos[sec*n_updates];
+            }
+            dst_update_idxs[n_update] = dst_update_idxs[0];
+            ++n_update;
+        }
+    };
+
+    bool have_fallback = false;
+    int32_t fallback_cells_arr[4] = { 0, 0, 0, 0 };
+    std::vector<int32_t> & fallback_cells_vec = mem->qsa_tmp.fallback_cells; // only used if r > 4
+    int32_t * fallback_cells_ptr = fallback_cells_arr;
+    if (r > 4) {
+        fallback_cells_vec.assign(r, 0);
+        fallback_cells_ptr = fallback_cells_vec.data();
+    }
+    int32_t fallback_pos[4] = { 0, 0, 0, 0 };
+    int64_t fallback_idx = 0;
+
+    auto & tmp = mem->qsa_tmp;
+    std::vector<uint32_t> & blk_cells = tmp.blk_cells;
+    blk_cells.resize(r);
+
+    // Incremental O(delta) fast path for single-stream non-2D decode/append.
+    auto & inc = mem->qsa_incr[ratio];
+    if (inc.valid && n_ns == 1 && !ubatch->is_pos_2d() && blk_bias && dst_block_cells != nullptr) {
+        const llama_seq_id seq_of_stream = ubatch->seq_id[0][0];
+        const auto & cells = mem_idx->get_cells(seq_of_stream);
+        int n_seq_present = 0;
+        for (int sq = 0; sq < LLAMA_MAX_SEQ && n_seq_present < 2; ++sq) {
+            if (cells.seq_pos_min(sq) >= 0) {
+                n_seq_present++;
+            }
+        }
+        const bool one_seq = n_seq_present <= 1;
+        const int64_t cache_stream = mem_idx->get_n_stream() == 1 ? 0 : seq_of_stream;
+        const int64_t stream_off = cache_stream * (int64_t) mem_idx->get_size();
+
+        if (one_seq && seq_of_stream == inc.seq_id && stream_off == inc.stream_off && n_kv >= inc.n_kv) {
+            auto & cached = mem->qsa_blocks[ratio][seq_of_stream];
+            if ((int64_t) cached.size() < n_blocks) {
+                cached.resize(n_blocks);
+            }
+            if (n_kv > inc.n_kv) {
+                inc.cell_slot.resize(n_kv, -1);
+                inc.n_kv = n_kv;
+            }
+            if (n_blocks > inc.n_blocks) {
+                inc.filled.resize(n_blocks, 0);
+                inc.cur_blk_cells.resize(r * n_blocks, -1);
+                inc.base_blk_bias.resize(n_blocks, -INFINITY);
+                inc.out_block_cells.resize(r * n_blocks, 0);
+                inc.out_block_cell_bias.resize(r * n_blocks, -INFINITY);
+                inc.key_cells.resize(n_blocks, 0);
+                inc.dirty_stamp.resize(n_blocks, 0);
+                inc.n_blocks = n_blocks;
+            }
+            if ((int64_t) inc.dirty_stamp.size() < n_blocks) {
+                inc.dirty_stamp.resize(n_blocks, 0);
+            }
+
+            inc.dirty_blocks.clear();
+            const uint32_t stamp = ++inc.dirty_epoch;
+            if (stamp == 0) {
+                std::fill(inc.dirty_stamp.begin(), inc.dirty_stamp.end(), 0);
+                inc.dirty_epoch = 1;
+            }
+            const uint32_t cur_stamp = inc.dirty_epoch;
+
+            auto mark_dirty = [&](int64_t b) {
+                if (inc.dirty_stamp[b] != cur_stamp) {
+                    inc.dirty_stamp[b] = cur_stamp;
+                    inc.dirty_blocks.push_back(b);
+                }
+            };
+
+            bool ok = true;
+            for (const uint32_t cell_u32 : inc.pending_cells) {
+                const int64_t j = (int64_t) cell_u32;
+                if (j >= n_kv) {
+                    continue;
+                }
+                if (inc.cell_slot[j] >= 0) {
+                    const int64_t old_slot = inc.cell_slot[j];
+                    const int64_t old_b = ratio_power_of_two ? (old_slot >> ratio_shift) : old_slot / r;
+                    inc.cur_blk_cells[old_slot] = -1;
+                    inc.out_block_cells[old_slot] = 0;
+                    inc.out_block_cell_bias[old_slot] = -INFINITY;
+                    inc.filled[old_b]--;
+                    inc.cell_slot[j] = -1;
+                    mark_dirty(old_b);
+                }
+                if (!cells.is_empty(j)) {
+                    const int64_t idx = cells.pos_get(j);
+                    const int64_t b = ratio_power_of_two && idx >= 0 ? (idx >> ratio_shift) : idx / r;
+                    if (idx < 0 || b >= n_blocks || inc.cur_blk_cells[idx] >= 0) {
+                        ok = false;
+                        break;
+                    }
+                    inc.cell_slot[j] = (int32_t) idx;
+                    inc.cur_blk_cells[idx] = (int32_t) j;
+                    inc.out_block_cells[idx] = (int32_t) j;
+                    inc.out_block_cell_bias[idx] = 0.0f;
+                    inc.filled[b]++;
+                    mark_dirty(b);
+                }
+            }
+
+            if (ok) {
+                for (const int64_t b : inc.dirty_blocks) {
+                    inc.base_blk_bias[b] = inc.filled[b] < r ? -INFINITY : 0.0f;
+                    if (inc.filled[b] != r) {
+                        mem->qsa_set_block_dirty(ratio, seq_of_stream, cached[b], false);
+                        mem->qsa_release_slot(ratio, cached[b]);
+                        inc.key_cells[b] = 0;
+                        continue;
+                    }
+                    const int32_t sec_pos[4] = { (int32_t) (b*r), (int32_t) (b*r), (int32_t) (b*r), (int32_t) (b*r) };
+                    for (int64_t ir = 0; ir < r; ++ir) {
+                        const int64_t global_src = stream_off + inc.cur_blk_cells[b*r + ir];
+                        GGML_ASSERT(global_src <= std::numeric_limits<int32_t>::max());
+                        blk_cells[ir] = (uint32_t) global_src;
+                    }
+                    bool refresh = false;
+                    if (!cached[b].valid || cached[b].cells != blk_cells) {
+                        mem->qsa_set_block_dirty(ratio, seq_of_stream, cached[b], false);
+                        mem->qsa_release_slot(ratio, cached[b]);
+                        llama_memory_hybrid_idx::qsa_block now;
+                        now.cells = blk_cells;
+                        bool is_new = false;
+                        now.cache_slot = mem->qsa_acquire_slot(ratio, now.cells, is_new);
+                        now.valid = true;
+                        cached[b] = std::move(now);
+                        refresh = is_new;
+                    }
+                    const uint32_t cache_slot = cached[b].cache_slot;
+                    GGML_ASSERT(cache_slot <= (uint32_t) std::numeric_limits<int32_t>::max());
+                    inc.key_cells[b] = (int32_t) cache_slot;
+                    if (!have_fallback) {
+                        have_fallback = true;
+                        for (int64_t sec = 0; sec < 4; ++sec) {
+                            fallback_pos[sec] = sec_pos[sec];
+                        }
+                        fallback_idx = cache_slot;
+                        for (int64_t ir = 0; ir < r; ++ir) {
+                            fallback_cells_ptr[ir] = (int32_t) cached[b].cells[ir];
+                        }
+                    }
+                    if (refresh) {
+                        emit_update(cache_slot, cached[b].cells.data(), sec_pos);
+                    }
+                }
+
+                if (n_update == 0 && !have_fallback) {
+                    for (int64_t b = 0; b < n_blocks; ++b) {
+                        if (cached[b].valid) {
+                            have_fallback = true;
+                            for (int64_t sec = 0; sec < 4; ++sec) {
+                                fallback_pos[sec] = (int32_t) (b*r);
+                            }
+                            fallback_idx = cached[b].cache_slot;
+                            for (int64_t ir = 0; ir < r; ++ir) {
+                                fallback_cells_ptr[ir] = (int32_t) cached[b].cells[ir];
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                std::memcpy(dst_block_key_cell, inc.key_cells.data(), (size_t) n_blocks * sizeof(int32_t));
+                std::memcpy(dst_block_cells, inc.out_block_cells.data(), (size_t) (r * n_blocks) * sizeof(int32_t));
+                std::memcpy(dst_block_cell_bias, inc.out_block_cell_bias.data(), (size_t) (r * n_blocks) * sizeof(float));
+
+                for (int64_t ii = 0; ii < n_tps; ++ii) {
+                    fill_blk_bias(ii, ubatch->pos[ii], inc.base_blk_bias.data());
+                }
+
+                finish_updates(have_fallback, fallback_idx, fallback_cells_ptr, fallback_pos);
+                inc.pending_cells.clear();
+                return;
+            }
+        }
+        inc.valid = false;
+        inc.pending_cells.clear();
+    } else {
+        inc.valid = false;
+        inc.pending_cells.clear();
+    }
+
     std::fill(dst_block_key_cell, dst_block_key_cell + ggml_nelements(block_key_cells), 0);
     std::fill(dst_update_cells, dst_update_cells + ggml_nelements(update_cells), 0);
     std::fill(dst_update_pos, dst_update_pos + ggml_nelements(update_pos), 0);
     std::fill(dst_update_idxs, dst_update_idxs + ggml_nelements(update_idxs), 0);
 
-
     // one pass per stream: cell j is a different token in each, so no mapping is shared
     const bool need_blk_of = dst_cell_blk != nullptr || !blk_bias;
-    std::vector<int32_t> blk_of(need_blk_of ? n_kv : 0);
-    std::vector<int32_t> filled(n_blocks);
+    std::vector<int32_t> & blk_of = tmp.blk_of;
+    std::vector<int32_t> & filled = tmp.filled;
+    std::vector<int32_t> & cur_blk_cells = tmp.cur_blk_cells;
+    std::vector<float> & base_blk_bias = tmp.base_blk_bias;
+    std::vector<int32_t> & order = tmp.order;
+    std::vector<int32_t> & rank = tmp.rank;
 
-    std::vector<int32_t> cur_blk_cells(r*n_blocks);
-    std::vector<uint32_t> blk_cells(r);
-    std::vector<float> base_blk_bias(blk_bias ? n_blocks : 0);
+    if (need_blk_of) {
+        blk_of.resize(n_kv);
+    }
+    filled.resize(n_blocks);
+    cur_blk_cells.resize(r*n_blocks);
+    if (blk_bias) {
+        base_blk_bias.resize(n_blocks);
+    }
 
-    std::vector<int32_t> order;
-    std::vector<int32_t> rank;
-
-    int64_t n_update = 0;
-    bool have_fallback = false;
-    std::vector<int32_t> fallback_cells(r, 0);
-    int32_t fallback_pos[4] = { 0, 0, 0, 0 };
-    int64_t fallback_idx = 0;
+    bool can_cache_incr = n_ns == 1 && !ubatch->is_pos_2d() && blk_bias && dst_block_cells != nullptr;
 
     for (int64_t s = 0; s < n_ns; ++s) {
         // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
@@ -1068,8 +1377,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             dst_block_key_cell[s*n_blocks + b] = 0;
 
             if (filled[b] != r) {
+                mem->qsa_set_block_dirty(ratio, seq_of_stream, cached[b], false);
                 mem->qsa_release_slot(ratio, cached[b]);
-                cached[b].dirty = false;
                 continue;
             }
 
@@ -1094,6 +1403,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
             bool refresh = false;
             if (!cached[b].valid || cached[b].cells != blk_cells) {
+                mem->qsa_set_block_dirty(ratio, seq_of_stream, cached[b], false);
                 mem->qsa_release_slot(ratio, cached[b]);
 
                 llama_memory_hybrid_idx::qsa_block now;
@@ -1116,7 +1426,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 }
                 fallback_idx = cache_slot;
                 for (int64_t ir = 0; ir < r; ++ir) {
-                    fallback_cells[ir] = (int32_t) cached[b].cells[ir];
+                    fallback_cells_ptr[ir] = (int32_t) cached[b].cells[ir];
                 }
             }
 
@@ -1126,14 +1436,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 continue;
             }
 
-            GGML_ASSERT(n_update < n_updates);
-            for (int64_t ir = 0; ir < r; ++ir) {
-                dst_update_cells[n_update*r + ir] = (int32_t) cached[b].cells[ir];
-            }
-            for (int64_t sec = 0; sec < 4; ++sec) {
-                dst_update_pos[sec*n_updates + n_update] = sec_pos[sec];
-            }
-            dst_update_idxs[n_update++] = cache_slot;
+            emit_update(cache_slot, cached[b].cells.data(), sec_pos);
         }
 
         if (dst_block_cells != nullptr) {
@@ -1165,6 +1468,31 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             }
         }
 
+        if (can_cache_incr && !ranked && !oor && !dup && one_seq) {
+            inc.valid = true;
+            inc.seq_id = seq_of_stream;
+            inc.stream_off = stream_off;
+            inc.n_kv = n_kv;
+            inc.n_blocks = n_blocks;
+            inc.cell_slot.assign(n_kv, -1);
+            for (int64_t bi = 0; bi < r * n_blocks; ++bi) {
+                if (cur_blk_cells[bi] >= 0 && cur_blk_cells[bi] < n_kv) {
+                    inc.cell_slot[cur_blk_cells[bi]] = (int32_t) bi;
+                }
+            }
+            inc.filled.assign(filled.begin(), filled.begin() + n_blocks);
+            inc.cur_blk_cells.assign(cur_blk_cells.begin(), cur_blk_cells.begin() + r * n_blocks);
+            inc.base_blk_bias.assign(base_blk_bias.begin(), base_blk_bias.begin() + n_blocks);
+            inc.out_block_cells.assign(dst_block_cells, dst_block_cells + r * n_blocks);
+            inc.out_block_cell_bias.assign(dst_block_cell_bias, dst_block_cell_bias + r * n_blocks);
+            inc.key_cells.assign(dst_block_key_cell, dst_block_key_cell + n_blocks);
+            inc.dirty_stamp.assign(n_blocks, 0);
+            inc.dirty_epoch = 0;
+            inc.pending_cells.clear();
+        } else {
+            can_cache_incr = false;
+        }
+
         for (int64_t ii = 0; ii < n_tps; ++ii) {
             const int64_t      i      = s*n_tps + ii;
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
@@ -1194,35 +1522,17 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 q = lo - 1;
             }
 
-            // the tail is an incomplete block and is always visible, as in the reference
-            const int64_t tail_start = (q + 1)/r*r;
-
             if (blk_bias) {
                 // Block-first compact selection performs its top-k before the per-cell
                 // attention mask is gathered. Reject future blocks here so they cannot
                 // consume the shortlist; only the current partial tail is force-selected.
                 // The legacy expanded path still gets its future masking before token top-k.
-                float * cur_blk_bias = dst_bias + i*n_blocks;
-
-                const int64_t past_blk = dst_block_cells != nullptr ?
-                    (q >= 0 ? std::min(n_blocks, q/r + 1) : 0) : n_blocks;
-                const int64_t tail_blk = tail_start <= 0 ? 0 :
-                    std::min(n_blocks, (tail_start + r - 1)/r);
-                const int64_t n_base = std::min(tail_blk, past_blk);
-                const int64_t n_tail = std::max(n_base, past_blk);
-
-                if (n_base > 0) {
-                    std::memcpy(cur_blk_bias, base_blk_bias.data(), (size_t) n_base * sizeof(float));
-                }
-                if (n_tail > n_base) {
-                    std::fill(cur_blk_bias + n_base, cur_blk_bias + n_tail, 1e9f);
-                }
-                if (n_tail < n_blocks) {
-                    std::fill(cur_blk_bias + n_tail, cur_blk_bias + n_blocks, -INFINITY);
-                }
-
+                fill_blk_bias(i, q, base_blk_bias.data());
                 continue;
             }
+
+            // the tail is an incomplete block and is always visible, as in the reference
+            const int64_t tail_start = (q + 1)/r*r;
 
             float * cur_bias = dst_bias + i*n_kv;
 
@@ -1243,32 +1553,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         }
     }
 
-    if (n_update == 0) {
-        // ggml tensors cannot have a zero-sized update dimension. Recompute one already
-        // cached block when possible; before the first complete block, row zero is harmless
-        // because every incomplete block is excluded from scoring or force-selected as tail.
-        for (int64_t ir = 0; ir < r; ++ir) {
-            dst_update_cells[ir] = have_fallback ? fallback_cells[ir] : 0;
-        }
-        for (int64_t sec = 0; sec < 4; ++sec) {
-            dst_update_pos[sec*n_updates] = have_fallback ? fallback_pos[sec] : 0;
-        }
-        dst_update_idxs[0] = have_fallback ? fallback_idx : 0;
-        n_update = 1;
-    }
-
-    // Capacity is an upper bound chosen to keep the graph shape reusable. Duplicate the
-    // first refresh into unused rows; repeated writes of the same derived key are harmless.
-    while (n_update < n_updates) {
-        for (int64_t ir = 0; ir < r; ++ir) {
-            dst_update_cells[n_update*r + ir] = dst_update_cells[ir];
-        }
-        for (int64_t sec = 0; sec < 4; ++sec) {
-            dst_update_pos[sec*n_updates + n_update] = dst_update_pos[sec*n_updates];
-        }
-        dst_update_idxs[n_update] = dst_update_idxs[0];
-        ++n_update;
-    }
+    finish_updates(have_fallback, fallback_idx, fallback_cells_ptr, fallback_pos);
 
 }
 

@@ -133,9 +133,42 @@ private:
         uint32_t next_slot = 0;
     };
 
+    struct qsa_incr_state {
+        bool valid = false;
+        llama_seq_id seq_id = -1;
+        int64_t stream_off = 0;
+        int64_t n_kv = 0;
+        int64_t n_blocks = 0;
+        std::vector<uint32_t> pending_cells;
+        std::vector<int32_t>  cell_slot;
+        std::vector<int32_t>  filled;
+        std::vector<int32_t>  cur_blk_cells;
+        std::vector<float>    base_blk_bias;
+        std::vector<int32_t>  out_block_cells;
+        std::vector<float>    out_block_cell_bias;
+        std::vector<int32_t>  key_cells;
+        std::vector<int64_t>  dirty_blocks;
+        std::vector<uint32_t> dirty_stamp;
+        uint32_t              dirty_epoch = 0;
+    };
+
+    struct qsa_scratch {
+        std::vector<int32_t>  blk_of;
+        std::vector<int32_t>  filled;
+        std::vector<int32_t>  cur_blk_cells;
+        std::vector<uint32_t> blk_cells;
+        std::vector<float>    base_blk_bias;
+        std::vector<int32_t>  order;
+        std::vector<int32_t>  rank;
+        std::vector<int32_t>  fallback_cells;
+    };
+
     void qsa_reset(uint32_t ratio = 0) const;
     void qsa_trim(llama_seq_id seq_id, llama_pos p0) const;
     void qsa_invalidate_rows(const llama_kv_cache::slot_info & sinfo) const;
+    void qsa_incr_invalidate(uint32_t ratio = 0) const;
+    void qsa_incr_record_apply(const llama_kv_cache::slot_info & sinfo) const;
+    void qsa_set_block_dirty(uint32_t ratio, llama_seq_id seq_id, qsa_block & block, bool dirty) const;
     uint32_t qsa_acquire_slot(uint32_t ratio, const std::vector<uint32_t> & cells, bool & is_new) const;
     void qsa_release_slot(uint32_t ratio, qsa_block & block) const;
 
@@ -154,7 +187,10 @@ private:
     const std::unique_ptr<llama_kv_cache> mem_qsa_blocks;
 
     mutable std::map<uint32_t, std::map<llama_seq_id, std::vector<qsa_block>>> qsa_blocks;
+    mutable std::map<uint32_t, std::map<llama_seq_id, uint32_t>> qsa_dirty_counts;
     mutable std::map<uint32_t, qsa_slot_state> qsa_slots;
+    mutable std::map<uint32_t, qsa_incr_state> qsa_incr;
+    mutable qsa_scratch qsa_tmp;
 
 
     // unique_ptr because kpool_layout is incomplete here
