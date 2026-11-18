@@ -102,64 +102,170 @@ namespace qsa_cub = cub;
 
 // Compact QSA keeps almost every candidate: prune the small complement, then
 // emit physical cells in candidate order rather than sorting the survivors.
-template <bool compact>
-static __global__ __launch_bounds__(256, 1) void qsa_refine_cuda(
+template <bool compact, bool fused_gather, int MAX_TILES>
+static __global__ void qsa_refine_cuda(
         const float * scores,
         const int32_t * cells,
+        const float * slot_bias,
+        const int32_t * top_blocks,
         const half * mask,
         const int32_t * positions,
         int32_t * dst,
         const int n_candidates,
         const int width,
+        const int ratio,
+        const int n_blocks,
+        const int n_block_top,
         const size_t mask_query_stride,
         const int n_kv) {
-    using reduce_t = qsa_cub::BlockReduce<uint64_t, 256>;
-    using scan_t   = qsa_cub::BlockScan<int, 256>;
-    __shared__ uint64_t keys[4096];
-    __shared__ typename reduce_t::TempStorage reduce_temp;
-    __shared__ typename scan_t::TempStorage scan_temp;
-
-    const int tid = threadIdx.x;
-    scores += int64_t(blockIdx.x)*n_candidates;
-    cells  += int64_t(blockIdx.x)*n_candidates;
-    if constexpr (!compact) {
-        mask = (const half *) ((const char *) mask + size_t(blockIdx.x) * mask_query_stride);
-    }
-    dst += int64_t(blockIdx.x)*width;
-    for (int i = tid; i < n_candidates; i += 256) {
-        float value = scores[i];
-        if constexpr (compact) {
-            const bool visible = ggml_qsa_is_visible(positions, n_kv, cells[i], blockIdx.x);
-            value += visible ? 0.0f : -INFINITY;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = 256 / warp_size;
+    const auto popc = [](const ggml_cuda_thread_mask_t m) -> int {
+        if constexpr (warp_size == 64) {
+            return __popcll(m);
         } else {
-            value += __half2float(mask[cells[i]]);
+            return __popc(m);
         }
-        keys[i] = (uint64_t(top_k_float_to_ordered(value)) << 32) | uint32_t(i);
-    }
-    __syncthreads();
+    };
 
-    for (int removed = 0; removed < n_candidates - width; ++removed) {
-        uint64_t smallest = UINT64_MAX;
-        for (int i = tid; i < n_candidates; i += 256) {
-            smallest = min(smallest, keys[i]);
+    __shared__ uint32_t warp_min_val[nwarps];
+    __shared__ uint32_t warp_min_idx[nwarps];
+    __shared__ uint32_t min_idx_shared;
+    __shared__ uint16_t warp_kept[nwarps];
+
+    const int tid  = threadIdx.x;
+    const int warp = tid / warp_size;
+    const int lane = tid % warp_size;
+    const int iq   = blockIdx.x;
+    const ggml_cuda_thread_mask_t below_lane = ((ggml_cuda_thread_mask_t) 1 << lane) - 1;
+
+    if constexpr (fused_gather) {
+        scores     += int64_t(iq) * n_blocks;
+        top_blocks += int64_t(iq) * n_block_top;
+    } else {
+        scores += int64_t(iq) * n_candidates;
+        cells  += int64_t(iq) * n_candidates;
+    }
+    if constexpr (!compact) {
+        mask = (const half *) ((const char *) mask + size_t(iq) * mask_query_stride);
+    }
+    dst += int64_t(iq) * width;
+
+    uint32_t my_vals[MAX_TILES];
+    int32_t  my_cells[MAX_TILES];
+    uint32_t active_mask   = 0;
+    uint32_t local_min_val = UINT32_MAX;
+    uint32_t local_min_idx = UINT32_MAX;
+
+#pragma unroll
+    for (int t = 0; t < MAX_TILES; ++t) {
+        const int i = tid + t * 256;
+        if (i < n_candidates) {
+            float value;
+            int32_t cell;
+            if constexpr (fused_gather) {
+                const int tb   = i / ratio;
+                const int slot = i - tb * ratio;
+                const int32_t b = top_blocks[tb];
+                const int64_t raw_idx = int64_t(b) * ratio + slot;
+                cell  = cells[raw_idx];
+                value = scores[b] + slot_bias[raw_idx];
+            } else {
+                cell  = cells[i];
+                value = scores[i];
+            }
+            if constexpr (compact) {
+                const bool visible = ggml_qsa_is_visible(positions, n_kv, cell, iq);
+                value += visible ? 0.0f : -INFINITY;
+            } else {
+                value += __half2float(mask[cell]);
+            }
+            const uint32_t ord = top_k_float_to_ordered(value);
+            my_vals[t]  = ord;
+            my_cells[t] = cell;
+            active_mask |= (1U << t);
+            if (local_min_idx == UINT32_MAX || ord < local_min_val) {
+                local_min_val = ord;
+                local_min_idx = uint32_t(i);
+            }
         }
-        const uint64_t block_min = reduce_t(reduce_temp).Reduce(smallest, qsa_cub::Min());
-        if (tid == 0) {
-            keys[uint32_t(block_min)] = UINT64_MAX;
+    }
+
+    const int n_remove = n_candidates - width;
+    for (int removed = 0; removed < n_remove; ++removed) {
+        uint32_t bval = local_min_val;
+        uint32_t bidx = local_min_idx;
+#pragma unroll
+        for (int off = warp_size / 2; off >= 1; off >>= 1) {
+            const uint32_t oval = ggml_cuda_shfl_xor_sync(bval, off);
+            const uint32_t oidx = ggml_cuda_shfl_xor_sync(bidx, off);
+            if (oidx != UINT32_MAX && (bidx == UINT32_MAX || oval < bval || (oval == bval && oidx < bidx))) {
+                bval = oval;
+                bidx = oidx;
+            }
+        }
+        if (lane == 0) {
+            warp_min_val[warp] = bval;
+            warp_min_idx[warp] = bidx;
         }
         __syncthreads();
+
+        if (warp == 0) {
+            uint32_t gval = lane < nwarps ? warp_min_val[lane] : UINT32_MAX;
+            uint32_t gidx = lane < nwarps ? warp_min_idx[lane] : UINT32_MAX;
+#pragma unroll
+            for (int off = nwarps / 2; off >= 1; off >>= 1) {
+                const uint32_t oval = ggml_cuda_shfl_xor_sync(gval, off);
+                const uint32_t oidx = ggml_cuda_shfl_xor_sync(gidx, off);
+                if (oidx != UINT32_MAX && (gidx == UINT32_MAX || oval < gval || (oval == gval && oidx < gidx))) {
+                    gval = oval;
+                    gidx = oidx;
+                }
+            }
+            if (lane == 0) {
+                min_idx_shared = gidx;
+            }
+        }
+        __syncthreads();
+
+        const uint32_t drop = min_idx_shared;
+        if ((drop & 255U) == uint32_t(tid)) {
+            active_mask &= ~(1U << (drop >> 8));
+            if (removed + 1 < n_remove) {
+                local_min_val = UINT32_MAX;
+                local_min_idx = UINT32_MAX;
+#pragma unroll
+                for (int t = 0; t < MAX_TILES; ++t) {
+                    if (((active_mask >> t) & 1U) && (local_min_idx == UINT32_MAX || my_vals[t] < local_min_val)) {
+                        local_min_val = my_vals[t];
+                        local_min_idx = uint32_t(tid + t * 256);
+                    }
+                }
+            }
+        }
     }
 
     int written = 0;
-    for (int base = 0; base < n_candidates; base += 256) {
-        const int i = base + tid;
-        const int keep = i < n_candidates && keys[i] != UINT64_MAX;
-        int offset, total;
-        scan_t(scan_temp).ExclusiveSum(keep, offset, total);
-        if (keep) {
-            dst[written + offset] = cells[i];
+    for (int t = 0; t * 256 < n_candidates; ++t) {
+        const bool keep = (active_mask >> t) & 1U;
+        const ggml_cuda_thread_mask_t ballot = ggml_cuda_ballot(keep);
+        if (lane == 0) {
+            warp_kept[warp] = (uint16_t) popc(ballot);
         }
-        written += total;
+        __syncthreads();
+
+        int warp_off = 0;
+        for (int w = 0; w < warp; ++w) {
+            warp_off += warp_kept[w];
+        }
+        int total_tile = warp_off;
+        for (int w = warp; w < nwarps; ++w) {
+            total_tile += warp_kept[w];
+        }
+        if (keep) {
+            dst[written + warp_off + popc(ballot & below_lane)] = my_cells[t];
+        }
+        written += total_tile;
         __syncthreads();
     }
 }
@@ -169,8 +275,11 @@ void ggml_cuda_qsa_refine(
         const ggml_tensor * scores,
         const ggml_tensor * cells,
         const ggml_tensor * mask,
-        ggml_tensor * dst) {
+        ggml_tensor * dst,
+        const ggml_tensor * slot_bias,
+        const ggml_tensor * top_blocks) {
     const bool compact = mask->type == GGML_TYPE_I32;
+    const bool fused_gather = top_blocks != nullptr;
     const half * mask_data = nullptr;
     const int32_t * positions = nullptr;
     size_t query_stride_mask = 0;
@@ -178,21 +287,58 @@ void ggml_cuda_qsa_refine(
 
     if (compact) {
         positions = (const int32_t *) mask->data;
-        n_kv = mask->ne[1] - cells->ne[1];
+        n_kv = mask->ne[1] - dst->ne[1];
     } else {
         mask_data = (const half *) mask->data;
         query_stride_mask = mask->nb[2];
     }
 
-    const auto kernel = compact ? qsa_refine_cuda<true> : qsa_refine_cuda<false>;
-    const dim3 blocks_num(cells->ne[1], 1, 1);
-    const dim3 block_dim(256, 1, 1);
-    const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, ctx.stream());
+    const int n_candidates = fused_gather ? (int) (cells->ne[0] * top_blocks->ne[0]) : (int) cells->ne[0];
+    const int ratio        = fused_gather ? (int) cells->ne[0] : 1;
+    const int n_blocks     = fused_gather ? (int) scores->ne[0] : 0;
+    const int n_block_top  = fused_gather ? (int) top_blocks->ne[0] : 0;
+    const float * slot_bias_data = fused_gather ? (const float *) slot_bias->data : nullptr;
+    const int32_t * top_blocks_data = fused_gather ? (const int32_t *) top_blocks->data : nullptr;
 
-    ggml_cuda_kernel_launch(kernel, launch_params,
-            (const float *) scores->data, (const int32_t *) cells->data,
-            mask_data, positions, (int32_t *) dst->data,
-            (int) cells->ne[0], (int) dst->ne[0], query_stride_mask, n_kv);
+    const auto launch = [&](auto kernel) {
+        const dim3 blocks_num(dst->ne[1], 1, 1);
+        const dim3 block_dim(256, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, ctx.stream());
+        ggml_cuda_kernel_launch(kernel, launch_params,
+                (const float *) scores->data, (const int32_t *) cells->data,
+                slot_bias_data, top_blocks_data, mask_data, positions, (int32_t *) dst->data,
+                n_candidates, (int) dst->ne[0], ratio, n_blocks, n_block_top, query_stride_mask, n_kv);
+    };
+
+    if (n_candidates <= 2304) {
+        if (compact) {
+            if (fused_gather) {
+                launch(qsa_refine_cuda<true, true, 9>);
+            } else {
+                launch(qsa_refine_cuda<true, false, 9>);
+            }
+        } else {
+            if (fused_gather) {
+                launch(qsa_refine_cuda<false, true, 9>);
+            } else {
+                launch(qsa_refine_cuda<false, false, 9>);
+            }
+        }
+    } else {
+        if (compact) {
+            if (fused_gather) {
+                launch(qsa_refine_cuda<true, true, 16>);
+            } else {
+                launch(qsa_refine_cuda<true, false, 16>);
+            }
+        } else {
+            if (fused_gather) {
+                launch(qsa_refine_cuda<false, true, 16>);
+            } else {
+                launch(qsa_refine_cuda<false, false, 16>);
+            }
+        }
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

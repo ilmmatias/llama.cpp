@@ -9,5 +9,7 @@ void ggml_cuda_qsa_refine(
         const ggml_tensor * scores,
         const ggml_tensor * cells,
         const ggml_tensor * mask,
-        ggml_tensor * dst);
+        ggml_tensor * dst,
+        const ggml_tensor * slot_bias = nullptr,
+        const ggml_tensor * top_blocks = nullptr);
 #endif

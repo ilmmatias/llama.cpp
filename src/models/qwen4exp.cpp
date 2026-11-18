@@ -1083,7 +1083,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
 
             // Tail-forcing bias is finite 1e9: casting it to F16 would make
             // +inf, which becomes NaN when an invisible candidate adds -inf.
-            score = ggml_add(ctx0, ggml_reshape_3d(ctx0, score, n_blocks, n_tps, n_stream), inp->bias);
+            score = ggml_add(ctx0,
+                    ggml_are_same_shape(score, inp->bias) ? score : ggml_reshape_3d(ctx0, score, n_blocks, n_tps, n_stream),
+                    inp->bias);
         } else {
             score = ggml_qsa_block_score(ctx0, q_score, k_blocks,
                     inp->block_key_cells, inp->bias, 1.0f);
@@ -1122,6 +1124,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     ggml_tensor * top_k = nullptr;
 
     if (compact_select) {
+        // View [n_blocks, n_tps] as per-query row banks before top_blocks so the
+        // fused refine subgraph contains no view with an external source and
+        // already-contiguous scores skip an extra 256 MiB-class copy.
+        ggml_tensor * score_cont = ggml_is_contiguous(score) && score->view_src == nullptr ?
+            score : ggml_cont(ctx0, score);
+        ggml_tensor * score_rows = ggml_reshape_3d(ctx0, score_cont, 1, n_blocks, n_tps);
+        ggml_build_forward_expand(gf, score_rows);
+
         // Rank blocks per query before expanding to cells. The extra block covers
         // the worst-case partial tail while preserving the legacy fixed width.
         ggml_tensor * top_blocks = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_block_top));
@@ -1138,9 +1148,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         candidate_cells = ggml_reshape_2d(ctx0, candidate_cells, n_candidates, n_tps);
         candidate_slot_bias = ggml_reshape_3d(ctx0, candidate_slot_bias, r, n_block_top, n_tps);
 
-        // score is [n_blocks, n_tps]. View each query as a separate row bank so
-        // get_rows selects that query's own block ids without a dense cell expansion.
-        ggml_tensor * score_rows = ggml_reshape_3d(ctx0, ggml_cont(ctx0, score), 1, n_blocks, n_tps);
+        // score_rows is [1, n_blocks, n_tps], so get_rows selects each query's own
+        // block ids without a dense cell expansion.
         ggml_tensor * candidate_scores = ggml_get_rows(ctx0, score_rows, top_blocks);
         candidate_scores = ggml_repeat_4d(ctx0, candidate_scores, r, n_block_top, n_tps, 1);
         candidate_scores = ggml_add(ctx0, candidate_scores, candidate_slot_bias);
@@ -1170,6 +1179,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         top_k = ggml_get_rows(ctx0, candidate_rows, candidate_top);
         top_k = ggml_reshape_4d(ctx0, top_k, width, n_tps, 1, 1);
         cb(top_k, "indexer_top_k", il);
+        // Finish block/cell selection before building Q/K/V so the 256 MiB score
+        // buffer is freed before wqkv/Qcur allocate.
+        ggml_build_forward_expand(gf, top_k);
     } else {
         // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
         ggml_tensor * expanded = ggml_get_rows(ctx0,

@@ -5079,8 +5079,11 @@ static bool ggml_cuda_shared_mul_add_can_alias(
 struct ggml_cuda_qsa_refine_match {
     const ggml_tensor * scores;
     const ggml_tensor * cells;
+    const ggml_tensor * slot_bias;
+    const ggml_tensor * top_blocks;
     const ggml_tensor * mask;
           ggml_tensor * dst;
+          int           n_nodes;
 };
 
 struct ggml_cuda_gdn_norm_match {
@@ -5120,6 +5123,148 @@ static bool ggml_cuda_match_gdn_norm(
     return true;
 }
 
+static bool ggml_cuda_match_qsa_gather_refine(
+        const ggml_cgraph * graph, int i, bool has_cont, ggml_cuda_qsa_refine_match & match) {
+    const int s = has_cont ? 2 : 0;
+    if (i + s + 16 > graph->n_nodes) {
+        return false;
+    }
+
+    const bool has_score_cont = graph->nodes[i + s + 3]->op == GGML_OP_CONT;
+    const int sc = has_score_cont ? 2 : 0;
+    const int n_nodes = 16 + s + sc;
+    if (i + n_nodes > graph->n_nodes) {
+        return false;
+    }
+
+    const ggml_op mask_op = graph->nodes[i + s + sc + 8]->op;
+    if (mask_op != GGML_OP_GET_ROWS && mask_op != GGML_OP_QSA_MASK) {
+        return false;
+    }
+
+    int idxs[20];
+    for (int j = 0; j < n_nodes; ++j) {
+        idxs[j] = i + j;
+    }
+    const ggml_op prefix_ops[3] = {
+        GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_RESHAPE
+    };
+    const ggml_op suffix_ops[13] = {
+        GGML_OP_GET_ROWS, GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
+        GGML_OP_ADD, mask_op, GGML_OP_RESHAPE, GGML_OP_ADD,
+        GGML_OP_RESHAPE, GGML_OP_TOP_K, GGML_OP_CONT, GGML_OP_GET_ROWS,
+        GGML_OP_RESHAPE
+    };
+    ggml_op ops[20];
+    int k = 0;
+    if (has_cont) {
+        ops[k++] = GGML_OP_CONT;
+        ops[k++] = GGML_OP_RESHAPE;
+    }
+    std::copy(prefix_ops, prefix_ops + 3, ops + k);
+    k += 3;
+    if (has_score_cont) {
+        ops[k++] = GGML_OP_CONT;
+        ops[k++] = GGML_OP_RESHAPE;
+    }
+    std::copy(suffix_ops, suffix_ops + 13, ops + k);
+    const int outputs[2] = { i + n_nodes - 2, i + n_nodes - 1 };
+    if (!ggml_can_fuse_subgraph_ext(graph, idxs, n_nodes, ops, outputs, 2)) {
+        return false;
+    }
+
+    const ggml_tensor * top_cont        = has_cont ? graph->nodes[i] : nullptr;
+    const ggml_tensor * raw_cells       = graph->nodes[i + s + 0];
+    const ggml_tensor * top_flat        = has_cont ? graph->nodes[i + 1] : raw_cells->src[1];
+    const ggml_tensor * top_blocks      = has_cont ? top_cont->src[0] : (top_flat->op == GGML_OP_RESHAPE ? top_flat->src[0] : nullptr);
+    const ggml_tensor * top_blocks_ref  = has_cont ? top_cont : top_blocks;
+    const ggml_tensor * candidate_cells = graph->nodes[i + s + 1];
+    const ggml_tensor * candidate_rows  = graph->nodes[i + s + 2];
+    const ggml_tensor * score_cont      = has_score_cont ? graph->nodes[i + s + 3] : nullptr;
+    const ggml_tensor * blk_scores      = graph->nodes[i + s + sc + 3];
+    const ggml_tensor * score_rows      = has_score_cont ? graph->nodes[i + s + 4] : blk_scores->src[0];
+    const ggml_tensor * rep_scores      = graph->nodes[i + s + sc + 4];
+    const ggml_tensor * raw_slot_bias   = graph->nodes[i + s + sc + 5];
+    const ggml_tensor * slot_bias_3d    = graph->nodes[i + s + sc + 6];
+    const ggml_tensor * add1            = graph->nodes[i + s + sc + 7];
+    const ggml_tensor * gather          = graph->nodes[i + s + sc + 8];
+    const ggml_tensor * gathered        = graph->nodes[i + s + sc + 9];
+    const ggml_tensor * add2            = graph->nodes[i + s + sc + 10];
+    const ggml_tensor * flat            = graph->nodes[i + s + sc + 11];
+    const ggml_tensor * top             = graph->nodes[i + s + sc + 12];
+    const ggml_tensor * top_c           = graph->nodes[i + s + sc + 13];
+    const ggml_tensor * selected        = graph->nodes[i + s + sc + 14];
+          ggml_tensor * dst             = graph->nodes[i + s + sc + 15];
+
+    if (top_blocks == nullptr || (has_cont && top_blocks->op != GGML_OP_TOP_K) ||
+            score_rows == nullptr || score_rows->op != GGML_OP_RESHAPE ||
+            top_flat->src[0] != top_blocks_ref || raw_cells->src[1] != top_flat ||
+            candidate_cells->src[0] != raw_cells || candidate_rows->src[0] != candidate_cells ||
+            (has_score_cont && score_rows->src[0] != score_cont) || blk_scores->src[0] != score_rows ||
+            blk_scores->src[1] != top_blocks_ref || rep_scores->src[0] != blk_scores ||
+            raw_slot_bias->src[1] != top_flat || slot_bias_3d->src[0] != raw_slot_bias ||
+            add1->src[0] != rep_scores || add1->src[1] != slot_bias_3d ||
+            gather->src[1] != candidate_cells || gathered->src[0] != gather ||
+            add2->src[0] != add1 || add2->src[1] != gathered ||
+            flat->src[0] != add2 || top->src[0] != flat ||
+            top_c->src[0] != top || selected->src[0] != candidate_rows ||
+            selected->src[1] != top_c || dst->src[0] != selected ||
+            ggml_node_get_use_count(graph, i + n_nodes - 2) != 1) {
+        return false;
+    }
+
+    const ggml_tensor * block_cells = raw_cells->src[0];
+    const ggml_tensor * slot_bias   = raw_slot_bias->src[0];
+    const ggml_tensor * scores      = has_score_cont ? score_cont->src[0] : score_rows->src[0];
+    const ggml_tensor * mask        = gather->src[0];
+
+    const int64_t r           = block_cells->ne[0];
+    const int64_t n_blocks    = block_cells->ne[1];
+    const int64_t n_block_top = top_blocks->ne[0];
+    const int64_t queries     = top_blocks->ne[1];
+    const int64_t n           = r * n_block_top;
+    const int64_t width       = top->ne[0];
+
+    if (r <= 0 || n_blocks <= 0 || n_block_top <= 0 || queries <= 0 ||
+            n <= 0 || n > 4096 || width <= 0 || width >= n || n - width > 7 ||
+            scores == nullptr || (!has_score_cont && scores->view_src != nullptr) ||
+            top_blocks->type != GGML_TYPE_I32 || !ggml_is_contiguous(top_blocks) || !ggml_is_matrix(top_blocks) ||
+            block_cells->type != GGML_TYPE_I32 || !ggml_is_contiguous(block_cells) || !ggml_is_matrix(block_cells) ||
+            slot_bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(slot_bias) || !ggml_are_same_shape(block_cells, slot_bias) ||
+            scores->type != GGML_TYPE_F32 || !ggml_is_contiguous(scores) || !ggml_is_matrix(scores) ||
+            scores->ne[0] != n_blocks || scores->ne[1] != queries ||
+            !ggml_is_contiguous(top_flat) || top_flat->ne[0] != n_block_top * queries ||
+            raw_cells->ne[0] != r || raw_cells->ne[1] != n_block_top * queries ||
+            candidate_cells->ne[0] != n || candidate_cells->ne[1] != queries ||
+            score_rows->type != GGML_TYPE_F32 || score_rows->view_offs != 0 || !ggml_is_contiguous(score_rows) ||
+            score_rows->ne[0] != 1 || score_rows->ne[1] != n_blocks || score_rows->ne[2] != queries || score_rows->ne[3] != 1 ||
+            rep_scores->ne[0] != r || rep_scores->ne[1] != n_block_top || rep_scores->ne[2] != queries || rep_scores->ne[3] != 1 ||
+            !ggml_are_same_shape(rep_scores, slot_bias_3d) || !ggml_are_same_shape(rep_scores, gathered) ||
+            !ggml_is_matrix(flat) || flat->ne[0] != n || flat->ne[1] != queries ||
+            !ggml_is_contiguous(dst) || !ggml_is_matrix(dst) || dst->ne[0] != width || dst->ne[1] != queries) {
+        return false;
+    }
+
+    if (mask_op == GGML_OP_QSA_MASK) {
+        const int32_t n_kv = ggml_get_op_params_i32(gather, 0);
+        if (mask->type != GGML_TYPE_I32 || !ggml_is_contiguous(mask) ||
+                !ggml_is_matrix(mask) || mask->ne[0] != 4 || mask->ne[1] != n_kv + queries ||
+                !ggml_is_matrix(gather) || gather->ne[0] != n || gather->ne[1] != queries) {
+            return false;
+        }
+    } else {
+        if (mask->type != GGML_TYPE_F16 ||
+                mask->ne[0] != 1 || mask->ne[2] != queries || mask->ne[3] != 1 ||
+                mask->nb[0] != sizeof(ggml_fp16_t) || mask->nb[1] != sizeof(ggml_fp16_t) ||
+                !ggml_are_same_shape(gather, candidate_rows)) {
+            return false;
+        }
+    }
+
+    match = { scores, block_cells, slot_bias, top_blocks, mask, dst, n_nodes };
+    return true;
+}
+
 // Shared by allocation and execution so every early read stays live until dst.
 static bool ggml_cuda_match_qsa_refine(
         const ggml_cgraph * graph, int i, ggml_cuda_qsa_refine_match & match) {
@@ -5129,6 +5274,13 @@ static bool ggml_cuda_match_qsa_refine(
     GGML_UNUSED(match);
     return false;
 #else
+    if (graph->nodes[i]->op == GGML_OP_CONT && ggml_cuda_match_qsa_gather_refine(graph, i, true, match)) {
+        return true;
+    }
+    if (graph->nodes[i]->op == GGML_OP_GET_ROWS && ggml_cuda_match_qsa_gather_refine(graph, i, false, match)) {
+        return true;
+    }
+
     const ggml_op mask_op = graph->nodes[i]->op;
     if (mask_op != GGML_OP_GET_ROWS && mask_op != GGML_OP_QSA_MASK) {
         return false;
@@ -5190,7 +5342,7 @@ static bool ggml_cuda_match_qsa_refine(
         }
     }
 
-    match = { scores, cells, mask, dst };
+    match = { scores, cells, nullptr, nullptr, mask, dst, 8 };
     return true;
 #endif
 }
@@ -5275,15 +5427,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
 #if defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
-    if (node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_QSA_MASK) {
+    if (node->op == GGML_OP_CONT || node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_QSA_MASK) {
         ggml_cuda_qsa_refine_match match;
-        const int output = i + 7;
-        if (ggml_cuda_match_qsa_refine(cgraph, i, match) &&
-                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 8, &output, 1) &&
-                ggml_cuda_fusion_inputs_disjoint(match.dst, { match.scores, match.cells, match.mask }) &&
-                ggml_cuda_fusion_same_stream(*cuda_ctx, cgraph, i, output)) {
-            ggml_cuda_qsa_refine(*cuda_ctx, match.scores, match.cells, match.mask, match.dst);
-            return 7;
+        if (ggml_cuda_match_qsa_refine(cgraph, i, match)) {
+            const int output = i + match.n_nodes - 1;
+            const bool disjoint = match.top_blocks != nullptr ?
+                ggml_cuda_fusion_inputs_disjoint(match.dst, { match.scores, match.cells, match.slot_bias, match.top_blocks, match.mask }) :
+                ggml_cuda_fusion_inputs_disjoint(match.dst, { match.scores, match.cells, match.mask });
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.n_nodes, &output, 1) &&
+                    disjoint &&
+                    ggml_cuda_fusion_same_stream(*cuda_ctx, cgraph, i, output)) {
+                ggml_cuda_qsa_refine(*cuda_ctx, match.scores, match.cells, match.mask, match.dst,
+                        match.slot_bias, match.top_blocks);
+                return match.n_nodes - 1;
+            }
         }
     }
 #endif
@@ -6818,7 +6975,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             if (ggml_cuda_match_qsa_refine(cgraph, i, qsa)) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(qsa.scores), qsa.dst);
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(qsa.cells), qsa.dst);
+                if (qsa.slot_bias != nullptr) {
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(qsa.slot_bias), qsa.dst);
+                }
+                if (qsa.top_blocks != nullptr) {
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(qsa.top_blocks), qsa.dst);
+                }
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(qsa.mask), qsa.dst);
+                i += qsa.n_nodes - 1;
+                continue;
             }
             // Keep the inputs of the fused gate/up/GLU MMQ kernel alive until the GLU so that they cannot alias its output (under op offload the weights are buffer copies).
             if (i + 2 < cgraph->n_nodes && cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
