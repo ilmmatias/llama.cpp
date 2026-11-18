@@ -7,6 +7,7 @@
 namespace {
 
 constexpr int resolve_threads = 1024;
+constexpr int control_ints    = 16;
 
 struct cache_state {
     char * host;
@@ -19,7 +20,12 @@ struct cache_state {
     int * referenced;
     int * needed;
     int * misses;
-    int * control; // CLOCK hand, miss count, selection epoch
+    // [0] CLOCK hand, [1] placed misses, [2] selection epoch,
+    // [3] latest hits, [4] latest misses, [5] latest evictions,
+    // [6] latest overlap with prev epoch, [7] latest unique selected,
+    // [8] latest misses in prev epoch, [9] latest misses seen before,
+    // [10..15] cumulative totals for hits, misses, evictions, overlap_prev, coherence_denom, miss_in_prev.
+    int * control;
 
     size_t bytes;
     size_t page_bytes;
@@ -70,7 +76,7 @@ static cache_state * find_cache(const ggml_tensor * tensor) {
 }
 
 static size_t cache_metadata_size(size_t n_pages, size_t n_slots) {
-    return (2*n_pages + 3*n_slots + 3)*sizeof(int);
+    return (2*n_pages + 3*n_slots + control_ints)*sizeof(int);
 }
 
 static __device__ __forceinline__ int cache_page_for_byte(const cache_state & state, size_t byte) {
@@ -80,7 +86,7 @@ static __device__ __forceinline__ int cache_page_for_byte(const cache_state & st
 static void reset_cache(cache_state & state) {
     CUDA_CHECK(cudaMemset(state.pages, 0xff, (state.n_pages + state.n_slots) * sizeof(int)));
     CUDA_CHECK(cudaMemset(state.referenced, 0, state.n_slots * sizeof(int)));
-    CUDA_CHECK(cudaMemset(state.control, 0, 3*sizeof(int)));
+    CUDA_CHECK(cudaMemset(state.control, 0, control_ints*sizeof(int)));
 }
 
 static void before_host_write(ggml_backend_buffer_t buffer, const ggml_tensor * tensor = nullptr) {
@@ -103,9 +109,38 @@ static void before_host_write(ggml_backend_buffer_t buffer, const ggml_tensor * 
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
+static int qsa_kv_stats_level() {
+    static const int level = [] {
+        const char * env = getenv("LLAMA_QSA_KV_STATS");
+        return env ? atoi(env) : 0;
+    }();
+    return level;
+}
+
 static void free_buffer(ggml_backend_buffer_t buffer) {
     auto & ctx = context(buffer);
     ggml_cuda_set_device(ctx.device);
+
+    if (qsa_kv_stats_level() > 0 && !ctx.tensors.empty()) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        int idx = 0;
+        for (const auto & state : ctx.tensors) {
+            int ctrl[control_ints] = {};
+            CUDA_CHECK(cudaMemcpy(ctrl, state->control, control_ints * sizeof(int), cudaMemcpyDeviceToHost));
+            if (ctrl[2] > 0) {
+                const int64_t total_req = int64_t(ctrl[10]) + int64_t(ctrl[11]);
+                const double  hit_pct   = total_req > 0 ? 100.0 * double(ctrl[10]) / double(total_req) : 0.0;
+                const double  coh       = ctrl[14] > 0 ? 100.0 * double(ctrl[13]) / double(ctrl[14]) : 0.0;
+                fprintf(stderr, "qsa_kv[%02d] pages=%d slots=%d epochs=%d | last(hit=%d miss=%d evict=%d uniq=%d coh=%.1f%% miss_prev=%d miss_seen=%d) | tot(hits=%d misses=%d evict=%d hit=%.2f%% coh=%.2f%% [%d/%d] miss_prev=%d)\n",
+                    idx, state->n_pages, state->n_slots, ctrl[2],
+                    ctrl[3], ctrl[4], ctrl[5], ctrl[7],
+                    ctrl[7] > 0 ? 100.0 * double(ctrl[6]) / double(ctrl[7]) : 0.0,
+                    ctrl[8], ctrl[9],
+                    ctrl[10], ctrl[11], ctrl[12], hit_pct, coh, ctrl[13], ctrl[14], ctrl[15]);
+            }
+            ++idx;
+        }
+    }
 
     for (auto & state : ctx.tensors) {
         CUDA_CHECK(cudaFree(state->cache));
@@ -239,6 +274,28 @@ static ggml_backend_buffer_t alloc_buffer(ggml_backend_buffer_type_t buft, size_
     return ggml_backend_buffer_init(buft, iface, ctx.release(), size);
 }
 
+static __device__ __forceinline__ void record_resolve_stats(
+        const cache_state & state, int epoch,
+        int n_protected, int n_misses, int n_evictions,
+        int n_overlap_prev, int n_miss_in_prev, int n_miss_seen) {
+    const int uniq    = n_protected + n_misses;
+    state.control[3]  = n_protected;
+    state.control[4]  = n_misses;
+    state.control[5]  = n_evictions;
+    state.control[6]  = n_overlap_prev;
+    state.control[7]  = uniq;
+    state.control[8]  = n_miss_in_prev;
+    state.control[9]  = n_miss_seen;
+    state.control[10] += n_protected;
+    state.control[11] += n_misses;
+    state.control[12] += n_evictions;
+    if (epoch > 1) {
+        state.control[13] += n_overlap_prev;
+        state.control[14] += uniq;
+        state.control[15] += n_miss_in_prev;
+    }
+}
+
 // Mark the entire selection before replacing anything: no page used by another
 // query in this launch may be evicted. Oversized unions retain unmapped pages,
 // which attention reads from authoritative RAM rather than stale cache slots.
@@ -251,13 +308,21 @@ static __global__ void resolve_pages(
 
     __shared__ int n_protected;
     __shared__ int n_misses;
+    __shared__ int n_evictions;
+    __shared__ int n_overlap_prev;
+    __shared__ int n_miss_in_prev;
+    __shared__ int n_miss_seen;
     __shared__ int cut;
     __shared__ int warp_sums[resolve_threads / WARP_SIZE];
     __shared__ int epoch;
 
     if (threadIdx.x == 0) {
-        n_protected = 0;
-        n_misses    = 0;
+        n_protected    = 0;
+        n_misses       = 0;
+        n_evictions    = 0;
+        n_overlap_prev = 0;
+        n_miss_in_prev = 0;
+        n_miss_seen    = 0;
 
         epoch = state.control[2] == INT_MAX ? 1 : state.control[2] + 1;
         state.control[2] = epoch;
@@ -289,14 +354,26 @@ static __global__ void resolve_pages(
         }
 
         const int page = cache_page_for_byte(state, byte);
+        const int prev = atomicExch(state.needed + page, epoch);
 
-        if (atomicExch(state.needed + page, epoch) != epoch) {
+        if (prev != epoch) {
+            const bool in_prev = epoch > 1 && prev == epoch - 1;
+            if (in_prev) {
+                atomicAdd(&n_overlap_prev, 1);
+            }
+
             const int slot = state.pages[page];
 
             if (slot >= 0) {
                 state.referenced[slot] = 1;
                 atomicAdd(&n_protected, 1);
             } else {
+                if (in_prev) {
+                    atomicAdd(&n_miss_in_prev, 1);
+                }
+                if (epoch > 1 && prev > 0) {
+                    atomicAdd(&n_miss_seen, 1);
+                }
                 const int miss = atomicAdd(&n_misses, 1);
 
                 if (miss < state.n_slots) {
@@ -313,6 +390,9 @@ static __global__ void resolve_pages(
     if (need <= 0) {
         if (threadIdx.x == 0) {
             state.control[1] = 0;
+            record_resolve_stats(
+                state, epoch, n_protected, n_misses, 0,
+                n_overlap_prev, n_miss_in_prev, n_miss_seen);
         }
         return;
     }
@@ -368,6 +448,7 @@ static __global__ void resolve_pages(
 
             if (old >= 0) {
                 state.pages[old] = -1;
+                atomicAdd(&n_evictions, 1);
             }
 
             state.owners[slot]     = page;
@@ -390,6 +471,9 @@ static __global__ void resolve_pages(
     if (threadIdx.x == 0) {
         state.control[0] = hand;
         state.control[1] = placed;
+        record_resolve_stats(
+            state, epoch, n_protected, n_misses, n_evictions,
+            n_overlap_prev, n_miss_in_prev, n_miss_seen);
     }
 }
 
@@ -594,11 +678,31 @@ void ggml_cuda_qsa_kv_prepare(
 
     CUDA_CHECK(cudaGetLastError());
 
+    if (qsa_kv_stats_level() >= 2) {
+#ifdef GGML_USE_HIP
+        hipStreamCaptureStatus cap_status = hipStreamCaptureStatusNone;
+        const bool can_sync = hipStreamIsCapturing(ctx.stream(), &cap_status) == hipSuccess &&
+                              cap_status == hipStreamCaptureStatusNone;
+#else
+        cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+        const bool can_sync = cudaStreamIsCapturing(ctx.stream(), &cap_status) == cudaSuccess &&
+                              cap_status == cudaStreamCaptureStatusNone;
+#endif
+        if (can_sync) {
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            int ctrl[control_ints] = {};
+            CUDA_CHECK(cudaMemcpy(ctrl, state_k->control, control_ints * sizeof(int), cudaMemcpyDeviceToHost));
+            fprintf(stderr, "qsa_step K=%p epoch=%d n_idx=%d | hit=%d miss=%d placed=%d evict=%d uniq=%d coh=%.1f%% (%d/%d) miss_prev=%d miss_seen=%d\n",
+                (const void *) state_k, ctrl[2], n_indices, ctrl[3], ctrl[4], ctrl[1], ctrl[5], ctrl[7],
+                ctrl[7] > 0 ? 100.0 * double(ctrl[6]) / double(ctrl[7]) : 0.0, ctrl[6], ctrl[7], ctrl[8], ctrl[9]);
+        }
+    }
+
     K_cache = { state_k->device_host, state_k->cache, state_k->pages, state_k->page_bytes, state_k->page_shift };
     V_cache = { state_v->device_host, state_v->cache, state_v->pages, state_v->page_bytes, state_v->page_shift };
 }
 
-void ggml_cuda_qsa_kv_invalidate_rows(
+void ggml_cuda_qsa_kv_sync_rows(
         ggml_backend_cuda_context & ctx, const ggml_tensor * tensor, const ggml_tensor * indices) {
     cache_state * state = find_cache(tensor);
 
