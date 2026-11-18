@@ -187,10 +187,13 @@ struct expert_cache_layer {
     std::vector<uint64_t> slot_stamp;
     std::vector<uint64_t> slot_generation;
     std::vector<uint8_t> slot_ready;
+    std::vector<uint8_t> slot_cold;
     std::vector<int64_t> last_seen;
     std::vector<int32_t> admissions;
+    std::vector<int32_t> cold_admissions;
     std::vector<uint8_t> admission_pending;
 
+    uint32_t next_free_slot = 0;
     uint64_t stamp = 0;
     int64_t observed_tokens = 0;
     bool disabled = false;
@@ -238,6 +241,7 @@ struct expert_cache_request {
     int32_t expert;
     int32_t slot;
     uint64_t generation;
+    bool is_cold = false;
 };
 
 
@@ -1458,9 +1462,12 @@ private:
         layer.slot_stamp.assign(slots, 0);
         layer.slot_generation.assign(slots, 0);
         layer.slot_ready.assign(slots, 0);
+        layer.slot_cold.assign(slots, 0);
         layer.last_seen.assign((size_t) layer.n_expert, -1);
         layer.admissions.reserve((size_t) layer.n_expert);
+        layer.cold_admissions.reserve((size_t) layer.n_expert);
         layer.admission_pending.assign((size_t) layer.n_expert, 0);
+        layer.next_free_slot = 0;
 
         return true;
     }
@@ -2176,12 +2183,15 @@ private:
 
     void observe_locked(expert_cache_layer & layer, int layer_id, const ggml_tensor * ids) {
         const int64_t first_token = layer.observed_tokens;
+        const bool is_decode = ids->ne[1] == 1;
         layer.observed_tokens += ids->ne[1];
         layer.admissions.clear();
+        layer.cold_admissions.clear();
 
         // Classify all routes before admissions can replace any frozen slot.
         for (int64_t t = 0; t < ids->ne[1]; ++t) {
             const int64_t token = first_token + t;
+            const bool allow_cold = (is_decode || t + 1 == ids->ne[1]) && layer.next_free_slot < slots;
             for (int64_t i = 0; i < ids->ne[0]; ++i) {
                 const int32_t expert = *(const int32_t *) ((const char *) ids->data + t * ids->nb[1] + i * ids->nb[0]);
                 if (expert < 0 || expert >= layer.n_expert) {
@@ -2194,14 +2204,29 @@ private:
                     if ((size_t) slot_at_begin < layer.slot_stamp.size() &&
                         layer.slot_to_expert[(size_t) slot_at_begin] == expert) {
                         layer.slot_stamp[(size_t) slot_at_begin] = ++layer.stamp;
+                        // Promote an unstarted cold-queue entry if it hits again within admit_window.
+                        if (!layer.slot_ready[(size_t) slot_at_begin] && layer.slot_cold[(size_t) slot_at_begin]) {
+                            const int64_t prev = layer.last_seen[(size_t) expert];
+                            const bool admit = admit_window == 0 ||
+                                (prev >= 0 && token >= prev && (uint64_t) (token - prev) <= admit_window);
+                            if (admit) {
+                                layer.slot_cold[(size_t) slot_at_begin] = 0;
+                                enqueue_urgent_request(
+                                    { layer_id, expert, slot_at_begin, layer.slot_generation[(size_t) slot_at_begin], false },
+                                    is_decode);
+                            }
+                        }
                     }
-                } else {
+                } else if (!layer.admission_pending[(size_t) expert]) {
                     const int64_t prev = layer.last_seen[(size_t) expert];
                     const bool admit = admit_window == 0 ||
                         (prev >= 0 && token >= prev && (uint64_t) (token - prev) <= admit_window);
-                    if (admit && !layer.admission_pending[(size_t) expert]) {
+                    if (admit) {
                         layer.admission_pending[(size_t) expert] = 1;
                         layer.admissions.push_back(expert);
+                    } else if (allow_cold) {
+                        layer.admission_pending[(size_t) expert] = 1;
+                        layer.cold_admissions.push_back(expert);
                     }
                 }
 
@@ -2212,21 +2237,61 @@ private:
         for (const int32_t expert : layer.admissions) {
             layer.admission_pending[(size_t) expert] = 0;
             if (layer.expert_to_slot[(size_t) expert] < 0) {
-                admit_expert_locked(layer, layer_id, expert);
+                admit_expert_locked(layer, layer_id, expert, false, is_decode);
+            }
+        }
+        for (const int32_t expert : layer.cold_admissions) {
+            layer.admission_pending[(size_t) expert] = 0;
+            if (layer.next_free_slot >= slots) {
+                continue;
+            }
+            if (layer.expert_to_slot[(size_t) expert] < 0) {
+                admit_expert_locked(layer, layer_id, expert, true, is_decode);
             }
         }
     }
 
 
-    void admit_expert_locked(expert_cache_layer & layer, int layer_id, int32_t expert) {
-        int32_t slot = -1;
-        for (uint32_t i = 0; i < slots; ++i) {
-            if (layer.slot_to_expert[i] < 0) {
-                slot = (int32_t) i;
-                break;
+    void enqueue_urgent_request(const expert_cache_request & req, bool is_decode) {
+        {
+            std::lock_guard<std::mutex> qlock(queue_mutex);
+            if (is_decode) {
+                queue.push_back(req);
+            } else {
+                pp_queue.push_back(req);
             }
         }
-        if (slot < 0) {
+        queue_cv.notify_one();
+    }
+
+    void admit_expert_locked(
+            expert_cache_layer & layer, int layer_id, int32_t expert, bool is_cold, bool is_decode) {
+        static constexpr size_t COLD_QUEUE_CAP = 512;
+
+        if (is_cold) {
+            if (layer.next_free_slot >= slots) {
+                return;
+            }
+            std::lock_guard<std::mutex> qlock(queue_mutex);
+            if (cold_queue.size() >= COLD_QUEUE_CAP) {
+                return;
+            }
+            const int32_t slot = (int32_t) layer.next_free_slot++;
+            layer.slot_to_expert[(size_t) slot] = expert;
+            layer.expert_to_slot[(size_t) expert] = slot;
+            layer.slot_stamp[(size_t) slot] = ++layer.stamp;
+            layer.slot_ready[(size_t) slot] = 0;
+            layer.slot_cold[(size_t) slot] = 1;
+            const uint64_t generation = ++layer.slot_generation[(size_t) slot];
+            cold_queue.push_back({ layer_id, expert, slot, generation, true });
+            queue_cv.notify_one();
+            return;
+        }
+
+        int32_t slot = -1;
+        if (layer.next_free_slot < slots) {
+            slot = (int32_t) layer.next_free_slot++;
+        } else {
             slot = (int32_t) std::distance(layer.slot_stamp.begin(),
                 std::min_element(layer.slot_stamp.begin(), layer.slot_stamp.end()));
         }
@@ -2240,13 +2305,10 @@ private:
         layer.expert_to_slot[(size_t) expert] = slot;
         layer.slot_stamp[(size_t) slot] = ++layer.stamp;
         layer.slot_ready[(size_t) slot] = 0;
+        layer.slot_cold[(size_t) slot] = 0;
         const uint64_t generation = ++layer.slot_generation[(size_t) slot];
 
-        {
-            std::lock_guard<std::mutex> qlock(queue_mutex);
-            queue.push_back({ layer_id, expert, slot, generation });
-        }
-        queue_cv.notify_one();
+        enqueue_urgent_request({ layer_id, expert, slot, generation, false }, is_decode);
     }
 
 
@@ -2304,15 +2366,25 @@ private:
             expert_cache_request req;
             {
                 std::unique_lock<std::mutex> lock(queue_mutex);
-                queue_cv.wait(lock, [this]() { return stop || !queue.empty(); });
-                if (queue.empty()) {
+                queue_cv.wait(lock, [this]() {
+                    return stop || !queue.empty() || !pp_queue.empty() || !cold_queue.empty();
+                });
+                if (queue.empty() && pp_queue.empty() && (stop || cold_queue.empty())) {
                     if (stop) {
                         break;
                     }
                     continue;
                 }
-                req = queue.front();
-                queue.pop_front();
+                if (!queue.empty()) {
+                    req = queue.front();
+                    queue.pop_front();
+                } else if (!pp_queue.empty()) {
+                    req = pp_queue.front();
+                    pp_queue.pop_front();
+                } else {
+                    req = cold_queue.front();
+                    cold_queue.pop_front();
+                }
             }
 
             size_t bundle_bytes = 0;
@@ -2327,9 +2399,12 @@ private:
                 auto & layer = *lit->second;
                 if (req.slot < 0 || (size_t) req.slot >= layer.slot_generation.size() ||
                     layer.slot_generation[(size_t) req.slot] != req.generation ||
-                    layer.slot_to_expert[(size_t) req.slot] != req.expert) {
+                    layer.slot_to_expert[(size_t) req.slot] != req.expert ||
+                    layer.slot_ready[(size_t) req.slot] != 0 ||
+                    (req.is_cold && !layer.slot_cold[(size_t) req.slot])) {
                     continue;
                 }
+                layer.slot_cold[(size_t) req.slot] = 0;
                 bundle_bytes = layer.bundle_bytes;
                 parts = layer.parts;
                 part_bytes = layer.part_bytes;
@@ -2463,6 +2538,8 @@ private:
     std::mutex queue_mutex;
     std::condition_variable queue_cv;
     std::deque<expert_cache_request> queue;
+    std::deque<expert_cache_request> pp_queue;
+    std::deque<expert_cache_request> cold_queue;
     bool stop = false;
 
     std::vector<std::unique_ptr<expert_cache_staging>> staging;
