@@ -703,7 +703,8 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                 }
 
                 // if the node's data is external, then we cannot re-use it
-                if (!ggml_gallocr_is_own(galloc, parent)) {
+                struct ggml_tensor * own = ggml_impl_is_view(parent) ? parent->view_src : parent;
+                if (!ggml_gallocr_is_own(galloc, own)) {
                     AT_PRINTF("not reusing parent %s for %s as %p is external\n", parent->name, node->name, parent->data);
                     continue;
                 }
@@ -724,11 +725,14 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                     if (ggml_impl_is_view(parent)) {
                         struct ggml_tensor * view_src = parent->view_src;
                         struct hash_node * view_src_hn = ggml_gallocr_hash_get(galloc, view_src);
-                        if (view_src_hn->n_views == 1 && view_src_hn->n_children == 0 && view_src->data == parent->data) {
+                        if (view_src_hn->buffer_id == buffer_id &&
+                                view_src_hn->n_views == 1 && view_src_hn->n_children == 0 &&
+                                parent->view_offs == 0 && view_src->data == parent->data &&
+                                ggml_backend_buft_get_alloc_size(galloc->bufts[view_src_hn->buffer_id], view_src) >=
+                                ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], node)) {
                             AT_PRINTF("reusing view parent %s (%s) for %s\n", parent->name, view_src->name, node->name);
-                            assert(view_src_hn->addr.chunk == p_hn->addr.chunk && view_src_hn->addr.offset == p_hn->addr.offset);
-                            hn->buffer_id = p_hn->buffer_id;
-                            hn->addr = p_hn->addr;
+                            hn->buffer_id = view_src_hn->buffer_id;
+                            hn->addr = view_src_hn->addr;
                             p_hn->allocated = false; // avoid freeing the parent
                             view_src_hn->allocated = false;
                             ggml_gallocr_free_extra_space(galloc, node, view_src);
