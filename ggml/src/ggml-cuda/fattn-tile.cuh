@@ -450,6 +450,8 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
 
             if (i0 + nwarps*stride_i <= I || i < I) {
                 const int row = oob_check && i >= i_sup ? -1 : (use_sparse ? indices[i] : i);
+                const char * row_ptr = row >= 0 ? ggml_cuda_qsa_kv_address(
+                    reinterpret_cast<const char *>(KV + int64_t(row)*stride_KV), cache) : nullptr;
 #pragma unroll
                 for (int j0 = j0_start; j0 < j0_stop; j0 += stride_j) {
                     const int j = j0*cpy_ne + (stride_j == warp_size ? threadIdx.x : threadIdx.x % stride_j)*cpy_ne;
@@ -457,8 +459,7 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
                     const __align__(16) half2 zero[cpy_ne] = {{0.0f, 0.0f}};
                     ggml_cuda_memcpy_1<cpy_nb>(
                         tile_KV + i*(J/2 + J_padding) + j,
-                        row >= 0 ? reinterpret_cast<const half2 *>(ggml_cuda_qsa_kv_address(
-                            reinterpret_cast<const char *>(KV + int64_t(row)*stride_KV + j), cache)) : zero);
+                        row_ptr ? reinterpret_cast<const half2 *>(row_ptr) + j : zero);
                 }
             }
         }
@@ -503,6 +504,8 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
 
             if (i0 + nwarps*stride_i <= I || i < I) {
                 const int row = oob_check && i >= i_sup ? -1 : (use_sparse ? indices[i] : i);
+                const char * row_ptr = row >= 0 ? ggml_cuda_qsa_kv_address(
+                    reinterpret_cast<const char *>(KV + int64_t(row)*stride_KV), cache) : nullptr;
 #pragma unroll
                 for (int j0 = j0_start; j0 < j0_stop; j0 += stride_j) {
                     const int j = j0*(cpy_ne/2) + (stride_j == warp_size ? threadIdx.x : threadIdx.x % stride_j)*(cpy_ne/2);
@@ -510,8 +513,7 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
                     const half2 zero[cpy_ne/2] = {{0.0f, 0.0f}};
                     __align__(16) half2 tmp_h2[cpy_ne/2];
                     ggml_cuda_memcpy_1<sizeof(tmp_h2)>(
-                        tmp_h2, row >= 0 ? reinterpret_cast<const half2 *>(ggml_cuda_qsa_kv_address(
-                            reinterpret_cast<const char *>(KV + int64_t(row)*stride_KV + j), cache)) : zero);
+                        tmp_h2, row_ptr ? reinterpret_cast<const half2 *>(row_ptr) + j : zero);
 
                     __align__(16) float2 tmp_f2[cpy_ne/2];
 #pragma unroll
