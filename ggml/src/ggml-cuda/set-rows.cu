@@ -415,5 +415,5 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         GGML_ABORT("unsupported type %s", ggml_type_name(src0->type));
     }
 
-    ggml_cuda_qsa_kv_invalidate_rows(ctx, dst, src1);
+    ggml_cuda_qsa_kv_sync_rows(ctx, dst, src1);
 }

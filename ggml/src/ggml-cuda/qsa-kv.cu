@@ -411,6 +411,60 @@ static __global__ void copy_pages(cache_state state_k, cache_state state_v) {
 }
 
 template <typename T>
+static __global__ void sync_rows(cache_state state, const T * indices, int n, size_t offset, size_t row_bytes) {
+    const int i = blockIdx.x;
+    if (i >= n) {
+        return;
+    }
+
+    const int64_t row = int64_t(indices[i]);
+    if (row < 0) {
+        return;
+    }
+
+    const size_t byte = offset + size_t(row) * row_bytes;
+    if (byte >= state.bytes) {
+        return;
+    }
+
+    const int page = cache_page_for_byte(state, byte);
+    const int slot = state.pages[page];
+    if (slot < 0) {
+        return;
+    }
+
+    const size_t in_page = byte - size_t(page) * state.page_bytes;
+    const size_t nbytes  = min(row_bytes, state.bytes - byte);
+    if (in_page + nbytes > state.page_bytes) {
+        if (threadIdx.x == 0) {
+            const int evicted = atomicExch(state.pages + page, -1);
+            if (evicted >= 0) {
+                state.owners[evicted] = -1;
+            }
+        }
+        return;
+    }
+
+    const char * src = state.device_host + byte;
+    char *       dst = state.cache + size_t(slot) * state.page_bytes + in_page;
+    if (((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 15u) == 0) {
+        const size_t  n16 = nbytes / sizeof(uint4);
+        const uint4 * s16 = reinterpret_cast<const uint4 *>(src);
+        uint4 *       d16 = reinterpret_cast<uint4 *>(dst);
+        for (size_t j = threadIdx.x; j < n16; j += blockDim.x) {
+            d16[j] = s16[j];
+        }
+        for (size_t j = n16 * sizeof(uint4) + threadIdx.x; j < nbytes; j += blockDim.x) {
+            dst[j] = src[j];
+        }
+    } else {
+        for (size_t j = threadIdx.x; j < nbytes; j += blockDim.x) {
+            dst[j] = src[j];
+        }
+    }
+}
+
+template <typename T>
 static __global__ void invalidate_rows(cache_state state, const T * indices, int n, size_t offset, size_t row_bytes) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
         const size_t byte = offset + size_t(indices[i]) * row_bytes;
@@ -556,7 +610,22 @@ void ggml_cuda_qsa_kv_invalidate_rows(
     const int    n      = ggml_nelements(indices);
     const size_t offset = static_cast<const char *>(tensor->data) - state->host;
 
-    if (indices->type == GGML_TYPE_I64) {
+    if (n <= 0) {
+        return;
+    }
+
+    // Preserve mapped pages on decode/small writes by syncing written rows
+    // directly into the resident slot; bulk prefill writes invalidate instead.
+    if (n <= 64) {
+        if (indices->type == GGML_TYPE_I64) {
+            sync_rows<<<n, 256, 0, ctx.stream()>>>(
+                    *state, static_cast<const int64_t *>(indices->data), n, offset, tensor->nb[1]);
+        } else {
+            GGML_ASSERT(indices->type == GGML_TYPE_I32);
+            sync_rows<<<n, 256, 0, ctx.stream()>>>(
+                    *state, static_cast<const int32_t *>(indices->data), n, offset, tensor->nb[1]);
+        }
+    } else if (indices->type == GGML_TYPE_I64) {
         invalidate_rows<<<(n + 255) / 256, 256, 0, ctx.stream()>>>(
                 *state, static_cast<const int64_t *>(indices->data), n, offset, tensor->nb[1]);
     } else {

@@ -41,7 +41,7 @@ void ggml_cuda_qsa_kv_prepare(
         ggml_backend_cuda_context & ctx, const ggml_tensor * K, const ggml_tensor * V,
         const int32_t * indices, int n_indices, ggml_cuda_qsa_kv_view & K_cache, ggml_cuda_qsa_kv_view & V_cache);
 
-void ggml_cuda_qsa_kv_invalidate_rows(
+void ggml_cuda_qsa_kv_sync_rows(
         ggml_backend_cuda_context & ctx, const ggml_tensor * tensor, const ggml_tensor * indices);
 
 void ggml_cuda_qsa_kv_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * tensor);

@@ -625,8 +625,6 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
         row_indices     = (const int64_t *) set_rows->src[1]->data;
         dst_type        = set_rows->type;
         set_rows_stride = set_rows->nb[1] / ggml_type_size(set_rows->type);
-
-        ggml_cuda_qsa_kv_invalidate_rows(ctx, set_rows, set_rows->src[1]);
     } else {
         ggml_cuda_qsa_kv_invalidate(ctx, dst);
     }
@@ -772,6 +770,10 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
         } else {
             GGML_ABORT("fatal error");
         }
+    }
+
+    if (set_rows != nullptr) {
+        ggml_cuda_qsa_kv_sync_rows(ctx, set_rows, set_rows->src[1]);
     }
 }
 
@@ -966,8 +968,6 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
         dst_type        = set_rows->type;
         row_indices     = (const int64_t *) set_rows->src[1]->data;
         set_rows_stride = set_rows->nb[1] / ggml_type_size(set_rows->type);
-
-        ggml_cuda_qsa_kv_invalidate_rows(ctx, set_rows, set_rows->src[1]);
     }
 
     const int n_dims     = ((const int32_t *) rope->op_params)[1];
@@ -1032,5 +1032,9 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
             freq_factors, row_indices, set_rows_stride, is_neox, stream);
     } else {
         GGML_ABORT("fatal error");
+    }
+
+    if (set_rows != nullptr) {
+        ggml_cuda_qsa_kv_sync_rows(ctx, set_rows, set_rows->src[1]);
     }
 }
