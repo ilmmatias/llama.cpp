@@ -1234,7 +1234,7 @@ static bool top_k_use_small_kernel(int ncols, int nrows, int k) {
     if (k <= 32) {
         return elements <= (1U << 20);
     }
-    return nrows == 1 && ncols <= (1U << 17);
+    return nrows == 1 && k < 1024 && ncols <= (1U << 17);
 #else
     GGML_UNUSED(ncols);
     GGML_UNUSED(nrows);
@@ -1346,12 +1346,15 @@ static __global__ void top_k_radix_gather(
             return __popc(mask);
         }
     };
+    __shared__ int warp_gt[nwarps];
     __shared__ int warp_ties[nwarps];
+    __shared__ int block_gt_base;
 
     const int row = blockIdx.x / blocks_per_row;
     const int row_block = blockIdx.x % blocks_per_row;
     const int lane = threadIdx.x % warp_size;
     const int warp = threadIdx.x / warp_size;
+    const ggml_cuda_thread_mask_t below_lane = ((ggml_cuda_thread_mask_t) 1 << lane) - 1;
     const float * row_src = src + (size_t) row * ncols;
     int * row_dst = dst + (size_t) row * k;
     top_k_radix_state * state = &states[row];
@@ -1359,18 +1362,73 @@ static __global__ void top_k_radix_gather(
     const int rank = state->rank;
 
     // each warp reads a contiguous part of the contiguous range of the block
-    const int     warp_cols  = block_cols / nwarps;
-    const int64_t warp_begin = (int64_t) row_block * block_cols + warp * warp_cols;
-    const int64_t warp_end   = min(warp_begin + warp_cols, (int64_t) ncols);
+    const int     warp_cols   = block_cols / nwarps;
+    const int64_t warp_begin  = (int64_t) row_block * block_cols + warp * warp_cols;
+    const int64_t warp_end    = min(warp_begin + warp_cols, (int64_t) ncols);
+    const bool    use_bitmask = warp_cols <= 32 * warp_size;
 
     int nties = 0;
-    for (int64_t col = warp_begin + lane; col < warp_end; col += warp_size) {
-        const uint32_t key = top_k_float_to_ordered(row_src[col]);
-        if (key > threshold) {
-            const int pos = atomicAdd(&state->greater_count, 1);
-            row_dst[pos] = col;
-        } else if (key == threshold) {
-            nties++;
+    uint32_t gt_bits = 0;
+    uint32_t eq_bits = 0;
+    if (use_bitmask) {
+        int ngt = 0;
+        int t = 0;
+        for (int64_t col = warp_begin + lane; col < warp_end; col += warp_size, ++t) {
+            const uint32_t key = top_k_float_to_ordered(row_src[col]);
+            if (key > threshold) {
+                gt_bits |= 1U << t;
+                ++ngt;
+            } else if (key == threshold) {
+                eq_bits |= 1U << t;
+                ++nties;
+            }
+        }
+        ngt = warp_reduce_sum<warp_size>(ngt);
+        if (lane == 0) {
+            warp_gt[warp] = ngt;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int total_gt = 0;
+            for (int w = 0; w < nwarps; ++w) {
+                const int wgt = warp_gt[w];
+                warp_gt[w] = total_gt;
+                total_gt += wgt;
+            }
+            block_gt_base = total_gt > 0 ? atomicAdd(&state->greater_count, total_gt) : 0;
+        }
+        __syncthreads();
+
+        if (ggml_cuda_ballot(gt_bits != 0) != 0) {
+            int out_pos = block_gt_base + warp_gt[warp];
+            for (int t = 0; warp_begin + (int64_t) t * warp_size < warp_end; ++t) {
+                const bool is_gt = (gt_bits >> t) & 1U;
+                const ggml_cuda_thread_mask_t gt_ballot = ggml_cuda_ballot(is_gt);
+                if (is_gt) {
+                    row_dst[out_pos + popc(gt_ballot & below_lane)] = warp_begin + (int64_t) t * warp_size + lane;
+                }
+                out_pos += popc(gt_ballot);
+            }
+        }
+    } else {
+        for (int64_t tile = warp_begin; tile < warp_end; tile += warp_size) {
+            const int64_t col = tile + lane;
+            const uint32_t key = col < warp_end ? top_k_float_to_ordered(row_src[col]) : 0U;
+            const bool is_gt = col < warp_end && key > threshold;
+            const ggml_cuda_thread_mask_t gt_ballot = ggml_cuda_ballot(is_gt);
+            if (gt_ballot != 0) {
+                int base = 0;
+                if (lane == 0) {
+                    base = atomicAdd(&state->greater_count, popc(gt_ballot));
+                }
+                base = ggml_cuda_shfl(base, 0);
+                if (is_gt) {
+                    row_dst[base + popc(gt_ballot & below_lane)] = col;
+                }
+            }
+            if (col < warp_end && key == threshold) {
+                nties++;
+            }
         }
     }
 
@@ -1397,16 +1455,30 @@ static __global__ void top_k_radix_gather(
 
     // pos is the same in all lanes of the warp, so the lanes leave the loop together
     const int pos_end = min(pos + nties, rank);
-    for (int64_t tile = warp_begin; tile < warp_end && pos < pos_end; tile += warp_size) {
-        const int64_t col    = tile + lane;
-        const bool    is_tie = col < warp_end && top_k_float_to_ordered(row_src[col]) == threshold;
+    if (use_bitmask) {
+        for (int t = 0; warp_begin + (int64_t) t * warp_size < warp_end && pos < pos_end; ++t) {
+            const int64_t col    = warp_begin + (int64_t) t * warp_size + lane;
+            const bool    is_tie = col < warp_end && ((eq_bits >> t) & 1U);
 
-        const ggml_cuda_thread_mask_t ties = ggml_cuda_ballot(is_tie);
-        const int tie_pos = pos + popc(ties & (((ggml_cuda_thread_mask_t) 1 << lane) - 1));
-        if (is_tie && tie_pos < pos_end) {
-            row_dst[k - rank + tie_pos] = col;
+            const ggml_cuda_thread_mask_t ties = ggml_cuda_ballot(is_tie);
+            const int tie_pos = pos + popc(ties & below_lane);
+            if (is_tie && tie_pos < pos_end) {
+                row_dst[k - rank + tie_pos] = col;
+            }
+            pos += popc(ties);
         }
-        pos += popc(ties);
+    } else {
+        for (int64_t tile = warp_begin; tile < warp_end && pos < pos_end; tile += warp_size) {
+            const int64_t col    = tile + lane;
+            const bool    is_tie = col < warp_end && top_k_float_to_ordered(row_src[col]) == threshold;
+
+            const ggml_cuda_thread_mask_t ties = ggml_cuda_ballot(is_tie);
+            const int tie_pos = pos + popc(ties & below_lane);
+            if (is_tie && tie_pos < pos_end) {
+                row_dst[k - rank + tie_pos] = col;
+            }
+            pos += popc(ties);
+        }
     }
 }
 
@@ -1495,7 +1567,7 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_pool & pool  = ctx.pool();
 
 #if defined(GGML_USE_HIP)
-    if (k > 1 && ncols > 1024 && ncols <= 16384 && (nrows <= 4 || nrows >= 40)) {
+    if (k > 1 && ncols > 1024 && ncols <= 16384 && nrows >= 40) {
         top_k_radix_select_cuda(src0_d, dst_d, ncols, nrows, k, stream);
     } else if (top_k_use_small_kernel(ncols, nrows, k)) {
         top_k_small_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
