@@ -163,9 +163,8 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
             layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, flags);
             layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, flags);
 
-            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, flags);
+            create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert, flags);
             layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, flags);
-            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, flags);
 
             layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, flags);
             layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {        n_ff_exp * n_expert_shared, n_embd}, flags);
@@ -620,7 +619,9 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llm_graph_params & params) :
             LLM_FFN_SILU, hparams.expert_weights_norm,
             hparams.expert_weights_scale,
             (llama_expert_gating_func_type) hparams.expert_gating_func,
-            il);
+            il,
+            nullptr,
+            layer.ffn_gate_up_exps);
     cb(moe_out, "mtp_ffn_moe_out", il);
 
     ggml_tensor * ffn_shexp = build_ffn(cur,
@@ -742,7 +743,9 @@ llama_model_glm5_next::graph::graph(const llm_graph_params & params) :
                     LLM_FFN_SILU, hparams.expert_weights_norm,
                     hparams.expert_weights_scale,
                     (llama_expert_gating_func_type) hparams.expert_gating_func,
-                    il);
+                    il,
+                    nullptr,
+                    layer.ffn_gate_up_exps);
             cb(moe_out, "ffn_moe_out", il);
 
             ggml_tensor * ffn_shexp = build_ffn(cur,

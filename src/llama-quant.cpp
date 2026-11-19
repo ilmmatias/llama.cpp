@@ -1392,6 +1392,23 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 if (imatrix_data) {
                     auto it = imatrix_data->find(tm.remapped_imatrix_name);
                     if (it == imatrix_data->end()) {
+                        // Fused tensors share the same input activations as their unfused counterparts.
+                        const size_t pos_gu = tm.remapped_imatrix_name.find("ffn_gate_up_exps.weight");
+                        if (pos_gu != std::string::npos) {
+                            std::string alt = tm.remapped_imatrix_name;
+                            alt.replace(pos_gu, strlen("ffn_gate_up_exps.weight"), "ffn_gate_exps.weight");
+                            it = imatrix_data->find(alt);
+                        }
+                    }
+                    if (it == imatrix_data->end()) {
+                        const size_t pos_qkv = tm.remapped_imatrix_name.find("attn_qkv.weight");
+                        if (pos_qkv != std::string::npos) {
+                            std::string alt = tm.remapped_imatrix_name;
+                            alt.replace(pos_qkv, strlen("attn_qkv.weight"), "attn_q.weight");
+                            it = imatrix_data->find(alt);
+                        }
+                    }
+                    if (it == imatrix_data->end()) {
                         LLAMA_LOG_INFO("\n====== %s: did not find weights for %s\n", __func__, tensor->name);
                     } else {
                         if (it->second.size() == (size_t)tensor->ne[0]*tensor->ne[2]*tensor->ne[3]) {
