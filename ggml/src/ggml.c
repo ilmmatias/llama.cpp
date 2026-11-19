@@ -4266,7 +4266,7 @@ struct ggml_tensor * ggml_set_rows(
     GGML_ASSERT(b->ne[2] % c->ne[1] == 0);
     GGML_ASSERT(b->ne[3] % c->ne[2] == 0);
     GGML_ASSERT(c->ne[3] == 1);
-    GGML_ASSERT(b->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F16);
+    GGML_ASSERT(b->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F16 || (b->type == GGML_TYPE_I32 && a->type == GGML_TYPE_I32));
     GGML_ASSERT(c->type == GGML_TYPE_I64 || c->type == GGML_TYPE_I32);
 
     GGML_ASSERT(ggml_is_contiguous_rows(a));
@@ -6889,7 +6889,7 @@ struct ggml_tensor * ggml_qsa_block_score(
         struct ggml_tensor  * mask,
         float                 scale) {
     GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
     GGML_ASSERT(cells->type == GGML_TYPE_I32);
     GGML_ASSERT(mask->type == GGML_TYPE_F32);
     GGML_ASSERT(q->ne[0] == k->ne[0]);
@@ -6913,6 +6913,52 @@ struct ggml_tensor * ggml_qsa_block_score(
     result->src[1] = k;
     result->src[2] = cells;
     result->src[3] = mask;
+
+    ggml_set_op_params_f32(result, 0, scale);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_qsa_block_score_compact(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * cells,
+        struct ggml_tensor  * base_mask,
+        struct ggml_tensor  * bounds,
+        float                 scale) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
+    GGML_ASSERT(cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(base_mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(bounds->type == GGML_TYPE_I32);
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(k->ne[2] == 1 && k->ne[3] == 1);
+    GGML_ASSERT(cells->ne[0] == base_mask->ne[0]);
+    GGML_ASSERT(cells->ne[1] == q->ne[3]);
+    GGML_ASSERT(cells->ne[2] == 1 && cells->ne[3] == 1);
+    GGML_ASSERT(base_mask->ne[1] == 1);
+    GGML_ASSERT(base_mask->ne[2] == 1 || base_mask->ne[2] == q->ne[3]);
+    GGML_ASSERT(base_mask->ne[3] == 1);
+    GGML_ASSERT(bounds->ne[0] == 2);
+    GGML_ASSERT(bounds->ne[1] == q->ne[2]);
+    GGML_ASSERT(bounds->ne[2] == q->ne[3]);
+    GGML_ASSERT(bounds->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous(cells));
+    GGML_ASSERT(ggml_is_contiguous(base_mask));
+    GGML_ASSERT(ggml_is_contiguous(bounds));
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F32, cells->ne[0], q->ne[2], q->ne[3]);
+
+    result->op     = GGML_OP_QSA_BLOCK_SCORE;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = cells;
+    result->src[3] = base_mask;
+    result->src[4] = bounds;
 
     ggml_set_op_params_f32(result, 0, scale);
 
@@ -7854,6 +7900,7 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
         /*.hash_table   =*/ { hash_size, hash_used, hash_keys_ptr },
         /*.order        =*/ GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT,
         /*.uid          =*/ 0,
+        /*.uid_immutable=*/ false,
     };
 
     ggml_hash_set_reset(&cgraph->visited_hash_set);
@@ -7881,7 +7928,8 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1)
         /*.use_counts       =*/ cgraph0->use_counts,
         /*.visited_hash_set =*/ cgraph0->visited_hash_set,
         /*.order            =*/ cgraph0->order,
-        /*.uid              =*/ 0
+        /*.uid              =*/ 0,
+        /*.uid_immutable    =*/ false,
     };
 
     return cgraph;
@@ -7892,9 +7940,10 @@ void ggml_graph_cpy(struct ggml_cgraph * src, struct ggml_cgraph * dst) {
     GGML_ASSERT(dst->size >= src->n_nodes);
     GGML_ASSERT(dst->visited_hash_set.size >= src->visited_hash_set.size);
 
-    dst->n_leafs = src->n_leafs;
-    dst->n_nodes = src->n_nodes;
-    dst->order   = src->order;
+    dst->n_leafs       = src->n_leafs;
+    dst->n_nodes       = src->n_nodes;
+    dst->order         = src->order;
+    dst->uid_immutable = false;
 
     for (int i = 0; i < src->n_leafs; ++i) {
         dst->leafs[i] = src->leafs[i];

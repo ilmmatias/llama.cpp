@@ -2588,6 +2588,19 @@ extern "C" {
             struct ggml_tensor  * mask,
             float                 scale);
 
+    // Compact-mask variant of ggml_qsa_block_score:
+    // base_mask: F32 [n_blocks, 1, 1 or n_stream] - per-block base bias (0 or -inf)
+    // bounds:    I32 [2, n_query, n_stream]       - (n_base, n_tail) per query row:
+    //            b < n_base -> base_mask[b], b < n_tail -> 1e9f, else -inf
+    GGML_API struct ggml_tensor * ggml_qsa_block_score_compact(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * cells,
+            struct ggml_tensor  * base_mask,
+            struct ggml_tensor  * bounds,
+            float                 scale);
+
     // Compact attention visibility: positions is I32 [4, n_kv + n_query].
     // KV rows contain (position, x, y, unused); query rows contain
     // (position, x, y, flags), with bit 0 causal and bit 1 two-dimensional.

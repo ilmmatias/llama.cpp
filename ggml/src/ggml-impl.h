@@ -381,6 +381,9 @@ struct ggml_cgraph {
     // an optional identifier that can be utilized to recognize same graphs if two non-zero values match
     // a value of 0 means it is not set and should be ignored
     uint64_t uid;
+
+    // true when tensor pointers, shapes, strides, and op_params remain fixed across calls with the same uid
+    bool uid_immutable;
 };
 
 // returns a slice of cgraph with nodes [i0, i1)
