@@ -25,17 +25,98 @@ static __global__ void rms_norm_sigmoid_gate_f32(
     dst[feature] = weighted*ggml_cuda_op_sigmoid_single(gate[feature]);
 }
 
+template <int WARPS_PER_BLOCK, int CHANNELS_PER_ITER>
+static __global__ void __launch_bounds__(32 * WARPS_PER_BLOCK) rms_norm_sigmoid_gate_vec4_f32(
+        const float * __restrict__ x,
+        const float * __restrict__ gamma,
+        const float * __restrict__ gate,
+        float * __restrict__ dst,
+        const int64_t ne1,
+        const int64_t ne2,
+        const int64_t xs1,
+        const int64_t xs2,
+        const int64_t xs3,
+        const int64_t zs1,
+        const int64_t zs2,
+        const int64_t zs3,
+        const float eps) {
+    const int warp_id = threadIdx.x >> 5;
+    const int lane    = threadIdx.x & 31;
+    const int64_t row = (int64_t) blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    if (row >= ne1) {
+        return;
+    }
+
+    const int64_t ch0    = (int64_t) blockIdx.y * CHANNELS_PER_ITER;
+    const int64_t sample = blockIdx.z;
+    const float4  g4     = *reinterpret_cast<const float4 *>(gamma + lane * 4);
+
+#pragma unroll
+    for (int k = 0; k < CHANNELS_PER_ITER; ++k) {
+        const int64_t ch = ch0 + k;
+        if (ch >= ne2) {
+            break;
+        }
+        const float4 xv = *reinterpret_cast<const float4 *>(x    + row*xs1 + ch*xs2 + sample*xs3 + lane*4);
+        const float4 zv = *reinterpret_cast<const float4 *>(gate + row*zs1 + ch*zs2 + sample*zs3 + lane*4);
+
+        const float sq  = xv.x*xv.x + xv.y*xv.y + xv.z*xv.z + xv.w*xv.w;
+        const float sum = warp_reduce_sum(sq);
+        const float sc  = rsqrtf(sum * (1.0f / 128.0f) + eps);
+
+        float4 out;
+        out.x = (sc * xv.x) * g4.x * ggml_cuda_op_sigmoid_single(zv.x);
+        out.y = (sc * xv.y) * g4.y * ggml_cuda_op_sigmoid_single(zv.y);
+        out.z = (sc * xv.z) * g4.z * ggml_cuda_op_sigmoid_single(zv.z);
+        out.w = (sc * xv.w) * g4.w * ggml_cuda_op_sigmoid_single(zv.w);
+
+        float * dp = dst + ((sample*ne2 + ch)*ne1 + row)*128 + lane*4;
+        *reinterpret_cast<float4 *>(dp) = out;
+    }
+}
+
 void ggml_cuda_op_rms_norm_sigmoid_gate_fused(
         ggml_backend_cuda_context & ctx, const ggml_tensor * rms_node,
         const ggml_tensor * gamma, const ggml_tensor * gate, ggml_tensor * dst) {
     const ggml_tensor * x = rms_node->src[0];
+    const float eps = ggml_get_op_params_f32(rms_node, 0);
+    const int64_t xs1 = x->nb[1]/sizeof(float);
+    const int64_t xs2 = x->nb[2]/sizeof(float);
+    const int64_t xs3 = x->nb[3]/sizeof(float);
+    const int64_t zs1 = gate->nb[1]/sizeof(float);
+    const int64_t zs2 = gate->nb[2]/sizeof(float);
+    const int64_t zs3 = gate->nb[3]/sizeof(float);
+
+    const bool can_vec4 = ggml_cuda_info().devices[ctx.device].warp_size == 32
+        && ((uintptr_t) x->data & 15) == 0 && ((uintptr_t) gamma->data & 15) == 0
+        && ((uintptr_t) gate->data & 15) == 0 && ((uintptr_t) dst->data & 15) == 0
+        && x->nb[0] == sizeof(float) && gamma->nb[0] == sizeof(float) && gate->nb[0] == sizeof(float)
+        && (xs1 & 3) == 0 && (xs2 & 3) == 0 && (xs3 & 3) == 0
+        && (zs1 & 3) == 0 && (zs2 & 3) == 0 && (zs3 & 3) == 0;
+
+    if (can_vec4) {
+        if (x->ne[2] <= 4) {
+            const dim3 blocks(x->ne[1], x->ne[2], x->ne[3]);
+            rms_norm_sigmoid_gate_vec4_f32<1, 1><<<blocks, 32, 0, ctx.stream()>>>(
+                (const float *) x->data, (const float *) gamma->data,
+                (const float *) gate->data, (float *) dst->data,
+                x->ne[1], x->ne[2], xs1, xs2, xs3, zs1, zs2, zs3, eps);
+        } else {
+            const dim3 blocks((x->ne[1] + 3)/4, (x->ne[2] + 3)/4, x->ne[3]);
+            rms_norm_sigmoid_gate_vec4_f32<4, 4><<<blocks, 128, 0, ctx.stream()>>>(
+                (const float *) x->data, (const float *) gamma->data,
+                (const float *) gate->data, (float *) dst->data,
+                x->ne[1], x->ne[2], xs1, xs2, xs3, zs1, zs2, zs3, eps);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
     const dim3 blocks(x->ne[1], x->ne[2], x->ne[3]);
     rms_norm_sigmoid_gate_f32<<<blocks, 128, 32*sizeof(float), ctx.stream()>>>(
         (const float *) x->data, (const float *) gamma->data,
         (const float *) gate->data, (float *) dst->data,
-        x->nb[1]/sizeof(float), x->nb[2]/sizeof(float), x->nb[3]/sizeof(float),
-        gate->nb[1]/sizeof(float), gate->nb[2]/sizeof(float), gate->nb[3]/sizeof(float),
-        ggml_get_op_params_f32(rms_node, 0));
+        xs1, xs2, xs3, zs1, zs2, zs3, eps);
     CUDA_CHECK(cudaGetLastError());
 }
 

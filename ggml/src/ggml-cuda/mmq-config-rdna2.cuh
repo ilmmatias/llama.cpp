@@ -1,8 +1,10 @@
 static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_rdna2(ggml_type type, int J, bool fallback) {
-    // Smaller row tiles help high-bit ZNQ at J=8; wider tiles retain better weight reuse at larger J.
-    if ((type == GGML_TYPE_ZNQ6_S || type == GGML_TYPE_ZNQ6_SM || type == GGML_TYPE_ZNQ6_M || type == GGML_TYPE_ZNQ6_L ||
-         type == GGML_TYPE_ZNQ7_S || type == GGML_TYPE_ZNQ7_SM || type == GGML_TYPE_ZNQ7_M || type == GGML_TYPE_ZNQ7_L) &&
-        J == 8) {
+    // Smaller row tiles help unaligned fallback matrices fill CUs cleanly and help high-bit ZNQ at J=8.
+    if (znq_bits_cuda(type) != 0 &&
+        ((fallback && (J == 8 || J == 16 || J == 32 || J == 64)) ||
+         (!fallback && J == 8 &&
+          (type == GGML_TYPE_ZNQ6_S || type == GGML_TYPE_ZNQ6_SM || type == GGML_TYPE_ZNQ6_M || type == GGML_TYPE_ZNQ6_L ||
+           type == GGML_TYPE_ZNQ7_S || type == GGML_TYPE_ZNQ7_SM || type == GGML_TYPE_ZNQ7_M || type == GGML_TYPE_ZNQ7_L)))) {
         return ggml_cuda_mmq_config(type, 256, 2, 64, J, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, fallback);
     }
 

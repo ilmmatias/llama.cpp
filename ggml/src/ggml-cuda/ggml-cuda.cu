@@ -6649,6 +6649,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    if (node->op == GGML_OP_IM2COL && i + 1 < cgraph->n_nodes) {
+        ggml_tensor * mm = cgraph->nodes[i + 1];
+        const int32_t * params = (const int32_t *) node->op_params;
+        const bool is_2D = params[6] == 1;
+        const ggml_tensor * x = node->src[1];
+        const ggml_tensor * kernel = mm->src[1];
+        const int out_nodes[] = { i + 1 };
+        if (!is_2D && mm->op == GGML_OP_MUL_MAT && mm->src[0] == node &&
+                x->type == GGML_TYPE_F32 && x->ne[1] == 1 && x->ne[3] == 1 &&
+                (kernel->type == GGML_TYPE_F32 || kernel->type == GGML_TYPE_F16 || kernel->type == GGML_TYPE_BF16) &&
+                kernel->ne[0] == node->ne[0] && kernel->ne[1] == 1 && kernel->ne[2] == x->ne[2] && kernel->ne[3] == 1 &&
+                mm->type == GGML_TYPE_F32 && mm->ne[0] == node->ne[1] && mm->ne[1] == 1 && mm->ne[2] == x->ne[2] && mm->ne[3] == 1 &&
+                x->nb[0] % sizeof(float) == 0 && x->nb[2] % sizeof(float) == 0 &&
+                kernel->nb[0] % ggml_element_size(kernel) == 0 && kernel->nb[2] % ggml_element_size(kernel) == 0 &&
+                mm->nb[0] % sizeof(float) == 0 && mm->nb[2] % sizeof(float) == 0 &&
+                ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_IM2COL, GGML_OP_MUL_MAT }, { i + 1 }) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1) &&
+                ggml_cuda_fusion_same_stream(*cuda_ctx, cgraph, i, i + 1)) {
+            ggml_cuda_op_conv_1d_dw_fused(*cuda_ctx, node, mm);
+            return 1;
+        }
+    }
+
     if (node->op == GGML_OP_CONT && i + 2 < cgraph->n_nodes) {
         ggml_tensor * unary = cgraph->nodes[i + 1];
         ggml_tensor * mul = cgraph->nodes[i + 2];

@@ -293,6 +293,105 @@ cudaStream_t stream) {
     ggml_cuda_kernel_launch(cpy_scalar_contiguous<src_t, dst_t>, launch_params, cx, cdst, ne);
 }
 
+template <typename T, int VE>
+static __global__ void cpy_vec16_same(
+        const char * __restrict__ cx, char * __restrict__ cdst, const int64_t nv,
+        const int64_t ne00v, const int64_t ne01, const int64_t ne02,
+        const int64_t nb01, const int64_t nb02, const int64_t nb03,
+        const int64_t ne10v, const int64_t ne11, const int64_t ne12,
+        const int64_t nb11, const int64_t nb12, const int64_t nb13,
+        const bool dst_cont) {
+    ggml_cuda_pdl_lc();
+    const int64_t v = (int64_t) blockDim.x * blockIdx.x + threadIdx.x;
+    if (v >= nv) {
+        return;
+    }
+
+    const int64_t n012 = ne00v * ne01 * ne02;
+    const int64_t n01  = ne00v * ne01;
+    const int64_t i03 = v / n012;
+    const int64_t r03 = v - i03 * n012;
+    const int64_t i02 = r03 / n01;
+    const int64_t r02 = r03 - i02 * n01;
+    const int64_t i01 = r02 / ne00v;
+    const int64_t i00v = r02 - i01 * ne00v;
+    const int64_t x_offset = i00v * 16 + i01 * nb01 + i02 * nb02 + i03 * nb03;
+
+    int64_t dst_offset;
+    if (dst_cont) {
+        dst_offset = v * 16;
+    } else {
+        const int64_t n112 = ne10v * ne11 * ne12;
+        const int64_t n11  = ne10v * ne11;
+        const int64_t i13 = v / n112;
+        const int64_t r13 = v - i13 * n112;
+        const int64_t i12 = r13 / n11;
+        const int64_t r12 = r13 - i12 * n11;
+        const int64_t i11 = r12 / ne10v;
+        const int64_t i10v = r12 - i11 * ne10v;
+        dst_offset = i10v * 16 + i11 * nb11 + i12 * nb12 + i13 * nb13;
+    }
+
+    ggml_cuda_pdl_sync();
+    *reinterpret_cast<uint4 *>(cdst + dst_offset) = *reinterpret_cast<const uint4 *>(cx + x_offset);
+}
+
+template <typename src_t, typename dst_t>
+static __global__ void cpy_vec4_cvt(
+        const char * __restrict__ cx, char * __restrict__ cdst, const int64_t nv,
+        const int64_t ne00v, const int64_t ne01, const int64_t ne02,
+        const int64_t nb01, const int64_t nb02, const int64_t nb03,
+        const int64_t ne10v, const int64_t ne11, const int64_t ne12,
+        const int64_t nb11, const int64_t nb12, const int64_t nb13,
+        const bool dst_cont) {
+    ggml_cuda_pdl_lc();
+    const int64_t v = (int64_t) blockDim.x * blockIdx.x + threadIdx.x;
+    if (v >= nv) {
+        return;
+    }
+
+    const int64_t n012 = ne00v * ne01 * ne02;
+    const int64_t n01  = ne00v * ne01;
+    const int64_t i03 = v / n012;
+    const int64_t r03 = v - i03 * n012;
+    const int64_t i02 = r03 / n01;
+    const int64_t r02 = r03 - i02 * n01;
+    const int64_t i01 = r02 / ne00v;
+    const int64_t i00v = r02 - i01 * ne00v;
+    const int64_t x_offset = i00v * (4 * sizeof(src_t)) + i01 * nb01 + i02 * nb02 + i03 * nb03;
+
+    int64_t dst_offset;
+    if (dst_cont) {
+        dst_offset = v * (4 * sizeof(dst_t));
+    } else {
+        const int64_t n112 = ne10v * ne11 * ne12;
+        const int64_t n11  = ne10v * ne11;
+        const int64_t i13 = v / n112;
+        const int64_t r13 = v - i13 * n112;
+        const int64_t i12 = r13 / n11;
+        const int64_t r12 = r13 - i12 * n11;
+        const int64_t i11 = r12 / ne10v;
+        const int64_t i10v = r12 - i11 * ne10v;
+        dst_offset = i10v * (4 * sizeof(dst_t)) + i11 * nb11 + i12 * nb12 + i13 * nb13;
+    }
+
+    ggml_cuda_pdl_sync();
+    if constexpr (std::is_same_v<src_t, float> && std::is_same_v<dst_t, half>) {
+        const float4 f = *reinterpret_cast<const float4 *>(cx + x_offset);
+        uint2 out;
+        const half2 h0 = __floats2half2_rn(f.x, f.y);
+        const half2 h1 = __floats2half2_rn(f.z, f.w);
+        out.x = *reinterpret_cast<const uint32_t *>(&h0);
+        out.y = *reinterpret_cast<const uint32_t *>(&h1);
+        *reinterpret_cast<uint2 *>(cdst + dst_offset) = out;
+    } else if constexpr (std::is_same_v<src_t, half> && std::is_same_v<dst_t, float>) {
+        const uint2 in = *reinterpret_cast<const uint2 *>(cx + x_offset);
+        const float2 f0 = __half22float2(*reinterpret_cast<const half2 *>(&in.x));
+        const float2 f1 = __half22float2(*reinterpret_cast<const half2 *>(&in.y));
+        *reinterpret_cast<float4 *>(cdst + dst_offset) = make_float4(f0.x, f0.y, f1.x, f1.y);
+    }
+}
+
 template<typename src_t, typename dst_t, bool transposed = false>
 static void ggml_cpy_scalar_cuda(
     const char * cx, char * cdst, const int64_t ne,
@@ -306,6 +405,52 @@ static void ggml_cpy_scalar_cuda(
         ggml_cuda_kernel_launch(cpy_scalar<cpy_1_scalar<src_t, dst_t>>, launch_params,
             cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
     };
+
+    if (!transposed) {
+        if constexpr (std::is_same_v<src_t, dst_t> && (sizeof(src_t) == 2 || sizeof(src_t) == 4)) {
+            constexpr int VE = 16 / (int) sizeof(src_t);
+            if (nb00 == sizeof(src_t) && nb10 == sizeof(dst_t) &&
+                    (ne00 % VE) == 0 && (ne10 % VE) == 0 &&
+                    (((uintptr_t) cx | (uintptr_t) cdst | nb01 | nb02 | nb03 | nb11 | nb12 | nb13) & 15) == 0) {
+                const int64_t nv = ne / VE;
+                const int64_t num_blocks = (nv + 255) / 256;
+                if (num_blocks <= INT_MAX) {
+                    const int64_t ne13 = ne / (ne10 * ne11 * ne12);
+                    const bool dst_cont = (nb11 == ne10 * nb10) &&
+                                          (ne12 <= 1 || nb12 == ne11 * nb11) &&
+                                          (ne13 <= 1 || nb13 == ne12 * nb12);
+                    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3) num_blocks, 256, 0, stream);
+                    ggml_cuda_kernel_launch(cpy_vec16_same<src_t, VE>, launch_params,
+                        cx, cdst, nv, ne00 / VE, ne01, ne02, nb01, nb02, nb03,
+                        ne10 / VE, ne11, ne12, nb11, nb12, nb13, dst_cont);
+                    return;
+                }
+            }
+        } else if constexpr ((std::is_same_v<src_t, float> && std::is_same_v<dst_t, half>) ||
+                             (std::is_same_v<src_t, half> && std::is_same_v<dst_t, float>)) {
+            const uintptr_t align_f = std::is_same_v<src_t, float> ? (uintptr_t) cx : (uintptr_t) cdst;
+            const size_t salign_f = std::is_same_v<src_t, float> ? (nb01 | nb02 | nb03) : (nb11 | nb12 | nb13);
+            const uintptr_t align_h = std::is_same_v<src_t, half> ? (uintptr_t) cx : (uintptr_t) cdst;
+            const size_t salign_h = std::is_same_v<src_t, half> ? (nb01 | nb02 | nb03) : (nb11 | nb12 | nb13);
+            if (nb00 == sizeof(src_t) && nb10 == sizeof(dst_t) &&
+                    (ne00 % 4) == 0 && (ne10 % 4) == 0 &&
+                    ((align_f | salign_f) & 15) == 0 && ((align_h | salign_h) & 7) == 0) {
+                const int64_t nv = ne / 4;
+                const int64_t num_blocks = (nv + 255) / 256;
+                if (num_blocks <= INT_MAX) {
+                    const int64_t ne13 = ne / (ne10 * ne11 * ne12);
+                    const bool dst_cont = (nb11 == ne10 * nb10) &&
+                                          (ne12 <= 1 || nb12 == ne11 * nb11) &&
+                                          (ne13 <= 1 || nb13 == ne12 * nb12);
+                    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3) num_blocks, 256, 0, stream);
+                    ggml_cuda_kernel_launch(cpy_vec4_cvt<src_t, dst_t>, launch_params,
+                        cx, cdst, nv, ne00 / 4, ne01, ne02, nb01, nb02, nb03,
+                        ne10 / 4, ne11, ne12, nb11, nb12, nb13, dst_cont);
+                    return;
+                }
+            }
+        }
+    }
 
     if (transposed) {
         GGML_ASSERT(ne == ne00*ne01*ne02);  // ne[3] is 1 assumed

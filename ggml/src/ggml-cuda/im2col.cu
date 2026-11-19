@@ -1,4 +1,5 @@
 #include "im2col.cuh"
+#include "convert.cuh"
 
 #define MAX_GRIDDIM_Y 65535
 #define MAX_GRIDDIM_Z 65535
@@ -266,5 +267,110 @@ void ggml_cuda_op_im2col_3d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         im2col_3d_cuda_f32(src1_d, (float *) dst_d, N, IC, ID, IH, IW, OC, KD, KH, KW, OD, OH, OW,
                            stride_q, stride_z, stride_y, stride_x,
                            s0, s1, s2, p0, p1, p2, d0, d1, d2, stream);
+    }
+}
+
+template <typename Tw>
+static __global__ void conv_1d_dw_fused_kernel(
+        const float * __restrict__ x,
+        const Tw    * __restrict__ w,
+        float       * __restrict__ dst,
+        int64_t IW, int64_t KW, int64_t OW, int64_t C,
+        int64_t sx0, int64_t sxc,
+        int64_t sw0, int64_t swc,
+        int64_t sd0, int64_t sdc,
+        int s0, int p0, int d0) {
+    for (int64_t ic = (int64_t) blockIdx.y * blockDim.y + threadIdx.y; ic < C; ic += (int64_t) gridDim.y * blockDim.y) {
+        const float * x_c = x + ic * sxc;
+        const Tw    * w_c = w + ic * swc;
+        for (int64_t iow = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; iow < OW; iow += (int64_t) gridDim.x * blockDim.x) {
+            float sum = 0.0f;
+#pragma unroll 4
+            for (int64_t ikw = 0; ikw < KW; ++ikw) {
+                const int64_t iiw = iow * s0 + ikw * d0 - p0;
+                if ((uint64_t) iiw < (uint64_t) IW) {
+                    sum = fmaf(x_c[iiw * sx0], ggml_cuda_cast<float>(w_c[ikw * sw0]), sum);
+                }
+            }
+            dst[ic * sdc + iow * sd0] = sum;
+        }
+    }
+}
+
+template <typename Tw>
+static void launch_conv_1d_dw_fused(
+        const float * x, const Tw * w, float * dst,
+        int64_t IW, int64_t KW, int64_t OW, int64_t C,
+        int64_t sx0, int64_t sxc,
+        int64_t sw0, int64_t swc,
+        int64_t sd0, int64_t sdc,
+        int s0, int p0, int d0, cudaStream_t stream) {
+    int tx = 64;
+    int ty = 2;
+    if (OW <= 1) {
+        tx = 1;  ty = 64;
+    } else if (OW <= 4) {
+        tx = 4;  ty = 16;
+    } else if (OW <= 8) {
+        tx = 8;  ty = 8;
+    } else if (OW <= 16) {
+        tx = 16; ty = 4;
+    } else if (OW <= 32) {
+        tx = 32; ty = 2;
+    }
+
+    const int64_t bx = std::min<int64_t>((OW + tx - 1) / tx, MAX_GRIDDIM_Y);
+    const int64_t by = std::min<int64_t>((C  + ty - 1) / ty, MAX_GRIDDIM_Z);
+    const dim3 block_dims(tx, ty, 1);
+    const dim3 grid_dims(bx, by, 1);
+
+    conv_1d_dw_fused_kernel<Tw><<<grid_dims, block_dims, 0, stream>>>(
+            x, w, dst, IW, KW, OW, C, sx0, sxc, sw0, swc, sd0, sdc, s0, p0, d0);
+}
+
+void ggml_cuda_op_conv_1d_dw_fused(ggml_backend_cuda_context & ctx, ggml_tensor * im2col_node, ggml_tensor * mul_mat_node) {
+    const ggml_tensor * x = im2col_node->src[1];
+    const ggml_tensor * w = mul_mat_node->src[1];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(mul_mat_node->type == GGML_TYPE_F32);
+
+    const int32_t * params = (const int32_t *) im2col_node->op_params;
+    const int32_t s0 = params[0];
+    const int32_t p0 = params[2];
+    const int32_t d0 = params[4];
+
+    const int64_t IW = x->ne[0];
+    const int64_t KW = w->ne[0];
+    const int64_t OW = mul_mat_node->ne[0];
+    const int64_t C  = mul_mat_node->ne[2];
+
+    const size_t  es_w = ggml_element_size(w);
+    const int64_t sx0  = x->nb[0] / sizeof(float);
+    const int64_t sxc  = x->nb[2] / sizeof(float);
+    const int64_t sw0  = w->nb[0] / es_w;
+    const int64_t swc  = w->nb[2] / es_w;
+    const int64_t sd0  = mul_mat_node->nb[0] / sizeof(float);
+    const int64_t sdc  = mul_mat_node->nb[2] / sizeof(float);
+
+    cudaStream_t stream = ctx.stream();
+    switch (w->type) {
+        case GGML_TYPE_F32:
+            launch_conv_1d_dw_fused<float>(
+                    (const float *) x->data, (const float *) w->data, (float *) mul_mat_node->data,
+                    IW, KW, OW, C, sx0, sxc, sw0, swc, sd0, sdc, s0, p0, d0, stream);
+            break;
+        case GGML_TYPE_F16:
+            launch_conv_1d_dw_fused<half>(
+                    (const float *) x->data, (const half *) w->data, (float *) mul_mat_node->data,
+                    IW, KW, OW, C, sx0, sxc, sw0, swc, sd0, sdc, s0, p0, d0, stream);
+            break;
+        case GGML_TYPE_BF16:
+            launch_conv_1d_dw_fused<nv_bfloat16>(
+                    (const float *) x->data, (const nv_bfloat16 *) w->data, (float *) mul_mat_node->data,
+                    IW, KW, OW, C, sx0, sxc, sw0, swc, sd0, sdc, s0, p0, d0, stream);
+            break;
+        default:
+            GGML_ABORT("unsupported conv_1d_dw kernel type");
     }
 }

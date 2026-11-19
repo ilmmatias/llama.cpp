@@ -127,6 +127,77 @@ static __global__ void concat_transposed_src1_dim0(
     }
 }
 
+// Fast dim==1 concatenation with 16-byte vectorized row copies when dim-0 is 16-byte aligned.
+template <typename T>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+    concat_dim1_fast(
+        const char * __restrict__ src0,
+        const char * __restrict__ src1,
+              char * __restrict__ dst,
+           int64_t   ne00,
+           int64_t   ne01,
+           int64_t   ne02,
+           int64_t   ne03,
+          uint64_t   nb00,
+          uint64_t   nb01,
+          uint64_t   nb02,
+          uint64_t   nb03,
+          uint64_t   nb10,
+          uint64_t   nb11,
+          uint64_t   nb12,
+          uint64_t   nb13,
+           int64_t   ne0,
+           int64_t   ne2,
+          uint64_t   nb1,
+          uint64_t   nb2,
+          uint64_t   nb3,
+           bool      src0_vec4,
+           bool      src1_vec4) {
+    const int64_t i1 = blockIdx.y;
+    const int64_t i2 = blockIdx.z % ne2;
+    const int64_t i3 = blockIdx.z / ne2;
+
+    const bool from_src0 = (i1 < ne01 && i2 < ne02 && i3 < ne03);
+    char * y_row = dst + i3*nb3 + i2*nb2 + i1*nb1;
+
+    constexpr int V = 16 / sizeof(T);
+    const int64_t idx4    = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t i0_base = idx4 * V;
+    if (i0_base >= ne0) {
+        return;
+    }
+
+    if (from_src0) {
+        if (src0_vec4 && i0_base + V <= ne00) {
+            const uint4 * x = (const uint4 *) (src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0_base*sizeof(T));
+            ((uint4 *) y_row)[idx4] = *x;
+            return;
+        }
+        for (int k = 0; k < V; ++k) {
+            const int64_t i0 = i0_base + k;
+            if (i0 < ne0 && i0 < ne00) {
+                *((T *) (y_row + i0*sizeof(T))) = *(const T *) (src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
+            } else if (i0 < ne0) {
+                *((T *) (y_row + i0*sizeof(T))) = *(const T *) (src1 + i3*nb13 + i2*nb12 + (i1 - ne01)*nb11 + i0*nb10);
+            }
+        }
+        return;
+    }
+
+    if (src1_vec4 && i0_base + V <= ne0) {
+        const uint4 * x = (const uint4 *) (src1 + i3*nb13 + i2*nb12 + (i1 - ne01)*nb11 + i0_base*sizeof(T));
+        ((uint4 *) y_row)[idx4] = *x;
+        return;
+    }
+
+    for (int k = 0; k < V; ++k) {
+        const int64_t i0 = i0_base + k;
+        if (i0 < ne0) {
+            *((T *) (y_row + i0*sizeof(T))) = *(const T *) (src1 + i3*nb13 + i2*nb12 + (i1 - ne01)*nb11 + i0*nb10);
+        }
+    }
+}
+
 // non-contiguous kernel (slow)
 template <typename T, int dim>
 static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
@@ -225,6 +296,26 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
 
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
+    } else if (dim == 1 && dst->nb[0] == sizeof(T) &&
+               ((uintptr_t) dst->data & 15) == 0 && (dst->nb[1] & 15) == 0 &&
+               (dst->nb[2] & 15) == 0 && (dst->nb[3] & 15) == 0) {
+        GGML_ASSERT(!ggml_is_quantized(src0->type));
+
+        constexpr int V = 16 / sizeof(T);
+        const bool src0_vec4 = src0->nb[0] == sizeof(T) && ((uintptr_t) src0->data & 15) == 0 &&
+                               (src0->nb[1] & 15) == 0 && (src0->nb[2] & 15) == 0 && (src0->nb[3] & 15) == 0;
+        const bool src1_vec4 = src1->nb[0] == sizeof(T) && ((uintptr_t) src1->data & 15) == 0 &&
+                               (src1->nb[1] & 15) == 0 && (src1->nb[2] & 15) == 0 && (src1->nb[3] & 15) == 0;
+        const int64_t n_vec4 = (dst->ne[0] + V - 1) / V;
+        const dim3 grid_dim((n_vec4 + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE, dst->ne[1], dst->ne[2] * dst->ne[3]);
+        concat_dim1_fast<T><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+            (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+            src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+            src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+            src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+            dst->ne[0], dst->ne[2],
+            dst->nb[1], dst->nb[2], dst->nb[3],
+            src0_vec4, src1_vec4);
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 

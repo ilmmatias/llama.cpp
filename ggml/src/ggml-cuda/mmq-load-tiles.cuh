@@ -591,8 +591,8 @@ template <ggml_type type, int J, bool fallback, int bits> static __device__ __fo
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 
 #if defined(GGML_USE_HIP) && defined(RDNA2)
-    // Decode a full block per lane to reuse codebooks across quads.
-    constexpr bool decode_block = bits == 4 && group >= 8;
+    // Decode a full block per lane to reuse codebooks/headers across quads without coalescing regressions.
+    constexpr bool decode_block = (bits == 4 && group >= 8) || (bits == 6 && group == 4);
 #else
     constexpr bool decode_block = false;
 #endif
@@ -617,10 +617,24 @@ template <ggml_type type, int J, bool fallback, int bits> static __device__ __fo
         x_qs[i*sram_stride + MMQ_TILE_NE_K + txi] = znq_pack4_cuda<bits, false, group, selector_bits>(bxi + (MMQ_TILE_NE_K/QI8_0) * block_size, 4*kqsx);
 #else
         if constexpr (decode_block) {
+            if constexpr (bits == 6) {
+                const uint32_t books = znq6_load_books_cuda<group, selector_bits>(bxi);
 #pragma unroll
-            for (int q = 0; q < QI8_0; ++q) {
-                x_qs[i*(2*MMQ_TILE_NE_K + 1) + txi*QI8_0 + q] = znq_pack4_cuda<bits, true, group, selector_bits>(bxi, 4*q);
+                for (int q0 = 0; q0 < QI8_0; q0 += 4) {
+                    int qs[4];
+                    znq6_decode_4quads_cuda<group, selector_bits>(bxi, books, q0, nullptr, qs);
+#pragma unroll
+                    for (int q = 0; q < 4; ++q) {
+                        x_qs[i*(2*MMQ_TILE_NE_K + 1) + txi*QI8_0 + q0 + q] = qs[q];
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int q = 0; q < QI8_0; ++q) {
+                    x_qs[i*(2*MMQ_TILE_NE_K + 1) + txi*QI8_0 + q] = znq_pack4_cuda<bits, true, group, selector_bits>(bxi, 4*q);
+                }
             }
+            x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + txi] = znq_scale_cuda(bxi[0]);
         } else {
             x_qs[i*(2*MMQ_TILE_NE_K + 1) + 0             + txi] = znq_pack4_cuda<bits, false, group, selector_bits>(bxi, 4*kqsx);
             x_qs[i*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = znq_pack4_cuda<bits, false, group, selector_bits>(bxi + (MMQ_TILE_NE_K/QI8_0) * block_size, 4*kqsx);
@@ -628,25 +642,27 @@ template <ggml_type type, int J, bool fallback, int bits> static __device__ __fo
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 
-    constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QI8_0;
-    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
-    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+    if constexpr (!decode_block) {
+        constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QI8_0;
+        constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+        const int kbxd = threadIdx.x % blocks_per_tile_x_row;
 
 #pragma unroll
-    for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
-        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+        for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
+            int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
 
-        if (fallback) {
-            i = min(i, i_max);
-        }
+            if (fallback) {
+                i = min(i, i_max);
+            }
 
-        const uint8_t * bxi = (const uint8_t *) x + (kbx0 + i*stride + kbxd) * block_size;
+            const uint8_t * bxi = (const uint8_t *) x + (kbx0 + i*stride + kbxd) * block_size;
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_df[i*sram_stride                           + kbxd] = znq_scale_cuda(bxi[0]);
+            x_df[i*sram_stride                           + kbxd] = znq_scale_cuda(bxi[0]);
 #else
-        x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + kbxd] = znq_scale_cuda(bxi[0]);
+            x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + kbxd] = znq_scale_cuda(bxi[0]);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        }
     }
 }
 

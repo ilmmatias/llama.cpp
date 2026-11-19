@@ -176,7 +176,7 @@ static __global__ void dsv4_hc_comb_f32(
     }
 }
 
-template <bool gated>
+template <bool gated, bool vec4>
 static __global__ void dsv4_hc_pre_f32_tiled(
         const float * x,
         const float * weights,
@@ -209,6 +209,45 @@ static __global__ void dsv4_hc_pre_f32_tiled(
         __syncthreads();
     }
 
+    if constexpr (vec4) {
+        const int64_t n_embd4 = n_embd >> 2;
+        if (i0 >= n_embd4) {
+            return;
+        }
+
+        const float4 * x4 = (const float4 *) x;
+        const float4 * w4 = (const float4 *) weights;
+        float4       * d4 = (float4 *)       dst;
+
+        const int64_t sx1_4 = sx1 >> 2;
+        const int64_t sx2_4 = sx2 >> 2;
+        const int64_t sw1_4 = sw1 >> 2;
+        const int64_t sw2_4 = sw2 >> 2;
+        const int64_t sd1_4 = sd1 >> 2;
+
+        float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+        for (int ih = 0; ih < DSV4_HC; ++ih) {
+            const float4 xv = x4[i0 + ih*sx1_4 + it*sx2_4];
+            if constexpr (gated) {
+                const float4 wraw = w4[i0 + ih*sw1_4 + it*sw2_4];
+                sum.x = fmaf(xv.x, 1.0f / (1.0f + __expf(-wraw.x)), sum.x);
+                sum.y = fmaf(xv.y, 1.0f / (1.0f + __expf(-wraw.y)), sum.y);
+                sum.z = fmaf(xv.z, 1.0f / (1.0f + __expf(-wraw.z)), sum.z);
+                sum.w = fmaf(xv.w, 1.0f / (1.0f + __expf(-wraw.w)), sum.w);
+            } else {
+                const float wv = weights_s[ih];
+                sum.x = fmaf(xv.x, wv, sum.x);
+                sum.y = fmaf(xv.y, wv, sum.y);
+                sum.z = fmaf(xv.z, wv, sum.z);
+                sum.w = fmaf(xv.w, wv, sum.w);
+            }
+        }
+
+        d4[i0 + it*sd1_4] = make_float4(scale * sum.x, scale * sum.y, scale * sum.z, scale * sum.w);
+        return;
+    }
+
     if (i0 >= n_embd) {
         return;
     }
@@ -218,7 +257,7 @@ static __global__ void dsv4_hc_pre_f32_tiled(
     for (int ih = 0; ih < DSV4_HC; ++ih) {
         float wv;
         if constexpr (gated) {
-            wv = 1.0f / (1.0f + expf(-weights[i0*sw0 + ih*sw1 + it*sw2]));
+            wv = 1.0f / (1.0f + __expf(-weights[i0*sw0 + ih*sw1 + it*sw2]));
         } else {
             wv = weights_s[ih];
         }
@@ -230,7 +269,7 @@ static __global__ void dsv4_hc_pre_f32_tiled(
 }
 
 // gated: post = gate_scale_out*sigmoid(gate_scale_in*post)
-template <bool has_comb, bool gated>
+template <bool has_comb, bool gated, bool vec4>
 static __global__ void dsv4_hc_post_f32_tiled(
         const float * x,
         const float * residual,
@@ -268,7 +307,7 @@ static __global__ void dsv4_hc_post_f32_tiled(
     if (tid < DSV4_HC) {
         float pv = post[tid*sp0 + it*sp1];
         if constexpr (gated) {
-            pv = gate_scale_out * (1.0f / (1.0f + expf(-(gate_scale_in * pv))));
+            pv = gate_scale_out * (1.0f / (1.0f + __expf(-(gate_scale_in * pv))));
         }
         post_s[tid] = pv;
     }
@@ -282,6 +321,60 @@ static __global__ void dsv4_hc_post_f32_tiled(
     }
 
     __syncthreads();
+
+    if constexpr (vec4) {
+        const int64_t n_embd4 = n_embd >> 2;
+        if (i0 >= n_embd4) {
+            return;
+        }
+
+        const float4 * x4 = (const float4 *) x;
+        const float4 * r4 = (const float4 *) residual;
+        float4       * d4 = (float4 *)       dst;
+
+        const int64_t sx1_4 = sx1 >> 2;
+        const int64_t sr1_4 = sr1 >> 2;
+        const int64_t sr2_4 = sr2 >> 2;
+        const int64_t sd1_4 = sd1 >> 2;
+        const int64_t sd2_4 = sd2 >> 2;
+
+        const float4 xv = x4[i0 + it*sx1_4];
+
+        if constexpr (has_comb) {
+            float4 r[DSV4_HC];
+#pragma unroll
+            for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+                r[isrc] = r4[i0 + isrc*sr1_4 + it*sr2_4];
+            }
+
+#pragma unroll
+            for (int idst = 0; idst < DSV4_HC; ++idst) {
+                const float pv = post_s[idst];
+                float4 sum = make_float4(xv.x * pv, xv.y * pv, xv.z * pv, xv.w * pv);
+#pragma unroll
+                for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+                    const float c = comb_s[idst + DSV4_HC*isrc];
+                    sum.x = fmaf(r[isrc].x, c, sum.x);
+                    sum.y = fmaf(r[isrc].y, c, sum.y);
+                    sum.z = fmaf(r[isrc].z, c, sum.z);
+                    sum.w = fmaf(r[isrc].w, c, sum.w);
+                }
+                d4[i0 + idst*sd1_4 + it*sd2_4] = sum;
+            }
+        } else {
+#pragma unroll
+            for (int idst = 0; idst < DSV4_HC; ++idst) {
+                const float pv = post_s[idst];
+                const float4 rv = r4[i0 + idst*sr1_4 + it*sr2_4];
+                d4[i0 + idst*sd1_4 + it*sd2_4] = make_float4(
+                        fmaf(xv.x, pv, rv.x),
+                        fmaf(xv.y, pv, rv.y),
+                        fmaf(xv.z, pv, rv.z),
+                        fmaf(xv.w, pv, rv.w));
+            }
+        }
+        return;
+    }
 
     if (i0 >= n_embd) {
         return;
@@ -384,24 +477,39 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const float scale = ggml_get_op_params_f32(dst, 0);
     const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
 
-    constexpr int block_size = 256;
+    const int64_t sx0 = nbx0 / sizeof(float);
+    const int64_t sx1 = nbx1 / sizeof(float);
+    const int64_t sx2 = nbx2 / sizeof(float);
+    const int64_t sw0 = nbw0 / sizeof(float);
+    const int64_t sw1 = nbw1 / sizeof(float);
+    const int64_t sw2 = nbw2 / sizeof(float);
+    const int64_t sd0 = nbd0 / sizeof(float);
+    const int64_t sd1 = nbd1 / sizeof(float);
+
+    const bool use_vec4 = n_tokens >= 256 && (n_embd & 3) == 0 && sx0 == 1 && sd0 == 1 &&
+        (((uintptr_t) x->data) & 15) == 0 && (((uintptr_t) dst->data) & 15) == 0 &&
+        (sx1 & 3) == 0 && (sx2 & 3) == 0 && (sd1 & 3) == 0 &&
+        (!gated || (sw0 == 1 && (((uintptr_t) weights->data) & 15) == 0 && (sw1 & 3) == 0 && (sw2 & 3) == 0));
+
+    const int block_size = use_vec4 ? (n_tokens <= 4 ? 64 : 128) : 256;
+    const int64_t n_work = use_vec4 ? (n_embd >> 2) : n_embd;
     const dim3 block_dims(block_size, 1, 1);
-    const dim3 grid_dims((n_embd + block_size - 1) / block_size, n_tokens, 1);
+    const dim3 grid_dims((n_work + block_size - 1) / block_size, n_tokens, 1);
     const ggml_cuda_kernel_launch_params launch_params =
         ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    auto kernel = gated
-        ? dsv4_hc_pre_f32_tiled<true>
-        : dsv4_hc_pre_f32_tiled<false>;
+    auto kernel = use_vec4
+        ? (gated ? dsv4_hc_pre_f32_tiled<true, true>  : dsv4_hc_pre_f32_tiled<false, true>)
+        : (gated ? dsv4_hc_pre_f32_tiled<true, false> : dsv4_hc_pre_f32_tiled<false, false>);
 
     ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data,
             (const float *) weights->data,
             (float *) dst->data,
             n_embd, n_tokens,
-            nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
-            nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
-            nbd0 / sizeof(float), nbd1 / sizeof(float),
+            sx0, sx1, sx2,
+            sw0, sw1, sw2,
+            sd0, sd1,
             scale);
 }
 
@@ -444,13 +552,30 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
     GGML_ASSERT(hc == DSV4_HC);
 
-    constexpr int block_size = 256;
+    const int64_t sx0 = nbx0 / sizeof(float);
+    const int64_t sx1 = nbx1 / sizeof(float);
+    const int64_t sr0 = nbr0 / sizeof(float);
+    const int64_t sr1 = nbr1 / sizeof(float);
+    const int64_t sr2 = nbr2 / sizeof(float);
+    const int64_t sd0 = nbd0 / sizeof(float);
+    const int64_t sd1 = nbd1 / sizeof(float);
+    const int64_t sd2 = nbd2 / sizeof(float);
+
+    const bool use_vec4 = n_tokens >= 256 && (n_embd & 3) == 0 && sx0 == 1 && sr0 == 1 && sd0 == 1 &&
+        (((uintptr_t) x->data) & 15) == 0 && (((uintptr_t) residual->data) & 15) == 0 && (((uintptr_t) dst->data) & 15) == 0 &&
+        (sx1 & 3) == 0 && (sr1 & 3) == 0 && (sr2 & 3) == 0 && (sd1 & 3) == 0 && (sd2 & 3) == 0;
+
+    const int block_size = use_vec4 ? (n_tokens <= 4 ? 64 : 128) : 256;
+    const int64_t n_work = use_vec4 ? (n_embd >> 2) : n_embd;
     const dim3 block_dims(block_size, 1, 1);
-    const dim3 grid_dims((n_embd + block_size - 1) / block_size, n_tokens, 1);
+    const dim3 grid_dims((n_work + block_size - 1) / block_size, n_tokens, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    auto kernel = comb ? (gated ? dsv4_hc_post_f32_tiled<true,  true> : dsv4_hc_post_f32_tiled<true,  false>)
-                       : (gated ? dsv4_hc_post_f32_tiled<false, true> : dsv4_hc_post_f32_tiled<false, false>);
+    auto kernel = use_vec4
+        ? (comb ? (gated ? dsv4_hc_post_f32_tiled<true,  true,  true> : dsv4_hc_post_f32_tiled<true,  false, true>)
+                : (gated ? dsv4_hc_post_f32_tiled<false, true,  true> : dsv4_hc_post_f32_tiled<false, false, true>))
+        : (comb ? (gated ? dsv4_hc_post_f32_tiled<true,  true,  false> : dsv4_hc_post_f32_tiled<true,  false, false>)
+                : (gated ? dsv4_hc_post_f32_tiled<false, true,  false> : dsv4_hc_post_f32_tiled<false, false, false>));
     ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data,
             (const float *) residual->data,
@@ -458,10 +583,10 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             comb ? (const float *) comb->data : nullptr,
             (float *) dst->data,
             n_embd, n_tokens,
-            nbx0 / sizeof(float), nbx1 / sizeof(float),
-            nbr0 / sizeof(float), nbr1 / sizeof(float), nbr2 / sizeof(float),
+            sx0, sx1,
+            sr0, sr1, sr2,
             nbp0 / sizeof(float), nbp1 / sizeof(float),
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
-            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
+            sd0, sd1, sd2,
             gate_in, gate_out);
 }
