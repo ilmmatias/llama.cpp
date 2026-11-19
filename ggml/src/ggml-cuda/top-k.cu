@@ -1,5 +1,6 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
+#include "top-k-hip.cuh"
 
 #if defined(GGML_USE_HIP)
 #include <hip/hip_version.h>
@@ -1567,6 +1568,9 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_pool & pool  = ctx.pool();
 
 #if defined(GGML_USE_HIP)
+    if (ggml_cuda_top_k_hip(ctx, src0_d, dst_d, ncols, nrows, k, pool, stream)) {
+        return;
+    }
     if (k > 1 && ncols > 1024 && ncols <= 16384 && nrows >= 40) {
         top_k_radix_select_cuda(src0_d, dst_d, ncols, nrows, k, stream);
     } else if (top_k_use_small_kernel(ncols, nrows, k)) {

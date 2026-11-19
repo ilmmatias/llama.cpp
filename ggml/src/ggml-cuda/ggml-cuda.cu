@@ -82,6 +82,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/lightning-indexer-hip.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
 #include "ggml.h"
 
@@ -3474,7 +3475,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_fill(ctx, dst);
             break;
         case GGML_OP_LIGHTNING_INDEXER:
-            ggml_cuda_lightning_indexer(ctx, dst);
+            if (!ggml_cuda_lightning_indexer_hip(ctx, dst)) {
+                ggml_cuda_lightning_indexer(ctx, dst);
+            }
             break;
         case GGML_OP_TOP_K_MASK:
             ggml_cuda_op_top_k_mask(ctx, dst);
