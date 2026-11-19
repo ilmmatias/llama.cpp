@@ -116,6 +116,8 @@ struct expert_cache_template {
 
 struct expert_cache_merge {
     ggml_context * ctx = nullptr;
+    ggml_tensor * get_rows = nullptr;
+    void * saved_ids_data = nullptr;
     ggml_gallocr_t allocator = nullptr;
     ggml_backend_event_t copied = nullptr;
     int64_t output_capacity = 0;
@@ -141,7 +143,8 @@ struct expert_cache_merge {
         ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rows);
         misses = ggml_view_3d(ctx, packed, output_dim, n_expert_used, n_tokens,
                 packed->nb[1], packed->nb[1] * n_expert_used, rows * packed->nb[1]);
-        output = ggml_reshape_3d(ctx, ggml_get_rows(ctx, packed, ids), output_dim, n_expert_used, n_tokens);
+        get_rows = ggml_get_rows(ctx, packed, ids);
+        output = ggml_reshape_3d(ctx, get_rows, output_dim, n_expert_used, n_tokens);
         graph = ggml_new_graph_custom(ctx, 8, false);
         ggml_build_forward_expand(graph, output);
     }
@@ -884,6 +887,33 @@ public:
             return;
         }
 
+        if (ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device)) {
+            using mapped_alloc_fn_t = bool (*)(ggml_backend_dev_t, size_t, void **, void **);
+            auto alloc_fn = (mapped_alloc_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_mapped_host_alloc");
+            mapped_free_fn = (mapped_free_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_mapped_host_free");
+            if (alloc_fn != nullptr && mapped_free_fn != nullptr) {
+                half_events[0] = ggml_backend_event_new(device);
+                half_events[1] = ggml_backend_event_new(device);
+                if (half_events[0] != nullptr && half_events[1] != nullptr &&
+                        alloc_fn(device, MAPPED_RING_BYTES, &mapped_host, &mapped_dev)) {
+                    mapped_half = 0;
+                    mapped_off  = 0;
+                } else {
+                    for (int i = 0; i < 2; ++i) {
+                        if (half_events[i] != nullptr) {
+                            ggml_backend_event_free(half_events[i]);
+                            half_events[i] = nullptr;
+                        }
+                    }
+                    if (mapped_host != nullptr) {
+                        mapped_free_fn(mapped_host);
+                        mapped_host = nullptr;
+                        mapped_dev  = nullptr;
+                    }
+                }
+            }
+        }
+
         valid = true;
         staging.reserve(this->convert_workers);
         convert_threads.reserve(this->convert_workers);
@@ -923,6 +953,17 @@ public:
         if (compute_backend != nullptr) {
             ggml_backend_synchronize(compute_backend);
         }
+        for (int i = 0; i < 2; ++i) {
+            if (half_events[i] != nullptr) {
+                ggml_backend_event_free(half_events[i]);
+                half_events[i] = nullptr;
+            }
+        }
+        if (mapped_host != nullptr && mapped_free_fn != nullptr) {
+            mapped_free_fn(mapped_host);
+            mapped_host = nullptr;
+            mapped_dev  = nullptr;
+        }
         for (auto & s : staging) {
             if (s && s->buffer != nullptr) {
                 ggml_backend_buffer_free(s->buffer);
@@ -934,6 +975,9 @@ public:
         }
         if (output_buffer != nullptr) {
             ggml_backend_buffer_free(output_buffer);
+        }
+        if (route_buffer != nullptr) {
+            ggml_backend_buffer_free(route_buffer);
         }
         for (auto & layer : layers) {
             free_layer(*layer.second);
@@ -1143,15 +1187,55 @@ public:
                 if (ggml_is_contiguous(src) && ggml_nbytes(src) == (size_t) m.ids->ne[0] * row_bytes) {
                     const size_t offset = m.miss_route_begin * row_bytes;
                     const size_t bytes  = (m.miss_route_end - m.miss_route_begin) * row_bytes;
-                    ggml_backend_tensor_set_async(compute_backend, m.misses, (const uint8_t *) src->data + offset, offset, bytes);
+                    void * miss_host = nullptr;
+                    void * miss_dev  = nullptr;
+                    if (bytes <= MAPPED_INLINE_MAX && alloc_mapped_ring(bytes, miss_host, miss_dev)) {
+                        memcpy(miss_host, (const uint8_t *) src->data + offset, bytes);
+                        ggml_backend_tensor_set_async(compute_backend, m.misses, miss_host, offset, bytes);
+                    } else {
+                        ggml_backend_tensor_set_async(compute_backend, m.misses, (const uint8_t *) src->data + offset, offset, bytes);
+                    }
                 } else {
                     ggml_backend_tensor_set_async(compute_backend, m.misses, src->data, 0, ggml_nbytes(src));
                 }
             }
 
+            void * saved_get_rows_data = m.get_rows != nullptr ? m.get_rows->data : nullptr;
+            void * saved_output_data   = m.output != nullptr ? m.output->data : nullptr;
+            ggml_backend_buffer_t saved_get_rows_buf = m.get_rows != nullptr ? m.get_rows->buffer : nullptr;
+            ggml_backend_buffer_t saved_output_buf   = m.output != nullptr ? m.output->buffer : nullptr;
+            ggml_backend_buffer_t dst_buf = dst->view_src != nullptr ? dst->view_src->buffer : dst->buffer;
+            const bool direct_dst =
+                m.get_rows != nullptr &&
+                m.output != nullptr &&
+                m.get_rows->data == m.output->data &&
+                dst_buf != nullptr &&
+                ggml_backend_buffer_get_type(dst_buf) == device_buft &&
+                ggml_is_contiguous(dst) &&
+                m.get_rows->ne[0] == dst->ne[0] &&
+                m.get_rows->ne[1] == ggml_nrows(dst) &&
+                ggml_nbytes(m.output) == ggml_nbytes(dst);
+            if (direct_dst) {
+                m.get_rows->data   = dst->data;
+                m.get_rows->buffer = dst_buf;
+                m.output->data     = dst->data;
+                m.output->buffer   = dst_buf;
+            }
             const auto status = ggml_backend_graph_compute_async(compute_backend, m.graph);
+            if (direct_dst) {
+                m.get_rows->data   = saved_get_rows_data;
+                m.get_rows->buffer = saved_get_rows_buf;
+                m.output->data     = saved_output_data;
+                m.output->buffer   = saved_output_buf;
+            }
+            if (m.saved_ids_data != nullptr) {
+                m.ids->data      = m.saved_ids_data;
+                m.saved_ids_data = nullptr;
+            }
             GGML_ASSERT(status == GGML_STATUS_SUCCESS);
-            ggml_backend_tensor_copy_async(compute_backend, compute_backend, m.output, dst);
+            if (!direct_dst) {
+                ggml_backend_tensor_copy_async(compute_backend, compute_backend, m.output, dst);
+            }
         }
 
         // Copy on the compute stream before reusing the shared output or template workspace.
@@ -1972,6 +2056,31 @@ private:
         return output_ptr != nullptr;
     }
 
+    bool ensure_routes(size_t size) {
+        if (route_size >= size) {
+            return true;
+        }
+        if (route_buffer != nullptr) {
+            ggml_backend_buffer_free(route_buffer);
+            route_buffer = nullptr;
+            route_ptr = nullptr;
+        }
+        route_fallback.clear();
+
+        if (host_buft != nullptr) {
+            route_buffer = ggml_backend_buft_alloc_buffer(host_buft, size);
+            if (route_buffer != nullptr) {
+                route_ptr = ggml_backend_buffer_get_base(route_buffer);
+                route_size = size;
+                return true;
+            }
+        }
+        route_fallback.resize(size);
+        route_ptr = route_fallback.data();
+        route_size = size;
+        return route_ptr != nullptr;
+    }
+
     void start_projection_locked(expert_cache_layer & layer, expert_cache_part part, ggml_tensor * op) {
         layer.active_part = part;
         start_active_locked(layer, op->src[2], true, op);
@@ -2021,7 +2130,8 @@ private:
         const int64_t output_dim = projection ? op->ne[0] : layer.output_dim;
         const size_t output_row_bytes = (size_t) output_dim * sizeof(float);
         const size_t input_row_bytes = (size_t) input_dim * sizeof(float);
-        if (!ensure_input(GGML_PAD(input_row_bytes * (projection ? ids->ne[0] : 1), 64) * ids->ne[1])) {
+        const size_t per_tok_bytes = GGML_PAD(input_row_bytes * (projection ? ids->ne[0] : 1), 64);
+        if (!ensure_input(per_tok_bytes * (size_t) ids->ne[1] + 64 * (size_t) ids->ne[0] * EXPERT_CACHE_BATCH_SIZES)) {
             return;
         }
 
@@ -2030,97 +2140,109 @@ private:
                 get_template_locked(layer, hits, batch);
         };
         const int max_batch = 1 << (EXPERT_CACHE_BATCH_SIZES - 1);
-        if (get_template(layer.n_expert_used, max_batch) == nullptr) {
+        int check_batch = 1;
+        while (check_batch < max_batch && check_batch * 2 <= ids->ne[1]) {
+            check_batch *= 2;
+        }
+        if (get_template(layer.n_expert_used, check_batch) == nullptr) {
             return;
         }
 
+        const int n_ids = (int) ids->ne[0];
+        std::array<int, 65> bucket_counts = {};
+        std::array<int, 65> bucket_starts = {};
+        std::array<int, 65> bucket_write = {};
         std::vector<int> token_hits((size_t) ids->ne[1], 0);
-        std::vector<int64_t> tokens;
-        tokens.reserve((size_t) ids->ne[1]);
+        int total_hit_tokens = 0;
         for (int64_t token = 0; token < ids->ne[1]; ++token) {
             int hits = 0;
-            for (int id = 0; id < ids->ne[0]; ++id) {
+            for (int id = 0; id < n_ids; ++id) {
                 hits += (layer.active_ready_masks[(size_t) token] >> id) & 1;
             }
             token_hits[(size_t) token] = hits;
             if (hits != 0) {
-                tokens.push_back(token);
+                ++bucket_counts[(size_t) hits];
+                ++total_hit_tokens;
+            }
+        }
+
+        std::vector<int64_t> tokens((size_t) total_hit_tokens);
+        int running_off = 0;
+        for (int h = 1; h <= n_ids; ++h) {
+            bucket_starts[(size_t) h] = running_off;
+            bucket_write[(size_t) h] = running_off;
+            running_off += bucket_counts[(size_t) h];
+        }
+        for (int64_t token = 0; token < ids->ne[1]; ++token) {
+            const int h = token_hits[(size_t) token];
+            if (h != 0) {
+                tokens[(size_t) bucket_write[(size_t) h]++] = token;
             }
         }
 
         layer.active_slots.clear();
         layer.active_route_positions.clear();
         size_t input_offset = 0;
-        for (size_t first = 0; first < tokens.size();) {
-            int batch_size = 1;
-            while (batch_size < (1 << (EXPERT_CACHE_BATCH_SIZES - 1)) &&
-                    first + 2 * batch_size <= tokens.size()) {
-                batch_size *= 2;
-            }
+        for (int h = 1; h <= n_ids; ++h) {
+            const size_t bucket_end = (size_t) bucket_starts[(size_t) h] + (size_t) bucket_counts[(size_t) h];
+            for (size_t first = (size_t) bucket_starts[(size_t) h]; first < bucket_end;) {
+                int batch_size = 1;
+                while (batch_size < max_batch && first + 2 * (size_t) batch_size <= bucket_end) {
+                    batch_size *= 2;
+                }
 
-            int padded_hits = 0;
-            expert_cache_template * t = nullptr;
-            while (true) {
-                padded_hits = 0;
+                const int padded_hits = h;
+                expert_cache_template * t = nullptr;
+                while (true) {
+                    t = get_template(padded_hits, batch_size);
+                    if (t != nullptr || batch_size == 1) {
+                        break;
+                    }
+                    batch_size /= 2;
+                }
+                if (t == nullptr) {
+                    return;
+                }
+
+                const size_t route_offset = layer.active_slots.size();
                 for (int i = 0; i < batch_size; ++i) {
-                    padded_hits = std::max(padded_hits, token_hits[(size_t) tokens[first + i]]);
-                }
-
-                t = get_template(padded_hits, batch_size);
-                if (t != nullptr || batch_size == 1) {
-                    break;
-                }
-                batch_size /= 2;
-            }
-            if (t == nullptr) {
-                return;
-            }
-
-            const size_t route_offset = layer.active_slots.size();
-            for (int i = 0; i < batch_size; ++i) {
-                const int64_t token = tokens[first + i];
-                const auto * input_data = (const uint8_t *) op->src[1]->data + token * op->src[1]->nb[2];
-                auto * packed = (uint8_t *) input_ptr + input_offset + i * t->input->nb[2];
-                if (!projection) {
-                    if (t->input_q8) {
-                        pack_input_q8_1(input_data, op->src[1]->type, packed, input_dim);
-                    } else {
-                        pack_input_f32(input_data, op->src[1]->type, packed, input_dim);
-                    }
-                }
-
-                int hits = 0;
-                int32_t pad_slot = -1;
-                for (int id = 0; id < ids->ne[0]; ++id) {
-                    if (layer.active_ready_masks[(size_t) token] & (UINT64_C(1) << id)) {
-                        const size_t route = (size_t) token * ids->ne[0] + id;
-                        const int32_t slot = layer.active_route_slots[route];
-                        layer.active_slots.push_back(slot);
-                        layer.active_route_positions.push_back((int32_t) route);
-                        if (pad_slot < 0) {
-                            pad_slot = slot;
+                    const int64_t token = tokens[first + i];
+                    const auto * input_data = (const uint8_t *) op->src[1]->data + token * op->src[1]->nb[2];
+                    auto * packed = (uint8_t *) input_ptr + input_offset + i * t->input->nb[2];
+                    if (!projection) {
+                        if (t->input_q8) {
+                            pack_input_q8_1(input_data, op->src[1]->type, packed, input_dim);
+                        } else {
+                            pack_input_f32(input_data, op->src[1]->type, packed, input_dim);
                         }
-                        if (projection) {
-                            const auto * row = input_data + (id % op->src[1]->ne[1]) * op->src[1]->nb[1];
-                            pack_input_f32(row, op->src[1]->type, packed + hits * t->input->nb[1], input_dim);
+                    }
+
+                    int hits = 0;
+                    int32_t pad_slot = -1;
+                    for (int id = 0; id < n_ids; ++id) {
+                        if (layer.active_ready_masks[(size_t) token] & (UINT64_C(1) << id)) {
+                            const size_t route = (size_t) token * ids->ne[0] + id;
+                            const int32_t slot = layer.active_route_slots[route];
+                            layer.active_slots.push_back(slot);
+                            layer.active_route_positions.push_back((int32_t) route);
+                            if (pad_slot < 0) {
+                                pad_slot = slot;
+                            }
+                            if (projection) {
+                                const auto * row = input_data + (id % op->src[1]->ne[1]) * op->src[1]->nb[1];
+                                pack_input_f32(row, op->src[1]->type, packed + hits * t->input->nb[1], input_dim);
+                            }
+                            ++hits;
                         }
-                        ++hits;
                     }
+
+                    GGML_ASSERT(hits == padded_hits && pad_slot >= 0);
                 }
 
-                GGML_ASSERT(hits == token_hits[(size_t) token] && pad_slot >= 0);
-                for (; hits < padded_hits; ++hits) {
-                    layer.active_slots.push_back(pad_slot);
-                    layer.active_route_positions.push_back(-1);
-                    if (projection) {
-                        memcpy(packed + hits * t->input->nb[1], packed, input_row_bytes);
-                    }
-                }
+                layer.active_batches.push_back({ t, route_offset, input_offset });
+                input_offset += GGML_PAD(ggml_nbytes(t->input), 64);
+                first += batch_size;
             }
-
-            layer.active_batches.push_back({ t, route_offset, input_offset });
-            input_offset += GGML_PAD(ggml_nbytes(t->input), 64);
-            first += batch_size;
         }
 
         GGML_ASSERT(layer.active_slots.size() == layer.active_route_positions.size());
@@ -2132,27 +2254,96 @@ private:
             return;
         }
 
-        // Templates and host buffers are complete before any asynchronous use.
         const bool direct_deferred = layer.active_deferred && merge->direct_output != nullptr;
+        const size_t slots_bytes = layer.active_slots.size() * sizeof(int32_t);
+        const size_t merge_bytes = (layer.active_deferred && !direct_deferred) ? ggml_nbytes(merge->ids) : 0;
+        const size_t pinned_slots_off = 0;
+        const size_t pinned_merge_off = GGML_PAD(slots_bytes, 64);
+        const bool pinned_routes = ensure_routes(pinned_merge_off + merge_bytes);
+        if (pinned_routes) {
+            if (slots_bytes > 0) {
+                memcpy((uint8_t *) route_ptr + pinned_slots_off, layer.active_slots.data(), slots_bytes);
+            }
+            if (merge_bytes > 0) {
+                memcpy((uint8_t *) route_ptr + pinned_merge_off, layer.merge_routes.data(), merge_bytes);
+            }
+        }
+
+        // Templates and host buffers are complete before any asynchronous use.
         if (layer.active_deferred && !direct_deferred) {
-            ggml_backend_tensor_set_async(compute_backend, merge->ids,
-                    layer.merge_routes.data(), 0, ggml_nbytes(merge->ids));
+            const void * merge_src = pinned_routes ? (const uint8_t *) route_ptr + pinned_merge_off :
+                (const uint8_t *) layer.merge_routes.data();
+            void * m_host = nullptr;
+            void * m_dev  = nullptr;
+            if (merge_bytes > 0 && merge_bytes <= MAPPED_INLINE_MAX && alloc_mapped_ring(merge_bytes, m_host, m_dev)) {
+                memcpy(m_host, merge_src, merge_bytes);
+                merge->saved_ids_data = merge->ids->data;
+                merge->ids->data      = m_dev;
+            } else {
+                merge->saved_ids_data = nullptr;
+                ggml_backend_tensor_set_async(compute_backend, merge->ids, merge_src, 0, merge_bytes);
+            }
         }
 
         for (const auto & batch : layer.active_batches) {
             auto * t = batch.t;
-            ggml_backend_tensor_set_async(compute_backend, t->input,
-                    (const uint8_t *) input_ptr + batch.input_offset, 0, ggml_nbytes(t->input));
-            ggml_backend_tensor_set_async(compute_backend, t->ids,
-                    layer.active_slots.data() + batch.route_offset, 0, ggml_nbytes(t->ids));
+            void * saved_in_data   = t->input->data;
+            void * saved_ids_data  = t->ids->data;
+            void * saved_out_data  = t->output->data;
+            ggml_backend_buffer_t saved_out_buf = t->output->buffer;
+
+            const size_t t_in_bytes = ggml_nbytes(t->input);
+            void * in_host = nullptr;
+            void * in_dev  = nullptr;
+            if (t_in_bytes > 0 && t_in_bytes <= MAPPED_INLINE_MAX && alloc_mapped_ring(t_in_bytes, in_host, in_dev)) {
+                memcpy(in_host, (const uint8_t *) input_ptr + batch.input_offset, t_in_bytes);
+                t->input->data = in_dev;
+            } else {
+                ggml_backend_tensor_set_async(compute_backend, t->input,
+                        (const uint8_t *) input_ptr + batch.input_offset, 0, t_in_bytes);
+            }
+
+            const size_t t_ids_bytes = ggml_nbytes(t->ids);
+            const void * ids_src = pinned_routes ? (const uint8_t *) route_ptr + pinned_slots_off + batch.route_offset * sizeof(int32_t) :
+                (const void *) (layer.active_slots.data() + batch.route_offset);
+            void * ids_host = nullptr;
+            void * ids_dev  = nullptr;
+            if (t_ids_bytes > 0 && t_ids_bytes <= MAPPED_INLINE_MAX && alloc_mapped_ring(t_ids_bytes, ids_host, ids_dev)) {
+                memcpy(ids_host, ids_src, t_ids_bytes);
+                t->ids->data = ids_dev;
+            } else {
+                ggml_backend_tensor_set_async(compute_backend, t->ids, ids_src, 0, t_ids_bytes);
+            }
+
+            bool direct_packed_out = false;
+            if (layer.active_deferred && !direct_deferred && merge->packed != nullptr && merge->packed->data != nullptr &&
+                    ggml_is_contiguous(t->output) &&
+                    ggml_backend_buffer_get_type(merge->packed->buffer) == device_buft) {
+                const size_t t_out_bytes = ggml_nbytes(t->output);
+                const size_t packed_off  = batch.route_offset * output_row_bytes;
+                if (packed_off + t_out_bytes <= ggml_nbytes(merge->packed)) {
+                    t->output->data   = (uint8_t *) merge->packed->data + packed_off;
+                    t->output->buffer = merge->packed->buffer;
+                    direct_packed_out = true;
+                }
+            }
+
             const enum ggml_status status = ggml_backend_graph_compute_async(compute_backend, t->graph);
+            t->input->data   = saved_in_data;
+            t->ids->data     = saved_ids_data;
+            t->output->data  = saved_out_data;
+            t->output->buffer = saved_out_buf;
             if (status != GGML_STATUS_SUCCESS) {
+                if (merge->saved_ids_data != nullptr) {
+                    merge->ids->data      = merge->saved_ids_data;
+                    merge->saved_ids_data = nullptr;
+                }
                 ggml_backend_synchronize(compute_backend);
                 return;
             }
 
             if (layer.active_deferred) {
-                if (!direct_deferred) {
+                if (!direct_deferred && !direct_packed_out) {
                     auto slice = *t->output;
                     slice.buffer = merge->packed->buffer;
                     slice.data = (uint8_t *) merge->packed->data + batch.route_offset * output_row_bytes;
@@ -2187,6 +2378,68 @@ private:
         layer.observed_tokens += ids->ne[1];
         layer.admissions.clear();
         layer.cold_admissions.clear();
+
+        if (ids->ne[1] > 8) {
+            std::vector<uint32_t> miss_freq((size_t) layer.n_expert, 0);
+            for (int64_t t = 0; t < ids->ne[1]; ++t) {
+                const int64_t token = first_token + t;
+                for (int64_t i = 0; i < ids->ne[0]; ++i) {
+                    const int32_t expert = *(const int32_t *) ((const char *) ids->data + t * ids->nb[1] + i * ids->nb[0]);
+                    if (expert < 0 || expert >= layer.n_expert) {
+                        continue;
+                    }
+                    const int32_t slot_at_begin = layer.active_route_slots[(size_t) t * ids->ne[0] + i];
+                    if (slot_at_begin >= 0) {
+                        if ((size_t) slot_at_begin < layer.slot_stamp.size() &&
+                            layer.slot_to_expert[(size_t) slot_at_begin] == expert) {
+                            layer.slot_stamp[(size_t) slot_at_begin] = ++layer.stamp;
+                        }
+                    } else {
+                        ++miss_freq[(size_t) expert];
+                    }
+                    layer.last_seen[(size_t) expert] = token;
+                }
+            }
+
+            size_t pp_depth = 0;
+            {
+                std::lock_guard<std::mutex> qlock(queue_mutex);
+                pp_depth = pp_queue.size();
+            }
+            const uint32_t free_slots = layer.next_free_slot < slots ? slots - layer.next_free_slot : 0;
+            const uint32_t min_freq = free_slots > 0 ? 1 : 2;
+            const uint32_t budget = free_slots > 0 ?
+                free_slots :
+                (pp_depth < 64 ? std::min<uint32_t>(std::max<uint32_t>(1, slots / 8), 8) : 0);
+            if (budget == 0 || pp_depth >= 256) {
+                return;
+            }
+
+            std::vector<std::pair<uint32_t, int32_t>> candidates;
+            candidates.reserve((size_t) layer.n_expert);
+            for (int32_t e = 0; e < layer.n_expert; ++e) {
+                if (miss_freq[(size_t) e] >= min_freq && layer.expert_to_slot[(size_t) e] < 0) {
+                    candidates.emplace_back(miss_freq[(size_t) e], e);
+                }
+            }
+            const size_t n_admit = std::min<size_t>(budget, candidates.size());
+            if (n_admit > 0) {
+                std::partial_sort(candidates.begin(), candidates.begin() + n_admit, candidates.end(),
+                        [&](const auto & a, const auto & b) {
+                            if (a.first != b.first) {
+                                return a.first > b.first;
+                            }
+                            return layer.last_seen[(size_t) a.second] > layer.last_seen[(size_t) b.second];
+                        });
+                for (size_t k = 0; k < n_admit; ++k) {
+                    const int32_t expert = candidates[k].second;
+                    if (layer.expert_to_slot[(size_t) expert] < 0) {
+                        admit_expert_locked(layer, layer_id, expert, false, false);
+                    }
+                }
+            }
+            return;
+        }
 
         // Classify all routes before admissions can replace any frozen slot.
         for (int64_t t = 0; t < ids->ne[1]; ++t) {
@@ -2560,6 +2813,48 @@ private:
     void * output_ptr = nullptr;
     size_t output_size = 0;
     std::vector<uint8_t> output_fallback;
+
+    ggml_backend_buffer_t route_buffer = nullptr;
+    void * route_ptr = nullptr;
+    size_t route_size = 0;
+    std::vector<uint8_t> route_fallback;
+
+    static constexpr size_t MAPPED_HALF_BYTES   = 2u * 1024u * 1024u;
+    static constexpr size_t MAPPED_RING_BYTES   = 2u * MAPPED_HALF_BYTES;
+    static constexpr size_t MAPPED_INLINE_MAX   = 64u * 1024u;
+    using mapped_free_fn_t = void (*)(void *);
+    mapped_free_fn_t mapped_free_fn = nullptr;
+    void * mapped_host = nullptr;
+    void * mapped_dev  = nullptr;
+    int    mapped_half = 0;
+    size_t mapped_off  = 0;
+    ggml_backend_event_t half_events[2] = { nullptr, nullptr };
+    bool half_busy[2] = { false, false };
+
+    bool alloc_mapped_ring(size_t bytes, void * & out_host, void * & out_dev) {
+        if (mapped_host == nullptr || mapped_dev == nullptr || bytes == 0 || bytes > MAPPED_INLINE_MAX) {
+            return false;
+        }
+        const size_t aligned = GGML_PAD(bytes, 128);
+        if (aligned > MAPPED_HALF_BYTES) {
+            return false;
+        }
+        if (mapped_off + aligned > MAPPED_HALF_BYTES) {
+            ggml_backend_event_record(half_events[mapped_half], compute_backend);
+            half_busy[mapped_half] = true;
+            mapped_half = 1 - mapped_half;
+            if (half_busy[mapped_half]) {
+                ggml_backend_event_synchronize(half_events[mapped_half]);
+                half_busy[mapped_half] = false;
+            }
+            mapped_off = 0;
+        }
+        const size_t pos = (size_t) mapped_half * MAPPED_HALF_BYTES + mapped_off;
+        out_host = static_cast<uint8_t *>(mapped_host) + pos;
+        out_dev  = static_cast<uint8_t *>(mapped_dev) + pos;
+        mapped_off += aligned;
+        return true;
+    }
 
 
 };
