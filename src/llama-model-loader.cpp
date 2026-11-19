@@ -15,6 +15,11 @@
 #include <regex>
 #include <unordered_set>
 
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
@@ -2011,6 +2016,19 @@ bool llama_model_loader::load_all_data(
                     }
                 }
             }
+#if defined(__linux__)
+            if (!file->has_direct_io() && n_size >= 64 * kiB) {
+                static const long page_size = sysconf(_SC_PAGESIZE);
+                if (page_size > 0) {
+                    const size_t ps = (size_t) page_size;
+                    const off_t advise_beg = (off_t) (((weight->offs + ps - 1) / ps) * ps);
+                    const off_t advise_end = (off_t) (((weight->offs + n_size) / ps) * ps);
+                    if (advise_end > advise_beg) {
+                        posix_fadvise(file->file_id(), advise_beg, advise_end - advise_beg, POSIX_FADV_DONTNEED);
+                    }
+                }
+            }
+#endif
         }
 
         size_done += n_size;
