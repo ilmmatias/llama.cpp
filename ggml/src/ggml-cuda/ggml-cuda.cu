@@ -59,6 +59,7 @@
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
+#include "ggml-cuda/ssm-conv-concat.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
@@ -5069,11 +5070,312 @@ static bool ggml_cuda_fusion_inputs_disjoint(
     const uintptr_t begin = reinterpret_cast<uintptr_t>(dst->data);
     const uintptr_t end = begin + ggml_nbytes(dst);
     for (const ggml_tensor * src : inputs) {
+        if (!src || !src->data) {
+            continue;
+        }
         const uintptr_t src_begin = reinterpret_cast<uintptr_t>(src->data);
         if (begin < src_begin + ggml_nbytes(src) && src_begin < end) {
             return false;
         }
     }
+    return true;
+}
+
+// Match upstream Q/K norm, gate (alpha+dt -> softplus -> *ssm_a), and beta (sigmoid) ops right before GGML_OP_GATED_DELTA_NET.
+static bool ggml_cuda_try_gdn_prep_fusion(
+        ggml_backend_cuda_context * cuda_ctx,
+        const ggml_cgraph * cgraph,
+        int i,
+        int & gdn_idx_out,
+        int & cache_skip_out,
+        ggml_cuda_gated_delta_net_fused_cache & cache_out,
+        ggml_cuda_gated_delta_net_fused_prep & prep_out) {
+    static const bool disabled = getenv("GGML_DISABLE_GDN_PREP") != nullptr && std::atoi(getenv("GGML_DISABLE_GDN_PREP")) != 0;
+    if (disabled) {
+        return false;
+    }
+    const ggml_tensor * first = cgraph->nodes[i];
+    if (first->op != GGML_OP_RMS_NORM && first->op != GGML_OP_L2_NORM &&
+            first->op != GGML_OP_ADD && first->op != GGML_OP_UNARY) {
+        return false;
+    }
+
+    constexpr int MAX_SPAN = 24;
+    const int limit = std::min(cgraph->n_nodes, i + MAX_SPAN);
+    int gdn_idx = -1;
+    for (int k = i + 1; k < limit; ++k) {
+        if (cgraph->nodes[k]->op == GGML_OP_GATED_DELTA_NET) {
+            gdn_idx = k;
+            break;
+        }
+    }
+    if (gdn_idx < 0 || !ggml_cuda_fusion_same_stream(*cuda_ctx, cgraph, i, gdn_idx)) {
+        return false;
+    }
+
+    const ggml_tensor * gdn = cgraph->nodes[gdn_idx];
+    if (gdn->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const ggml_tensor * src_v = gdn->src[2];
+    const int64_t S_v      = src_v->ne[0];
+    const int64_t H        = src_v->ne[1];
+    const int64_t n_tokens = src_v->ne[2];
+    const int64_t n_seqs   = src_v->ne[3];
+    if (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) {
+        return false;
+    }
+
+    const auto & info = ggml_cuda_info().devices[cuda_ctx->device];
+#ifdef GGML_USE_HIP
+    if (info.warp_size != 32 && (S_v == 16 || S_v == 32)) {
+        return false;
+    }
+    if (ggml_get_op_params_i32(gdn, 0) <= 1 && gdn->src[3]->ne[0] != S_v && S_v == 128 &&
+            ((GGML_CUDA_CC_IS_RDNA3_5(info.cc) && n_tokens >= 2048) || (GGML_CUDA_CC_IS_CDNA(info.cc) && n_tokens >= 64))) {
+        return false;
+    }
+#else
+    if (ggml_get_op_params_i32(gdn, 0) <= 1 && gdn->src[3]->ne[0] != S_v && S_v == 128 &&
+            n_tokens >= 64 && ampere_mma_available(info.cc)) {
+        return false;
+    }
+#endif
+
+    const int span = gdn_idx - i;
+    auto find_in_win = [&](const ggml_tensor * t) -> int {
+        for (int k = 0; k < span; ++k) {
+            if (cgraph->nodes[i + k] == t) {
+                return k;
+            }
+        }
+        return -1;
+    };
+
+    auto is_external_data = [&](const ggml_tensor * t) -> bool {
+        while (t && find_in_win(t) >= 0) {
+            if (t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE) {
+                return false;
+            }
+            t = t->src[0];
+        }
+        return t != nullptr;
+    };
+
+    uint32_t absorbed_mask = 0;
+    auto mark_win = [&](const ggml_tensor * t) -> bool {
+        const int idx = find_in_win(t);
+        if (idx < 0 || (t->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+            return false;
+        }
+        absorbed_mask |= (1u << idx);
+        return true;
+    };
+
+    auto match_norm = [&](const ggml_tensor * t, ggml_cuda_gdn_norm_spec & spec) {
+        const int idx_t = find_in_win(t);
+        if (idx_t < 0 || t->type != GGML_TYPE_F32 || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return;
+        }
+        if (t->op == GGML_OP_SCALE) {
+            if (t->view_src != nullptr || ggml_get_op_params_f32(t, 1) != 0.0f) {
+                return;
+            }
+            const ggml_tensor * rn = t->src[0];
+            const int idx_rn = find_in_win(rn);
+            if (idx_rn < 0 || rn->op != GGML_OP_RMS_NORM || rn->type != GGML_TYPE_F32 ||
+                    (rn->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                return;
+            }
+            const ggml_tensor * raw = rn->src[0];
+            if (!is_external_data(raw) || raw->type != GGML_TYPE_F32 ||
+                    raw->nb[0] != sizeof(float) || !ggml_is_contiguous_rows(raw) ||
+                    !ggml_are_same_shape(raw, t)) {
+                return;
+            }
+            const float eps = ggml_get_op_params_f32(rn, 0);
+            const float sc  = ggml_get_op_params_f32(t, 0);
+            if (eps < 0.0f || !mark_win(t) || !mark_win(rn)) {
+                return;
+            }
+            spec = { 1, eps, sc, raw };
+            return;
+        }
+        if (t->op == GGML_OP_RMS_NORM || t->op == GGML_OP_L2_NORM) {
+            const ggml_tensor * raw = t->src[0];
+            if (!is_external_data(raw) || raw->type != GGML_TYPE_F32 ||
+                    raw->nb[0] != sizeof(float) || !ggml_is_contiguous_rows(raw) ||
+                    !ggml_are_same_shape(raw, t)) {
+                return;
+            }
+            const float eps = ggml_get_op_params_f32(t, 0);
+            if (eps < 0.0f || !mark_win(t)) {
+                return;
+            }
+            spec = { (uint8_t) (t->op == GGML_OP_RMS_NORM ? 1 : 2), eps, 1.0f, raw };
+        }
+    };
+
+    prep_out = {};
+    match_norm(gdn->src[0], prep_out.q_norm);
+    match_norm(gdn->src[1], prep_out.k_norm);
+
+    if (gdn->src[3]->ne[0] == 1) {
+        const ggml_tensor * g_cur = gdn->src[3];
+        const ggml_tensor * g_res = nullptr;
+        if (find_in_win(g_cur) >= 0 && (g_cur->op == GGML_OP_RESHAPE || g_cur->op == GGML_OP_VIEW) &&
+                g_cur->ne[0] == 1 && g_cur->ne[1] == H && g_cur->ne[2] == n_tokens && g_cur->ne[3] == n_seqs &&
+                ggml_is_contiguous(g_cur)) {
+            g_res = g_cur;
+            g_cur = g_cur->src[0];
+        }
+        if (find_in_win(g_cur) >= 0 && g_cur->op == GGML_OP_MUL && g_cur->type == GGML_TYPE_F32 &&
+                (g_cur->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+            auto try_mul = [&](const ggml_tensor * sp_cand, const ggml_tensor * a_cand) -> bool {
+                if (find_in_win(sp_cand) < 0 || sp_cand->op != GGML_OP_UNARY ||
+                        ggml_get_unary_op(sp_cand) != GGML_UNARY_OP_SOFTPLUS || sp_cand->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                const ggml_tensor * ssm_a = nullptr;
+                if (a_cand != nullptr) {
+                    if (!is_external_data(a_cand) || a_cand->type != GGML_TYPE_F32 ||
+                            !ggml_is_contiguous(a_cand) || a_cand->ne[0] != H ||
+                            a_cand->ne[1] != 1 || a_cand->ne[2] != 1 || a_cand->ne[3] != 1) {
+                        return false;
+                    }
+                    ssm_a = a_cand;
+                }
+                const ggml_tensor * sp_in = sp_cand->src[0];
+                const ggml_tensor * add_n = nullptr;
+                const ggml_tensor * dt    = nullptr;
+                const ggml_tensor * alpha = nullptr;
+                if (find_in_win(sp_in) >= 0 && sp_in->op == GGML_OP_ADD && sp_in->type == GGML_TYPE_F32) {
+                    auto try_add = [&](const ggml_tensor * x, const ggml_tensor * d) -> bool {
+                        if (!is_external_data(x) || !is_external_data(d) ||
+                                x->type != GGML_TYPE_F32 || d->type != GGML_TYPE_F32 ||
+                                x->nb[0] != sizeof(float) || !ggml_is_contiguous(d) ||
+                                x->ne[0] != H || x->ne[1] != n_tokens || x->ne[2] != n_seqs || x->ne[3] != 1 ||
+                                d->ne[0] != H || d->ne[1] != 1 || d->ne[2] != 1 || d->ne[3] != 1) {
+                            return false;
+                        }
+                        alpha = x;
+                        dt    = d;
+                        return true;
+                    };
+                    if (!try_add(sp_in->src[0], sp_in->src[1]) && !try_add(sp_in->src[1], sp_in->src[0])) {
+                        return false;
+                    }
+                    add_n = sp_in;
+                } else {
+                    if (!is_external_data(sp_in) || sp_in->type != GGML_TYPE_F32 ||
+                            sp_in->nb[0] != sizeof(float) ||
+                            sp_in->ne[0] != H || sp_in->ne[1] != n_tokens || sp_in->ne[2] != n_seqs || sp_in->ne[3] != 1) {
+                        return false;
+                    }
+                    alpha = sp_in;
+                }
+                if ((g_res && !mark_win(g_res)) || !mark_win(g_cur) || !mark_win(sp_cand) ||
+                        (add_n && !mark_win(add_n))) {
+                    return false;
+                }
+                prep_out.fuse_gate = true;
+                prep_out.alpha_raw = alpha;
+                prep_out.dt        = dt;
+                prep_out.ssm_a     = ssm_a;
+                return true;
+            };
+            if (!try_mul(g_cur->src[0], g_cur->src[1])) {
+                try_mul(g_cur->src[1], g_cur->src[0]);
+            }
+        }
+    }
+
+    {
+        const ggml_tensor * b_cur = gdn->src[4];
+        const ggml_tensor * b_res = nullptr;
+        if (find_in_win(b_cur) >= 0 && (b_cur->op == GGML_OP_RESHAPE || b_cur->op == GGML_OP_VIEW) &&
+                ggml_is_contiguous(b_cur)) {
+            b_res = b_cur;
+            b_cur = b_cur->src[0];
+        }
+        if (find_in_win(b_cur) >= 0 && b_cur->op == GGML_OP_UNARY &&
+                ggml_get_unary_op(b_cur) == GGML_UNARY_OP_SIGMOID && b_cur->type == GGML_TYPE_F32) {
+            const ggml_tensor * raw = b_cur->src[0];
+            const bool shape_ok = is_external_data(raw) && raw->type == GGML_TYPE_F32 &&
+                raw->nb[0] == sizeof(float) &&
+                ((raw->ne[0] == 1 && raw->ne[1] == H && raw->ne[2] == n_tokens && raw->ne[3] == n_seqs) ||
+                 (raw->ne[0] == H && raw->ne[1] == n_tokens && raw->ne[2] == n_seqs && raw->ne[3] == 1));
+            if (shape_ok && (!b_res || mark_win(b_res)) && mark_win(b_cur)) {
+                prep_out.fuse_beta = true;
+                prep_out.beta_raw  = raw;
+            }
+        }
+    }
+
+    if ((absorbed_mask & 1u) == 0 || prep_out.empty()) {
+        return false;
+    }
+
+    // Ensure every node in [i, gdn_idx) is either an absorbed op or a no-op view/reshape with no external readers.
+    for (int k = 0; k < span; ++k) {
+        const ggml_tensor * m = cgraph->nodes[i + k];
+        if ((m->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+            return false;
+        }
+        const bool is_view = (m->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            m->op == GGML_OP_VIEW || m->op == GGML_OP_RESHAPE;
+        if ((absorbed_mask & (1u << k)) == 0 && !is_view) {
+            return false;
+        }
+        int internal_uses = 0;
+        for (int j = k + 1; j <= span; ++j) {
+            const ggml_tensor * consumer = cgraph->nodes[i + j];
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (consumer->src[s] == m) {
+                    internal_uses++;
+                }
+            }
+        }
+        if (internal_uses != ggml_node_get_use_count(cgraph, i + k)) {
+            return false;
+        }
+    }
+
+    cache_skip_out = ggml_cuda_try_gdn_cache_fusion(cgraph, gdn_idx, cache_out);
+    if (!ggml_cuda_fusion_same_stream(*cuda_ctx, cgraph, i, gdn_idx + cache_skip_out)) {
+        return false;
+    }
+
+    const std::initializer_list<const ggml_tensor *> check_srcs_no_state = {
+        prep_out.q_norm.mode ? prep_out.q_norm.raw : gdn->src[0],
+        prep_out.k_norm.mode ? prep_out.k_norm.raw : gdn->src[1],
+        src_v,
+        prep_out.fuse_gate ? prep_out.alpha_raw : gdn->src[3],
+        prep_out.dt,
+        prep_out.ssm_a,
+        prep_out.fuse_beta ? prep_out.beta_raw : gdn->src[4],
+    };
+    if (!ggml_cuda_fusion_inputs_disjoint(gdn, check_srcs_no_state) ||
+            !ggml_cuda_fusion_inputs_disjoint(gdn, { gdn->src[5] })) {
+        return false;
+    }
+    if (cache_skip_out > 0) {
+        const ggml_tensor * cache_dst = cgraph->nodes[gdn_idx + cache_skip_out]->src[1];
+        if (!ggml_cuda_fusion_inputs_disjoint(cache_dst, check_srcs_no_state) ||
+                !ggml_cuda_fusion_inputs_disjoint(cache_dst, { gdn })) {
+            return false;
+        }
+        if (!ggml_cuda_fusion_inputs_disjoint(cache_dst, { gdn->src[5] })) {
+            // In-place cache state update (when K <= 1) loads curr_state into s_shard registers before writing.
+            const int K = ggml_get_op_params_i32(gdn, 0);
+            if (K > 1 || (const void *) cache_dst->data != (const void *) gdn->src[5]->data ||
+                    !ggml_is_contiguous(gdn->src[5])) {
+                return false;
+            }
+        }
+    }
+
+    gdn_idx_out = gdn_idx;
     return true;
 }
 
@@ -5734,6 +6036,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                 return match.node_count - 1;
             }
+        }
+    }
+
+    if (node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_L2_NORM ||
+            node->op == GGML_OP_ADD || node->op == GGML_OP_UNARY) {
+        int gdn_idx    = -1;
+        int cache_skip = 0;
+        ggml_cuda_gated_delta_net_fused_cache cache_plan{};
+        ggml_cuda_gated_delta_net_fused_prep  prep_plan{};
+        if (ggml_cuda_try_gdn_prep_fusion(cuda_ctx, cgraph, i, gdn_idx, cache_skip, cache_plan, prep_plan)) {
+            ggml_cuda_op_gated_delta_net_fused(
+                *cuda_ctx, cgraph->nodes[gdn_idx],
+                cache_skip > 0 ? &cache_plan : nullptr,
+                &prep_plan);
+            return (gdn_idx - i) + cache_skip;
         }
     }
 
@@ -6797,6 +7114,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             [[maybe_unused]] int prev_i = 0;
 
 
+            ggml_cuda_concat_ssm_conv_scheduler concat_ssm_sched;
+            concat_ssm_sched.reset(cgraph->n_nodes);
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
 #ifdef USE_CUDA_GRAPH
@@ -6845,6 +7165,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                if (concat_ssm_sched.should_skip(i)) {
+                    continue;
+                }
+
+                if (const int concat_skip = concat_ssm_sched.try_step(*cuda_ctx, cgraph, i); concat_skip >= 0) {
+                    i += concat_skip;
                     continue;
                 }
 
