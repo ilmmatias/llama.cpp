@@ -1290,9 +1290,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
+    bool is_nvme = false;
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        const ctx_key key { buft, is_lazy };
+        const ctx_key key { buft, is_lazy, is_nvme };
 
         auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
@@ -1462,6 +1463,18 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             buft = ggml_backend_dev_buffer_type(cpu_dev);
         }
 
+        // Route host-placed MoE expert weights to the NVMe-streamed L2 cache when enabled.
+        if (nvme_expert_cache && !is_lazy && op == GGML_OP_MUL_MAT_ID &&
+                tn.suffix != nullptr && strcmp(tn.suffix, "weight") == 0) {
+            auto * bdev = ggml_backend_buft_get_device(buft);
+            const bool is_cpu_buft = ggml_backend_buft_is_host(buft) ||
+                (bdev != nullptr && ggml_backend_dev_type(bdev) == GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (is_cpu_buft) {
+                buft = ggml_backend_cpu_buffer_type();
+                is_nvme = true;
+            }
+        }
+
         if (buft != buft_list->front().second) {
             if (n_tensors_moved == 0) {
                 first_tensor_moved_name = t_meta->name;
@@ -1549,6 +1562,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
     if (buft == nullptr) {
         return nullptr;
+    }
+
+    if (is_nvme && !no_alloc) {
+        const auto & w = require_weight(tn.str().c_str());
+        nvme_weights[tn.str()] = { files.at(w.idx)->path(), (uint64_t) w.offs };
     }
 
     ggml_context * ctx = ctx_for_buft(buft);

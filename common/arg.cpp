@@ -2817,6 +2817,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.expert_cache_workers = value;
         }
     ));
+    add_opt(common_arg(
+        {"-erc", "--expert-ram-cache"}, "MIB",
+        "RAM budget in MiB for the L2 NVMe-streamed MoE expert cache using O_DIRECT + io_uring (default: 0, disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("expert RAM cache size must be non-negative");
+            }
+            params.expert_ram_cache_size = (size_t) value * 1024ull * 1024ull;
+        }
+    ));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

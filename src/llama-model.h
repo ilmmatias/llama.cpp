@@ -997,6 +997,14 @@ struct llama_model {
     llama_split_mode split_mode() const;
     bool no_alloc() const;
 
+    struct nvme_weight_info {
+        const struct ggml_tensor * tensor = nullptr;
+        std::string file_path;
+        uint64_t    file_offset = 0;
+    };
+    size_t expert_ram_cache_size() const;
+    const std::vector<nvme_weight_info> & nvme_expert_weights() const;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
     // total number of parameters in the model

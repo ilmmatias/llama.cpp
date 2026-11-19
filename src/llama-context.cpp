@@ -645,7 +645,7 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        if (!model.no_alloc() && (cparams.expert_cache_slots != 0 || cparams.moe_cache_size != 0)) {
+        if (!model.no_alloc() && (cparams.expert_cache_slots != 0 || cparams.moe_cache_size != 0 || model.expert_ram_cache_size() != 0)) {
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs,
                     cparams.expert_cache_slots, cparams.expert_cache_admit_window,
                     cparams.expert_cache_workers, cparams.moe_cache_size);

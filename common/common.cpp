@@ -2069,6 +2069,9 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     mparams.expert_cache                = params.expert_cache_slots > 0 || params.expert_cache_slots_auto || params.moe_cache_size > 0;
+    if (params.expert_ram_cache_size > 0) {
+        mparams.expert_ram_cache_size   = params.expert_ram_cache_size;
+    }
 
     return mparams;
 }

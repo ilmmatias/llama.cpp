@@ -50,6 +50,8 @@ struct llama_moe_cache::impl {
     ggml_backend_cpu_expert_cache_prepare_t cache_prepare = nullptr;
     ggml_backend_cpu_expert_cache_copy_t cache_copy = nullptr;
     ggml_backend_cpu_expert_cache_memory_t cache_memory = nullptr;
+    ggml_backend_cpu_expert_cache_nvme_memory_t cache_nvme_memory = nullptr;
+    bool has_nvme = false;
     std::unique_ptr<ggml_backend_cpu_expert_cache, ggml_backend_cpu_expert_cache_free_t> root{nullptr, nullptr};
 
     impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, ggml_backend_t backend_cpu,
@@ -58,10 +60,15 @@ struct llama_moe_cache::impl {
         if (no_alloc) {
             return;
         }
+        const bool want_gpu_cache = (slots != 0 || size != 0);
+        const bool want_nvme = (model.expert_ram_cache_size() != 0 && !model.nvme_expert_weights().empty());
+        if (!want_gpu_cache && !want_nvme) {
+            return;
+        }
         if (slots != 0 && size != 0) {
             throw std::invalid_argument("expert cache slots and byte size are mutually exclusive");
         }
-        if (workers == 0) {
+        if (want_gpu_cache && workers == 0) {
             throw std::invalid_argument("expert cache requires at least one conversion worker");
         }
         if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
@@ -77,31 +84,33 @@ struct llama_moe_cache::impl {
                 devices.push_back({dev, ggml_backend_dev_buffer_type(dev), {}});
             }
         }
-        if (backend_cpu == nullptr || devices.empty()) {
+        if (backend_cpu == nullptr || (want_gpu_cache && devices.empty())) {
             throw std::runtime_error("expert cache requires CPU and GPU backends");
         }
 
         size_t host_bytes = 0;
-        for (size_t il = 0; il < model.layers.size(); ++il) {
-            auto it = std::find_if(devices.begin(), devices.end(), [&](const device & d) {
-                return d.dev == model.dev_layer(il);
-            });
-            if (it == devices.end()) {
-                continue;
-            }
-            const auto & layer = model.layers[il];
-            for (const auto * tensor : {layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps}) {
-                if (llama_model_expert_cache_is_host_weight(tensor)) {
-                    it->weights.push_back(tensor);
-                    const size_t bytes = ggml_nbytes(tensor);
-                    it->host_bytes += bytes;
-                    host_bytes += bytes;
+        if (want_gpu_cache) {
+            for (size_t il = 0; il < model.layers.size(); ++il) {
+                auto it = std::find_if(devices.begin(), devices.end(), [&](const device & d) {
+                    return d.dev == model.dev_layer(il);
+                });
+                if (it == devices.end()) {
+                    continue;
+                }
+                const auto & layer = model.layers[il];
+                for (const auto * tensor : {layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps}) {
+                    if (llama_model_expert_cache_is_host_weight(tensor)) {
+                        it->weights.push_back(tensor);
+                        const size_t bytes = ggml_nbytes(tensor);
+                        it->host_bytes += bytes;
+                        host_bytes += bytes;
+                    }
                 }
             }
-        }
-        if (host_bytes == 0) {
-            LLAMA_LOG_WARN("%s: no host-resident experts are assigned to a GPU, expert cache is disabled\n", __func__);
-            return;
+            if (host_bytes == 0 && !want_nvme) {
+                LLAMA_LOG_WARN("%s: no host-resident experts are assigned to a GPU, expert cache is disabled\n", __func__);
+                return;
+            }
         }
 
         const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
@@ -109,50 +118,72 @@ struct llama_moe_cache::impl {
         const auto free_cache = llama_moe_cache_proc<ggml_backend_cpu_expert_cache_free_t>(reg, "ggml_backend_cpu_expert_cache_free");
         const auto add_device = llama_moe_cache_proc<ggml_backend_cpu_expert_cache_add_device_t>(reg, "ggml_backend_cpu_expert_cache_add_device");
         const auto register_weight = llama_moe_cache_proc<ggml_backend_cpu_expert_cache_register_t>(reg, "ggml_backend_cpu_expert_cache_register");
+        const auto enable_nvme = llama_moe_cache_proc<ggml_backend_cpu_expert_cache_enable_nvme_t>(reg, "ggml_backend_cpu_expert_cache_enable_nvme");
+        const auto register_nvme = llama_moe_cache_proc<ggml_backend_cpu_expert_cache_register_nvme_t>(reg, "ggml_backend_cpu_expert_cache_register_nvme");
+        const auto register_nvme_router = llama_moe_cache_proc<ggml_backend_cpu_expert_cache_register_nvme_router_t>(reg, "ggml_backend_cpu_expert_cache_register_nvme_router");
         set_cache = llama_moe_cache_proc<ggml_backend_cpu_set_expert_cache_t>(reg, "ggml_backend_cpu_set_expert_cache");
         cache_device = llama_moe_cache_proc<ggml_backend_cpu_expert_cache_device_t>(reg, "ggml_backend_cpu_expert_cache_device");
         cache_offload_device = llama_moe_cache_proc<ggml_backend_cpu_expert_cache_device_t>(reg, "ggml_backend_cpu_expert_cache_offload_device");
         cache_prepare = llama_moe_cache_proc<ggml_backend_cpu_expert_cache_prepare_t>(reg, "ggml_backend_cpu_expert_cache_prepare");
         cache_copy = llama_moe_cache_proc<ggml_backend_cpu_expert_cache_copy_t>(reg, "ggml_backend_cpu_expert_cache_copy");
         cache_memory = llama_moe_cache_proc<ggml_backend_cpu_expert_cache_memory_t>(reg, "ggml_backend_cpu_expert_cache_memory");
+        cache_nvme_memory = llama_moe_cache_proc<ggml_backend_cpu_expert_cache_nvme_memory_t>(reg, "ggml_backend_cpu_expert_cache_nvme_memory");
 
         bool enabled = false;
-        for (auto & d : devices) {
-            if (d.weights.empty()) {
-                continue;
-            }
-            d.slots = slots;
-            if (size != 0) {
-                // Split by the model's host expert placement, independent of transient free memory.
-                const size_t budget = (size_t) ((long double) size * d.host_bytes / host_bytes);
-                uint32_t lo = 0;
-                uint32_t hi = model.hparams.n_expert;
-                while (lo < hi) {
-                    const uint32_t mid = lo + (hi - lo) / 2 + 1;
-                    if (llama_model_expert_cache_get_cache_size(&model, d.dev, mid) <= budget) {
-                        lo = mid;
-                    } else {
-                        hi = mid - 1;
-                    }
+        if (want_gpu_cache && host_bytes > 0) {
+            for (auto & d : devices) {
+                if (d.weights.empty()) {
+                    continue;
                 }
-                d.slots = lo;
+                d.slots = slots;
+                if (size != 0) {
+                    // Split by the model's host expert placement, independent of transient free memory.
+                    const size_t budget = (size_t) ((long double) size * d.host_bytes / host_bytes);
+                    uint32_t lo = 0;
+                    uint32_t hi = model.hparams.n_expert;
+                    while (lo < hi) {
+                        const uint32_t mid = lo + (hi - lo) / 2 + 1;
+                        if (llama_model_expert_cache_get_cache_size(&model, d.dev, mid) <= budget) {
+                            lo = mid;
+                        } else {
+                            hi = mid - 1;
+                        }
+                    }
+                    d.slots = lo;
+                }
+                if (d.slots == 0) {
+                    continue;
+                }
+                d.reservation = llama_model_expert_cache_get_cache_size(&model, d.dev, d.slots) +
+                    llama_model_expert_cache_get_buffer_size(&model, d.dev);
+                enabled = true;
+                LLAMA_LOG_INFO("%s: %s: %u expert cache slots, reserving %.2f MiB including workspace\n",
+                        __func__, ggml_backend_dev_name(d.dev), d.slots, d.reservation / (1024.0 * 1024.0));
             }
-            if (d.slots == 0) {
-                continue;
+            if (!enabled && !want_nvme) {
+                throw std::runtime_error("expert cache byte size is too small to hold one expert slot");
             }
-            d.reservation = llama_model_expert_cache_get_cache_size(&model, d.dev, d.slots) +
-                llama_model_expert_cache_get_buffer_size(&model, d.dev);
-            enabled = true;
-            LLAMA_LOG_INFO("%s: %s: %u expert cache slots, reserving %.2f MiB including workspace\n",
-                    __func__, ggml_backend_dev_name(d.dev), d.slots, d.reservation / (1024.0 * 1024.0));
-        }
-        if (!enabled) {
-            throw std::runtime_error("expert cache byte size is too small to hold one expert slot");
         }
 
         root = decltype(root)(create(), free_cache);
         if (!root) {
             throw std::runtime_error("failed to create expert cache");
+        }
+        if (want_nvme) {
+            const uint32_t nvme_admit_win = admit_window > 0 ? std::max<uint32_t>(admit_window, 16) : 16;
+            if (!enable_nvme(root.get(), model.expert_ram_cache_size(), nvme_admit_win)) {
+                throw std::runtime_error("failed to initialize NVMe L2 expert cache");
+            }
+            for (const auto & w : model.nvme_expert_weights()) {
+                register_nvme(root.get(), w.tensor, w.file_path.c_str(), w.file_offset);
+            }
+            for (size_t il = 0; il < model.layers.size(); ++il) {
+                const auto & layer = model.layers[il];
+                if (layer.ffn_gate_inp != nullptr) {
+                    register_nvme_router(root.get(), (int) il, layer.ffn_gate_inp, layer.ffn_exp_probs_b);
+                }
+            }
+            has_nvme = true;
         }
         for (const auto & d : devices) {
             if (d.slots == 0) {
@@ -218,6 +249,12 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
             if (d.slots != 0) {
                 // The cache allocates lazily; count the planned total or the actual total, never both.
                 result[d.buft] += std::max(d.reservation, pimpl->cache_memory(pimpl->root.get(), d.dev));
+            }
+        }
+        if (pimpl->has_nvme && pimpl->cache_nvme_memory != nullptr) {
+            const size_t nvme_mem = pimpl->cache_nvme_memory(pimpl->root.get());
+            if (nvme_mem > 0) {
+                result[ggml_backend_cpu_buffer_type()] += nvme_mem;
             }
         }
     }

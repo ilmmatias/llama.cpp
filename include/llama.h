@@ -394,6 +394,8 @@ extern "C" {
         // Set before loading if a context will use expert_cache_slots or moe_cache_size.
         // Keeps native host expert weights GPU-copyable while preserving supported ZNQ CPU repacking.
         bool expert_cache;
+        // RAM budget in bytes for the L2 NVMe-streamed MoE expert cache (0 = disabled, keep experts in RAM).
+        size_t expert_ram_cache_size;
     };
 
     struct llama_sampler_seq_config {

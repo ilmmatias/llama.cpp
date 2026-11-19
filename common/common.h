@@ -506,6 +506,7 @@ struct common_params {
     bool    expert_cache_slots_auto   = false; // the slot count is determined by --fit (see fit_prefer_cache)
     int32_t expert_cache_admit_window = 0;
     int32_t expert_cache_workers      = 1;
+    size_t  expert_ram_cache_size     = 0; // RAM budget in bytes for L2 NVMe-streamed MoE expert cache (0 = disabled)
     bool    expert_cache_moe_placement_explicit = false;
 
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory

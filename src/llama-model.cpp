@@ -1372,6 +1372,7 @@ struct llama_model::impl {
 
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
+    std::vector<llama_model_base::nvme_weight_info> nvme_expert_weights;
     llama_mlocks mlock_mmaps;
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
@@ -1704,6 +1705,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
     ml.expert_cache = params.expert_cache;
+    ml.nvme_expert_cache = params.expert_ram_cache_size > 0;
 
     if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
         for (const auto & dev : devices) {
@@ -2067,6 +2069,36 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
+
+        if (ctx_key.nvme) {
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ ml.no_alloc ? 0 : 64); // tiny sentinel buffer so t->data != nullptr
+            if (buf == nullptr) {
+                throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+            }
+            void * sentinel_ptr = ml.no_alloc ? nullptr : ggml_backend_buffer_get_base(buf);
+            size_t nvme_bytes = 0;
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                t->buffer = buf;
+                t->data = sentinel_ptr;
+                nvme_bytes += ggml_nbytes(t);
+                if (!ml.no_alloc) {
+                    auto it = ml.nvme_weights.find(t->name);
+                    if (it != ml.nvme_weights.end()) {
+                        pimpl->nvme_expert_weights.push_back({ t, it->second.file_path, it->second.file_offset });
+                    }
+                }
+            }
+            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            bufs.emplace_back(buf);
+            if (!ml.no_alloc) {
+                LLAMA_LOG_INFO("%s: NVMe-streamed MoE expert weights: %zu tensors (%.2f GiB on disk, 0 B static RAM; L2 budget = %.2f GiB)\n",
+                        __func__, pimpl->nvme_expert_weights.size(),
+                        (double) nvme_bytes / (1024.0 * 1024.0 * 1024.0),
+                        (double) params.expert_ram_cache_size / (1024.0 * 1024.0 * 1024.0));
+            }
+            pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
+            continue;
+        }
 
         if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
@@ -2591,6 +2623,14 @@ llama_split_mode llama_model::split_mode() const {
 
 bool llama_model::no_alloc() const {
     return params.no_alloc;
+}
+
+size_t llama_model::expert_ram_cache_size() const {
+    return params.expert_ram_cache_size;
+}
+
+const std::vector<llama_model::nvme_weight_info> & llama_model::nvme_expert_weights() const {
+    return pimpl->nvme_expert_weights;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
@@ -3606,7 +3646,15 @@ llama_model_params llama_model_default_params() {
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
         /*.expert_cache                =*/ false,
+        /*.expert_ram_cache_size       =*/ 0,
     };
+
+    if (const char * env = getenv("LLAMA_EXPERT_RAM_CACHE_MIB")) {
+        const long long mib = atoll(env);
+        if (mib > 0) {
+            result.expert_ram_cache_size = (size_t) mib * 1024ull * 1024ull;
+        }
+    }
 
     return result;
 }

@@ -125,6 +125,12 @@ struct llama_model_loader {
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
     bool expert_cache = false;
+    bool nvme_expert_cache = false;
+    struct nvme_weight_desc {
+        std::string file_path;
+        uint64_t    file_offset = 0;
+    };
+    std::unordered_map<std::string, nvme_weight_desc> nvme_weights;
 
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
@@ -146,16 +152,20 @@ struct llama_model_loader {
         }
     };
 
-    // lazy tensors need dedicated context
+    // lazy and nvme-streamed tensors need dedicated contexts
     struct ctx_key {
         ggml_backend_buffer_type_t buft;
         bool lazy;
+        bool nvme = false;
     };
 
     struct ctx_key_comparator {
         bool operator()(const ctx_key & lhs, const ctx_key & rhs) const {
             if (lhs.lazy != rhs.lazy) {
                 return lhs.lazy < rhs.lazy;
+            }
+            if (lhs.nvme != rhs.nvme) {
+                return lhs.nvme < rhs.nvme;
             }
             return strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft)) < 0;
         }
