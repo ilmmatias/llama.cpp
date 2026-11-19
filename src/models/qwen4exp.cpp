@@ -821,7 +821,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
 }
 
 static bool qwen4exp_qsa_select(int64_t n_kv, uint32_t top_k, uint32_t ratio) {
-    return n_kv > (int64_t) top_k + ratio - 1 && n_kv >= 8*(int64_t) top_k;
+    return n_kv > (int64_t) top_k + ratio - 1 && n_kv >= 2*(int64_t) top_k;
 }
 
 // Compact QSA inputs shared by layers with the same compression ratio.
