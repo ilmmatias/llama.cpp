@@ -1167,7 +1167,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             ggml_cuda_flash_attn_ext_tile_supported_type(K->type) &&
             ggml_cuda_flash_attn_ext_tile_supported_type(V->type) &&
             (mask || dst->src[6]) :
-            K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
+            ((K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) ||
+             ggml_cuda_fattn_tile_q8_0_KV_supported(dst));
         const bool supported_head = dst->src[6] ? K->ne[0] == 256 :
             K->ne[0] == 64 || K->ne[0] == 128 || K->ne[0] == 256;
 

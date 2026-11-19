@@ -45,3 +45,4 @@ void ggml_cuda_qsa_kv_sync_rows(
         ggml_backend_cuda_context & ctx, const ggml_tensor * tensor, const ggml_tensor * indices);
 
 void ggml_cuda_qsa_kv_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * tensor);
+bool ggml_cuda_qsa_kv_get_view(const ggml_tensor * tensor, ggml_cuda_qsa_kv_view & view);

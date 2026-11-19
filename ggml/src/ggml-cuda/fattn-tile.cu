@@ -1,7 +1,13 @@
 #include "common.cuh"
+#include "fattn-qsa-hip.cuh"
 #include "fattn-tile.cuh"
 
 void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_cuda_flash_attn_ext_qsa_hip_supported(dst)) {
+        ggml_cuda_flash_attn_ext_qsa_hip(ctx, dst);
+        return;
+    }
+
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     switch (K->ne[0]) {

@@ -32,6 +32,9 @@ struct cache_state {
     uint32_t page_shift = 0;
     int n_pages;
     int n_slots;
+
+    cache_state * paired_peer    = nullptr;
+    cache_state * paired_primary = nullptr;
 };
 
 struct buffer_context {
@@ -89,6 +92,35 @@ static void reset_cache(cache_state & state) {
     CUDA_CHECK(cudaMemset(state.control, 0, control_ints*sizeof(int)));
 }
 
+static void reset_cache_async(cache_state & state, cudaStream_t stream) {
+    CUDA_CHECK(cudaMemsetAsync(state.pages, 0xff, (state.n_pages + state.n_slots) * sizeof(int), stream));
+    CUDA_CHECK(cudaMemsetAsync(state.referenced, 0, state.n_slots * sizeof(int), stream));
+    CUDA_CHECK(cudaMemsetAsync(state.control, 0, control_ints*sizeof(int), stream));
+}
+
+static void unpair_state_sync(cache_state & state) {
+    if (state.paired_peer) {
+        cache_state * peer   = state.paired_peer;
+        state.paired_peer    = nullptr;
+        state.paired_primary = nullptr;
+        peer->paired_peer    = nullptr;
+        peer->paired_primary = nullptr;
+        reset_cache(*peer);
+    }
+}
+
+static void unpair_state_async(cache_state * state, cudaStream_t stream) {
+    if (state && state->paired_peer) {
+        cache_state * peer    = state->paired_peer;
+        state->paired_peer    = nullptr;
+        state->paired_primary = nullptr;
+        peer->paired_peer     = nullptr;
+        peer->paired_primary  = nullptr;
+        reset_cache_async(*state, stream);
+        reset_cache_async(*peer, stream);
+    }
+}
+
 static void before_host_write(ggml_backend_buffer_t buffer, const ggml_tensor * tensor = nullptr) {
     auto & ctx = context(buffer);
     ggml_cuda_set_device(ctx.device);
@@ -97,9 +129,12 @@ static void before_host_write(ggml_backend_buffer_t buffer, const ggml_tensor * 
     if (tensor) {
         cache_state * state = find_cache(tensor);
         GGML_ASSERT(state);
+        unpair_state_sync(*state);
         reset_cache(*state);
     } else {
         for (auto & state : ctx.tensors) {
+            state->paired_peer    = nullptr;
+            state->paired_primary = nullptr;
             reset_cache(*state);
         }
     }
@@ -296,106 +331,18 @@ static __device__ __forceinline__ void record_resolve_stats(
     }
 }
 
-// Mark the entire selection before replacing anything: no page used by another
-// query in this launch may be evicted. Oversized unions retain unmapped pages,
-// which attention reads from authoritative RAM rather than stale cache slots.
-static __global__ void resolve_pages(
-        cache_state state_k, cache_state state_v, const int32_t * indices, int n_indices,
-        size_t offset_k, size_t offset_v, size_t row_bytes_k, size_t row_bytes_v) {
-    const cache_state & state = blockIdx.x == 0 ? state_k : state_v;
-    const size_t offset      = blockIdx.x == 0 ? offset_k : offset_v;
-    const size_t row_bytes   = blockIdx.x == 0 ? row_bytes_k : row_bytes_v;
-
-    __shared__ int n_protected;
-    __shared__ int n_misses;
-    __shared__ int n_evictions;
-    __shared__ int n_overlap_prev;
-    __shared__ int n_miss_in_prev;
-    __shared__ int n_miss_seen;
+static __device__ __forceinline__ int clock_place_evictions(
+        const cache_state & state, int epoch, int need) {
     __shared__ int cut;
     __shared__ int warp_sums[resolve_threads / WARP_SIZE];
-    __shared__ int epoch;
+    __shared__ int n_evictions;
 
     if (threadIdx.x == 0) {
-        n_protected    = 0;
-        n_misses       = 0;
-        n_evictions    = 0;
-        n_overlap_prev = 0;
-        n_miss_in_prev = 0;
-        n_miss_seen    = 0;
-
-        epoch = state.control[2] == INT_MAX ? 1 : state.control[2] + 1;
-        state.control[2] = epoch;
+        n_evictions = 0;
     }
 
     __syncthreads();
 
-    // Epoch tags avoid scanning the entire allocated context on every token.
-    // Clear tags only on initialization, host reset, or epoch wraparound.
-    if (epoch == 1) {
-        for (int p = threadIdx.x; p < state.n_pages; p += blockDim.x) {
-            state.needed[p] = 0;
-        }
-    }
-
-    __syncthreads();
-
-    for (int i = threadIdx.x; i < n_indices; i += blockDim.x) {
-        const int row = indices ? indices[i] : i;
-
-        if (row < 0) {
-            continue;
-        }
-
-        const size_t byte = offset + size_t(row)*row_bytes;
-
-        if (byte >= state.bytes) {
-            continue;
-        }
-
-        const int page = cache_page_for_byte(state, byte);
-        const int prev = atomicExch(state.needed + page, epoch);
-
-        if (prev != epoch) {
-            const bool in_prev = epoch > 1 && prev == epoch - 1;
-            if (in_prev) {
-                atomicAdd(&n_overlap_prev, 1);
-            }
-
-            const int slot = state.pages[page];
-
-            if (slot >= 0) {
-                state.referenced[slot] = 1;
-                atomicAdd(&n_protected, 1);
-            } else {
-                if (in_prev) {
-                    atomicAdd(&n_miss_in_prev, 1);
-                }
-                if (epoch > 1 && prev > 0) {
-                    atomicAdd(&n_miss_seen, 1);
-                }
-                const int miss = atomicAdd(&n_misses, 1);
-
-                if (miss < state.n_slots) {
-                    state.misses[miss] = page;
-                }
-            }
-        }
-    }
-
-    __syncthreads();
-
-    // Admit only as many misses as can fit without evicting selected hits.
-    const int need       = min(n_misses, state.n_slots - n_protected);
-    if (need <= 0) {
-        if (threadIdx.x == 0) {
-            state.control[1] = 0;
-            record_resolve_stats(
-                state, epoch, n_protected, n_misses, 0,
-                n_overlap_prev, n_miss_in_prev, n_miss_seen);
-        }
-        return;
-    }
     const int scan_width = min(resolve_threads, state.n_slots);
     const int lane       = threadIdx.x % WARP_SIZE;
     const int warp       = threadIdx.x / WARP_SIZE;
@@ -471,22 +418,292 @@ static __global__ void resolve_pages(
     if (threadIdx.x == 0) {
         state.control[0] = hand;
         state.control[1] = placed;
+    }
+
+    return n_evictions;
+}
+
+// Mark the entire selection before replacing anything: no page used by another
+// query in this launch may be evicted. Oversized unions retain unmapped pages,
+// which attention reads from authoritative RAM rather than stale cache slots.
+static __global__ void resolve_pages(
+        cache_state state_k, cache_state state_v, const int32_t * indices, int n_indices,
+        size_t offset_k, size_t offset_v, size_t row_bytes_k, size_t row_bytes_v) {
+    const cache_state & state = blockIdx.x == 0 ? state_k : state_v;
+    const size_t offset      = blockIdx.x == 0 ? offset_k : offset_v;
+    const size_t row_bytes   = blockIdx.x == 0 ? row_bytes_k : row_bytes_v;
+
+    __shared__ int n_protected;
+    __shared__ int n_misses;
+    __shared__ int n_overlap_prev;
+    __shared__ int n_miss_in_prev;
+    __shared__ int n_miss_seen;
+    __shared__ int epoch;
+
+    if (threadIdx.x == 0) {
+        n_protected    = 0;
+        n_misses       = 0;
+        n_overlap_prev = 0;
+        n_miss_in_prev = 0;
+        n_miss_seen    = 0;
+
+        epoch = state.control[2] == INT_MAX ? 1 : state.control[2] + 1;
+        state.control[2] = epoch;
+    }
+
+    __syncthreads();
+
+    // Epoch tags avoid scanning the entire allocated context on every token.
+    // Clear tags only on initialization, host reset, or epoch wraparound.
+    if (epoch == 1) {
+        for (int p = threadIdx.x; p < state.n_pages; p += blockDim.x) {
+            state.needed[p] = 0;
+        }
+    }
+
+    __syncthreads();
+
+    int loc_prot   = 0;
+    int loc_ov     = 0;
+    int loc_m_prev = 0;
+    int loc_m_seen = 0;
+
+    for (int i = threadIdx.x; i < n_indices; i += blockDim.x) {
+        const int row = indices ? indices[i] : i;
+
+        if (row < 0) {
+            continue;
+        }
+
+        const size_t byte = offset + size_t(row)*row_bytes;
+
+        if (byte >= state.bytes) {
+            continue;
+        }
+
+        const int page = cache_page_for_byte(state, byte);
+        const int prev = atomicExch(state.needed + page, epoch);
+
+        if (prev != epoch) {
+            const bool in_prev = epoch > 1 && prev == epoch - 1;
+            if (in_prev) {
+                ++loc_ov;
+            }
+
+            const int slot = state.pages[page];
+
+            if (slot >= 0) {
+                state.referenced[slot] = 1;
+                ++loc_prot;
+            } else {
+                if (in_prev) {
+                    ++loc_m_prev;
+                }
+                if (epoch > 1 && prev > 0) {
+                    ++loc_m_seen;
+                }
+                const int miss = atomicAdd(&n_misses, 1);
+
+                if (miss < state.n_slots) {
+                    state.misses[miss] = page;
+                }
+            }
+        }
+    }
+
+    if (loc_prot > 0) {
+        atomicAdd(&n_protected, loc_prot);
+    }
+    if (loc_ov > 0) {
+        atomicAdd(&n_overlap_prev, loc_ov);
+    }
+    if (loc_m_prev > 0) {
+        atomicAdd(&n_miss_in_prev, loc_m_prev);
+    }
+    if (loc_m_seen > 0) {
+        atomicAdd(&n_miss_seen, loc_m_seen);
+    }
+
+    __syncthreads();
+
+    // Admit only as many misses as can fit without evicting selected hits.
+    const int need = min(n_misses, state.n_slots - n_protected);
+    if (need <= 0) {
+        if (threadIdx.x == 0) {
+            state.control[1] = 0;
+            record_resolve_stats(
+                state, epoch, n_protected, n_misses, 0,
+                n_overlap_prev, n_miss_in_prev, n_miss_seen);
+        }
+        return;
+    }
+
+    const int n_evictions = clock_place_evictions(state, epoch, need);
+
+    if (threadIdx.x == 0) {
         record_resolve_stats(
             state, epoch, n_protected, n_misses, n_evictions,
             n_overlap_prev, n_miss_in_prev, n_miss_seen);
     }
 }
 
-static __global__ void copy_pages(cache_state state_k, cache_state state_v) {
-    const cache_state & state = blockIdx.y == 0 ? state_k : state_v;
+static __global__ void resolve_begin(cache_state state_k, cache_state state_v) {
+    const cache_state & state = blockIdx.x == 0 ? state_k : state_v;
+    __shared__ int epoch;
 
-    for (int i = blockIdx.x; i < state.control[1]; i += gridDim.x) {
-        const int     page   = state.misses[i];
-        const int     slot   = state.pages[page];
-        const size_t  offset = size_t(page) * state.page_bytes;
-        const size_t  bytes  = min(state.page_bytes, state.bytes - offset);
-        const uint4 * src    = reinterpret_cast<const uint4 *>(state.device_host + offset);
-        uint4 *       dst    = reinterpret_cast<uint4 *>(state.cache + size_t(slot) * state.page_bytes);
+    if (threadIdx.x == 0) {
+        epoch            = state.control[2] == INT_MAX ? 1 : state.control[2] + 1;
+        state.control[1] = 0;
+        state.control[2] = epoch;
+        state.control[3] = 0;
+        state.control[4] = 0;
+        state.control[5] = 0;
+        state.control[6] = 0;
+        state.control[7] = 0;
+        state.control[8] = 0;
+        state.control[9] = 0;
+    }
+
+    __syncthreads();
+
+    if (epoch == 1) {
+        for (int p = threadIdx.x; p < state.n_pages; p += blockDim.x) {
+            state.needed[p] = 0;
+        }
+    }
+}
+
+static __global__ void resolve_mark_needed(
+        cache_state state_k, cache_state state_v, const int32_t * indices, int n_indices,
+        size_t offset_k, size_t offset_v, size_t row_bytes_k, size_t row_bytes_v) {
+    const cache_state & state = blockIdx.y == 0 ? state_k : state_v;
+    const size_t offset       = blockIdx.y == 0 ? offset_k : offset_v;
+    const size_t row_bytes    = blockIdx.y == 0 ? row_bytes_k : row_bytes_v;
+    const int    epoch        = state.control[2];
+
+    __shared__ int sh_prot;
+    __shared__ int sh_ov;
+    __shared__ int sh_m_prev;
+    __shared__ int sh_m_seen;
+    if (threadIdx.x == 0) {
+        sh_prot   = 0;
+        sh_ov     = 0;
+        sh_m_prev = 0;
+        sh_m_seen = 0;
+    }
+    __syncthreads();
+
+    int loc_prot   = 0;
+    int loc_ov     = 0;
+    int loc_m_prev = 0;
+    int loc_m_seen = 0;
+
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_indices; i += gridDim.x * blockDim.x) {
+        const int row = indices ? indices[i] : i;
+        if (row < 0) {
+            continue;
+        }
+        const size_t byte = offset + size_t(row) * row_bytes;
+        if (byte >= state.bytes) {
+            continue;
+        }
+
+        const int page = cache_page_for_byte(state, byte);
+        const int prev = atomicExch(state.needed + page, epoch);
+
+        if (prev != epoch) {
+            const bool in_prev = epoch > 1 && prev == epoch - 1;
+            if (in_prev) {
+                ++loc_ov;
+            }
+            const int slot = state.pages[page];
+            if (slot >= 0) {
+                state.referenced[slot] = 1;
+                ++loc_prot;
+            } else {
+                if (in_prev) {
+                    ++loc_m_prev;
+                }
+                if (epoch > 1 && prev > 0) {
+                    ++loc_m_seen;
+                }
+                const int miss = atomicAdd(state.control + 4, 1);
+                if (miss < state.n_slots) {
+                    state.misses[miss] = page;
+                }
+            }
+        }
+    }
+
+    if (loc_prot > 0) {
+        atomicAdd(&sh_prot, loc_prot);
+    }
+    if (loc_ov > 0) {
+        atomicAdd(&sh_ov, loc_ov);
+    }
+    if (loc_m_prev > 0) {
+        atomicAdd(&sh_m_prev, loc_m_prev);
+    }
+    if (loc_m_seen > 0) {
+        atomicAdd(&sh_m_seen, loc_m_seen);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        if (sh_prot > 0) {
+            atomicAdd(state.control + 3, sh_prot);
+        }
+        if (sh_ov > 0) {
+            atomicAdd(state.control + 6, sh_ov);
+        }
+        if (sh_m_prev > 0) {
+            atomicAdd(state.control + 8, sh_m_prev);
+        }
+        if (sh_m_seen > 0) {
+            atomicAdd(state.control + 9, sh_m_seen);
+        }
+    }
+}
+
+static __global__ void resolve_evictions(cache_state state_k, cache_state state_v) {
+    const cache_state & state = blockIdx.x == 0 ? state_k : state_v;
+    const int epoch          = state.control[2];
+    const int n_protected    = state.control[3];
+    const int n_misses       = state.control[4];
+    const int n_overlap_prev = state.control[6];
+    const int n_miss_in_prev = state.control[8];
+    const int n_miss_seen    = state.control[9];
+
+    const int need = min(n_misses, state.n_slots - n_protected);
+    if (need <= 0) {
+        if (threadIdx.x == 0) {
+            state.control[1] = 0;
+            record_resolve_stats(
+                state, epoch, n_protected, n_misses, 0,
+                n_overlap_prev, n_miss_in_prev, n_miss_seen);
+        }
+        return;
+    }
+
+    const int n_evictions = clock_place_evictions(state, epoch, need);
+    if (threadIdx.x == 0) {
+        record_resolve_stats(
+            state, epoch, n_protected, n_misses, n_evictions,
+            n_overlap_prev, n_miss_in_prev, n_miss_seen);
+    }
+}
+
+static __global__ void copy_pages(cache_state state_k, cache_state state_v, cache_state meta_k, cache_state meta_v) {
+    const cache_state & data = blockIdx.y == 0 ? state_k : state_v;
+    const cache_state & meta = blockIdx.y == 0 ? meta_k  : meta_v;
+
+    for (int i = blockIdx.x; i < meta.control[1]; i += gridDim.x) {
+        const int     page   = meta.misses[i];
+        const int     slot   = meta.pages[page];
+        const size_t  offset = size_t(page) * data.page_bytes;
+        const size_t  bytes  = min(data.page_bytes, data.bytes - offset);
+        const uint4 * src    = reinterpret_cast<const uint4 *>(data.device_host + offset);
+        uint4 *       dst    = reinterpret_cast<uint4 *>(data.cache + size_t(slot) * data.page_bytes);
 
         for (size_t j = threadIdx.x; j < bytes / sizeof(uint4); j += blockDim.x) {
             dst[j] = src[j];
@@ -495,7 +712,7 @@ static __global__ void copy_pages(cache_state state_k, cache_state state_v) {
 }
 
 template <typename T>
-static __global__ void sync_rows(cache_state state, const T * indices, int n, size_t offset, size_t row_bytes) {
+static __global__ void sync_rows(cache_state state, cache_state meta, const T * indices, int n, size_t offset, size_t row_bytes) {
     const int i = blockIdx.x;
     if (i >= n) {
         return;
@@ -512,7 +729,7 @@ static __global__ void sync_rows(cache_state state, const T * indices, int n, si
     }
 
     const int page = cache_page_for_byte(state, byte);
-    const int slot = state.pages[page];
+    const int slot = meta.pages[page];
     if (slot < 0) {
         return;
     }
@@ -521,9 +738,9 @@ static __global__ void sync_rows(cache_state state, const T * indices, int n, si
     const size_t nbytes  = min(row_bytes, state.bytes - byte);
     if (in_page + nbytes > state.page_bytes) {
         if (threadIdx.x == 0) {
-            const int evicted = atomicExch(state.pages + page, -1);
+            const int evicted = atomicExch(meta.pages + page, -1);
             if (evicted >= 0) {
-                state.owners[evicted] = -1;
+                meta.owners[evicted] = -1;
             }
         }
         return;
@@ -650,6 +867,34 @@ void * ggml_cuda_qsa_kv_device_ptr(const ggml_tensor * tensor) {
            (static_cast<const char *>(tensor->data) - static_cast<const char *>(ctx.host));
 }
 
+bool ggml_cuda_qsa_kv_get_view(const ggml_tensor * tensor, ggml_cuda_qsa_kv_view & view) {
+    cache_state * state = find_cache(tensor);
+    if (!state) {
+        return false;
+    }
+
+    cache_state * meta = state->paired_primary ? state->paired_primary : state;
+    view = { state->device_host, state->cache, meta->pages, state->page_bytes, state->page_shift };
+    return true;
+}
+
+static void launch_resolve_pages(
+        cudaStream_t stream,
+        const cache_state & state_0, const cache_state & state_1, int n_resolve,
+        const int32_t * indices, int n_indices,
+        size_t offset_0, size_t offset_1, size_t row_bytes_0, size_t row_bytes_1) {
+    if (n_indices <= 4096) {
+        resolve_pages<<<n_resolve, resolve_threads, 0, stream>>>(
+                state_0, state_1, indices, n_indices, offset_0, offset_1, row_bytes_0, row_bytes_1);
+    } else {
+        const int mark_blocks = std::min(64, (n_indices + 1023) / 1024);
+        resolve_begin<<<n_resolve, 256, 0, stream>>>(state_0, state_1);
+        resolve_mark_needed<<<dim3(mark_blocks, n_resolve), 256, 0, stream>>>(
+                state_0, state_1, indices, n_indices, offset_0, offset_1, row_bytes_0, row_bytes_1);
+        resolve_evictions<<<n_resolve, resolve_threads, 0, stream>>>(state_0, state_1);
+    }
+}
+
 void ggml_cuda_qsa_kv_prepare(
         ggml_backend_cuda_context & ctx, const ggml_tensor * K, const ggml_tensor * V,
         const int32_t * indices, int n_indices, ggml_cuda_qsa_kv_view & K_cache, ggml_cuda_qsa_kv_view & V_cache) {
@@ -659,21 +904,60 @@ void ggml_cuda_qsa_kv_prepare(
 
     const size_t offset_k = static_cast<const char *>(K->data) - state_k->host;
     const size_t offset_v = static_cast<const char *>(V->data) - state_v->host;
-    const int n_caches = state_k == state_v ? 1 : 2;
-
-    // K and V have independent page tables. Resolve and fill them in parallel
-    // rather than serializing two otherwise identical launch sequences.
     const int copy_blocks = n_indices <= 4096 ? 32 : 96;
-    resolve_pages<<<n_caches, resolve_threads, 0, ctx.stream()>>>(
-            *state_k, *state_v, indices, n_indices, offset_k, offset_v, K->nb[1], V->nb[1]);
-    copy_pages<<<dim3(copy_blocks, n_caches), 256, 0, ctx.stream()>>>(*state_k, *state_v);
 
-    // Aliased views must not update the same table concurrently. A second
-    // selection can evict K pages safely: unmapped reads fall back to RAM.
-    if (n_caches == 1 && (offset_k != offset_v || K->nb[1] != V->nb[1])) {
-        resolve_pages<<<1, resolve_threads, 0, ctx.stream()>>>(
-                *state_v, *state_v, indices, n_indices, offset_v, offset_v, V->nb[1], V->nb[1]);
-        copy_pages<<<copy_blocks, 256, 0, ctx.stream()>>>(*state_v, *state_v);
+    // Pair distinct symmetric (K, V) tensors onto one shared page table so
+    // page resolution runs once and attention resolves K/V slots with 1 load.
+    const bool want_pair =
+        state_k != state_v &&
+        state_k->bytes == state_v->bytes &&
+        state_k->page_bytes == state_v->page_bytes &&
+        state_k->n_pages == state_v->n_pages &&
+        state_k->n_slots == state_v->n_slots &&
+        offset_k == offset_v &&
+        K->nb[1] == V->nb[1];
+
+    cache_state * stats_state = state_k;
+
+    if (want_pair) {
+        if (state_k->paired_peer != state_v) {
+            unpair_state_async(state_k, ctx.stream());
+            unpair_state_async(state_v, ctx.stream());
+            reset_cache_async(*state_k, ctx.stream());
+            reset_cache_async(*state_v, ctx.stream());
+            state_k->paired_peer    = state_v;
+            state_k->paired_primary = nullptr;
+            state_v->paired_peer    = state_k;
+            state_v->paired_primary = state_k;
+        }
+
+        cache_state * primary = state_k->paired_primary ? state_k->paired_primary : state_k;
+        stats_state = primary;
+
+        launch_resolve_pages(ctx.stream(), *primary, *primary, 1, indices, n_indices, offset_k, offset_k, K->nb[1], K->nb[1]);
+        copy_pages<<<dim3(copy_blocks, 2), 256, 0, ctx.stream()>>>(*state_k, *state_v, *primary, *primary);
+
+        K_cache = { state_k->device_host, state_k->cache, primary->pages, state_k->page_bytes, state_k->page_shift };
+        V_cache = { state_v->device_host, state_v->cache, primary->pages, state_v->page_bytes, state_v->page_shift };
+    } else {
+        unpair_state_async(state_k, ctx.stream());
+        if (state_v != state_k) {
+            unpair_state_async(state_v, ctx.stream());
+        }
+
+        const int n_caches = state_k == state_v ? 1 : 2;
+        launch_resolve_pages(ctx.stream(), *state_k, *state_v, n_caches, indices, n_indices, offset_k, offset_v, K->nb[1], V->nb[1]);
+        copy_pages<<<dim3(copy_blocks, n_caches), 256, 0, ctx.stream()>>>(*state_k, *state_v, *state_k, *state_v);
+
+        // Aliased views must not update the same table concurrently. A second
+        // selection can evict K pages safely: unmapped reads fall back to RAM.
+        if (n_caches == 1 && (offset_k != offset_v || K->nb[1] != V->nb[1])) {
+            launch_resolve_pages(ctx.stream(), *state_v, *state_v, 1, indices, n_indices, offset_v, offset_v, V->nb[1], V->nb[1]);
+            copy_pages<<<copy_blocks, 256, 0, ctx.stream()>>>(*state_v, *state_v, *state_v, *state_v);
+        }
+
+        K_cache = { state_k->device_host, state_k->cache, state_k->pages, state_k->page_bytes, state_k->page_shift };
+        V_cache = { state_v->device_host, state_v->cache, state_v->pages, state_v->page_bytes, state_v->page_shift };
     }
 
     CUDA_CHECK(cudaGetLastError());
@@ -691,15 +975,12 @@ void ggml_cuda_qsa_kv_prepare(
         if (can_sync) {
             CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
             int ctrl[control_ints] = {};
-            CUDA_CHECK(cudaMemcpy(ctrl, state_k->control, control_ints * sizeof(int), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(ctrl, stats_state->control, control_ints * sizeof(int), cudaMemcpyDeviceToHost));
             fprintf(stderr, "qsa_step K=%p epoch=%d n_idx=%d | hit=%d miss=%d placed=%d evict=%d uniq=%d coh=%.1f%% (%d/%d) miss_prev=%d miss_seen=%d\n",
-                (const void *) state_k, ctrl[2], n_indices, ctrl[3], ctrl[4], ctrl[1], ctrl[5], ctrl[7],
+                (const void *) stats_state, ctrl[2], n_indices, ctrl[3], ctrl[4], ctrl[1], ctrl[5], ctrl[7],
                 ctrl[7] > 0 ? 100.0 * double(ctrl[6]) / double(ctrl[7]) : 0.0, ctrl[6], ctrl[7], ctrl[8], ctrl[9]);
         }
     }
-
-    K_cache = { state_k->device_host, state_k->cache, state_k->pages, state_k->page_bytes, state_k->page_shift };
-    V_cache = { state_v->device_host, state_v->cache, state_v->pages, state_v->page_bytes, state_v->page_shift };
 }
 
 void ggml_cuda_qsa_kv_sync_rows(
@@ -710,6 +991,7 @@ void ggml_cuda_qsa_kv_sync_rows(
         return;
     }
 
+    cache_state * meta = state->paired_primary ? state->paired_primary : state;
     GGML_ASSERT(ggml_is_contiguous(indices));
     const int    n      = ggml_nelements(indices);
     const size_t offset = static_cast<const char *>(tensor->data) - state->host;
@@ -723,19 +1005,19 @@ void ggml_cuda_qsa_kv_sync_rows(
     if (n <= 64) {
         if (indices->type == GGML_TYPE_I64) {
             sync_rows<<<n, 256, 0, ctx.stream()>>>(
-                    *state, static_cast<const int64_t *>(indices->data), n, offset, tensor->nb[1]);
+                    *state, *meta, static_cast<const int64_t *>(indices->data), n, offset, tensor->nb[1]);
         } else {
             GGML_ASSERT(indices->type == GGML_TYPE_I32);
             sync_rows<<<n, 256, 0, ctx.stream()>>>(
-                    *state, static_cast<const int32_t *>(indices->data), n, offset, tensor->nb[1]);
+                    *state, *meta, static_cast<const int32_t *>(indices->data), n, offset, tensor->nb[1]);
         }
     } else if (indices->type == GGML_TYPE_I64) {
         invalidate_rows<<<(n + 255) / 256, 256, 0, ctx.stream()>>>(
-                *state, static_cast<const int64_t *>(indices->data), n, offset, tensor->nb[1]);
+                *meta, static_cast<const int64_t *>(indices->data), n, offset, tensor->nb[1]);
     } else {
         GGML_ASSERT(indices->type == GGML_TYPE_I32);
         invalidate_rows<<<(n + 255) / 256, 256, 0, ctx.stream()>>>(
-                *state, static_cast<const int32_t *>(indices->data), n, offset, tensor->nb[1]);
+                *meta, static_cast<const int32_t *>(indices->data), n, offset, tensor->nb[1]);
     }
 
     CUDA_CHECK(cudaGetLastError());
@@ -748,8 +1030,10 @@ void ggml_cuda_qsa_kv_invalidate(ggml_backend_cuda_context & ctx, const ggml_ten
         return;
     }
 
+    cache_state * meta = state->paired_primary ? state->paired_primary : state;
+
     // Bulk device writes (copies and K-shifts) bypass SET_ROWS. Invalidate on
     // the same stream so subsequent attention cannot reuse pre-write pages.
-    CUDA_CHECK(cudaMemsetAsync(state->pages, 0xff, (state->n_pages + state->n_slots)*sizeof(int), ctx.stream()));
-    CUDA_CHECK(cudaMemsetAsync(state->referenced, 0, state->n_slots*sizeof(int), ctx.stream()));
+    CUDA_CHECK(cudaMemsetAsync(meta->pages, 0xff, (meta->n_pages + meta->n_slots)*sizeof(int), ctx.stream()));
+    CUDA_CHECK(cudaMemsetAsync(meta->referenced, 0, meta->n_slots*sizeof(int), ctx.stream()));
 }
