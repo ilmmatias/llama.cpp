@@ -839,8 +839,15 @@ public:
             mctx->reset_qsa(ratio);
             return;
         }
-        mctx->set_input_qsa(cell_blk, block_cells, block_cell_bias, bias, block_key_cells,
-                update_cells, update_pos, update_idxs, ubatch, ratio, blk_bias);
+        mctx->set_input_qsa(
+                cell_blk,
+                meta_cells ? nullptr : block_cells,
+                meta_cells ? nullptr : block_cell_bias,
+                bias,
+                meta_cells ? nullptr : block_key_cells,
+                update_cells, update_pos, update_idxs, ubatch, ratio, blk_bias,
+                meta_cells, meta_cell_bias, meta_key_cells, meta_idxs,
+                meta_base_bias, blk_bounds);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -883,8 +890,17 @@ public:
             res &= cell_blk->ne[0] == n_kv;
             res &= cell_blk->ne[1] == n_stream;
         }
-        res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
-        res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
+        if (blk_bounds != nullptr) {
+            res &= bias == nullptr && base_blk_bias != nullptr;
+            res &= base_blk_bias->ne[0] == n_blocks;
+            res &= blk_bounds->ne[0] == 2;
+            res &= blk_bounds->ne[1] == params.ubatch.n_tokens/n_stream;
+            res &= blk_bounds->ne[2] == n_stream;
+        } else {
+            res &= bias != nullptr && blk_bounds == nullptr;
+            res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
+            res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
+        }
 
         res &= block_key_cells->ne[0] == n_blocks;
         res &= block_key_cells->ne[1] == n_stream;
@@ -892,6 +908,7 @@ public:
         res &= update_cells->ne[1] == n_updates;
         res &= update_pos->ne[0] == 4*n_updates;
         res &= update_idxs->ne[0] == n_updates;
+        res &= mctx->can_reuse_qsa_meta(meta_cells, params.ubatch, ratio, n_blocks);
 
         return res;
     }
@@ -901,11 +918,18 @@ public:
     ggml_tensor * cell_blk  = nullptr;   // I32 [n_kv, n_stream]
     ggml_tensor * block_cells     = nullptr;   // I32 [ratio, n_blocks, 1], compact decode only
     ggml_tensor * block_cell_bias = nullptr;   // F32 same shape, -inf for unfilled tail slots
-    ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
+    ggml_tensor * bias            = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
+    ggml_tensor * base_blk_bias   = nullptr;   // F32 [n_blocks, 1], per-block static bias (-inf/0)
+    ggml_tensor * blk_bounds      = nullptr;   // I32 [2, n_tokens/n_stream, n_stream], (n_base, n_tail)
     ggml_tensor * block_key_cells = nullptr;   // I32 [n_blocks, n_stream], slots in compact QSA block cache
     ggml_tensor * update_cells    = nullptr;   // I32 [ratio, n_updates], global rows in indexer K
     ggml_tensor * update_pos      = nullptr;   // I32 [4*n_updates]
     ggml_tensor * update_idxs     = nullptr;   // I64 [n_updates], slots in compact QSA block cache
+    ggml_tensor * meta_cells      = nullptr;   // I32 [ratio, n_meta_updates], incremental GPU meta rows
+    ggml_tensor * meta_cell_bias  = nullptr;   // F32 [ratio, n_meta_updates]
+    ggml_tensor * meta_key_cells  = nullptr;   // I32 [1, n_meta_updates]
+    ggml_tensor * meta_base_bias  = nullptr;   // F32 [1, n_meta_updates]
+    ggml_tensor * meta_idxs       = nullptr;   // I32 [n_meta_updates]
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t ratio;
@@ -971,27 +995,64 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
         if (qsa_select) {
-            if (compact_select) {
-                qsa->block_cells = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, r, n_blocks, n_stream);
-                qsa->block_cell_bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, r, n_blocks, n_stream);
-            } else {
-                qsa->cell_blk = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
-            }
-            qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+            const auto * meta_dev = compact_select ? mctx_hyb->get_qsa_meta_dev((uint32_t) r, (uint32_t) n_blocks) : nullptr;
+            const int64_t n_meta_updates = meta_dev ? mctx_hyb->get_qsa_meta_update_capacity(ubatch, (uint32_t) r, (uint32_t) n_blocks) : 0;
+            const bool use_fused_lid = cparams.fused_lid &&
+                mctx_hyb->get_qsa_block_storage(il)->type == GGML_TYPE_F32 &&
+                idx_dim == 128 && n_idx_h == 4 && n_stream == 1 && n_blocks >= 4096 && n_tps >= 128;
+            const bool use_compact_bounds = compact_select && meta_dev != nullptr && n_meta_updates > 0 &&
+                !ubatch.is_pos_2d() && !use_fused_lid;
+            if (compact_select && meta_dev != nullptr && n_meta_updates > 0) {
+                qsa->meta_cells     = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r, n_meta_updates);
+                qsa->meta_cell_bias = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, r, n_meta_updates);
+                qsa->meta_key_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_meta_updates);
+                qsa->meta_idxs      = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_meta_updates);
+                ggml_set_input(qsa->meta_cells);
+                ggml_set_input(qsa->meta_cell_bias);
+                ggml_set_input(qsa->meta_key_cells);
+                ggml_set_input(qsa->meta_idxs);
 
-            qsa->block_key_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_blocks, n_stream);
-            qsa->update_cells    = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r, n_updates);
-            qsa->update_pos      = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_updates);
-            qsa->update_idxs     = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_updates);
-            if (compact_select) {
-                ggml_set_input(qsa->block_cells);
-                ggml_set_input(qsa->block_cell_bias);
-            } else {
-                ggml_set_input(qsa->cell_blk);
-            }
-            ggml_set_input(qsa->bias);
+                ggml_tensor * up_cells  = ggml_set_rows(ctx0, meta_dev->d_block_cells, qsa->meta_cells, qsa->meta_idxs);
+                ggml_tensor * up_bias   = ggml_set_rows(ctx0, meta_dev->d_block_cell_bias, qsa->meta_cell_bias, qsa->meta_idxs);
+                ggml_tensor * up_kcells = ggml_set_rows(ctx0, meta_dev->d_block_key_cells, qsa->meta_key_cells, qsa->meta_idxs);
 
-            ggml_set_input(qsa->block_key_cells);
+                qsa->block_cells     = ggml_view_2d(ctx0, up_cells,  r, n_blocks, up_cells->nb[1],  0);
+                qsa->block_cell_bias = ggml_view_2d(ctx0, up_bias,   r, n_blocks, up_bias->nb[1],   0);
+                ggml_tensor * kv_kcells = ggml_view_2d(ctx0, up_kcells, 1, n_blocks, up_kcells->nb[1], 0);
+                qsa->block_key_cells = ggml_reshape_2d(ctx0, kv_kcells, n_blocks, 1);
+
+                if (use_compact_bounds) {
+                    qsa->meta_base_bias = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_meta_updates);
+                    ggml_set_input(qsa->meta_base_bias);
+                    ggml_tensor * up_base = ggml_set_rows(ctx0, meta_dev->d_base_blk_bias, qsa->meta_base_bias, qsa->meta_idxs);
+                    ggml_tensor * kv_base = ggml_view_2d(ctx0, up_base, 1, n_blocks, up_base->nb[1], 0);
+                    qsa->base_blk_bias = ggml_reshape_2d(ctx0, kv_base, n_blocks, 1);
+                    qsa->blk_bounds    = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 2, n_tps, n_stream);
+                    ggml_set_input(qsa->blk_bounds);
+                }
+            } else {
+                if (compact_select) {
+                    qsa->block_cells = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, r, n_blocks, n_stream);
+                    qsa->block_cell_bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, r, n_blocks, n_stream);
+                } else {
+                    qsa->cell_blk = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+                }
+                qsa->block_key_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_blocks, n_stream);
+                if (compact_select) {
+                    ggml_set_input(qsa->block_cells);
+                    ggml_set_input(qsa->block_cell_bias);
+                } else {
+                    ggml_set_input(qsa->cell_blk);
+                }
+                ggml_set_input(qsa->block_key_cells);
+            }
+            if (qsa->blk_bounds == nullptr) {
+                qsa->bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+                ggml_set_input(qsa->bias);
+            }
+            qsa->update_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r, n_updates);
+            qsa->update_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_updates);
+            qsa->update_idxs  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_updates);
             ggml_set_input(qsa->update_cells);
             ggml_set_input(qsa->update_pos);
             ggml_set_input(qsa->update_idxs);
@@ -1059,9 +1120,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // Keep indexed scoring for decode and small batches. Large batches amortize
     // the pooled-key gather and benefit from lightning's key reuse across queries.
     if (blk_bias && q->type == GGML_TYPE_F32) {
-        ggml_tensor * q_score = ggml_reshape_4d(ctx0, ggml_cont(ctx0, q),
+        ggml_tensor * q_score = ggml_reshape_4d(ctx0, ggml_is_contiguous(q) ? q : ggml_cont(ctx0, q),
                 idx_dim, n_idx_h, n_tps, n_stream);
-        if (cparams.fused_lid && idx_dim == 128 && n_idx_h == 4 &&
+        if (cparams.fused_lid && inp->bias != nullptr && k_blocks->type == GGML_TYPE_F32 &&
+                idx_dim == 128 && n_idx_h == 4 &&
                 n_stream == 1 && n_blocks >= 4096 && n_tps >= 128) {
             ggml_tensor * pooled = ggml_get_rows(ctx0, k_blocks,
                     ggml_reshape_1d(ctx0, inp->block_key_cells, n_blocks));
@@ -1086,6 +1148,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
             score = ggml_add(ctx0,
                     ggml_are_same_shape(score, inp->bias) ? score : ggml_reshape_3d(ctx0, score, n_blocks, n_tps, n_stream),
                     inp->bias);
+        } else if (inp->blk_bounds != nullptr) {
+            score = ggml_qsa_block_score_compact(ctx0, q_score, k_blocks,
+                    inp->block_key_cells, inp->base_blk_bias, inp->blk_bounds, 1.0f);
         } else {
             score = ggml_qsa_block_score(ctx0, q_score, k_blocks,
                     inp->block_key_cells, inp->bias, 1.0f);
@@ -1099,7 +1164,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
 
         // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
         score = ggml_mul_mat(ctx0, pooled,
-                ggml_reshape_3d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h*n_tps, n_stream));
+                ggml_reshape_3d(ctx0, ggml_is_contiguous(q) ? q : ggml_cont(ctx0, q), idx_dim, n_idx_h*n_tps, n_stream));
         score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
         score = ggml_relu(ctx0, score);
 

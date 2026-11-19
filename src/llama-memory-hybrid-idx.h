@@ -135,10 +135,12 @@ private:
 
     struct qsa_incr_state {
         bool valid = false;
+        bool gpu_valid = false;
         llama_seq_id seq_id = -1;
         int64_t stream_off = 0;
         int64_t n_kv = 0;
         int64_t n_blocks = 0;
+        int64_t gpu_n_blocks = 0;
         std::vector<uint32_t> pending_cells;
         std::vector<int32_t>  cell_slot;
         std::vector<int32_t>  filled;
@@ -150,6 +152,19 @@ private:
         std::vector<int64_t>  dirty_blocks;
         std::vector<uint32_t> dirty_stamp;
         uint32_t              dirty_epoch = 0;
+        std::vector<int32_t>  gpu_meta_cells;
+        std::vector<float>    gpu_meta_cell_bias;
+        std::vector<int32_t>  gpu_meta_key_cells;
+        std::vector<float>    gpu_meta_base_bias;
+        std::vector<int32_t>  gpu_meta_idxs;
+    };
+
+    struct qsa_meta_dev {
+        ggml_tensor * d_block_cells     = nullptr; // I32 [ratio, max_blocks + 1]
+        ggml_tensor * d_block_cell_bias = nullptr; // F32 [ratio, max_blocks + 1]
+        ggml_tensor * d_block_key_cells = nullptr; // I32 [1,     max_blocks + 1]
+        ggml_tensor * d_base_blk_bias   = nullptr; // F32 [1,     max_blocks + 1]
+        int64_t       max_blocks        = 0;       // usable blocks [0..max_blocks - 1]; row max_blocks is unused sink
     };
 
     struct qsa_scratch {
@@ -185,6 +200,8 @@ private:
     const uint32_t qsa_block_capacity;
     const std::unique_ptr<llama_kv_cache> mem_idx;
     const std::unique_ptr<llama_kv_cache> mem_qsa_blocks;
+    llama_memory_bufs qsa_meta_bufs;
+    std::map<uint32_t, qsa_meta_dev> qsa_meta_devs;
 
     mutable std::map<uint32_t, std::map<llama_seq_id, std::vector<qsa_block>>> qsa_blocks;
     mutable std::map<uint32_t, std::map<llama_seq_id, uint32_t>> qsa_dirty_counts;
@@ -266,6 +283,14 @@ public:
     uint32_t get_qsa_update_capacity(
             const llama_ubatch & ubatch, uint32_t ratio, uint32_t n_blocks) const;
 
+    const llama_memory_hybrid_idx::qsa_meta_dev * get_qsa_meta_dev(uint32_t ratio, uint32_t n_blocks) const;
+    int64_t get_qsa_meta_update_capacity(const llama_ubatch & ubatch, uint32_t ratio, uint32_t n_blocks) const;
+    bool    can_reuse_qsa_meta(
+            const ggml_tensor * meta_cells,
+            const llama_ubatch & ubatch,
+            uint32_t ratio,
+            uint32_t n_blocks) const;
+
     void reset_qsa(uint32_t ratio) const;
 
     ggml_tensor * get_qsa_block_storage(int32_t il) const;
@@ -283,7 +308,13 @@ public:
                        ggml_tensor * bias, ggml_tensor * block_key_cells,
                        ggml_tensor * update_cells, ggml_tensor * update_pos,
                        ggml_tensor * update_idxs, const llama_ubatch * ubatch,
-                       uint32_t ratio, bool blk_bias) const;
+                       uint32_t ratio, bool blk_bias,
+                       ggml_tensor * meta_cells = nullptr,
+                       ggml_tensor * meta_cell_bias = nullptr,
+                       ggml_tensor * meta_key_cells = nullptr,
+                       ggml_tensor * meta_idxs = nullptr,
+                       ggml_tensor * meta_base_bias = nullptr,
+                       ggml_tensor * blk_bounds = nullptr) const;
     // glm5-next and qwen4exp, complete pools of kpool cells per sequence, scored as whole pools.
     uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
     uint32_t get_n_kpool_new() const; // Pools to re-pool this ubatch, padded to a stable bound, never below 1.
@@ -325,6 +356,7 @@ private:
 
     // Whether this context tracks k-pool states.
     bool kpool_track() const;
+    bool qsa_meta_can_incremental(const llama_ubatch & ubatch, uint32_t ratio, uint32_t n_blocks, int64_t & out_needed) const;
 
     // Positions each sequence must re-pool from, cleared only after the first ubatch succeeds
     llama_memory_hybrid_idx::stale_pos_t mem_idx_stale_batch = llama_memory_hybrid_idx::stale_pos_clean();

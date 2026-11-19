@@ -96,7 +96,9 @@ llama_kv_cache::llama_kv_cache(
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl),
     compact_states_impl(other ? other->compact_states_impl : std::make_shared<compact_states_vec>()),
-    compact_states(*compact_states_impl) {
+    compact_states(*compact_states_impl),
+    d_kq_mask_impl(other ? other->d_kq_mask_impl : std::make_shared<ggml_tensor *>(nullptr)),
+    d_kq_mask(*d_kq_mask_impl) {
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -124,7 +126,7 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer + 8u)*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -366,6 +368,19 @@ llama_kv_cache::llama_kv_cache(
             map_layer_ids[il] = map_layer_ids[il_reuse];
 
             LLAMA_LOG_DEBUG("%s: - layer %3d: reuse layer %d, is_swa = %d\n", __func__, il, il_reuse, hparams.is_swa(il));
+        }
+    }
+
+    if (!other && offload && model.arch == LLM_ARCH_QWEN4EXP && swa_type == LLAMA_SWA_TYPE_NONE &&
+        !is_indexer && !layers.empty() && n_stream == 1) {
+        auto * dev = model.dev_layer(layers[0].il);
+        if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            ggml_context * dev_ctx = ctx_for_buft(ggml_backend_dev_buffer_type(dev));
+            if (dev_ctx) {
+                // +4096 reserves room for ubatch query rows plus a dedicated dummy sink row at index kv_size + 4095.
+                d_kq_mask = ggml_new_tensor_2d(dev_ctx, GGML_TYPE_I32, 4, (int64_t) kv_size + 4096);
+                ggml_format_name(d_kq_mask, "cache_%skq_mask", name_tag);
+            }
         }
     }
 
@@ -2047,6 +2062,166 @@ static inline void fill_compact_mask_row(
     row[3] = 0;
 }
 
+static int64_t compact_mask_dedup_dirty_count(
+        std::vector<uint32_t> & dirty_cells,
+        int64_t limit) {
+    if (dirty_cells.size() > 1) {
+        std::sort(dirty_cells.begin(), dirty_cells.end());
+        dirty_cells.erase(std::unique(dirty_cells.begin(), dirty_cells.end()), dirty_cells.end());
+    }
+    int64_t count = 0;
+    for (const uint32_t cell : dirty_cells) {
+        if ((int64_t) cell < limit) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+ggml_tensor * llama_kv_cache::get_kq_mask_dev() const {
+    return (d_kq_mask && d_kq_mask->buffer && ggml_backend_buffer_get_size(d_kq_mask->buffer) > 0) ? d_kq_mask : nullptr;
+}
+
+int64_t llama_kv_cache::get_kq_mask_update_capacity(const llama_ubatch & ubatch, int64_t n_kv) const {
+    ggml_tensor * dev_mask = get_kq_mask_dev();
+    const uint32_t n_tokens = ubatch.n_tokens;
+    if (!dev_mask || n_kv + (int64_t) n_tokens >= dev_mask->ne[1]) {
+        return 0;
+    }
+
+    if (!ubatch.seq_id || !ubatch.seq_id[0]) {
+        return n_kv + (int64_t) n_tokens;
+    }
+
+    const llama_seq_id seq_id = ubatch.seq_id[0][0];
+    const uint32_t strm = seq_to_stream[seq_id];
+    auto & cs = (*compact_states_impl).at(strm);
+    const bool is_2d = ubatch.pos != nullptr && ubatch.is_pos_2d();
+
+    if (cs.gpu_valid && cs.seq_id == seq_id && cs.is_2d == is_2d && n_kv >= cs.gpu_n_kv) {
+        const int64_t n_dirty  = compact_mask_dedup_dirty_count(cs.gpu_dirty_cells, cs.gpu_n_kv);
+        const int64_t needed   = (n_kv - cs.gpu_n_kv) + n_dirty + (int64_t) n_tokens;
+        return n_tokens <= 8 ? std::max<int64_t>(needed, (int64_t) n_tokens + 8) : std::max<int64_t>(needed, (int64_t) n_tokens);
+    }
+
+    return n_kv + (int64_t) n_tokens;
+}
+
+bool llama_kv_cache::can_reuse_kq_mask_dev(
+        const ggml_tensor * kq_mask_vals,
+        const ggml_tensor * kq_mask_idxs,
+        int64_t             kq_mask_n_kv,
+        const llama_ubatch & ubatch) const {
+    ggml_tensor * dev_mask = get_kq_mask_dev();
+    if (!dev_mask || !kq_mask_vals || !kq_mask_idxs || swa_type != LLAMA_SWA_TYPE_NONE) {
+        return false;
+    }
+
+    const uint32_t n_tokens = ubatch.n_tokens;
+    if (ubatch.n_seqs_unq != 1 || !ubatch.seq_id || !ubatch.seq_id[0] || !ubatch.pos) {
+        return false;
+    }
+
+    if (kq_mask_n_kv + (int64_t) n_tokens >= dev_mask->ne[1]) {
+        return false;
+    }
+
+    const llama_seq_id seq_id = ubatch.seq_id[0][0];
+    const uint32_t strm = seq_to_stream[seq_id];
+    auto & cs = (*compact_states_impl).at(strm);
+    const bool is_2d = ubatch.is_pos_2d();
+
+    if (!cs.gpu_valid || cs.seq_id != seq_id || cs.is_2d != is_2d || kq_mask_n_kv < cs.gpu_n_kv) {
+        return false;
+    }
+
+    const int64_t n_dirty = compact_mask_dedup_dirty_count(cs.gpu_dirty_cells, cs.gpu_n_kv);
+    const int64_t needed  = (kq_mask_n_kv - cs.gpu_n_kv) + n_dirty + (int64_t) n_tokens;
+    return needed <= kq_mask_vals->ne[1];
+}
+
+void llama_kv_cache::set_input_kq_mask_update(
+        ggml_tensor * kq_mask_vals,
+        ggml_tensor * kq_mask_idxs,
+        int64_t       kq_mask_n_kv,
+        const llama_ubatch * ubatch,
+        bool          causal_attn) const {
+    ggml_tensor * dev_mask = get_kq_mask_dev();
+    GGML_ASSERT(dev_mask != nullptr);
+    GGML_ASSERT(ubatch->n_seqs_unq == 1 && swa_type == LLAMA_SWA_TYPE_NONE);
+
+    const uint32_t n_tokens = ubatch->n_tokens;
+    const int64_t  n_kv     = kq_mask_n_kv;
+    const int64_t  cap      = kq_mask_vals->ne[1];
+    GGML_ASSERT(n_kv + (int64_t) n_tokens < dev_mask->ne[1]);
+
+    const llama_seq_id seq_id = ubatch->seq_id[0][0];
+    const uint32_t strm = seq_to_stream[seq_id];
+    const auto & cells = v_cells.at(strm);
+    auto & cs = (*compact_states_impl).at(strm);
+    const bool is_2d = ubatch->is_pos_2d();
+
+    cs.gpu_vals.resize((size_t) cap * 4);
+    cs.gpu_idxs.resize((size_t) cap);
+    int32_t * vals  = cs.gpu_vals.data();
+    int32_t * idxs  = cs.gpu_idxs.data();
+    int64_t   count = 0;
+
+    if (cs.gpu_valid && cs.seq_id == seq_id && cs.is_2d == is_2d && n_kv >= cs.gpu_n_kv) {
+        compact_mask_dedup_dirty_count(cs.gpu_dirty_cells, cs.gpu_n_kv);
+        for (int64_t i = cs.gpu_n_kv; i < n_kv; ++i) {
+            fill_compact_mask_row(vals + 4 * count, cells, (uint32_t) i, seq_id, is_2d);
+            idxs[count++] = (int32_t) i;
+        }
+        for (const uint32_t cell : cs.gpu_dirty_cells) {
+            if ((int64_t) cell < cs.gpu_n_kv) {
+                fill_compact_mask_row(vals + 4 * count, cells, cell, seq_id, is_2d);
+                idxs[count++] = (int32_t) cell;
+            }
+        }
+        cs.gpu_n_kv = n_kv;
+        cs.gpu_dirty_cells.clear();
+    } else {
+        for (int64_t i = 0; i < n_kv; ++i) {
+            fill_compact_mask_row(vals + 4 * count, cells, (uint32_t) i, seq_id, is_2d);
+            idxs[count++] = (int32_t) i;
+        }
+        cs.gpu_valid  = true;
+        cs.seq_id     = seq_id;
+        cs.is_2d      = is_2d;
+        cs.gpu_n_kv   = n_kv;
+        cs.gpu_dirty_cells.clear();
+    }
+
+    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+        causal_attn = true;
+    }
+
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        GGML_ASSERT(ubatch->seq_id[i][0] == seq_id);
+        int32_t * row = vals + 4 * count;
+
+        row[0] = ubatch->pos[i];
+        row[1] = is_2d ? ubatch->pos[i + n_tokens*2] : 0;
+        row[2] = is_2d ? ubatch->pos[i + n_tokens] : 0;
+        row[3] = (causal_attn ? 1 : 0) | (is_2d ? 2 : 0);
+        idxs[count++] = (int32_t) (n_kv + i);
+    }
+
+    GGML_ASSERT(count <= cap);
+    const int32_t sink_idx = (int32_t) (dev_mask->ne[1] - 1);
+    for (int64_t k = count; k < cap; ++k) {
+        vals[4 * k + 0] = 0;
+        vals[4 * k + 1] = 0;
+        vals[4 * k + 2] = 0;
+        vals[4 * k + 3] = 0;
+        idxs[k] = sink_idx;
+    }
+
+    ggml_backend_tensor_set(kq_mask_vals, vals, 0, ggml_nbytes(kq_mask_vals));
+    ggml_backend_tensor_set(kq_mask_idxs, idxs, 0, ggml_nbytes(kq_mask_idxs));
+}
+
 void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const {
     // fill the cell rows of each slice
     if (attn_mask.rows && attn_mask.rows->buffer) {
@@ -3570,6 +3745,31 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_attn_mask(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_attn_mask(attn_mask, ubatch, causal_attn);
+}
+
+ggml_tensor * llama_kv_cache_context::get_kq_mask_dev() const {
+    return kv->get_kq_mask_dev();
+}
+
+int64_t llama_kv_cache_context::get_kq_mask_update_capacity(const llama_ubatch & ubatch, int64_t n_kv) const {
+    return kv->get_kq_mask_update_capacity(ubatch, n_kv);
+}
+
+bool llama_kv_cache_context::can_reuse_kq_mask_dev(
+        const ggml_tensor * kq_mask_vals,
+        const ggml_tensor * kq_mask_idxs,
+        int64_t             kq_mask_n_kv,
+        const llama_ubatch & ubatch) const {
+    return kv->can_reuse_kq_mask_dev(kq_mask_vals, kq_mask_idxs, kq_mask_n_kv, ubatch);
+}
+
+void llama_kv_cache_context::set_input_kq_mask_update(
+        ggml_tensor * kq_mask_vals,
+        ggml_tensor * kq_mask_idxs,
+        int64_t       kq_mask_n_kv,
+        const llama_ubatch * ubatch,
+        bool          causal_attn) const {
+    kv->set_input_kq_mask_update(kq_mask_vals, kq_mask_idxs, kq_mask_n_kv, ubatch, causal_attn);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

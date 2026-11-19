@@ -382,11 +382,18 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    void set_input_attn_mask_impl(const llama_ubatch * ubatch);
+    bool can_reuse_attn_mask_impl(const llm_graph_params & params, const llama_kv_cache_context * mctx_cur);
+
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
+
+    ggml_tensor * kq_mask_vals = nullptr; // I32 [4, cap]
+    ggml_tensor * kq_mask_idxs = nullptr; // I32 [cap]
+    int64_t       kq_mask_n_kv = 0;
 
     llm_attn_mask self_attn_mask;
 

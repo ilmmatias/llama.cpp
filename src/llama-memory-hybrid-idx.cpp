@@ -98,13 +98,48 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     mem_qsa_blocks(filter_idx == nullptr || qsa_block_capacity == 0 ? nullptr : [&] {
         LLAMA_LOG_INFO("%s: creating compact QSA block cache, size = %u blocks\n", __func__, qsa_block_capacity);
 
-        // This cache is storage only: one F32 K row per derived block, shared across
+        // This cache is storage only: one F16 K row per derived block, shared across
         // sequences by our slot table. It is always one stream and never stores V.
         return new llama_kv_cache(
-            model, no_alloc, hparams_idx, GGML_TYPE_F32, GGML_TYPE_F32, false, offload, true,
+            model, no_alloc, hparams_idx, GGML_TYPE_F16, GGML_TYPE_F16, false, offload, true,
             qsa_block_capacity, 1, 0, LLAMA_SWA_TYPE_NONE,
             nullptr, filter_idx, nullptr, nullptr, "idx_blk_");
-    }()) {}
+    }()),
+    qsa_meta_bufs(no_alloc) {
+    if (offload && unified && model.arch == LLM_ARCH_QWEN4EXP && filter_idx != nullptr && qsa_block_capacity > 0) {
+        for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
+            if (!filter_idx(il)) {
+                continue;
+            }
+            const uint32_t ratio = model.hparams.dsv4_compress_ratios[il];
+            if (ratio == 0 || qsa_meta_devs.find(ratio) != qsa_meta_devs.end()) {
+                continue;
+            }
+            auto * dev = model.dev_layer(il);
+            if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                continue;
+            }
+            ggml_context * raw_ctx = ggml_init({ 6 * ggml_tensor_overhead(), nullptr, true });
+            if (!raw_ctx) {
+                throw std::runtime_error("failed to create ggml context for QSA metadata");
+            }
+            ggml_context_ptr ctx(raw_ctx);
+            const int64_t max_blocks = ((int64_t) kv_size + 256 + ratio - 1) / ratio + 1;
+            qsa_meta_dev meta;
+            meta.d_block_cells     = ggml_new_tensor_2d(raw_ctx, GGML_TYPE_I32, ratio, max_blocks + 1);
+            meta.d_block_cell_bias = ggml_new_tensor_2d(raw_ctx, GGML_TYPE_F32, ratio, max_blocks + 1);
+            meta.d_block_key_cells = ggml_new_tensor_2d(raw_ctx, GGML_TYPE_I32, 1,     max_blocks + 1);
+            meta.d_base_blk_bias   = ggml_new_tensor_2d(raw_ctx, GGML_TYPE_F32, 1,     max_blocks + 1);
+            meta.max_blocks        = max_blocks;
+            ggml_format_name(meta.d_block_cells,     "qsa_blk_cells_r%u", ratio);
+            ggml_format_name(meta.d_block_cell_bias, "qsa_blk_bias_r%u", ratio);
+            ggml_format_name(meta.d_block_key_cells, "qsa_blk_kcells_r%u", ratio);
+            ggml_format_name(meta.d_base_blk_bias,   "qsa_blk_base_r%u", ratio);
+            qsa_meta_bufs.emplace(std::move(ctx), ggml_backend_dev_buffer_type(dev), "qsa_meta");
+            qsa_meta_devs.emplace(ratio, meta);
+        }
+    }
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -188,6 +223,11 @@ void llama_memory_hybrid_idx::clear(bool data) {
     }
     if (mem_qsa_blocks) {
         mem_qsa_blocks->clear(data);
+    }
+    if (data) {
+        for (auto & [_, buf] : qsa_meta_bufs) {
+            ggml_backend_buffer_clear(buf.get(), 0);
+        }
     }
 
     qsa_reset();
@@ -318,6 +358,9 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
             mb[buft_size.first] += buft_size.second;
         }
     }
+    for (const auto & buft_size : qsa_meta_bufs.memory_breakdown()) {
+        mb[buft_size.first] += buft_size.second;
+    }
 
     return mb;
 }
@@ -404,6 +447,8 @@ void llama_memory_hybrid_idx::qsa_incr_invalidate(uint32_t ratio) const {
         const auto it = qsa_incr.find(ratio);
         if (it != qsa_incr.end()) {
             it->second.valid = false;
+            it->second.gpu_valid = false;
+            it->second.gpu_n_blocks = 0;
             it->second.pending_cells.clear();
         }
         return;
@@ -411,6 +456,8 @@ void llama_memory_hybrid_idx::qsa_incr_invalidate(uint32_t ratio) const {
     for (auto & [r, st] : qsa_incr) {
         GGML_UNUSED(r);
         st.valid = false;
+        st.gpu_valid = false;
+        st.gpu_n_blocks = 0;
         st.pending_cells.clear();
     }
 }
@@ -624,6 +671,102 @@ uint32_t llama_memory_hybrid_idx::get_qsa_update_capacity(
     result = std::max<uint64_t>(1, result);
     GGML_ASSERT(result <= std::numeric_limits<uint32_t>::max());
     return (uint32_t) result;
+}
+
+const llama_memory_hybrid_idx::qsa_meta_dev * llama_memory_hybrid_idx_context::get_qsa_meta_dev(uint32_t ratio, uint32_t n_blocks) const {
+    if (mem == nullptr || ratio == 0 || n_blocks == 0) {
+        return nullptr;
+    }
+    const auto it = mem->qsa_meta_devs.find(ratio);
+    if (it == mem->qsa_meta_devs.end()) {
+        return nullptr;
+    }
+    const auto & meta = it->second;
+    if (!meta.d_block_cells || !meta.d_base_blk_bias || !meta.d_block_cells->buffer ||
+        ggml_backend_buffer_get_size(meta.d_block_cells->buffer) == 0 ||
+        (int64_t) n_blocks > meta.max_blocks) {
+        return nullptr;
+    }
+    return &meta;
+}
+
+bool llama_memory_hybrid_idx_context::qsa_meta_can_incremental(
+        const llama_ubatch & ubatch,
+        uint32_t ratio,
+        uint32_t n_blocks,
+        int64_t & out_needed) const {
+    out_needed = (int64_t) n_blocks;
+    const llama_kv_cache_context * idx_ctx = get_idx();
+    if (mem == nullptr || idx_ctx == nullptr || mem->get_mem_idx() == nullptr || ubatch.n_seqs_unq != 1 ||
+        !ubatch.seq_id || !ubatch.seq_id[0] || !ubatch.pos || ubatch.is_pos_2d()) {
+        return false;
+    }
+    const auto it = mem->qsa_incr.find(ratio);
+    if (it == mem->qsa_incr.end()) {
+        return false;
+    }
+    const auto & inc = it->second;
+    const llama_seq_id seq_id = ubatch.seq_id[0][0];
+    const auto * mem_idx = mem->get_mem_idx();
+    const int64_t cache_stream = mem_idx->get_n_stream() == 1 ? 0 : seq_id;
+    const int64_t stream_off   = cache_stream * (int64_t) mem_idx->get_size();
+    if (!inc.valid || !inc.gpu_valid || seq_id != inc.seq_id || stream_off != inc.stream_off ||
+        (int64_t) n_blocks < inc.gpu_n_blocks) {
+        return false;
+    }
+    const auto & cells = mem_idx->get_cells(seq_id);
+    int n_seq_present = 0;
+    for (int sq = 0; sq < LLAMA_MAX_SEQ && n_seq_present < 2; ++sq) {
+        if (cells.seq_pos_min(sq) >= 0) {
+            ++n_seq_present;
+        }
+    }
+    if (n_seq_present > 1) {
+        return false;
+    }
+    const int64_t n_kv = idx_ctx->get_n_kv();
+    for (const uint32_t cell_u32 : inc.pending_cells) {
+        const int64_t j = (int64_t) cell_u32;
+        if (j < n_kv && !cells.is_empty(j)) {
+            const int64_t pos = cells.pos_get(j);
+            const int64_t b = pos >= 0 ? pos / (int64_t) ratio : -1;
+            if (pos < 0 || b >= (int64_t) n_blocks) {
+                return false;
+            }
+        }
+    }
+    const int64_t needed = ((int64_t) n_blocks - inc.gpu_n_blocks) + (int64_t) inc.pending_cells.size() * 2;
+    out_needed = std::min<int64_t>((int64_t) n_blocks, std::max<int64_t>(needed, 1));
+    return true;
+}
+
+int64_t llama_memory_hybrid_idx_context::get_qsa_meta_update_capacity(
+        const llama_ubatch & ubatch, uint32_t ratio, uint32_t n_blocks) const {
+    if (get_qsa_meta_dev(ratio, n_blocks) == nullptr || get_n_stream() != 1) {
+        return 0;
+    }
+    int64_t needed = (int64_t) n_blocks;
+    if (qsa_meta_can_incremental(ubatch, ratio, n_blocks, needed)) {
+        return ubatch.n_tokens <= 8 ? std::min<int64_t>(n_blocks, std::max<int64_t>(needed, 16)) : needed;
+    }
+    return (int64_t) n_blocks;
+}
+
+bool llama_memory_hybrid_idx_context::can_reuse_qsa_meta(
+        const ggml_tensor * meta_cells,
+        const llama_ubatch & ubatch,
+        uint32_t ratio,
+        uint32_t n_blocks) const {
+    const auto * meta_dev = get_qsa_meta_dev(ratio, n_blocks);
+    if (meta_cells == nullptr) {
+        return meta_dev == nullptr || get_n_stream() != 1;
+    }
+    if (meta_dev == nullptr || get_n_stream() != 1) {
+        return false;
+    }
+    int64_t needed = (int64_t) n_blocks;
+    qsa_meta_can_incremental(ubatch, ratio, n_blocks, needed);
+    return needed <= meta_cells->ne[1];
 }
 
 
@@ -925,23 +1068,35 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * update_idxs,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias) const {
+        bool blk_bias,
+        ggml_tensor * meta_cells,
+        ggml_tensor * meta_cell_bias,
+        ggml_tensor * meta_key_cells,
+        ggml_tensor * meta_idxs,
+        ggml_tensor * meta_base_bias,
+        ggml_tensor * blk_bounds) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
 
+    const bool use_gpu_meta = meta_cells != nullptr;
+
     // The generic path uploads cell -> block. The compact decode path uploads
     // block -> cell instead, so do not pay for both O(n_kv) maps on every token.
-    GGML_ASSERT((cell_blk == nullptr) != (block_cells == nullptr));
+    GGML_ASSERT(!use_gpu_meta ? ((cell_blk == nullptr) != (block_cells == nullptr)) : (cell_blk == nullptr && block_cells == nullptr));
     if (cell_blk != nullptr) {
         GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
         GGML_ASSERT(block_cell_bias == nullptr);
+        GGML_ASSERT(ggml_backend_buffer_is_host(block_key_cells->buffer));
+    } else if (use_gpu_meta) {
+        GGML_ASSERT(block_cell_bias == nullptr && block_key_cells == nullptr);
+        GGML_ASSERT(meta_cell_bias != nullptr && meta_key_cells != nullptr && meta_idxs != nullptr);
     } else {
-        GGML_ASSERT(block_cells != nullptr && block_cell_bias != nullptr);
+        GGML_ASSERT(block_cells != nullptr && block_cell_bias != nullptr && block_key_cells != nullptr);
         GGML_ASSERT(ggml_backend_buffer_is_host(block_cells->buffer));
         GGML_ASSERT(ggml_backend_buffer_is_host(block_cell_bias->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(block_key_cells->buffer));
     }
-    GGML_ASSERT(ggml_backend_buffer_is_host(bias->buffer));
-    GGML_ASSERT(ggml_backend_buffer_is_host(block_key_cells->buffer));
+    GGML_ASSERT(bias != nullptr ? ggml_backend_buffer_is_host(bias->buffer) : (blk_bounds != nullptr && ggml_backend_buffer_is_host(blk_bounds->buffer)));
     GGML_ASSERT(ggml_backend_buffer_is_host(update_cells->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(update_pos->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(update_idxs->buffer));
@@ -965,8 +1120,6 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
     GGML_ASSERT(n_tokens % n_ns == 0);
     GGML_ASSERT(n_updates > 0);
-    GGML_ASSERT(block_key_cells->type == GGML_TYPE_I32);
-    GGML_ASSERT(block_key_cells->ne[0] == n_blocks && block_key_cells->ne[1] == n_ns);
     GGML_ASSERT(update_cells->type == GGML_TYPE_I32);
     GGML_ASSERT(update_cells->ne[0] == r && update_cells->ne[1] == n_updates);
     GGML_ASSERT(update_pos->type == GGML_TYPE_I32 && update_pos->ne[0] == 4*n_updates);
@@ -974,20 +1127,38 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     if (cell_blk != nullptr) {
         GGML_ASSERT(cell_blk->type == GGML_TYPE_I32);
         GGML_ASSERT(cell_blk->ne[0] == n_kv && cell_blk->ne[1] == n_ns);
+        GGML_ASSERT(block_key_cells->type == GGML_TYPE_I32);
+        GGML_ASSERT(block_key_cells->ne[0] == n_blocks && block_key_cells->ne[1] == n_ns);
+    } else if (use_gpu_meta) {
+        GGML_ASSERT(n_ns == 1);
+        GGML_ASSERT(meta_cells->type == GGML_TYPE_I32 && meta_cells->ne[0] == r);
+        GGML_ASSERT(meta_cell_bias->type == GGML_TYPE_F32 && ggml_are_same_shape(meta_cells, meta_cell_bias));
+        GGML_ASSERT(meta_key_cells->type == GGML_TYPE_I32 && meta_key_cells->ne[0] == 1 && meta_key_cells->ne[1] == meta_cells->ne[1]);
+        GGML_ASSERT(meta_idxs->type == GGML_TYPE_I32 && meta_idxs->ne[0] == meta_cells->ne[1]);
+        if (meta_base_bias != nullptr) {
+            GGML_ASSERT(meta_base_bias->type == GGML_TYPE_F32 && meta_base_bias->ne[0] == 1 && meta_base_bias->ne[1] == meta_cells->ne[1]);
+        }
     } else {
         GGML_ASSERT(n_ns == 1); // stage-3 fast path is intentionally single-stream
         GGML_ASSERT(block_cells->type == GGML_TYPE_I32);
         GGML_ASSERT(block_cells->ne[0] == r && block_cells->ne[1] == n_blocks && block_cells->ne[2] == n_ns);
         GGML_ASSERT(block_cell_bias->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_are_same_shape(block_cells, block_cell_bias));
+        GGML_ASSERT(block_key_cells->type == GGML_TYPE_I32);
+        GGML_ASSERT(block_key_cells->ne[0] == n_blocks && block_key_cells->ne[1] == n_ns);
     }
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
+    if (blk_bounds != nullptr) {
+        GGML_ASSERT(blk_bias && !ubatch->is_pos_2d());
+        GGML_ASSERT(blk_bounds->type == GGML_TYPE_I32 && blk_bounds->ne[0] == 2 && blk_bounds->ne[1] == n_tps && blk_bounds->ne[2] == n_ns);
+    }
     int32_t * dst_cell_blk = cell_blk != nullptr ? (int32_t *) cell_blk->data : nullptr;
-    float   * dst_bias      = (float   *) bias->data;
+    float   * dst_bias      = bias != nullptr ? (float *) bias->data : nullptr;
+    int32_t * dst_bounds    = blk_bounds != nullptr ? (int32_t *) blk_bounds->data : nullptr;
     int32_t * dst_block_cells = block_cells != nullptr ? (int32_t *) block_cells->data : nullptr;
     float * dst_block_cell_bias = block_cell_bias != nullptr ? (float *) block_cell_bias->data : nullptr;
 
-    int32_t * dst_block_key_cell = (int32_t *) block_key_cells->data;
+    int32_t * dst_block_key_cell = block_key_cells != nullptr ? (int32_t *) block_key_cells->data : nullptr;
     int32_t * dst_update_cells   = (int32_t *) update_cells->data;
     int32_t * dst_update_pos     = (int32_t *) update_pos->data;
     int64_t * dst_update_idxs    = (int64_t *) update_idxs->data;
@@ -1008,15 +1179,21 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     auto fill_blk_bias = [&](int64_t i, int64_t q, const float * base_bias_ptr) {
         // the tail is an incomplete block and is always visible, as in the reference
         const int64_t tail_start = (q + 1)/r*r;
-        float * cur_blk_bias = dst_bias + i*n_blocks;
 
-        const int64_t past_blk = dst_block_cells != nullptr ?
+        const int64_t past_blk = (dst_block_cells != nullptr || use_gpu_meta) ?
             (q >= 0 ? std::min(n_blocks, q/r + 1) : 0) : n_blocks;
         const int64_t tail_blk = tail_start <= 0 ? 0 :
             std::min(n_blocks, (tail_start + r - 1)/r);
         const int64_t n_base = std::min(tail_blk, past_blk);
-        const int64_t n_tail = std::max(n_base, past_blk);
+        const int64_t n_tail = std::min(n_blocks, std::max(n_base, past_blk));
 
+        if (dst_bounds != nullptr) {
+            dst_bounds[2 * i + 0] = (int32_t) n_base;
+            dst_bounds[2 * i + 1] = (int32_t) n_tail;
+            return;
+        }
+
+        float * cur_blk_bias = dst_bias + i*n_blocks;
         if (n_base > 0) {
             std::memcpy(cur_blk_bias, base_bias_ptr, (size_t) n_base * sizeof(float));
         }
@@ -1068,7 +1245,85 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
     // Incremental O(delta) fast path for single-stream non-2D decode/append.
     auto & inc = mem->qsa_incr[ratio];
-    if (inc.valid && n_ns == 1 && !ubatch->is_pos_2d() && blk_bias && dst_block_cells != nullptr) {
+    auto upload_gpu_meta = [&](bool incremental) {
+        if (!use_gpu_meta) {
+            return;
+        }
+        const auto * meta_dev = get_qsa_meta_dev(ratio, (uint32_t) n_blocks);
+        GGML_ASSERT(meta_dev != nullptr);
+        const int64_t cap = meta_cells->ne[1];
+        inc.gpu_meta_cells.resize((size_t) cap * r);
+        inc.gpu_meta_cell_bias.resize((size_t) cap * r);
+        inc.gpu_meta_key_cells.resize((size_t) cap);
+        if (meta_base_bias != nullptr) {
+            inc.gpu_meta_base_bias.resize((size_t) cap);
+        }
+        inc.gpu_meta_idxs.resize((size_t) cap);
+
+        int64_t count = 0;
+        auto emit_blk = [&](int64_t b) {
+            for (int64_t ir = 0; ir < r; ++ir) {
+                inc.gpu_meta_cells[count * r + ir]     = inc.out_block_cells[b * r + ir];
+                inc.gpu_meta_cell_bias[count * r + ir] = inc.out_block_cell_bias[b * r + ir];
+            }
+            inc.gpu_meta_key_cells[count] = inc.key_cells[b];
+            if (meta_base_bias != nullptr) {
+                inc.gpu_meta_base_bias[count] = inc.base_blk_bias[b];
+            }
+            inc.gpu_meta_idxs[count]      = (int32_t) b;
+            ++count;
+        };
+
+        bool emitted_incr = false;
+        if (incremental && inc.gpu_valid && n_blocks >= inc.gpu_n_blocks) {
+            int64_t dirty_below = 0;
+            for (const int64_t b : inc.dirty_blocks) {
+                if (b < inc.gpu_n_blocks) {
+                    ++dirty_below;
+                }
+            }
+            if ((n_blocks - inc.gpu_n_blocks) + dirty_below <= cap) {
+                for (int64_t b = inc.gpu_n_blocks; b < n_blocks; ++b) {
+                    emit_blk(b);
+                }
+                for (const int64_t b : inc.dirty_blocks) {
+                    if (b < inc.gpu_n_blocks) {
+                        emit_blk(b);
+                    }
+                }
+                emitted_incr = true;
+            }
+        }
+        if (!emitted_incr) {
+            GGML_ASSERT(n_blocks <= cap);
+            for (int64_t b = 0; b < n_blocks; ++b) {
+                emit_blk(b);
+            }
+        }
+
+        const int32_t sink_idx = (int32_t) meta_dev->max_blocks;
+        for (int64_t k = count; k < cap; ++k) {
+            for (int64_t ir = 0; ir < r; ++ir) {
+                inc.gpu_meta_cells[k * r + ir]     = 0;
+                inc.gpu_meta_cell_bias[k * r + ir] = -INFINITY;
+            }
+            inc.gpu_meta_key_cells[k] = 0;
+            if (meta_base_bias != nullptr) {
+                inc.gpu_meta_base_bias[k] = -INFINITY;
+            }
+            inc.gpu_meta_idxs[k]      = sink_idx;
+        }
+
+        ggml_backend_tensor_set(meta_cells,     inc.gpu_meta_cells.data(),     0, ggml_nbytes(meta_cells));
+        ggml_backend_tensor_set(meta_cell_bias, inc.gpu_meta_cell_bias.data(), 0, ggml_nbytes(meta_cell_bias));
+        ggml_backend_tensor_set(meta_key_cells, inc.gpu_meta_key_cells.data(), 0, ggml_nbytes(meta_key_cells));
+        if (meta_base_bias != nullptr) {
+            ggml_backend_tensor_set(meta_base_bias, inc.gpu_meta_base_bias.data(), 0, ggml_nbytes(meta_base_bias));
+        }
+        ggml_backend_tensor_set(meta_idxs,      inc.gpu_meta_idxs.data(),      0, ggml_nbytes(meta_idxs));
+    };
+
+    if (inc.valid && n_ns == 1 && !ubatch->is_pos_2d() && blk_bias && (dst_block_cells != nullptr || use_gpu_meta)) {
         const llama_seq_id seq_of_stream = ubatch->seq_id[0][0];
         const auto & cells = mem_idx->get_cells(seq_of_stream);
         int n_seq_present = 0;
@@ -1212,9 +1467,15 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                     }
                 }
 
-                std::memcpy(dst_block_key_cell, inc.key_cells.data(), (size_t) n_blocks * sizeof(int32_t));
-                std::memcpy(dst_block_cells, inc.out_block_cells.data(), (size_t) (r * n_blocks) * sizeof(int32_t));
-                std::memcpy(dst_block_cell_bias, inc.out_block_cell_bias.data(), (size_t) (r * n_blocks) * sizeof(float));
+                if (use_gpu_meta) {
+                    upload_gpu_meta(true);
+                    inc.gpu_valid    = true;
+                    inc.gpu_n_blocks = n_blocks;
+                } else {
+                    std::memcpy(dst_block_key_cell, inc.key_cells.data(), (size_t) n_blocks * sizeof(int32_t));
+                    std::memcpy(dst_block_cells, inc.out_block_cells.data(), (size_t) (r * n_blocks) * sizeof(int32_t));
+                    std::memcpy(dst_block_cell_bias, inc.out_block_cell_bias.data(), (size_t) (r * n_blocks) * sizeof(float));
+                }
 
                 for (int64_t ii = 0; ii < n_tps; ++ii) {
                     fill_blk_bias(ii, ubatch->pos[ii], inc.base_blk_bias.data());
@@ -1226,13 +1487,26 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             }
         }
         inc.valid = false;
+        inc.gpu_valid = false;
+        inc.gpu_n_blocks = 0;
         inc.pending_cells.clear();
     } else {
         inc.valid = false;
+        inc.gpu_valid = false;
+        inc.gpu_n_blocks = 0;
         inc.pending_cells.clear();
     }
 
-    std::fill(dst_block_key_cell, dst_block_key_cell + ggml_nelements(block_key_cells), 0);
+    if (use_gpu_meta) {
+        inc.out_block_cells.assign((size_t) r * n_blocks, 0);
+        inc.out_block_cell_bias.assign((size_t) r * n_blocks, -INFINITY);
+        inc.key_cells.assign((size_t) n_blocks, 0);
+        dst_block_cells     = inc.out_block_cells.data();
+        dst_block_cell_bias = inc.out_block_cell_bias.data();
+        dst_block_key_cell  = inc.key_cells.data();
+    } else {
+        std::fill(dst_block_key_cell, dst_block_key_cell + ggml_nelements(block_key_cells), 0);
+    }
     std::fill(dst_update_cells, dst_update_cells + ggml_nelements(update_cells), 0);
     std::fill(dst_update_pos, dst_update_pos + ggml_nelements(update_pos), 0);
     std::fill(dst_update_idxs, dst_update_idxs + ggml_nelements(update_idxs), 0);
@@ -1483,9 +1757,11 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             inc.filled.assign(filled.begin(), filled.begin() + n_blocks);
             inc.cur_blk_cells.assign(cur_blk_cells.begin(), cur_blk_cells.begin() + r * n_blocks);
             inc.base_blk_bias.assign(base_blk_bias.begin(), base_blk_bias.begin() + n_blocks);
-            inc.out_block_cells.assign(dst_block_cells, dst_block_cells + r * n_blocks);
-            inc.out_block_cell_bias.assign(dst_block_cell_bias, dst_block_cell_bias + r * n_blocks);
-            inc.key_cells.assign(dst_block_key_cell, dst_block_key_cell + n_blocks);
+            if (!use_gpu_meta) {
+                inc.out_block_cells.assign(dst_block_cells, dst_block_cells + r * n_blocks);
+                inc.out_block_cell_bias.assign(dst_block_cell_bias, dst_block_cell_bias + r * n_blocks);
+                inc.key_cells.assign(dst_block_key_cell, dst_block_key_cell + n_blocks);
+            }
             inc.dirty_stamp.assign(n_blocks, 0);
             inc.dirty_epoch = 0;
             inc.pending_cells.clear();
@@ -1554,6 +1830,11 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     }
 
     finish_updates(have_fallback, fallback_idx, fallback_cells_ptr, fallback_pos);
+    if (use_gpu_meta) {
+        upload_gpu_meta(false);
+        inc.gpu_valid    = inc.valid;
+        inc.gpu_n_blocks = inc.valid ? n_blocks : 0;
+    }
 
 }
 

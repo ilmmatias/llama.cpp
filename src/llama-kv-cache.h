@@ -248,6 +248,19 @@ public:
     void set_input_k_shift(ggml_tensor * dst) const;
 
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
+    ggml_tensor * get_kq_mask_dev() const;
+    int64_t       get_kq_mask_update_capacity(const llama_ubatch & ubatch, int64_t n_kv) const;
+    bool          can_reuse_kq_mask_dev(
+            const ggml_tensor * kq_mask_vals,
+            const ggml_tensor * kq_mask_idxs,
+            int64_t             kq_mask_n_kv,
+            const llama_ubatch & ubatch) const;
+    void          set_input_kq_mask_update(
+            ggml_tensor * kq_mask_vals,
+            ggml_tensor * kq_mask_idxs,
+            int64_t       kq_mask_n_kv,
+            const llama_ubatch * ubatch,
+            bool          causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
 
@@ -337,34 +350,55 @@ private:
     llama_kv_cells_vec & v_cells;
 
     struct compact_mask_state {
-        bool                  valid  = false;
-        llama_seq_id          seq_id = -1;
-        bool                  is_2d  = false;
-        int64_t               n_kv   = 0;
+        bool                  valid     = false;
+        bool                  gpu_valid = false;
+        llama_seq_id          seq_id    = -1;
+        bool                  is_2d     = false;
+        int64_t               n_kv      = 0;
+        int64_t               gpu_n_kv  = 0;
         std::vector<int32_t>  data;
         std::vector<uint32_t> dirty_cells;
+        std::vector<uint32_t> gpu_dirty_cells;
+        std::vector<int32_t>  gpu_vals;
+        std::vector<int32_t>  gpu_idxs;
 
         void invalidate() {
-            valid = false;
-            n_kv  = 0;
+            valid     = false;
+            gpu_valid = false;
+            n_kv      = 0;
+            gpu_n_kv  = 0;
             dirty_cells.clear();
+            gpu_dirty_cells.clear();
         }
 
         void mark_dirty(uint32_t cell) {
-            if (!valid) {
-                return;
+            if (valid) {
+                if (dirty_cells.size() >= 4096) {
+                    valid = false;
+                    n_kv  = 0;
+                    dirty_cells.clear();
+                } else {
+                    dirty_cells.push_back(cell);
+                }
             }
-            if (dirty_cells.size() >= 4096) {
-                invalidate();
-                return;
+            if (gpu_valid) {
+                if (gpu_dirty_cells.size() >= 4096) {
+                    gpu_valid = false;
+                    gpu_n_kv  = 0;
+                    gpu_dirty_cells.clear();
+                } else {
+                    gpu_dirty_cells.push_back(cell);
+                }
             }
-            dirty_cells.push_back(cell);
         }
     };
 
     using compact_states_vec = std::vector<compact_mask_state>;
     std::shared_ptr<compact_states_vec> compact_states_impl;
     compact_states_vec & compact_states;
+
+    std::shared_ptr<ggml_tensor *> d_kq_mask_impl;
+    ggml_tensor *& d_kq_mask;
 
     // maps from a sequence id to a stream id
     std::vector<uint32_t> seq_to_stream;
@@ -488,6 +522,19 @@ public:
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
+    ggml_tensor * get_kq_mask_dev() const;
+    int64_t       get_kq_mask_update_capacity(const llama_ubatch & ubatch, int64_t n_kv) const;
+    bool          can_reuse_kq_mask_dev(
+            const ggml_tensor * kq_mask_vals,
+            const ggml_tensor * kq_mask_idxs,
+            int64_t             kq_mask_n_kv,
+            const llama_ubatch & ubatch) const;
+    void          set_input_kq_mask_update(
+            ggml_tensor * kq_mask_vals,
+            ggml_tensor * kq_mask_idxs,
+            int64_t       kq_mask_n_kv,
+            const llama_ubatch * ubatch,
+            bool          causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
 
