@@ -8231,9 +8231,10 @@ static void ggml_gemm_znq3_m_8x8_q8_0_impl(
     const int32_t * neg_corr = pre_neg_corr != nullptr ? pre_neg_corr
         : (nc >= 16 ? znq_alloc_neg_corr(a_ptr_start, nr, nb) : nullptr);
 
-    // Large-prompt path. Decode 32 output rows across an L1-resident K tile once,
+    // Decode 32 output rows across an L1-resident K tile once,
     // then reuse the +128-biased uint8 panel over every 4-row activation tile.
-    if (nr >= 20 && nc >= 32 && neg_corr != nullptr) {
+    // Keep nr==16 on the register-resident 16x16 kernel; panel beats 8x16+4x16 at nr==12.
+    if ((nr >= 20 || nr == 12) && nc >= 32 && neg_corr != nullptr) {
         const int panel_blocks = std::min(nb, ZNQ3_PANEL_BLOCKS);
         const size_t panel_size = (size_t) panel_blocks * sizeof(znq3_mx32_panel_block);
         auto * panel = (znq3_mx32_panel_block *) znq_scratch.get(panel_size);

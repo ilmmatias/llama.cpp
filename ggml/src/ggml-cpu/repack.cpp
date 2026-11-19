@@ -3179,6 +3179,34 @@ void ggml_znq_local_prepare_sums(int n, int nr, bool packed, const void * vy, in
     const auto * y4 = (const block_q8_0x4 *) vy;
 
     if (packed) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX2__)
+        const __m512i bias80 = _mm512_set1_epi8((char) 0x80);
+        const __m512i zero = _mm512_setzero_si512();
+        const __m256i offset4096 = _mm256_set1_epi32(4096);
+        const __m256i perm_idx = _mm256_set_epi32(0, 0, 0, 0, 6, 4, 2, 0);
+        for (int r4 = 0; r4 < nr / 4; ++r4) {
+            int32_t * dst0 = sums + size_t(r4 * 4 + 0) * nb;
+            int32_t * dst1 = sums + size_t(r4 * 4 + 1) * nb;
+            int32_t * dst2 = sums + size_t(r4 * 4 + 2) * nb;
+            int32_t * dst3 = sums + size_t(r4 * 4 + 3) * nb;
+            for (int ib = 0; ib < nb; ++ib) {
+                const int8_t * qs = y4[size_t(r4) * nb + ib].qs;
+                const __m512i u01 = _mm512_xor_si512(_mm512_loadu_si512((const void *) qs), bias80);
+                const __m512i u23 = _mm512_xor_si512(_mm512_loadu_si512((const void *) (qs + 64)), bias80);
+                const __m512i sum64 = _mm512_add_epi64(_mm512_sad_epu8(u01, zero), _mm512_sad_epu8(u23, zero));
+                const __m256i s256 = _mm256_add_epi32(
+                        _mm512_castsi512_si256(sum64), _mm512_extracti64x4_epi64(sum64, 1));
+                const __m256i corr = _mm256_slli_epi32(_mm256_sub_epi32(s256, offset4096), 7);
+                const __m128i v = _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(corr, perm_idx));
+                int32_t tmp[4];
+                _mm_storeu_si128((__m128i *) tmp, v);
+                dst0[ib] = tmp[0];
+                dst1[ib] = tmp[1];
+                dst2[ib] = tmp[2];
+                dst3[ib] = tmp[3];
+            }
+        }
+#else
         for (int r4 = 0; r4 < nr / 4; ++r4) {
             for (int ib = 0; ib < nb; ++ib) {
                 const auto & a = y4[size_t(r4) * nb + ib];
@@ -3196,7 +3224,23 @@ void ggml_znq_local_prepare_sums(int n, int nr, bool packed, const void * vy, in
                 }
             }
         }
+#endif
     } else {
+#if defined(__AVX2__)
+        const __m256i bias80 = _mm256_set1_epi8((char) 0x80);
+        const __m256i zero = _mm256_setzero_si256();
+        for (int row = 0; row < nr; ++row) {
+            const auto * yr = y + size_t(row) * nb;
+            int32_t * dst_row = sums + size_t(row) * nb;
+            for (int ib = 0; ib < nb; ++ib) {
+                const __m256i u = _mm256_xor_si256(_mm256_loadu_si256((const __m256i *) yr[ib].qs), bias80);
+                const __m256i s64 = _mm256_sad_epu8(u, zero);
+                const __m128i s2 = _mm_add_epi32(_mm256_castsi256_si128(s64), _mm256_extracti128_si256(s64, 1));
+                const int32_t sum_u8 = _mm_cvtsi128_si32(s2) + _mm_extract_epi32(s2, 2);
+                dst_row[ib] = (sum_u8 - 4096) * 128;
+            }
+        }
+#else
         for (int row = 0; row < nr; ++row) {
             for (int ib = 0; ib < nb; ++ib) {
                 int sum = 0;
@@ -3209,6 +3253,7 @@ void ggml_znq_local_prepare_sums(int n, int nr, bool packed, const void * vy, in
                 sums[size_t(row) * nb + ib] = 128 * sum;
             }
         }
+#endif
     }
 }
 
@@ -6171,6 +6216,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
                     size += sizeof_mmid_row_mapping*ne02*(ne12 + 1);
                     size += (ne02 + 1)*sizeof(int32_t);
+                    size = GGML_PAD(size, sizeof(void *)) + sizeof(void *);
 
                     return true;
                 }
@@ -6481,7 +6527,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const uint64_t * cached_route_masks = nullptr;
         if (use_expert_cache && ith == 0) {
             cached_route_masks = ggml_backend_cpu_expert_cache_begin(params->expert_cache, op);
-            if (cached_route_masks != nullptr) {
+            if (cached_route_masks != nullptr && ids->ne[1] <= 1) {
                 for (int64_t token = 0; token < ids->ne[1]; ++token) {
                     for (int id = 0; id < n_ids; ++id) {
                         if (cached_route_masks[token] & (UINT64_C(1) << id)) {
@@ -6522,11 +6568,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             sizeof(int32_t) * sums_stride * (size_t) ne12 * ((size_t) n_ids + (reuse_znq_input ? 1 : 0)) : 0;
         const size_t sums_offset = GGML_PAD(activation_size, sizeof(int32_t));
         const size_t mapping_offset = GGML_PAD(sums_offset + sums_size, sizeof(int64_t));
+        const size_t active_offset = mapping_offset + (size_t) n_as*(ne12 + 1)*sizeof(mmid_row_mapping);
+        const size_t mask_slot_offset = GGML_PAD(active_offset + (size_t) (n_as + 1)*sizeof(int32_t), sizeof(void *));
 
-        GGML_ASSERT(params->wsize >=
-                (mapping_offset +
-                 n_as*(ne12 + 1)*sizeof(mmid_row_mapping) + (n_as + 1)*sizeof(int32_t))
-                );
+        GGML_ASSERT(params->wsize >= mask_slot_offset + sizeof(void *));
 
         auto * wdata          = (char *)params->wdata;
         auto * wdata_src1_end = wdata + mapping_offset;
@@ -6538,6 +6583,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *) (matrix_row_counts + n_as); // [n_as][ne12]
 
         auto * active_experts = (int32_t *) (matrix_rows + n_as*ne12); // [n_as], followed by count
+        const uint64_t ** cached_mask_slot = (const uint64_t **) (wdata + mask_slot_offset);
 
         // Broadcast gate/up inputs are shared by all selected experts.
         char * shared_q8 = reuse_znq_input ? wdata + routed_q8_size : nullptr;
@@ -6603,6 +6649,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 }
             }
             active_experts[n_as] = n_active;
+            *cached_mask_slot = ids->ne[1] > 1 ? cached_route_masks : nullptr;
 
             if (use_znq_moe) {
                 // Seed one task per worker before publishing the route map.
@@ -6612,6 +6659,24 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         ggml_barrier(params->threadpool);
         const int n_active = active_experts[n_as];
+
+        const uint64_t * shared_cached_masks = *cached_mask_slot;
+        if (shared_cached_masks != nullptr) {
+            for (int64_t token = ith; token < ids->ne[1]; token += nth) {
+                const uint64_t mask = shared_cached_masks[token];
+                if (mask == 0) {
+                    continue;
+                }
+                for (int id = 0; id < n_ids; ++id) {
+                    if (mask & (UINT64_C(1) << id)) {
+                        memset((char *) dst->data + token * nb2 + (size_t) id * nb1, 0, (size_t) ne01 * sizeof(float));
+                    }
+                }
+            }
+            if (!use_znq_moe) {
+                ggml_barrier(params->threadpool);
+            }
+        }
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
         if (use_znq_moe) {

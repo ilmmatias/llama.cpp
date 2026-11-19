@@ -5763,7 +5763,7 @@ static void ggml_compute_forward_set_rows_impl(
     assert(ne0  == nc);
     assert(ne2  == ne02);
     assert(ne3  == ne03);
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || (src0->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32));
     assert(ne02 % ne11 == 0);
     assert(ne03 % ne12 == 0);
 
@@ -5796,6 +5796,12 @@ static void ggml_compute_forward_set_rows_impl(
                     from_float(
                             (const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03),
                                             ((char *)  dst->data + i1*nb1  + i02*nb2  + i03*nb3), nc);
+                } else if constexpr (std::is_same_v<src_t, int32_t>) {
+                    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+                    memcpy(
+                            ((char *)  dst->data + i1*nb1  + i02*nb2  + i03*nb3),
+                            ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03),
+                            rs);
                 } else if constexpr (std::is_same_v<src_t, ggml_fp16_t>) {
                     if (dst->type == GGML_TYPE_F16) {
                         memcpy(
@@ -5842,6 +5848,16 @@ void ggml_compute_forward_set_rows(
                     ggml_compute_forward_set_rows_impl<ggml_fp16_t, int64_t>(params, dst);
                 } else if (src1->type == GGML_TYPE_I32) {
                     ggml_compute_forward_set_rows_impl<ggml_fp16_t, int32_t>(params, dst);
+                } else {
+                    GGML_ABORT("src1->type = %d (%s) not supported", src1->type, ggml_type_name(src1->type));
+                }
+            } break;
+        case GGML_TYPE_I32:
+            {
+                if (src1->type == GGML_TYPE_I64) {
+                    ggml_compute_forward_set_rows_impl<int32_t, int64_t>(params, dst);
+                } else if (src1->type == GGML_TYPE_I32) {
+                    ggml_compute_forward_set_rows_impl<int32_t, int32_t>(params, dst);
                 } else {
                     GGML_ABORT("src1->type = %d (%s) not supported", src1->type, ggml_type_name(src1->type));
                 }
@@ -12036,15 +12052,17 @@ void ggml_compute_forward_qsa_mask(const ggml_compute_params * params, ggml_tens
 void ggml_compute_forward_qsa_block_score(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
-    const ggml_tensor * q     = dst->src[0];
-    const ggml_tensor * k     = dst->src[1];
-    const ggml_tensor * cells = dst->src[2];
-    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * q      = dst->src[0];
+    const ggml_tensor * k      = dst->src[1];
+    const ggml_tensor * cells  = dst->src[2];
+    const ggml_tensor * mask   = dst->src[3];
+    const ggml_tensor * bounds = dst->src[4];
 
     GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
     GGML_ASSERT(cells->type == GGML_TYPE_I32);
     GGML_ASSERT(mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(!bounds || bounds->type == GGML_TYPE_I32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
     GGML_TENSOR_LOCALS(size_t, nbq, q,     nb);
@@ -12074,14 +12092,37 @@ void ggml_compute_forward_qsa_block_score(
     const int64_t ir0 = dr*ith;
     const int64_t ir1 = MIN(ir0 + dr, nr);
 
+    std::vector<float> k_f32_buf;
+    if (k->type == GGML_TYPE_F16) {
+        k_f32_buf.resize(n_embd);
+    }
+
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t ib = ir % n_blocks;
         const int64_t iq = (ir/n_blocks) % n_query;
         const int64_t is = ir/(n_blocks*n_query);
+        float mv;
+        if (bounds != nullptr) {
+            const int32_t * bnd = (const int32_t *) ((const char *) bounds->data + iq*bounds->nb[1] + is*bounds->nb[2]);
+            if (ib < bnd[0]) {
+                const int64_t ms = is % mask->ne[2];
+                mv = *(const float *) ((const char *) mask->data + ib*nbm0 + ms*nbm2);
+            } else {
+                mv = ib < bnd[1] ? 1e9f : -INFINITY;
+            }
+        } else {
+            mv = *(const float *) ((const char *) mask->data + ib*nbm0 + iq*nbm1 + is*nbm2);
+        }
         const int32_t cell = *(const int32_t *) ((const char *) cells->data + ib*nbc0 + is*nbc1);
         GGML_ASSERT(cell >= 0 && cell < n_cache);
 
-        const float * k_row = (const float *) ((const char *) k->data + cell*nbk1);
+        const float * k_row;
+        if (k->type == GGML_TYPE_F16) {
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) ((const char *) k->data + cell*nbk1), k_f32_buf.data(), n_embd);
+            k_row = k_f32_buf.data();
+        } else {
+            k_row = (const float *) ((const char *) k->data + cell*nbk1);
+        }
         float score = 0.0f;
         for (int64_t ih = 0; ih < n_head; ++ih) {
             const float * q_row = (const float *) ((const char *) q->data + ih*nbq1 + iq*nbq2 + is*nbq3);
@@ -12090,7 +12131,6 @@ void ggml_compute_forward_qsa_block_score(
             score += MAX(qk, 0.0f);
         }
 
-        const float mv = *(const float *) ((const char *) mask->data + ib*nbm0 + iq*nbm1 + is*nbm2);
         *(float *) ((char *) dst->data + ib*nbd0 + iq*nbd1 + is*nbd2) = score*scale + mv;
     }
 }
