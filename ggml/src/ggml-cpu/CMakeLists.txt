@@ -31,6 +31,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ggml-cpu.cpp
         ggml-cpu/expert-cache.cpp
         ggml-cpu/expert-cache.h
+        ggml-cpu/nvme-expert-cache.cpp
+        ggml-cpu/nvme-expert-cache.h
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h
         ggml-cpu/hbm.cpp
@@ -119,6 +121,17 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_HBM)
 
         target_link_libraries(${GGML_CPU_NAME} PUBLIC memkind)
+    endif()
+
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        find_library(LIBURING_LIBRARY uring)
+        find_path(LIBURING_INCLUDE_DIR liburing.h)
+        if (LIBURING_LIBRARY AND LIBURING_INCLUDE_DIR)
+            message(STATUS "Using liburing for NVMe expert streaming")
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_IO_URING)
+            target_include_directories(${GGML_CPU_NAME} PRIVATE ${LIBURING_INCLUDE_DIR})
+            target_link_libraries(${GGML_CPU_NAME} PRIVATE ${LIBURING_LIBRARY})
+        endif()
     endif()
 
     if (GGML_SYSTEM_ARCH STREQUAL "ARM")

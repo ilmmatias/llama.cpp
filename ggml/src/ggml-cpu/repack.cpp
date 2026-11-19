@@ -7020,6 +7020,210 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                        (int) NB_COLS, (int) INTER_SIZE);
         return ggml::cpu::repack::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>(t, data, data_size);
     }
+
+    int repack_col_align() const override {
+        return NB_COLS;
+    }
+
+    int repack_one(struct ggml_tensor * t, const void * data, size_t data_size) const override {
+        return ggml::cpu::repack::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>(t, data, data_size);
+    }
+
+    bool gemv_one(const struct ggml_tensor * src0, const void * expert_data, bool is_repacked, bool repack_in_place,
+                  const void * src1_q, enum ggml_type src1_q_type,
+                  float * dst_row, int64_t col_start, int64_t col_end) const override {
+        if (src1_q_type != PARAM_TYPE) {
+            return false;
+        }
+        if (col_start >= col_end) {
+            return true;
+        }
+        const int64_t nc = col_end - col_start;
+        if ((nc % NB_COLS) != 0) {
+            return false;
+        }
+        const char * vx = (const char *) expert_data + col_start * src0->nb[1];
+        thread_local std::vector<uint8_t> tl_rep;
+        if (!is_repacked) {
+            const size_t slice_bytes = (size_t) nc * src0->nb[1];
+            if (tl_rep.size() < slice_bytes) {
+                tl_rep.resize(slice_bytes);
+            }
+            struct ggml_tensor slice = *src0;
+            slice.ne[1] = nc;
+            slice.ne[2] = 1;
+            slice.ne[3] = 1;
+            slice.nb[2] = slice_bytes;
+            slice.nb[3] = slice_bytes;
+            slice.data  = tl_rep.data();
+            if (ggml::cpu::repack::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>(&slice, vx, slice_bytes) != 0) {
+                return false;
+            }
+            if (repack_in_place) {
+                memcpy(const_cast<char *>(vx), tl_rep.data(), slice_bytes);
+            } else {
+                vx = (const char *) tl_rep.data();
+            }
+        }
+        gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+            (int) src0->ne[0], dst_row + col_start, (size_t) src0->ne[1],
+            vx, src1_q, 1, (int) nc);
+        return true;
+    }
+
+    bool gemm_rows(const struct ggml_tensor * src0, const void * expert_data, bool is_repacked, bool repack_in_place,
+                   const void * src1_q_base, size_t nb11_q, size_t nb12_q, int64_t ne11,
+                   enum ggml_type src1_q_type, const int32_t * row_map, int64_t cne1,
+                   float * dst_data, size_t dst_nb1, size_t dst_nb2,
+                   int64_t col_start, int64_t col_end) const override {
+        if (src1_q_type != PARAM_TYPE) {
+            return false;
+        }
+        if (col_start >= col_end || cne1 <= 0) {
+            return true;
+        }
+        const int64_t nc = col_end - col_start;
+        if ((nc % NB_COLS) != 0) {
+            return false;
+        }
+
+        const char * vx = (const char *) expert_data + col_start * src0->nb[1];
+        thread_local std::vector<uint8_t> tl_rep;
+        if (!is_repacked) {
+            const size_t slice_bytes = (size_t) nc * src0->nb[1];
+            if (tl_rep.size() < slice_bytes) {
+                tl_rep.resize(slice_bytes);
+            }
+            struct ggml_tensor slice = *src0;
+            slice.ne[1] = nc;
+            slice.ne[2] = 1;
+            slice.ne[3] = 1;
+            slice.nb[2] = slice_bytes;
+            slice.nb[3] = slice_bytes;
+            slice.data  = tl_rep.data();
+            if (ggml::cpu::repack::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>(&slice, vx, slice_bytes) != 0) {
+                return false;
+            }
+            if (repack_in_place) {
+                memcpy(const_cast<char *>(vx), tl_rep.data(), slice_bytes);
+            } else {
+                vx = (const char *) tl_rep.data();
+            }
+        }
+
+        int64_t ir1 = 0;
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+        if constexpr (PARAM_TYPE == GGML_TYPE_Q8_0 && INTER_SIZE == 8) {
+            thread_local std::vector<uint8_t> tl_vy;
+            thread_local std::vector<float>   tl_out;
+            thread_local std::vector<int32_t> tl_sums;
+            const size_t vy_stride   = (size_t) (src0->ne[0] / QK8_0) * sizeof(block_q8_0x4);
+            const size_t sums_stride = (size_t) (src0->ne[0] / QK_ZNQ);
+            const size_t dst_bs1     = dst_nb1 / sizeof(float);
+            const size_t dst_bs2     = dst_nb2 / sizeof(float);
+            const int64_t gemm_nr    = cne1 - (cne1 % 4);
+
+            if (gemm_nr >= 4) {
+                const size_t total_vy = (size_t) (gemm_nr / 4) * vy_stride;
+                if (tl_vy.size() < total_vy) {
+                    tl_vy.resize(total_vy);
+                }
+                if constexpr (local_znq) {
+                    if (tl_sums.size() < (size_t) gemm_nr * sums_stride) {
+                        tl_sums.resize((size_t) gemm_nr * sums_stride);
+                    }
+                }
+                for (int64_t r0 = 0; r0 < gemm_nr; r0 += 4) {
+                    const void * ptrs[4];
+                    for (int r = 0; r < 4; ++r) {
+                        const int32_t i1  = row_map[2 * (r0 + r) + 0];
+                        const int32_t i12 = row_map[2 * (r0 + r) + 1];
+                        const int64_t i11 = i1 % ne11;
+                        ptrs[r] = (const char *) src1_q_base + i11 * nb11_q + i12 * nb12_q;
+                    }
+                    uint8_t * vy_chunk = tl_vy.data() + (size_t) (r0 / 4) * vy_stride;
+                    ggml_repack_q8_0_4x8(ptrs, vy_chunk, src0->ne[0]);
+                    if constexpr (local_znq) {
+                        ggml_znq_local_prepare_sums(src0->ne[0], 4, true, vy_chunk, tl_sums.data() + (size_t) r0 * sums_stride);
+                    }
+                }
+
+                const bool is_znq_m = (src0->type == GGML_TYPE_ZNQ2_M || src0->type == GGML_TYPE_ZNQ3_M || src0->type == GGML_TYPE_ZNQ4_M);
+                if (local_znq || is_znq_m) {
+                    float * out_tile = dst_data + col_start;
+                    if constexpr (local_znq) {
+                        ggml_gemm_znq_local((int) src0->ne[0], out_tile, 0, vx, tl_vy.data(),
+                                            (int) gemm_nr, (int) nc, local_group, row_map, dst_bs1, dst_bs2,
+                                            tl_sums.data(), local_bits, local_selector_bits);
+                    } else if (src0->type == GGML_TYPE_ZNQ2_M) {
+                        ggml_gemm_znq2_m_8x8_q8_0_moe((int) src0->ne[0], out_tile, dst_bs1, dst_bs2,
+                                                      row_map, vx, tl_vy.data(), (int) gemm_nr, (int) nc);
+                    } else if (src0->type == GGML_TYPE_ZNQ3_M) {
+                        ggml_gemm_znq3_m_8x8_q8_0_moe((int) src0->ne[0], out_tile, dst_bs1, dst_bs2,
+                                                      row_map, vx, tl_vy.data(), (int) gemm_nr, (int) nc);
+                    } else {
+                        ggml_gemm_znq4_m_8x8_q8_0_moe((int) src0->ne[0], out_tile, dst_bs1, dst_bs2,
+                                                      row_map, vx, tl_vy.data(), (int) gemm_nr, (int) nc);
+                    }
+                } else {
+                    if (tl_out.size() < (size_t) (gemm_nr * nc)) {
+                        tl_out.resize((size_t) (gemm_nr * nc));
+                    }
+                    gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                        (int) src0->ne[0], tl_out.data(), (size_t) nc,
+                        vx, tl_vy.data(), (int) gemm_nr, (int) nc);
+                    for (int64_t r = 0; r < gemm_nr; ++r) {
+                        const int32_t i1  = row_map[2 * r + 0];
+                        const int32_t i12 = row_map[2 * r + 1];
+                        float * dst_row = (float *) ((char *) dst_data + (size_t) i1 * dst_nb1 + (size_t) i12 * dst_nb2);
+                        memcpy(dst_row + col_start, tl_out.data() + (size_t) r * (size_t) nc, (size_t) nc * sizeof(float));
+                    }
+                }
+                ir1 = gemm_nr;
+            }
+
+            // Multi-row tail (2 or 3 remaining rows): decode weights ONCE across all tail rows
+            const int64_t tail_rows = cne1 - ir1;
+            if ((local_znq || src0->type == GGML_TYPE_ZNQ3_M) && tail_rows > 1 && nc >= 16) {
+                const size_t row_q8_bytes = (size_t) (src0->ne[0] / QK8_0) * sizeof(block_q8_0);
+                if (tl_vy.size() < (size_t) tail_rows * row_q8_bytes) {
+                    tl_vy.resize((size_t) tail_rows * row_q8_bytes);
+                }
+                if (tl_out.size() < (size_t) (tail_rows * nc)) {
+                    tl_out.resize((size_t) (tail_rows * nc));
+                }
+                for (int64_t r = 0; r < tail_rows; ++r) {
+                    const int32_t i1  = row_map[2 * (ir1 + r) + 0];
+                    const int32_t i12 = row_map[2 * (ir1 + r) + 1];
+                    const int64_t i11 = i1 % ne11;
+                    const void * src1_col = (const char *) src1_q_base + i11 * nb11_q + i12 * nb12_q;
+                    memcpy(tl_vy.data() + (size_t) r * row_q8_bytes, src1_col, row_q8_bytes);
+                }
+                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                    (int) src0->ne[0], tl_out.data(), (size_t) nc,
+                    vx, tl_vy.data(), (int) tail_rows, (int) nc);
+                for (int64_t r = 0; r < tail_rows; ++r) {
+                    const int32_t i1  = row_map[2 * (ir1 + r) + 0];
+                    const int32_t i12 = row_map[2 * (ir1 + r) + 1];
+                    float * dst_row = (float *) ((char *) dst_data + (size_t) i1 * dst_nb1 + (size_t) i12 * dst_nb2);
+                    memcpy(dst_row + col_start, tl_out.data() + (size_t) r * (size_t) nc, (size_t) nc * sizeof(float));
+                }
+                ir1 = cne1;
+            }
+        }
+#endif
+        for (; ir1 < cne1; ++ir1) {
+            const int32_t i1  = row_map[2 * ir1 + 0];
+            const int32_t i12 = row_map[2 * ir1 + 1];
+            const int64_t i11 = i1 % ne11;
+            const void * src1_col = (const char *) src1_q_base + i11 * nb11_q + i12 * nb12_q;
+            float * dst_row = (float *) ((char *) dst_data + (size_t) i1 * dst_nb1 + (size_t) i12 * dst_nb2);
+            gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                (int) src0->ne[0], dst_row + col_start, (size_t) src0->ne[1],
+                vx, src1_col, 1, (int) nc);
+        }
+        return true;
+    }
 };
 
 }  // namespace ggml::cpu::repack
@@ -7471,4 +7675,59 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void) {
     };
 
     return &ggml_backend_cpu_buffer_type_repack;
+}
+
+extern "C" bool ggml_cpu_nvme_can_repack(const struct ggml_tensor * t) {
+    return t != nullptr && ggml_repack_get_optimal_repack_type(t) != nullptr;
+}
+
+extern "C" int ggml_cpu_nvme_repack_col_align(const struct ggml_tensor * t) {
+    if (t == nullptr) {
+        return 0;
+    }
+    const auto * traits = ggml_repack_get_optimal_repack_type(t);
+    return traits != nullptr ? traits->repack_col_align() : 0;
+}
+
+extern "C" bool ggml_cpu_nvme_repack_expert(const struct ggml_tensor * t, const void * native_src, void * repacked_dst, size_t expert_bytes) {
+    if (t == nullptr || native_src == nullptr || repacked_dst == nullptr) {
+        return false;
+    }
+    const auto * traits = ggml_repack_get_optimal_repack_type(t);
+    if (traits == nullptr) {
+        return false;
+    }
+    struct ggml_tensor slice = *t;
+    slice.ne[2] = 1;
+    slice.ne[3] = 1;
+    slice.nb[3] = slice.nb[2];
+    slice.data  = repacked_dst;
+    return traits->repack_one(&slice, native_src, expert_bytes) == 0;
+}
+
+extern "C" bool ggml_cpu_nvme_repack_gemv(const struct ggml_tensor * src0, const void * repacked_expert, bool is_repacked, bool repack_in_place,
+        const void * src1_q, enum ggml_type src1_q_type, float * dst_row, int64_t col_start, int64_t col_end) {
+    if (src0 == nullptr || repacked_expert == nullptr || src1_q == nullptr || dst_row == nullptr) {
+        return false;
+    }
+    const auto * traits = ggml_repack_get_optimal_repack_type(src0);
+    if (traits == nullptr) {
+        return false;
+    }
+    return traits->gemv_one(src0, repacked_expert, is_repacked, repack_in_place, src1_q, src1_q_type, dst_row, col_start, col_end);
+}
+
+extern "C" bool ggml_cpu_nvme_repack_gemm_rows(const struct ggml_tensor * src0, const void * expert_data, bool is_repacked, bool repack_in_place,
+        const void * src1_q_base, size_t nb11_q, size_t nb12_q, int64_t ne11,
+        enum ggml_type src1_q_type, const int32_t * row_map, int64_t cne1,
+        float * dst_data, size_t dst_nb1, size_t dst_nb2, int64_t col_start, int64_t col_end) {
+    if (src0 == nullptr || expert_data == nullptr || src1_q_base == nullptr || row_map == nullptr || dst_data == nullptr) {
+        return false;
+    }
+    const auto * traits = ggml_repack_get_optimal_repack_type(src0);
+    if (traits == nullptr) {
+        return false;
+    }
+    return traits->gemm_rows(src0, expert_data, is_repacked, repack_in_place, src1_q_base, nb11_q, nb12_q, ne11,
+            src1_q_type, row_map, cne1, dst_data, dst_nb1, dst_nb2, col_start, col_end);
 }

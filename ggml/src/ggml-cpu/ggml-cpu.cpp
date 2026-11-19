@@ -741,6 +741,18 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_expert_cache_get_buffer_size") == 0) {
         return (void *) ggml_backend_cpu_expert_cache_get_buffer_size;
     }
+    if (strcmp(name, "ggml_backend_cpu_expert_cache_enable_nvme") == 0) {
+        return (void *) ggml_backend_cpu_expert_cache_enable_nvme;
+    }
+    if (strcmp(name, "ggml_backend_cpu_expert_cache_register_nvme") == 0) {
+        return (void *) ggml_backend_cpu_expert_cache_register_nvme;
+    }
+    if (strcmp(name, "ggml_backend_cpu_expert_cache_register_nvme_router") == 0) {
+        return (void *) ggml_backend_cpu_expert_cache_register_nvme_router;
+    }
+    if (strcmp(name, "ggml_backend_cpu_expert_cache_nvme_memory") == 0) {
+        return (void *) ggml_backend_cpu_expert_cache_nvme_memory;
+    }
 
     // threadpool - TODO:  move to ggml-base
     if (strcmp(name, "ggml_threadpool_new") == 0) {

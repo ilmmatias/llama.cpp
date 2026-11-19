@@ -1759,20 +1759,25 @@ static void ggml_compute_forward_mul_mat_id(
     const int n_as  = ne02;       // n_expert
 
     const bool use_expert_cache = params->expert_cache != NULL && ggml_cpu_expert_cache_supports_ids(ids);
+    const bool use_nvme_cache   = params->expert_cache != NULL && ggml_backend_cpu_expert_cache_is_nvme(params->expert_cache, dst);
     const uint64_t * cached_route_masks = NULL;
+    uint64_t nvme_pending_mask = 0;
+    uint8_t * nvme_ready_ids = NULL;
     struct ggml_compute_params cache_params;
-    if (use_expert_cache) {
-        // Publish one frozen mask pointer to all workers without allocating per-op state.
-        // The plan reserves this prefix even when the cache is attached after planning.
+    if (use_expert_cache || use_nvme_cache) {
+        // Publish frozen mask pointers/bitmasks to all workers without allocating per-op state.
+        // The plan reserves this 64-byte prefix even when the cache is attached after planning.
+        nvme_ready_ids = (uint8_t *) params->wdata + sizeof(cached_route_masks) + sizeof(nvme_pending_mask);
         cache_params = *params;
-        cache_params.wdata = (void *) GGML_PAD((uintptr_t) params->wdata + sizeof(cached_route_masks), 64);
+        cache_params.wdata = (void *) GGML_PAD((uintptr_t) params->wdata + sizeof(cached_route_masks) + sizeof(nvme_pending_mask), 64);
         const size_t prefix_size = (char *) cache_params.wdata - (char *) params->wdata;
         GGML_ASSERT(params->wsize >= prefix_size);
         cache_params.wsize -= prefix_size;
 
         if (ith == 0) {
-            cached_route_masks = ggml_backend_cpu_expert_cache_begin(params->expert_cache, dst);
-            memcpy(params->wdata, &cached_route_masks, sizeof(cached_route_masks));
+            if (use_expert_cache) {
+                cached_route_masks = ggml_backend_cpu_expert_cache_begin(params->expert_cache, dst);
+            }
             if (cached_route_masks != NULL) {
                 for (int64_t token = 0; token < ids->ne[1]; ++token) {
                     for (int id = 0; id < n_ids; ++id) {
@@ -1782,9 +1787,27 @@ static void ggml_compute_forward_mul_mat_id(
                     }
                 }
             }
+            if (use_nvme_cache) {
+                ggml_backend_cpu_expert_cache_nvme_begin(params->expert_cache, dst, cached_route_masks);
+                if (ids->ne[1] == 1 && ne12 == 1 && ne13 == 1 && n_ids <= 64) {
+                    for (int id = 0; id < n_ids; ++id) {
+                        if (cached_route_masks != NULL && (cached_route_masks[0] & (UINT64_C(1) << id))) {
+                            continue;
+                        }
+                        const int32_t cur_a = *(const int32_t *) ((const char *) ids->data + id*ids->nb[0]);
+                        if (cur_a >= 0 && cur_a < n_as &&
+                                ggml_backend_cpu_expert_cache_nvme_get_expert(params->expert_cache, dst, cur_a, false) == NULL) {
+                            nvme_pending_mask |= (UINT64_C(1) << id);
+                        }
+                    }
+                }
+            }
+            memcpy(params->wdata, &cached_route_masks, sizeof(cached_route_masks));
+            memcpy((char *) params->wdata + sizeof(cached_route_masks), &nvme_pending_mask, sizeof(nvme_pending_mask));
         }
         ggml_barrier(params->threadpool);
         memcpy(&cached_route_masks, params->wdata, sizeof(cached_route_masks));
+        memcpy(&nvme_pending_mask, (const char *) params->wdata + sizeof(cached_route_masks), sizeof(nvme_pending_mask));
         params = &cache_params;
     }
 
@@ -1849,28 +1872,151 @@ static void ggml_compute_forward_mul_mat_id(
         const int64_t dr0 = (ne01 + nth - 1) / nth;
         const int64_t ir0_start = dr0 * ith;
         const int64_t ir0_end   = MIN(ir0_start + dr0, ne01);
-        if (ir0_start < ir0_end) {
+        if (!use_nvme_cache) {
+            if (ir0_start < ir0_end) {
+                for (int id = 0; id < n_ids; ++id) {
+                    if (cached_route_masks != NULL && (cached_route_masks[0] & (UINT64_C(1) << id))) {
+                        continue;
+                    }
+                    const int32_t cur_a = *(const int32_t *) ((const char *) ids->data + id*ids->nb[0]);
+                    GGML_ASSERT(cur_a == -1 || (cur_a >= 0 && cur_a < n_as));
+                    if (cur_a == -1) {
+                        memset((char *) dst->data + id*nb1 + ir0_start*nb0, 0, (ir0_end - ir0_start)*sizeof(float));
+                        continue;
+                    }
+                    const struct mmid_row_mapping direct = { id, 0 };
+                    ggml_compute_forward_mul_mat_id_one_chunk(
+                        dst, src0, src1, ids, cur_a,
+                        ir0_start, ir0_end, 0, 1,
+                        (const char *) src0->data + cur_a*nb02, NULL, row_size, src1_cont, src1_q, &direct);
+                }
+            }
+        } else {
+            // 2-pass NVMe overlap: Pass 0 computes all L2-RAM-resident experts immediately
+            // (using AVX-512 repacked GEMV when repacked!) while io_uring fetches L3 NVMe misses
+            // in parallel; Pass 1 waits & computes misses.
+            const int col_align = ggml_cpu_nvme_repack_col_align(src0);
+            int64_t rep_start = (ith * ne01) / nth;
+            int64_t rep_end   = ((ith + 1) * ne01) / nth;
+            if (col_align > 0) {
+                rep_start = (rep_start % col_align) ? rep_start + col_align - (rep_start % col_align) : rep_start;
+                rep_end   = (rep_end   % col_align) ? rep_end   + col_align - (rep_end   % col_align) : rep_end;
+                if (rep_end > ne01) {
+                    rep_end = ne01;
+                }
+            }
+            const size_t src1_q_stride = src1_priv != NULL ? row_size : nb11;
+
+            const uint64_t pending_mask = nvme_pending_mask;
             for (int id = 0; id < n_ids; ++id) {
                 if (cached_route_masks != NULL && (cached_route_masks[0] & (UINT64_C(1) << id))) {
+                    continue;
+                }
+                if (pending_mask & (UINT64_C(1) << id)) {
                     continue;
                 }
                 const int32_t cur_a = *(const int32_t *) ((const char *) ids->data + id*ids->nb[0]);
                 GGML_ASSERT(cur_a == -1 || (cur_a >= 0 && cur_a < n_as));
                 if (cur_a == -1) {
-                    memset((char *) dst->data + id*nb1 + ir0_start*nb0, 0, (ir0_end - ir0_start)*sizeof(float));
+                    if (ir0_start < ir0_end) {
+                        memset((char *) dst->data + id*nb1 + ir0_start*nb0, 0, (ir0_end - ir0_start)*sizeof(float));
+                    }
                     continue;
                 }
-                const struct mmid_row_mapping direct = { id, 0 };
-                ggml_compute_forward_mul_mat_id_one_chunk(
-                    dst, src0, src1, ids, cur_a,
-                    ir0_start, ir0_end, 0, 1,
-                    (const char *) src0->data + cur_a*nb02, NULL, row_size, src1_cont, src1_q, &direct);
+                const void * expert_ptr = ggml_backend_cpu_expert_cache_nvme_get_expert(params->expert_cache, dst, cur_a, false);
+                const int rep_state = ggml_backend_cpu_expert_cache_nvme_is_repacked(params->expert_cache, dst, cur_a) & 3;
+                if (col_align > 0 && (rep_state == 1 || rep_state == 2)) {
+                    if (rep_start < rep_end) {
+                        const void * src1_row = (const char *) src1_q + (size_t) (id % ne11) * src1_q_stride;
+                        float * dst_row = (float *) ((char *) dst->data + (size_t) id * nb1);
+                        if (!ggml_cpu_nvme_repack_gemv(src0, expert_ptr, rep_state == 1, rep_state == 2, src1_row, vec_dot_type, dst_row, rep_start, rep_end)) {
+                            const struct mmid_row_mapping direct = { id, 0 };
+                            ggml_compute_forward_mul_mat_id_one_chunk(
+                                dst, src0, src1, ids, cur_a,
+                                rep_start, rep_end, 0, 1,
+                                expert_ptr, NULL, row_size, src1_cont, src1_q, &direct);
+                        }
+                    }
+                } else if (ir0_start < ir0_end) {
+                    const struct mmid_row_mapping direct = { id, 0 };
+                    ggml_compute_forward_mul_mat_id_one_chunk(
+                        dst, src0, src1, ids, cur_a,
+                        ir0_start, ir0_end, 0, 1,
+                        expert_ptr, NULL, row_size, src1_cont, src1_q, &direct);
+                }
+            }
+            if (pending_mask != 0) {
+                uint64_t rem_mask = pending_mask;
+                int miss_step = 0;
+                while (rem_mask != 0) {
+                    if (ith == 0) {
+                        int ready_id = -1;
+                        ggml_backend_cpu_expert_cache_nvme_get_expert(params->expert_cache, dst, -1, false);
+                        for (uint64_t m = rem_mask; m != 0; m &= m - 1) {
+                            const int cand_id = __builtin_ctzll(m);
+                            const int32_t cand_a = *(const int32_t *) ((const char *) ids->data + cand_id*ids->nb[0]);
+                            if (ggml_backend_cpu_expert_cache_nvme_get_expert(params->expert_cache, dst, cand_a, false) != NULL) {
+                                ready_id = cand_id;
+                                break;
+                            }
+                        }
+                        while (ready_id < 0) {
+                            ggml_backend_cpu_expert_cache_nvme_get_expert(params->expert_cache, dst, -1, true);
+                            for (uint64_t m = rem_mask; m != 0; m &= m - 1) {
+                                const int cand_id = __builtin_ctzll(m);
+                                const int32_t cand_a = *(const int32_t *) ((const char *) ids->data + cand_id*ids->nb[0]);
+                                if (ggml_backend_cpu_expert_cache_nvme_get_expert(params->expert_cache, dst, cand_a, false) != NULL) {
+                                    ready_id = cand_id;
+                                    break;
+                                }
+                            }
+                            if (ready_id < 0) {
+                                const int first_id = __builtin_ctzll(rem_mask);
+                                const int32_t first_a = *(const int32_t *) ((const char *) ids->data + first_id*ids->nb[0]);
+                                ggml_backend_cpu_expert_cache_nvme_get_expert(params->expert_cache, dst, first_a, true);
+                                ready_id = first_id;
+                            }
+                        }
+                        nvme_ready_ids[miss_step & 31] = (uint8_t) ready_id;
+                    }
+                    ggml_barrier(params->threadpool);
+                    const int id = (int) nvme_ready_ids[miss_step & 31];
+                    miss_step++;
+                    rem_mask &= ~(UINT64_C(1) << id);
+                    const int32_t cur_a = *(const int32_t *) ((const char *) ids->data + id*ids->nb[0]);
+                    const void * expert_ptr = ggml_backend_cpu_expert_cache_nvme_get_expert(params->expert_cache, dst, cur_a, false);
+                    const int rep_state = ggml_backend_cpu_expert_cache_nvme_is_repacked(params->expert_cache, dst, cur_a) & 3;
+                    if (col_align > 0 && (rep_state == 1 || rep_state == 2)) {
+                        if (rep_start < rep_end) {
+                            const void * src1_row = (const char *) src1_q + (size_t) (id % ne11) * src1_q_stride;
+                            float * dst_row = (float *) ((char *) dst->data + (size_t) id * nb1);
+                            if (!ggml_cpu_nvme_repack_gemv(src0, expert_ptr, rep_state == 1, rep_state == 2, src1_row, vec_dot_type, dst_row, rep_start, rep_end)) {
+                                const struct mmid_row_mapping direct = { id, 0 };
+                                ggml_compute_forward_mul_mat_id_one_chunk(
+                                    dst, src0, src1, ids, cur_a,
+                                    rep_start, rep_end, 0, 1,
+                                    expert_ptr, NULL, row_size, src1_cont, src1_q, &direct);
+                            }
+                        }
+                    } else if (ir0_start < ir0_end) {
+                        const struct mmid_row_mapping direct = { id, 0 };
+                        ggml_compute_forward_mul_mat_id_one_chunk(
+                            dst, src0, src1, ids, cur_a,
+                            ir0_start, ir0_end, 0, 1,
+                            expert_ptr, NULL, row_size, src1_cont, src1_q, &direct);
+                    }
+                }
             }
         }
-        if (use_expert_cache) {
+        if (use_expert_cache || use_nvme_cache) {
             ggml_barrier(params->threadpool);
             if (ith == 0) {
-                ggml_backend_cpu_expert_cache_end(params->expert_cache, dst);
+                if (use_nvme_cache) {
+                    ggml_backend_cpu_expert_cache_nvme_end(params->expert_cache, dst);
+                }
+                if (use_expert_cache) {
+                    ggml_backend_cpu_expert_cache_end(params->expert_cache, dst);
+                }
             }
         }
         return;
@@ -1893,6 +2039,18 @@ static void ggml_compute_forward_mul_mat_id(
             const int64_t i13 = ir/(ne12*ne11);
             const int64_t i12 = (ir - i13*ne12*ne11)/ne11;
             const int64_t i11 = ir - i13*ne12*ne11 - i12*ne11;
+            if (cached_route_masks != NULL && ne13 == 1 && ne12 == ids->ne[1]) {
+                bool needed = false;
+                for (int64_t id = i11; id < n_ids; id += ne11) {
+                    if ((cached_route_masks[i12] & (UINT64_C(1) << id)) == 0) {
+                        needed = true;
+                        break;
+                    }
+                }
+                if (!needed) {
+                    continue;
+                }
+            }
             from_float((const float *) ((const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
                        (void *) (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
                        ne10);
@@ -1922,6 +2080,9 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
+        if (use_nvme_cache) {
+            ggml_threadpool_chunk_set(params->threadpool, nth);
+        }
     }
 
     // reset current_chunk
@@ -1932,82 +2093,211 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
-    for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+    int32_t nvme_active_list[4096];
+    int nvme_n_active = 0;
+    int nvme_n_hits = 0;
+    int nvme_n_miss = 0;
+    if (use_nvme_cache) {
+        GGML_ASSERT(n_as <= 4096);
+        // Partition active experts into Pass 0 (already resident in L2 RAM) followed by Pass 1 (L3 NVMe misses)
+        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+            if (matrix_row_counts[cur_a] > 0 &&
+                    (ggml_backend_cpu_expert_cache_nvme_is_repacked(params->expert_cache, dst, cur_a) & 4) != 0) {
+                nvme_active_list[nvme_n_active++] = cur_a;
+            }
+        }
+        nvme_n_hits = nvme_n_active;
+        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+            if (matrix_row_counts[cur_a] > 0 &&
+                    (ggml_backend_cpu_expert_cache_nvme_is_repacked(params->expert_cache, dst, cur_a) & 4) == 0) {
+                nvme_active_list[nvme_n_active++] = cur_a;
+            }
+        }
+        nvme_n_miss = nvme_n_active - nvme_n_hits;
+        // Kick off async io_uring reads for the first PP_WINDOW L3 misses before Pass 0 computes L2 hits!
+        if (nvme_n_miss > 0 && ith == 0) {
+            ggml_backend_cpu_expert_cache_nvme_pp_prepare(
+                    params->expert_cache, dst, nvme_active_list + nvme_n_hits, -1, nvme_n_miss);
+        }
+    }
+
+    const int col_align_op = use_nvme_cache ? ggml_cpu_nvme_repack_col_align(src0) : 0;
+    const bool dynamic_pass0 = use_nvme_cache && col_align_op > 0 && (ne01 % col_align_op == 0) && (nvme_n_hits >= nth * 2);
+    if (dynamic_pass0) {
+        const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+        const void * src1_base = (src1->type == vec_dot_type) ? src1->data : wdata;
+        const size_t nb11_q    = (src1->type == vec_dot_type) ? nb11 : row_size;
+        const size_t nb12_q    = (src1->type == vec_dot_type) ? nb12 : row_size * ne11;
+
+        for (int h = ith; h < nvme_n_hits; h = ggml_threadpool_chunk_add(params->threadpool, 1)) {
+            const int cur_a = nvme_active_list[h];
+            const int64_t cne1 = matrix_row_counts[cur_a];
+            const char * src0_cur = (const char *) ggml_backend_cpu_expert_cache_nvme_get_expert(params->expert_cache, dst, cur_a, false);
+            const int nvme_rep_state = ggml_backend_cpu_expert_cache_nvme_is_repacked(params->expert_cache, dst, cur_a) & 3;
+            const bool is_repacked = (nvme_rep_state == 1);
+            const bool repack_in_place = (nvme_rep_state == 2);
+            ggml_cpu_nvme_repack_gemm_rows(
+                    src0, src0_cur, is_repacked, repack_in_place,
+                    src1_base, nb11_q, nb12_q, ne11, vec_dot_type,
+                    (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), cne1,
+                    (float *) dst->data, nb1, nb2, 0, ne01);
+        }
+    }
+
+    const int pp_miss_batch = (src0->nb[2] >= 2 * 1024 * 1024) ? 1 : 4;
+    const int n_loop = use_nvme_cache ? nvme_n_active : n_as;
+    for (int loop_idx = dynamic_pass0 ? nvme_n_hits : 0; loop_idx < n_loop; ++loop_idx) {
+        const int cur_a = use_nvme_cache ? nvme_active_list[loop_idx] : loop_idx;
         const int64_t cne1 = matrix_row_counts[cur_a];
 
         if (cne1 == 0) {
             continue;
         }
 
-        // tiled takes over if profitable for this expert (see tiled.h)
-        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
-            continue;
-        }
+        const char * src0_cur = NULL;
+        int nvme_rep_state = 0;
+        const int miss_idx = loop_idx - nvme_n_hits;
+        const bool is_end_of_miss_batch = use_nvme_cache && (miss_idx >= 0) &&
+                (((miss_idx + 1) % pp_miss_batch == 0) || (miss_idx + 1 == nvme_n_miss));
 
-        if (iqp && ggml_cpu_iqp_mul_mat_id_min_batch(cne1)) {
-            ggml_compute_forward_mul_mat_id_iqp(params, dst, cur_a, cne1,
-                    (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), iqp_scratch);
-            continue;
-        }
+        if (use_nvme_cache) {
+            if (miss_idx >= 0 && (miss_idx % pp_miss_batch == 0)) {
+                if (ith == 0) {
+                    const int b_end = MIN(miss_idx + pp_miss_batch, nvme_n_miss);
+                    for (int b = miss_idx; b < b_end; ++b) {
+                        ggml_backend_cpu_expert_cache_nvme_pp_prepare(
+                                params->expert_cache, dst, nvme_active_list + nvme_n_hits, b, nvme_n_miss);
+                    }
+                }
+                ggml_barrier(params->threadpool);
+            }
+            src0_cur = (const char *) ggml_backend_cpu_expert_cache_nvme_get_expert(params->expert_cache, dst, cur_a, false);
+            nvme_rep_state = ggml_backend_cpu_expert_cache_nvme_is_repacked(params->expert_cache, dst, cur_a) & 3;
+        } else {
+            // tiled takes over if profitable for this expert (see tiled.h)
+            if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch, NULL)) {
+                continue;
+            }
 
-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+            if (iqp && ggml_cpu_iqp_mul_mat_id_min_batch(cne1)) {
+                ggml_compute_forward_mul_mat_id_iqp(params, dst, cur_a, cne1,
+                        (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), iqp_scratch);
+                continue;
+            }
+
+            src0_cur = (const char *) src0->data + cur_a * nb02;
+        }
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
-        const int64_t nr0 = ne01;
-        const int64_t nr1 = cne1;
-
-        int chunk_size = 16;
-        if (nr0 == 1 || nr1 == 1) {
-            chunk_size = 64;
+        bool handled_nvme = false;
+        if (use_nvme_cache) {
+            const bool is_repacked = (nvme_rep_state == 1);
+            const bool repack_in_place = (nvme_rep_state == 2);
+            // 1. Native K/IQ-quant tiled GEMM (when not repacked and not in-place ZNQ repack)
+            if (!is_repacked && !repack_in_place &&
+                    ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch, src0_cur)) {
+                handled_nvme = true;
+            }
+            // 2. Repacked L2 hits, in-place parallel L2 slot repack, OR multi-row AVX-512 GEMM/GEMV (for cne1 >= 2)
+            if (!handled_nvme) {
+                const int col_align = ggml_cpu_nvme_repack_col_align(src0);
+                if (col_align > 0 && (is_repacked || repack_in_place || cne1 >= 2)) {
+                    int64_t rep_start = (ith * ne01) / nth;
+                    int64_t rep_end   = ((ith + 1) * ne01) / nth;
+                    rep_start = (rep_start % col_align) ? rep_start + col_align - (rep_start % col_align) : rep_start;
+                    rep_end   = (rep_end   % col_align) ? rep_end   + col_align - (rep_end   % col_align) : rep_end;
+                    if (rep_end > ne01) {
+                        rep_end = ne01;
+                    }
+                    const void * src1_base = (src1->type == vec_dot_type) ? src1->data : wdata;
+                    const size_t nb11_q    = (src1->type == vec_dot_type) ? nb11 : row_size;
+                    const size_t nb12_q    = (src1->type == vec_dot_type) ? nb12 : row_size * ne11;
+                    const bool ok = (rep_start >= rep_end) || ggml_cpu_nvme_repack_gemm_rows(
+                            src0, src0_cur, is_repacked, repack_in_place,
+                            src1_base, nb11_q, nb12_q, ne11, vec_dot_type,
+                            (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), cne1,
+                            (float *) dst->data, nb1, nb2, rep_start, rep_end);
+                    if (ok) {
+                        handled_nvme = true;
+                    }
+                }
+            }
         }
 
-        // disable for NUMA
-        const bool disable_chunking = ggml_is_numa();
+        if (!handled_nvme) {
+            const int64_t nr0 = ne01;
+            const int64_t nr1 = cne1;
 
-        int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
-        int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
-
-        if (nchunk0 * nchunk1 < nth * 4 || disable_chunking) {
-            nchunk0 = nr0 > nr1 ? nth : 1;
-            nchunk1 = nr0 > nr1 ? 1 : nth;
-        }
-
-        const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
-        const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
-
-        int current_chunk = ith;
-
-        atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
-
-        while (current_chunk < nchunk0 * nchunk1) {
-            const int64_t ith0 = current_chunk % nchunk0;
-            const int64_t ith1 = current_chunk / nchunk0;
-
-            const int64_t ir0_start = dr0 * ith0;
-            const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
-
-            const int64_t ir1_start = dr1 * ith1;
-            const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
-
-            ggml_compute_forward_mul_mat_id_one_chunk(
-                dst, src0, src1, ids, cur_a,
-                ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata, NULL
-            );
-
-            if (nth >= nchunk0 * nchunk1) {
-                break;
+            int chunk_size = 16;
+            if (nr0 == 1 || nr1 == 1) {
+                chunk_size = 64;
             }
 
-            current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
+            // disable for NUMA
+            const bool disable_chunking = ggml_is_numa();
+
+            int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+            int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
+
+            if (nchunk0 * nchunk1 < nth * 4 || disable_chunking) {
+                nchunk0 = nr0 > nr1 ? nth : 1;
+                nchunk1 = nr0 > nr1 ? 1 : nth;
+            }
+
+            const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+            const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
+
+            int current_chunk = ith;
+
+            atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+
+            while (current_chunk < nchunk0 * nchunk1) {
+                const int64_t ith0 = current_chunk % nchunk0;
+                const int64_t ith1 = current_chunk / nchunk0;
+
+                const int64_t ir0_start = dr0 * ith0;
+                const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
+
+                const int64_t ir1_start = dr1 * ith1;
+                const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
+
+                ggml_compute_forward_mul_mat_id_one_chunk(
+                    dst, src0, src1, ids, cur_a,
+                    ir0_start, ir0_end, ir1_start, ir1_end,
+                    src0_cur, matrix_rows, row_size, src1_cont, wdata, NULL
+                );
+
+                if (nth >= nchunk0 * nchunk1) {
+                    break;
+                }
+
+                current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
+            }
+        }
+
+        if (is_end_of_miss_batch) {
+            ggml_barrier(params->threadpool);
+            if (ith == 0) {
+                const int b_start = miss_idx - (miss_idx % pp_miss_batch);
+                for (int b = b_start; b <= miss_idx; ++b) {
+                    ggml_backend_cpu_expert_cache_nvme_pp_release(
+                            params->expert_cache, dst, nvme_active_list[nvme_n_hits + b]);
+                }
+            }
         }
     }
 
-    if (use_expert_cache) {
+    if (use_expert_cache || use_nvme_cache) {
         ggml_barrier(params->threadpool);
         if (ith == 0) {
-            ggml_backend_cpu_expert_cache_end(params->expert_cache, dst);
+            if (use_nvme_cache) {
+                ggml_backend_cpu_expert_cache_nvme_end(params->expert_cache, dst);
+            }
+            if (use_expert_cache) {
+                ggml_backend_cpu_expert_cache_end(params->expert_cache, dst);
+            }
         }
     }
 }

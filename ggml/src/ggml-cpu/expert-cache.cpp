@@ -1,4 +1,5 @@
 #include "expert-cache.h"
+#include "nvme-expert-cache.h"
 
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
@@ -996,6 +997,7 @@ public:
     }
 
     bool is_valid() const { return valid; }
+    void set_nvme_store(nvme_expert_cache * store) { nvme_store = store; }
     ggml_backend_dev_t get_device() const { return ggml_backend_get_device(compute_backend); }
     uint64_t hits() const { return gpu_hits.load(std::memory_order_relaxed); }
 
@@ -1458,7 +1460,8 @@ private:
         layer.bundle_bytes = 0;
         layer.part_bytes.clear();
         for (const auto * tensor : layer.parts) {
-            if (tensor == nullptr || tensor->data == nullptr || tensor->ne[2] != layer.n_expert || tensor->ne[3] != 1) {
+            if (tensor == nullptr || (tensor->data == nullptr && (nvme_store == nullptr || !nvme_store->has_tensor(tensor))) ||
+                tensor->ne[2] != layer.n_expert || tensor->ne[3] != 1) {
                 layer.disabled = true;
                 return false;
             }
@@ -2670,7 +2673,10 @@ private:
             uint8_t * dst = (uint8_t *) s.ptr;
             bool converted = true;
             for (size_t i = 0; i < parts.size(); ++i) {
-                if (!copy_native_expert(parts[i], req.expert, dst, part_bytes[i])) {
+                const bool ok = (nvme_store != nullptr && nvme_store->has_tensor(parts[i]))
+                    ? nvme_store->copy_expert_to_staging(parts[i], req.expert, dst, part_bytes[i])
+                    : copy_native_expert(parts[i], req.expert, dst, part_bytes[i]);
+                if (!ok) {
                     converted = false;
                     break;
                 }
@@ -2771,6 +2777,7 @@ private:
     const uint32_t slots;
     const uint32_t admit_window;
     const uint32_t convert_workers;
+    nvme_expert_cache * nvme_store = nullptr;
     ggml_backend_t upload_backend = nullptr;
     ggml_backend_t compute_backend = nullptr;
     ggml_backend_buffer_type_t device_buft = nullptr;
@@ -2866,10 +2873,28 @@ extern "C" bool ggml_cpu_expert_cache_unpack(const ggml_tensor * tensor, int32_t
     return is_cpu_repack_tensor(tensor) && unpack_repacked_znq_expert(tensor, expert, dst, size);
 }
 
+extern "C" bool ggml_cpu_nvme_unpack_znq_expert(const ggml_tensor * tensor, const void * repacked_src, void * dst, size_t dst_size) {
+    if (tensor == nullptr || repacked_src == nullptr || dst == nullptr) {
+        return false;
+    }
+    ggml_tensor slice = *tensor;
+    slice.ne[2] = 1;
+    slice.ne[3] = 1;
+    slice.data  = const_cast<void *>(repacked_src);
+    return unpack_repacked_znq_expert(&slice, 0, dst, dst_size);
+}
+
 
 struct ggml_backend_cpu_expert_cache {
+    std::unique_ptr<nvme_expert_cache> nvme;
     std::vector<std::unique_ptr<expert_cache>> devices;
     std::unordered_map<const ggml_tensor *, expert_cache *> weights;
+
+    ~ggml_backend_cpu_expert_cache() {
+        devices.clear();
+        weights.clear();
+        nvme.reset();
+    }
 
     expert_cache * find(const ggml_tensor * op) const {
         if (!op || op->op != GGML_OP_MUL_MAT_ID) {
@@ -2903,6 +2928,7 @@ extern "C" bool ggml_backend_cpu_expert_cache_add_device(
     if (!entry->is_valid()) {
         return false;
     }
+    entry->set_nvme_store(cache->nvme.get());
     cache->devices.push_back(std::move(entry));
     return true;
 }
@@ -2992,7 +3018,13 @@ extern "C" void ggml_backend_cpu_expert_cache_end(ggml_backend_cpu_expert_cache_
 extern "C" ggml_backend_dev_t ggml_backend_cpu_expert_cache_device(
         ggml_backend_cpu_expert_cache_t cache, const ggml_tensor * op) {
     auto * entry = cache ? cache->find(op) : nullptr;
-    return entry ? entry->device(op) : nullptr;
+    if (entry != nullptr) {
+        return entry->device(op);
+    }
+    if (cache && cache->nvme && op && op->op == GGML_OP_MUL_MAT_ID && cache->nvme->has_tensor(op->src[0])) {
+        return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
+    return nullptr;
 }
 
 extern "C" ggml_backend_dev_t ggml_backend_cpu_expert_cache_offload_device(
@@ -3020,5 +3052,81 @@ extern "C" bool ggml_backend_cpu_expert_cache_copy(
         }
     }
     return false;
+}
+
+extern "C" bool ggml_backend_cpu_expert_cache_enable_nvme(
+        ggml_backend_cpu_expert_cache_t cache, size_t ram_budget_bytes, uint32_t admit_window) {
+    if (!cache || ram_budget_bytes == 0) {
+        return false;
+    }
+    auto store = std::make_unique<nvme_expert_cache>(ram_budget_bytes, admit_window);
+    if (!store->is_valid()) {
+        return false;
+    }
+    cache->nvme = std::move(store);
+    for (const auto & entry : cache->devices) {
+        entry->set_nvme_store(cache->nvme.get());
+    }
+    return true;
+}
+
+extern "C" void ggml_backend_cpu_expert_cache_register_nvme(
+        ggml_backend_cpu_expert_cache_t cache, const ggml_tensor * weights, const char * file_path, uint64_t file_offset) {
+    if (cache && cache->nvme && weights && file_path) {
+        cache->nvme->register_tensor(weights, file_path, file_offset);
+    }
+}
+
+extern "C" void ggml_backend_cpu_expert_cache_register_nvme_router(
+        ggml_backend_cpu_expert_cache_t cache, int layer_id, const ggml_tensor * gate_inp, const ggml_tensor * exp_probs_b) {
+    if (cache && cache->nvme && gate_inp) {
+        cache->nvme->register_router(layer_id, gate_inp, exp_probs_b);
+    }
+}
+
+extern "C" size_t ggml_backend_cpu_expert_cache_nvme_memory(ggml_backend_cpu_expert_cache_t cache) {
+    return (cache && cache->nvme) ? cache->nvme->memory_bytes() : 0;
+}
+
+extern "C" bool ggml_backend_cpu_expert_cache_is_nvme(
+        ggml_backend_cpu_expert_cache_t cache, const ggml_tensor * op) {
+    return cache && cache->nvme && op && op->op == GGML_OP_MUL_MAT_ID && cache->nvme->has_tensor(op->src[0]);
+}
+
+extern "C" void ggml_backend_cpu_expert_cache_nvme_begin(
+        ggml_backend_cpu_expert_cache_t cache, ggml_tensor * op, const uint64_t * l1_ready_masks) {
+    if (cache && cache->nvme) {
+        cache->nvme->begin_op(op, l1_ready_masks);
+    }
+}
+
+extern "C" void ggml_backend_cpu_expert_cache_nvme_end(
+        ggml_backend_cpu_expert_cache_t cache, ggml_tensor * op) {
+    if (cache && cache->nvme) {
+        cache->nvme->end_op(op);
+    }
+}
+
+extern "C" const void * ggml_backend_cpu_expert_cache_nvme_get_expert(
+        ggml_backend_cpu_expert_cache_t cache, const ggml_tensor * op, int32_t expert, bool wait) {
+    return (cache && cache->nvme) ? cache->nvme->get_expert(op, expert, wait) : nullptr;
+}
+
+extern "C" int ggml_backend_cpu_expert_cache_nvme_is_repacked(
+        ggml_backend_cpu_expert_cache_t cache, const ggml_tensor * op, int32_t expert) {
+    return (cache && cache->nvme) ? cache->nvme->is_expert_repacked(op, expert) : 0;
+}
+
+extern "C" const void * ggml_backend_cpu_expert_cache_nvme_pp_prepare(
+        ggml_backend_cpu_expert_cache_t cache, const ggml_tensor * op,
+        const int32_t * active_experts, int active_idx, int n_active) {
+    return (cache && cache->nvme) ? cache->nvme->pp_prepare_expert(op, active_experts, active_idx, n_active) : nullptr;
+}
+
+extern "C" void ggml_backend_cpu_expert_cache_nvme_pp_release(
+        ggml_backend_cpu_expert_cache_t cache, const ggml_tensor * op, int32_t expert) {
+    if (cache && cache->nvme) {
+        cache->nvme->pp_release_expert(op, expert);
+    }
 }
 

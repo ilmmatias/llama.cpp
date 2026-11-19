@@ -32,6 +32,14 @@ extern "C" {
     typedef uint64_t (*ggml_backend_cpu_expert_cache_hits_t)(ggml_backend_cpu_expert_cache_t cache);
     typedef size_t (*ggml_backend_cpu_expert_cache_get_buffer_size_t)(
         ggml_backend_dev_t device, int64_t input_dim, int64_t ffn_dim, int64_t output_dim, int64_t n_expert_used);
+    typedef bool (*ggml_backend_cpu_expert_cache_enable_nvme_t)(
+        ggml_backend_cpu_expert_cache_t cache, size_t ram_budget_bytes, uint32_t admit_window);
+    typedef void (*ggml_backend_cpu_expert_cache_register_nvme_t)(
+        ggml_backend_cpu_expert_cache_t cache, const struct ggml_tensor * weights, const char * file_path, uint64_t file_offset);
+    typedef void (*ggml_backend_cpu_expert_cache_register_nvme_router_t)(
+        ggml_backend_cpu_expert_cache_t cache, int layer_id, const struct ggml_tensor * gate_inp, const struct ggml_tensor * exp_probs_b);
+    typedef size_t (*ggml_backend_cpu_expert_cache_nvme_memory_t)(
+        ggml_backend_cpu_expert_cache_t cache);
 
     // the compute plan that needs to be prepared for ggml_graph_compute()
     // since https://github.com/ggml-org/ggml/issues/287
@@ -202,6 +210,29 @@ extern "C" {
     GGML_BACKEND_API uint64_t ggml_backend_cpu_expert_cache_hits(ggml_backend_cpu_expert_cache_t cache);
     GGML_BACKEND_API size_t ggml_backend_cpu_expert_cache_get_buffer_size(
         ggml_backend_dev_t device, int64_t input_dim, int64_t ffn_dim, int64_t output_dim, int64_t n_expert_used);
+    GGML_BACKEND_API bool ggml_backend_cpu_expert_cache_enable_nvme(
+        ggml_backend_cpu_expert_cache_t cache, size_t ram_budget_bytes, uint32_t admit_window);
+    GGML_BACKEND_API void ggml_backend_cpu_expert_cache_register_nvme(
+        ggml_backend_cpu_expert_cache_t cache, const struct ggml_tensor * weights, const char * file_path, uint64_t file_offset);
+    GGML_BACKEND_API void ggml_backend_cpu_expert_cache_register_nvme_router(
+        ggml_backend_cpu_expert_cache_t cache, int layer_id, const struct ggml_tensor * gate_inp, const struct ggml_tensor * exp_probs_b);
+    GGML_BACKEND_API size_t ggml_backend_cpu_expert_cache_nvme_memory(
+        ggml_backend_cpu_expert_cache_t cache);
+    GGML_BACKEND_API bool ggml_backend_cpu_expert_cache_is_nvme(
+        ggml_backend_cpu_expert_cache_t cache, const struct ggml_tensor * op);
+    GGML_BACKEND_API void ggml_backend_cpu_expert_cache_nvme_begin(
+        ggml_backend_cpu_expert_cache_t cache, struct ggml_tensor * op, const uint64_t * l1_ready_masks);
+    GGML_BACKEND_API void ggml_backend_cpu_expert_cache_nvme_end(
+        ggml_backend_cpu_expert_cache_t cache, struct ggml_tensor * op);
+    GGML_BACKEND_API const void * ggml_backend_cpu_expert_cache_nvme_get_expert(
+        ggml_backend_cpu_expert_cache_t cache, const struct ggml_tensor * op, int32_t expert, bool wait);
+    GGML_BACKEND_API int ggml_backend_cpu_expert_cache_nvme_is_repacked(
+        ggml_backend_cpu_expert_cache_t cache, const struct ggml_tensor * op, int32_t expert);
+    GGML_BACKEND_API const void * ggml_backend_cpu_expert_cache_nvme_pp_prepare(
+        ggml_backend_cpu_expert_cache_t cache, const struct ggml_tensor * op,
+        const int32_t * active_experts, int active_idx, int n_active);
+    GGML_BACKEND_API void ggml_backend_cpu_expert_cache_nvme_pp_release(
+        ggml_backend_cpu_expert_cache_t cache, const struct ggml_tensor * op, int32_t expert);
 
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 

@@ -24,7 +24,8 @@ bool ggml_compute_forward_mul_mat_id_tiled(const struct ggml_compute_params * pa
                                            int64_t                            cur_a,
                                            int64_t                            cne1,
                                            const int32_t *                    expert_rows,
-                                           char *                             scratch);
+                                           char *                             scratch,
+                                           const void *                       src0_override);
 #ifdef __cplusplus
 }
 #endif
