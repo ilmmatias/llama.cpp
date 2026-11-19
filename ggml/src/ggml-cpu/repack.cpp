@@ -3905,6 +3905,72 @@ static block_q2_Kx16 make_block_q2_Kx16(const block_q2_K * in, unsigned int blck
     return out;
 }
 
+template <int nrows_interleaved, typename block_t, typename block_xN_t, typename make_fn_t>
+static void repack_interleaved_bl_parallel(
+        const block_t * src,
+        block_xN_t * dst,
+        int64_t nrow,
+        int64_t nblocks,
+        size_t data_size,
+        int interleave_block,
+        make_fn_t make_block) {
+    GGML_ASSERT(nrow % nrows_interleaved == 0);
+
+    const int64_t n_groups = nrow / nrows_interleaved;
+    if (n_groups == 0) {
+        return;
+    }
+
+    constexpr size_t min_bytes_per_thread = 16ull * 1024 * 1024;
+
+    size_t n_threads = std::thread::hardware_concurrency();
+    if (n_threads == 0) {
+        n_threads = 1;
+    }
+
+    const size_t max_threads_by_work = std::max<size_t>(1, (data_size + min_bytes_per_thread - 1) / min_bytes_per_thread);
+    n_threads = std::min(n_threads, (size_t) n_groups);
+    n_threads = std::min(n_threads, max_threads_by_work);
+
+    auto run_range = [&](size_t tid) {
+        const int64_t begin = n_groups * (int64_t) tid       / (int64_t) n_threads;
+        const int64_t end   = n_groups * (int64_t) (tid + 1) / (int64_t) n_threads;
+
+        const bool in_place = ((const void *) src == (const void *) dst);
+        std::vector<block_t> row_buf;
+        if (in_place) {
+            row_buf.resize((size_t) (nrows_interleaved * nblocks));
+        }
+
+        block_t tmp[nrows_interleaved];
+        for (int64_t g = begin; g < end; ++g) {
+            const block_t * src_g = src + g * nrows_interleaved * nblocks;
+            block_xN_t * dst_g = dst + g * nblocks;
+            if (in_place) {
+                memcpy(row_buf.data(), src_g, (size_t) (nrows_interleaved * nblocks) * sizeof(block_t));
+                src_g = row_buf.data();
+            }
+
+            for (int64_t x = 0; x < nblocks; ++x) {
+                for (int i = 0; i < nrows_interleaved; ++i) {
+                    tmp[i] = src_g[x + (int64_t) i * nblocks];
+                }
+                dst_g[x] = make_block(tmp, interleave_block);
+            }
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(n_threads > 0 ? n_threads - 1 : 0);
+    for (size_t tid = 1; tid < n_threads; ++tid) {
+        workers.emplace_back(run_range, tid);
+    }
+    run_range(0);
+    for (auto & worker : workers) {
+        worker.join();
+    }
+}
+
 static int repack_q4_0_to_q4_0_4_bl(struct ggml_tensor * t, int interleave_block, const void * GGML_RESTRICT data, size_t data_size) {
     GGML_ASSERT(t->type == GGML_TYPE_Q4_0);
     GGML_ASSERT(interleave_block == 4 || interleave_block == 8);
@@ -3912,7 +3978,6 @@ static int repack_q4_0_to_q4_0_4_bl(struct ggml_tensor * t, int interleave_block
 
     block_q4_0x4 * dst = (block_q4_0x4 *)t->data;
     const block_q4_0 * src = (const block_q4_0 *)data;
-    block_q4_0 dst_tmp[4];
     int nrow = ggml_nrows(t);
     int nblocks = t->ne[0] / QK4_0;
 
@@ -3922,18 +3987,8 @@ static int repack_q4_0_to_q4_0_4_bl(struct ggml_tensor * t, int interleave_block
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i = 0; i < nrows_interleaved; i++) {
-                dst_tmp[i] = src[x + i * nblocks];
-            }
-            *dst++ = make_block_q4_0x4(dst_tmp, interleave_block);
-        }
-        src += nrows_interleaved * nblocks;
-    }
+    repack_interleaved_bl_parallel<nrows_interleaved>(src, dst, nrow, nblocks, data_size, interleave_block, make_block_q4_0x4);
     return 0;
-
-    GGML_UNUSED(data_size);
 }
 
 static int repack_q4_K_to_q4_K_8_bl(struct ggml_tensor * t, int interleave_block, const void * GGML_RESTRICT data, size_t data_size) {
@@ -3943,7 +3998,6 @@ static int repack_q4_K_to_q4_K_8_bl(struct ggml_tensor * t, int interleave_block
 
     block_q4_Kx8 * dst = (block_q4_Kx8*)t->data;
     const block_q4_K * src = (const block_q4_K*) data;
-    block_q4_K dst_tmp[8];
     int nrow = ggml_nrows(t);
     int nblocks = t->ne[0] / QK_K;
 
@@ -3953,18 +4007,8 @@ static int repack_q4_K_to_q4_K_8_bl(struct ggml_tensor * t, int interleave_block
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i  = 0; i < nrows_interleaved; i++ ) {
-                dst_tmp[i] = src[x + i * nblocks];
-            }
-            *dst++ = make_block_q4_Kx8(dst_tmp, interleave_block);
-        }
-        src += nrows_interleaved * nblocks;
-    }
+    repack_interleaved_bl_parallel<nrows_interleaved>(src, dst, nrow, nblocks, data_size, interleave_block, make_block_q4_Kx8);
     return 0;
-
-    GGML_UNUSED(data_size);
 }
 
 static int repack_q4_K_to_q4_K_16_bl(struct ggml_tensor * t, int interleave_block, const void * GGML_RESTRICT data, size_t data_size) {
@@ -3973,7 +4017,6 @@ static int repack_q4_K_to_q4_K_16_bl(struct ggml_tensor * t, int interleave_bloc
 
     block_q4_Kx16 * dst = (block_q4_Kx16*)t->data;
     const block_q4_K * src = (const block_q4_K*) data;
-    block_q4_K dst_tmp[16];
     int nrow = ggml_nrows(t);
     int nblocks = t->ne[0] / QK_K;
 
@@ -3983,18 +4026,8 @@ static int repack_q4_K_to_q4_K_16_bl(struct ggml_tensor * t, int interleave_bloc
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i  = 0; i < nrows_interleaved; i++ ) {
-                dst_tmp[i] = src[x + i * nblocks];
-            }
-            *dst++ = make_block_q4_Kx16(dst_tmp, interleave_block);
-        }
-        src += nrows_interleaved * nblocks;
-    }
+    repack_interleaved_bl_parallel<nrows_interleaved>(src, dst, nrow, nblocks, data_size, interleave_block, make_block_q4_Kx16);
     return 0;
-
-    GGML_UNUSED(data_size);
 }
 
 static int repack_q2_K_to_q2_K_8_bl(struct ggml_tensor * t, int interleave_block, const void * GGML_RESTRICT data, size_t data_size) {
@@ -4004,7 +4037,6 @@ static int repack_q2_K_to_q2_K_8_bl(struct ggml_tensor * t, int interleave_block
 
     block_q2_Kx8 * dst = (block_q2_Kx8*)t->data;
     const block_q2_K * src = (const block_q2_K*) data;
-    block_q2_K dst_tmp[8];
     int nrow = ggml_nrows(t);
     int nblocks = t->ne[0] / QK_K;
 
@@ -4014,18 +4046,8 @@ static int repack_q2_K_to_q2_K_8_bl(struct ggml_tensor * t, int interleave_block
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i = 0; i < nrows_interleaved; i++) {
-                dst_tmp[i] = src[x + i * nblocks];
-            }
-            *dst++ = make_block_q2_Kx8(dst_tmp, interleave_block);
-        }
-        src += nrows_interleaved * nblocks;
-    }
+    repack_interleaved_bl_parallel<nrows_interleaved>(src, dst, nrow, nblocks, data_size, interleave_block, make_block_q2_Kx8);
     return 0;
-
-    GGML_UNUSED(data_size);
 }
 
 static int repack_q2_K_to_q2_K_16_bl(struct ggml_tensor * t, int interleave_block, const void * GGML_RESTRICT data, size_t data_size) {
@@ -4034,9 +4056,6 @@ static int repack_q2_K_to_q2_K_16_bl(struct ggml_tensor * t, int interleave_bloc
 
     block_q2_Kx16 * dst = (block_q2_Kx16*)t->data;
     const block_q2_K * src = (const block_q2_K*) data;
-
-    block_q2_K dst_tmp[nrows_interleaved];
-
     int nrow = ggml_nrows(t);
     int nblocks = t->ne[0] / QK_K;
 
@@ -4046,21 +4065,8 @@ static int repack_q2_K_to_q2_K_16_bl(struct ggml_tensor * t, int interleave_bloc
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            // This loop gathers 16 separate blocks (one from each column)
-            // that correspond to the same K-dimension chunk.
-            for (int i  = 0; i < nrows_interleaved; i++ ) {
-                dst_tmp[i] = src[x + i * nblocks];
-            }
-
-            *dst++ = make_block_q2_Kx16(dst_tmp, interleave_block);
-        }
-        src += nrows_interleaved * nblocks;
-    }
+    repack_interleaved_bl_parallel<nrows_interleaved>(src, dst, nrow, nblocks, data_size, interleave_block, make_block_q2_Kx16);
     return 0;
-
-    GGML_UNUSED(data_size);
 }
 
 static int repack_q4_0_to_q4_0_16_bl(struct ggml_tensor * t, int interleave_block, const void * GGML_RESTRICT data, size_t data_size) {
@@ -4069,7 +4075,6 @@ static int repack_q4_0_to_q4_0_16_bl(struct ggml_tensor * t, int interleave_bloc
 
     block_q4_0x16 * dst = (block_q4_0x16*)t->data;
     const block_q4_0 * src = (const block_q4_0*) data;
-    block_q4_0 dst_tmp[16];
     int nrow = ggml_nrows(t);
     int nblocks = t->ne[0] / QK4_0;
 
@@ -4079,18 +4084,8 @@ static int repack_q4_0_to_q4_0_16_bl(struct ggml_tensor * t, int interleave_bloc
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i  = 0; i < nrows_interleaved; i++ ) {
-                dst_tmp[i] = src[x + i * nblocks];
-            }
-            *dst++ = make_block_q4_0x16(dst_tmp, interleave_block);
-        }
-        src += nrows_interleaved * nblocks;
-    }
+    repack_interleaved_bl_parallel<nrows_interleaved>(src, dst, nrow, nblocks, data_size, interleave_block, make_block_q4_0x16);
     return 0;
-
-    GGML_UNUSED(data_size);
 }
 
 static int repack_q5_K_to_q5_K_8_bl(struct ggml_tensor *       t,
@@ -4103,7 +4098,6 @@ static int repack_q5_K_to_q5_K_8_bl(struct ggml_tensor *       t,
 
     block_q5_Kx8 *     dst = (block_q5_Kx8 *) t->data;
     const block_q5_K * src = (const block_q5_K *) data;
-    block_q5_K         dst_tmp[8];
     int                nrow    = ggml_nrows(t);
     int                nblocks = t->ne[0] / QK_K;
 
@@ -4113,15 +4107,7 @@ static int repack_q5_K_to_q5_K_8_bl(struct ggml_tensor *       t,
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i = 0; i < nrows_interleaved; i++) {
-                dst_tmp[i] = src[x + i * nblocks];
-            }
-            *dst++ = make_block_q5_Kx8(dst_tmp, interleave_block);
-        }
-        src += nrows_interleaved * nblocks;
-    }
+    repack_interleaved_bl_parallel<nrows_interleaved>(src, dst, nrow, nblocks, data_size, interleave_block, make_block_q5_Kx8);
     return 0;
 }
 
@@ -4132,7 +4118,6 @@ static int repack_q6_K_to_q6_K_8_bl(struct ggml_tensor * t, int interleave_block
 
     block_q6_Kx8 * dst = (block_q6_Kx8 *)t->data;
     const block_q6_K * src = (const block_q6_K *) data;
-    block_q6_K dst_tmp[8];
     int nrow = ggml_nrows(t);
     int nblocks = t->ne[0] / QK_K;
 
@@ -4142,15 +4127,7 @@ static int repack_q6_K_to_q6_K_8_bl(struct ggml_tensor * t, int interleave_block
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i = 0; i < nrows_interleaved; i++) {
-                dst_tmp[i] = src[x + i * nblocks];
-            }
-            *dst++ = make_block_q6_Kx8(dst_tmp, interleave_block);
-        }
-        src += nrows_interleaved * nblocks;
-    }
+    repack_interleaved_bl_parallel<nrows_interleaved>(src, dst, nrow, nblocks, data_size, interleave_block, make_block_q6_Kx8);
     return 0;
 }
 
@@ -4161,7 +4138,6 @@ static int repack_q4_0_to_q4_0_8_bl(struct ggml_tensor * t, int interleave_block
 
     block_q4_0x8 * dst = (block_q4_0x8*)t->data;
     const block_q4_0 * src = (const block_q4_0*) data;
-    block_q4_0 dst_tmp[8];
     int nrow = ggml_nrows(t);
     int nblocks = t->ne[0] / QK4_0;
 
@@ -4171,18 +4147,8 @@ static int repack_q4_0_to_q4_0_8_bl(struct ggml_tensor * t, int interleave_block
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i  = 0; i < nrows_interleaved; i++ ) {
-                dst_tmp[i] = src[x + i * nblocks];
-            }
-            *dst++ = make_block_q4_0x8(dst_tmp, interleave_block);
-        }
-        src += nrows_interleaved * nblocks;
-    }
+    repack_interleaved_bl_parallel<nrows_interleaved>(src, dst, nrow, nblocks, data_size, interleave_block, make_block_q4_0x8);
     return 0;
-
-    GGML_UNUSED(data_size);
 }
 
 static int repack_q8_0_to_q8_0_4_bl(struct ggml_tensor *       t,
@@ -4195,7 +4161,6 @@ static int repack_q8_0_to_q8_0_4_bl(struct ggml_tensor *       t,
 
     block_q8_0x4 *     dst = (block_q8_0x4 *) t->data;
     const block_q8_0 * src = (const block_q8_0 *) data;
-    block_q8_0         dst_tmp[4];
     int                nrow    = ggml_nrows(t);
     int                nblocks = t->ne[0] / QK8_0;
 
@@ -4205,15 +4170,7 @@ static int repack_q8_0_to_q8_0_4_bl(struct ggml_tensor *       t,
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i = 0; i < nrows_interleaved; i++) {
-                dst_tmp[i] = src[x + i * nblocks];
-            }
-            *dst++ = make_block_q8_0x4(dst_tmp, interleave_block);
-        }
-        src += nrows_interleaved * nblocks;
-    }
+    repack_interleaved_bl_parallel<nrows_interleaved>(src, dst, nrow, nblocks, data_size, interleave_block, make_block_q8_0x4);
     return 0;
 }
 
@@ -4227,7 +4184,6 @@ static int repack_q1_0_to_q1_0_4_bl(struct ggml_tensor *       t,
 
     block_q1_0x4 *     dst = (block_q1_0x4 *) t->data;
     const block_q1_0 * src = (const block_q1_0 *) data;
-    block_q1_0         dst_tmp[4];
     int                nrow    = ggml_nrows(t);
     int                nblocks = t->ne[0] / QK1_0;
 
@@ -4237,15 +4193,7 @@ static int repack_q1_0_to_q1_0_4_bl(struct ggml_tensor *       t,
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i = 0; i < nrows_interleaved; i++) {
-                dst_tmp[i] = src[x + i * nblocks];
-            }
-            *dst++ = make_block_q1_0x4(dst_tmp, interleave_block);
-        }
-        src += nrows_interleaved * nblocks;
-    }
+    repack_interleaved_bl_parallel<nrows_interleaved>(src, dst, nrow, nblocks, data_size, interleave_block, make_block_q1_0x4);
     return 0;
 }
 
@@ -4279,9 +4227,8 @@ static int repack_q8_0_to_q8_0_16_bl(struct ggml_tensor *       t,
     GGML_ASSERT(t->type == GGML_TYPE_Q8_0);
     constexpr int nrows_interleaved = 16;
 
-    block_q8_0x16 *     dst = (block_q8_0x16 *) t->data;
+    block_q8_0x16 *    dst = (block_q8_0x16 *) t->data;
     const block_q8_0 * src = (const block_q8_0 *) data;
-    block_q8_0         dst_tmp[16];
     int                nrow    = ggml_nrows(t);
     int                nblocks = t->ne[0] / QK8_0;
 
@@ -4291,15 +4238,7 @@ static int repack_q8_0_to_q8_0_16_bl(struct ggml_tensor *       t,
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i = 0; i < nrows_interleaved; i++) {
-                dst_tmp[i] = src[x + i * nblocks];
-            }
-            *dst++ = make_block_q8_0x16(dst_tmp, interleave_block);
-        }
-        src += nrows_interleaved * nblocks;
-    }
+    repack_interleaved_bl_parallel<nrows_interleaved>(src, dst, nrow, nblocks, data_size, interleave_block, make_block_q8_0x16);
     return 0;
 }
 
@@ -4312,17 +4251,6 @@ static block_iq4_nlx4 make_block_iq4_nlx4(block_iq4_nl * in, unsigned int blck_s
 
     const int end = QK4_NL * 2 / blck_size_interleave;
 
-    // TODO: this branch seems wrong
-    //if (blck_size_interleave == 8) {
-    //    for (int i = 0; i < end; ++i) {
-    //        int src_id = i % 4;
-    //        int src_offset = (i / 4) * blck_size_interleave;
-    //        int dst_offset = i * blck_size_interleave;
-
-    //        // Using memcpy to avoid unaligned memory accesses
-    //        memcpy(&out.qs[dst_offset], &in[src_id].qs[src_offset], sizeof(uint64_t));
-    //    }
-    //} else
     if (blck_size_interleave == 4) {
         for (int i = 0; i < end; ++i) {
             int src_id = i % 4;
@@ -4345,10 +4273,8 @@ static int repack_iq4_nl_to_iq4_nl_4_bl(struct ggml_tensor * t, int interleave_b
     const block_iq4_nl   * src = (const block_iq4_nl   *)data;
           block_iq4_nlx4 * dst = (      block_iq4_nlx4 *)t->data;
 
-    block_iq4_nl dst_tmp[4];
-
     int nrow = ggml_nrows(t);
-    int nrows_interleaved = 4;
+    constexpr int nrows_interleaved = 4;
     int nblocks = t->ne[0] / QK4_NL;
 
     GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_iq4_nl));
@@ -4357,18 +4283,8 @@ static int repack_iq4_nl_to_iq4_nl_4_bl(struct ggml_tensor * t, int interleave_b
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i = 0; i < nrows_interleaved; i++) {
-                dst_tmp[i] = src[x + i * nblocks];
-            }
-            *dst++ = make_block_iq4_nlx4(dst_tmp, interleave_block);
-        }
-        src += nrows_interleaved * nblocks;
-    }
+    repack_interleaved_bl_parallel<nrows_interleaved>(src, dst, nrow, nblocks, data_size, interleave_block, make_block_iq4_nlx4);
     return 0;
-
-    GGML_UNUSED(data_size);
 }
 
 static block_iq4_nlx8 make_block_iq4_nlx8(block_iq4_nl * in, unsigned int blck_size_interleave) {
@@ -4402,10 +4318,8 @@ static int repack_iq4_nl_to_iq4_nl_8_bl(struct ggml_tensor * t, int interleave_b
     const block_iq4_nl   * src = (const block_iq4_nl   *)data;
           block_iq4_nlx8 * dst = (      block_iq4_nlx8 *)t->data;
 
-    block_iq4_nl dst_tmp[8];
-
     int nrow = ggml_nrows(t);
-    int nrows_interleaved = 8;
+    constexpr int nrows_interleaved = 8;
     int nblocks = t->ne[0] / QK4_NL;
 
     GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_iq4_nl));
@@ -4414,18 +4328,8 @@ static int repack_iq4_nl_to_iq4_nl_8_bl(struct ggml_tensor * t, int interleave_b
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i = 0; i < nrows_interleaved; i++) {
-                dst_tmp[i] = src[x + i * nblocks];
-            }
-            *dst++ = make_block_iq4_nlx8(dst_tmp, interleave_block);
-        }
-        src += nrows_interleaved * nblocks;
-    }
+    repack_interleaved_bl_parallel<nrows_interleaved>(src, dst, nrow, nblocks, data_size, interleave_block, make_block_iq4_nlx8);
     return 0;
-
-    GGML_UNUSED(data_size);
 }
 
 template <typename block_t, typename block_x8_t>
@@ -4461,10 +4365,20 @@ static void repack_znq_8_bl_parallel(
         const int64_t begin = n_groups * (int64_t) tid       / (int64_t) n_threads;
         const int64_t end   = n_groups * (int64_t) (tid + 1) / (int64_t) n_threads;
 
+        const bool in_place = ((const void *) src == (const void *) dst);
+        std::vector<block_t> row_buf;
+        if (in_place) {
+            row_buf.resize((size_t) (8 * nblocks));
+        }
+
         block_t tmp[8];
         for (int64_t g = begin; g < end; ++g) {
             const block_t * src_g = src + g * 8 * nblocks;
             block_x8_t * dst_g = dst + g * nblocks;
+            if (in_place) {
+                memcpy(row_buf.data(), src_g, (size_t) (8 * nblocks) * sizeof(block_t));
+                src_g = row_buf.data();
+            }
 
             for (int64_t x = 0; x < nblocks; ++x) {
                 for (int r = 0; r < 8; ++r) {
@@ -4486,6 +4400,116 @@ static void repack_znq_8_bl_parallel(
     }
 }
 
+template <typename block_t>
+static inline void repack_znq_1bit_qs_8(const block_t * in, uint8_t * out_qs) {
+#if defined(__BMI2__) && defined(__x86_64__)
+    constexpr uint64_t md = 0x0000000F0000000FULL;
+    uint64_t p[4] = { 0, 0, 0, 0 };
+    for (int r = 0; r < 8; ++r) {
+        uint32_t w = 0;
+        memcpy(&w, in[r].qs, sizeof(uint32_t));
+        const int sh = 4 * r;
+        p[0] |= _pdep_u64(w,       md) << sh;
+        p[1] |= _pdep_u64(w >> 8,  md) << sh;
+        p[2] |= _pdep_u64(w >> 16, md) << sh;
+        p[3] |= _pdep_u64(w >> 24, md) << sh;
+    }
+    memcpy(out_qs, p, sizeof(p));
+#else
+    for (int r = 0; r < 8; ++r) {
+        uint32_t w = 0;
+        memcpy(&w, in[r].qs, sizeof(uint32_t));
+        for (int q = 0; q < 8; ++q) {
+            const uint8_t nib = (uint8_t) ((w >> (4 * q)) & 0xFU);
+            out_qs[4 * q + (r >> 1)] |= (uint8_t) (nib << (4 * (r & 1)));
+        }
+    }
+#endif
+}
+
+template <typename block_t>
+static inline void repack_znq_3bit_planes_8(const block_t * in, uint32_t planes[QK_ZNQ / 4][3]);
+
+template <typename block_t>
+static inline void repack_znq_5bit_qs_8(const block_t * in, uint8_t out_qs[8][20]) {
+#if defined(__BMI2__) && defined(__x86_64__)
+    for (int q = 0; q < 8; ++q) {
+        const int bit_off = 20 * q;
+        const int byte_off = std::min(16, bit_off / 8);
+        const int shift = bit_off - 8 * byte_off;
+        uint32_t high = 0;
+        for (int r = 0; r < 8; ++r) {
+            uint32_t v = 0;
+            memcpy(&v, in[r].qs + byte_off, sizeof(uint32_t));
+            v >>= shift;
+            const uint16_t lo16 = (uint16_t) _pext_u32(v, 0x07BDEFU);
+            const uint32_t hi4  = _pext_u32(v, 0x084210U);
+            memcpy(out_qs[q] + 2 * r, &lo16, sizeof(uint16_t));
+            high |= hi4 << (4 * r);
+        }
+        memcpy(out_qs[q] + 16, &high, sizeof(high));
+    }
+#else
+    for (int r = 0; r < 8; ++r) {
+        for (int q = 0; q < 8; ++q) {
+            uint32_t high = 0;
+            memcpy(&high, out_qs[q] + 16, sizeof(high));
+            for (int j = 0; j < 4; ++j) {
+                const int bit = 5 * (4 * q + j);
+                unsigned code = in[r].qs[bit / 8] >> (bit % 8);
+                if (bit % 8 > 3) {
+                    code |= unsigned(in[r].qs[bit / 8 + 1]) << (8 - bit % 8);
+                }
+                out_qs[q][2 * r + j / 2] |= (code & 15) << (4 * (j % 2));
+                high |= uint32_t((code >> 4) & 1) << (4 * r + j);
+            }
+            memcpy(out_qs[q] + 16, &high, sizeof(high));
+        }
+    }
+#endif
+}
+
+template <typename block_t>
+static inline void repack_znq_6bit_qs_8(const block_t * in, uint8_t out_qs[8][24]) {
+#if defined(__BMI2__) && defined(__x86_64__)
+    for (int q = 0; q < 8; ++q) {
+        const int byte_off = std::min(20, 3 * q);
+        const int shift = (3 * q - byte_off) * 8;
+        uint32_t high[2] = { 0, 0 };
+        for (int r = 0; r < 8; ++r) {
+            uint32_t v = 0;
+            memcpy(&v, in[r].qs + byte_off, sizeof(uint32_t));
+            v >>= shift;
+            const uint16_t lo16 = (uint16_t) _pext_u32(v, 0x3CF3CFU);
+            const uint32_t hi0  = _pext_u32(v, 0x410410U);
+            const uint32_t hi1  = _pext_u32(v, 0x820820U);
+            memcpy(out_qs[q] + 2 * r, &lo16, sizeof(uint16_t));
+            high[0] |= hi0 << (4 * r);
+            high[1] |= hi1 << (4 * r);
+        }
+        memcpy(out_qs[q] + 16, high, sizeof(high));
+    }
+#else
+    for (int r = 0; r < 8; ++r) {
+        for (int q = 0; q < 8; ++q) {
+            uint32_t high[2] = { 0, 0 };
+            memcpy(high, out_qs[q] + 16, sizeof(high));
+            for (int j = 0; j < 4; ++j) {
+                const int bit = 6 * (4 * q + j);
+                unsigned code = in[r].qs[bit / 8] >> (bit % 8);
+                if (bit % 8 > 2) {
+                    code |= unsigned(in[r].qs[bit / 8 + 1]) << (8 - bit % 8);
+                }
+                out_qs[q][2 * r + j / 2] |= (code & 15) << (4 * (j % 2));
+                high[0] |= uint32_t((code >> 4) & 1) << (4 * r + j);
+                high[1] |= uint32_t((code >> 5) & 1) << (4 * r + j);
+            }
+            memcpy(out_qs[q] + 16, high, sizeof(high));
+        }
+    }
+#endif
+}
+
 template<typename block_t, typename block_x8_t, int bits, int sbits>
 static block_x8_t make_block_znq_g4x8(const block_t * in) {
     block_x8_t out = {};
@@ -4496,30 +4520,29 @@ static block_x8_t make_block_znq_g4x8(const block_t * in) {
         } else {
             memcpy(out.header + 4 * r, &in[r], 4);
         }
-        for (int j = 0; j < QK_ZNQ; ++j) {
-            const int bit = bits * j;
-            unsigned code = in[r].qs[bit / 8] >> (bit % 8);
-            if (bit % 8 + bits > 8) {
-                code |= unsigned(in[r].qs[bit / 8 + 1]) << (8 - bit % 8);
-            }
-            code &= (1 << bits) - 1;
-            const int q = j / 4;
-            const int k = j % 4;
-            if constexpr (bits == 1 || bits == 3) {
-                for (int b = 0; b < bits; ++b) {
-                    const int out_bit = 4 * r + k;
-                    out.qs[4 * (bits * q + b) + out_bit / 8] |= ((code >> b) & 1) << (out_bit % 8);
-                }
-            } else if constexpr (bits == 2) {
-                out.qs[8 * q + r] |= code << (2 * k);
-            } else {
-                out.qs[4 * bits * q + 2 * r + k / 2] |= (code & 15) << (4 * (k % 2));
-                for (int b = 4; b < bits; ++b) {
-                    const int out_bit = 4 * r + k;
-                    out.qs[4 * bits * q + 16 + 4 * (b - 4) + out_bit / 8] |= ((code >> b) & 1) << (out_bit % 8);
-                }
+    }
+    if constexpr (bits == 1) {
+        repack_znq_1bit_qs_8(in, out.qs);
+    } else if constexpr (bits == 2) {
+        for (int r = 0; r < 8; ++r) {
+            for (int q = 0; q < 8; ++q) {
+                out.qs[8 * q + r] = in[r].qs[q];
             }
         }
+    } else if constexpr (bits == 3) {
+        uint32_t planes[QK_ZNQ / 4][3] = {};
+        repack_znq_3bit_planes_8(in, planes);
+        memcpy(out.qs, planes, sizeof(planes));
+    } else if constexpr (bits == 4) {
+        for (int r = 0; r < 8; ++r) {
+            for (int q = 0; q < 8; ++q) {
+                memcpy(out.qs + 16 * q + 2 * r, in[r].qs + 2 * q, 2);
+            }
+        }
+    } else if constexpr (bits == 5) {
+        repack_znq_5bit_qs_8(in, reinterpret_cast<uint8_t (*)[20]>(out.qs));
+    } else if constexpr (bits == 6) {
+        repack_znq_6bit_qs_8(in, reinterpret_cast<uint8_t (*)[24]>(out.qs));
     }
     return out;
 }
@@ -4666,14 +4689,58 @@ static inline uint8_t znq3_m_repack_code(const uint8_t * qs, int j) {
     return (uint8_t) (v & 7u);
 }
 
-static block_znq3_mx8 make_block_znq3_mx8(const block_znq3_m * in) {
-    block_znq3_mx8 out = {};
+template <typename block_t>
+static inline void repack_znq_3bit_planes_8(const block_t * in, uint32_t planes[QK_ZNQ / 4][3]) {
+#if defined(__BMI2__) && defined(__x86_64__)
+    constexpr uint64_t m0 = 0x249249249249ULL;
+    constexpr uint64_t m1 = 0x492492492492ULL;
+    constexpr uint64_t m2 = 0x924924924924ULL;
+    constexpr uint64_t md = 0x0000000F0000000FULL;
+
+    uint64_t p0[4] = { 0, 0, 0, 0 };
+    uint64_t p1[4] = { 0, 0, 0, 0 };
+    uint64_t p2[4] = { 0, 0, 0, 0 };
 
     for (int r = 0; r < 8; ++r) {
-        out.d[r] = in[r].d;
-        out.books[r] = in[r].books;
+        uint64_t w0 = 0;
+        uint32_t w1_hi = 0;
+        memcpy(&w0, in[r].qs, sizeof(uint64_t));
+        memcpy(&w1_hi, in[r].qs + 8, sizeof(uint32_t));
+        const uint64_t w1 = (w0 >> 48) | ((uint64_t) w1_hi << 16);
+        const int sh = 4 * r;
+
+        const uint64_t b0_lo = _pext_u64(w0, m0);
+        const uint64_t b1_lo = _pext_u64(w0, m1);
+        const uint64_t b2_lo = _pext_u64(w0, m2);
+        const uint64_t b0_hi = _pext_u64(w1, m0);
+        const uint64_t b1_hi = _pext_u64(w1, m1);
+        const uint64_t b2_hi = _pext_u64(w1, m2);
+
+        p0[0] |= _pdep_u64(b0_lo,      md) << sh;
+        p0[1] |= _pdep_u64(b0_lo >> 8, md) << sh;
+        p0[2] |= _pdep_u64(b0_hi,      md) << sh;
+        p0[3] |= _pdep_u64(b0_hi >> 8, md) << sh;
+
+        p1[0] |= _pdep_u64(b1_lo,      md) << sh;
+        p1[1] |= _pdep_u64(b1_lo >> 8, md) << sh;
+        p1[2] |= _pdep_u64(b1_hi,      md) << sh;
+        p1[3] |= _pdep_u64(b1_hi >> 8, md) << sh;
+
+        p2[0] |= _pdep_u64(b2_lo,      md) << sh;
+        p2[1] |= _pdep_u64(b2_lo >> 8, md) << sh;
+        p2[2] |= _pdep_u64(b2_hi,      md) << sh;
+        p2[3] |= _pdep_u64(b2_hi >> 8, md) << sh;
     }
 
+    for (int k = 0; k < 4; ++k) {
+        planes[2 * k + 0][0] = (uint32_t) p0[k];
+        planes[2 * k + 1][0] = (uint32_t) (p0[k] >> 32);
+        planes[2 * k + 0][1] = (uint32_t) p1[k];
+        planes[2 * k + 1][1] = (uint32_t) (p1[k] >> 32);
+        planes[2 * k + 0][2] = (uint32_t) p2[k];
+        planes[2 * k + 1][2] = (uint32_t) (p2[k] >> 32);
+    }
+#else
     for (int g = 0; g < QK_ZNQ / 4; ++g) {
         uint32_t p0 = 0;
         uint32_t p1 = 0;
@@ -4687,10 +4754,22 @@ static block_znq3_mx8 make_block_znq3_mx8(const block_znq3_m * in) {
                 p2 |= (uint32_t) ((code >> 2) & 1u) << pos;
             }
         }
-        out.planes[g][0] = p0;
-        out.planes[g][1] = p1;
-        out.planes[g][2] = p2;
+        planes[g][0] = p0;
+        planes[g][1] = p1;
+        planes[g][2] = p2;
     }
+#endif
+}
+
+static block_znq3_mx8 make_block_znq3_mx8(const block_znq3_m * in) {
+    block_znq3_mx8 out = {};
+
+    for (int r = 0; r < 8; ++r) {
+        out.d[r] = in[r].d;
+        out.books[r] = in[r].books;
+    }
+
+    repack_znq_3bit_planes_8(in, out.planes);
 
     return out;
 }
@@ -4723,19 +4802,9 @@ static block_znq3_lx8 make_block_znq3_lx8(const block_znq3_l * in) {
         out.header[r] = in[r].d;
         out.header[8 + r] = in[r].books[0];
         out.header[16 + r] = in[r].books[1];
-
-        for (int j = 0; j < QK_ZNQ; ++j) {
-            const int bit = 3 * j;
-            unsigned code = in[r].qs[bit / 8] >> (bit % 8);
-            if (bit % 8 > 5) {
-                code |= unsigned(in[r].qs[bit / 8 + 1]) << (8 - bit % 8);
-            }
-
-            for (int b = 0; b < 3; ++b) {
-                out.planes[j / 4][b] |= ((code >> b) & 1u) << (4 * r + j % 4);
-            }
-        }
     }
+
+    repack_znq_3bit_planes_8(in, out.planes);
 
     return out;
 }
@@ -4767,19 +4836,9 @@ static block_znq4_sx8 make_block_znq4_sx8(const block_znq4_s * in) {
     for (int r = 0; r < 8; ++r) {
         out.header[4 * r] = in[r].d;
         memcpy(out.header + 4 * r + 1, in[r].books, 3);
-
-        for (int j = 0; j < QK_ZNQ; ++j) {
-            const int bit = 3 * j;
-            unsigned code = in[r].qs[bit / 8] >> (bit % 8);
-            if (bit % 8 > 5) {
-                code |= unsigned(in[r].qs[bit / 8 + 1]) << (8 - bit % 8);
-            }
-
-            for (int b = 0; b < 3; ++b) {
-                out.planes[j / 4][b] |= ((code >> b) & 1u) << (4 * r + j % 4);
-            }
-        }
     }
+
+    repack_znq_3bit_planes_8(in, out.planes);
 
     return out;
 }
@@ -4928,30 +4987,11 @@ static block_znq5_mx8 make_block_znq5_mx8(const block_znq5_m * in) {
 
     for (int r = 0; r < 8; ++r) {
         const uint8_t * src = (const uint8_t *) &in[r];
-
         for (int b = 0; b < 2; ++b) {
             out.header[b * 8 + r] = src[b];
         }
-
-        for (int q = 0; q < 8; ++q) {
-            uint32_t high;
-            memcpy(&high, out.qs[q] + 16, sizeof(high));
-
-            for (int j = 0; j < 4; ++j) {
-                const int bit = 5 * (4 * q + j);
-                unsigned code = in[r].qs[bit / 8] >> (bit % 8);
-                if (bit % 8 > 3) {
-                    code |= unsigned(in[r].qs[bit / 8 + 1]) << (8 - bit % 8);
-                }
-
-                out.qs[q][2 * r + j / 2] |= (code & 15) << (4 * (j % 2));
-                high |= uint32_t((code >> 4) & 1) << (4 * r + j);
-            }
-
-            memcpy(out.qs[q] + 16, &high, sizeof(high));
-        }
     }
-
+    repack_znq_5bit_qs_8(in, out.qs);
     return out;
 }
 
@@ -4981,30 +5021,11 @@ static block_znq5_lx8 make_block_znq5_lx8(const block_znq5_l * in) {
 
     for (int r = 0; r < 8; ++r) {
         const uint8_t * src = (const uint8_t *) &in[r];
-
         for (int b = 0; b < 3; ++b) {
             out.header[b * 8 + r] = src[b];
         }
-
-        for (int q = 0; q < 8; ++q) {
-            uint32_t high;
-            memcpy(&high, out.qs[q] + 16, sizeof(high));
-
-            for (int j = 0; j < 4; ++j) {
-                const int bit = 5 * (4 * q + j);
-                unsigned code = in[r].qs[bit / 8] >> (bit % 8);
-                if (bit % 8 > 3) {
-                    code |= unsigned(in[r].qs[bit / 8 + 1]) << (8 - bit % 8);
-                }
-
-                out.qs[q][2 * r + j / 2] |= (code & 15) << (4 * (j % 2));
-                high |= uint32_t((code >> 4) & 1) << (4 * r + j);
-            }
-
-            memcpy(out.qs[q] + 16, &high, sizeof(high));
-        }
     }
-
+    repack_znq_5bit_qs_8(in, out.qs);
     return out;
 }
 
@@ -5034,30 +5055,11 @@ static block_znq6_sx8 make_block_znq6_sx8(const block_znq6_s * in) {
 
     for (int r = 0; r < 8; ++r) {
         const uint8_t * src = (const uint8_t *) &in[r];
-
         for (int b = 0; b < 4; ++b) {
             out.header[r * 4 + b] = src[b];
         }
-
-        for (int q = 0; q < 8; ++q) {
-            uint32_t high;
-            memcpy(&high, out.qs[q] + 16, sizeof(high));
-
-            for (int j = 0; j < 4; ++j) {
-                const int bit = 5 * (4 * q + j);
-                unsigned code = in[r].qs[bit / 8] >> (bit % 8);
-                if (bit % 8 > 3) {
-                    code |= unsigned(in[r].qs[bit / 8 + 1]) << (8 - bit % 8);
-                }
-
-                out.qs[q][2 * r + j / 2] |= (code & 15) << (4 * (j % 2));
-                high |= uint32_t((code >> 4) & 1) << (4 * r + j);
-            }
-
-            memcpy(out.qs[q] + 16, &high, sizeof(high));
-        }
     }
-
+    repack_znq_5bit_qs_8(in, out.qs);
     return out;
 }
 
@@ -5087,31 +5089,11 @@ static block_znq6_mx8 make_block_znq6_mx8(const block_znq6_m * in) {
 
     for (int r = 0; r < 8; ++r) {
         const uint8_t * src = (const uint8_t *) &in[r];
-
         for (int b = 0; b < 2; ++b) {
             out.header[b * 8 + r] = src[b];
         }
-
-        for (int q = 0; q < 8; ++q) {
-            uint32_t high[2];
-            memcpy(high, out.qs[q] + 16, sizeof(high));
-
-            for (int j = 0; j < 4; ++j) {
-                const int bit = 6 * (4 * q + j);
-                unsigned code = in[r].qs[bit / 8] >> (bit % 8);
-                if (bit % 8 > 2) {
-                    code |= unsigned(in[r].qs[bit / 8 + 1]) << (8 - bit % 8);
-                }
-
-                out.qs[q][2 * r + j / 2] |= (code & 15) << (4 * (j % 2));
-                high[0] |= uint32_t((code >> 4) & 1) << (4 * r + j);
-                high[1] |= uint32_t((code >> 5) & 1) << (4 * r + j);
-            }
-
-            memcpy(out.qs[q] + 16, high, sizeof(high));
-        }
     }
-
+    repack_znq_6bit_qs_8(in, out.qs);
     return out;
 }
 
@@ -5141,31 +5123,11 @@ static block_znq6_lx8 make_block_znq6_lx8(const block_znq6_l * in) {
 
     for (int r = 0; r < 8; ++r) {
         const uint8_t * src = (const uint8_t *) &in[r];
-
         for (int b = 0; b < 3; ++b) {
             out.header[b * 8 + r] = src[b];
         }
-
-        for (int q = 0; q < 8; ++q) {
-            uint32_t high[2];
-            memcpy(high, out.qs[q] + 16, sizeof(high));
-
-            for (int j = 0; j < 4; ++j) {
-                const int bit = 6 * (4 * q + j);
-                unsigned code = in[r].qs[bit / 8] >> (bit % 8);
-                if (bit % 8 > 2) {
-                    code |= unsigned(in[r].qs[bit / 8 + 1]) << (8 - bit % 8);
-                }
-
-                out.qs[q][2 * r + j / 2] |= (code & 15) << (4 * (j % 2));
-                high[0] |= uint32_t((code >> 4) & 1) << (4 * r + j);
-                high[1] |= uint32_t((code >> 5) & 1) << (4 * r + j);
-            }
-
-            memcpy(out.qs[q] + 16, high, sizeof(high));
-        }
     }
-
+    repack_znq_6bit_qs_8(in, out.qs);
     return out;
 }
 
@@ -5195,31 +5157,11 @@ static block_znq7_sx8 make_block_znq7_sx8(const block_znq7_s * in) {
 
     for (int r = 0; r < 8; ++r) {
         const uint8_t * src = (const uint8_t *) &in[r];
-
         for (int b = 0; b < 4; ++b) {
             out.header[r * 4 + b] = src[b];
         }
-
-        for (int q = 0; q < 8; ++q) {
-            uint32_t high[2];
-            memcpy(high, out.qs[q] + 16, sizeof(high));
-
-            for (int j = 0; j < 4; ++j) {
-                const int bit = 6 * (4 * q + j);
-                unsigned code = in[r].qs[bit / 8] >> (bit % 8);
-                if (bit % 8 + 6 > 8) {
-                    code |= unsigned(in[r].qs[bit / 8 + 1]) << (8 - bit % 8);
-                }
-
-                out.qs[q][2 * r + j / 2] |= (code & 15) << (4 * (j % 2));
-                high[0] |= uint32_t((code >> 4) & 1) << (4 * r + j);
-                high[1] |= uint32_t((code >> 5) & 1) << (4 * r + j);
-            }
-
-            memcpy(out.qs[q] + 16, high, sizeof(high));
-        }
     }
-
+    repack_znq_6bit_qs_8(in, out.qs);
     return out;
 }
 
@@ -5349,10 +5291,8 @@ static int repack_iq4_nl_to_iq4_nl_16_bl(struct ggml_tensor * t, int interleave_
     const block_iq4_nl    * src = (const block_iq4_nl   *)data;
           block_iq4_nlx16 * dst = (      block_iq4_nlx16 *)t->data;
 
-    block_iq4_nl dst_tmp[16];
-
     int nrow = ggml_nrows(t);
-    int nrows_interleaved = 16;
+    constexpr int nrows_interleaved = 16;
     int nblocks = t->ne[0] / QK4_NL;
 
     GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_iq4_nl));
@@ -5361,18 +5301,8 @@ static int repack_iq4_nl_to_iq4_nl_16_bl(struct ggml_tensor * t, int interleave_
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i = 0; i < nrows_interleaved; i++) {
-                dst_tmp[i] = src[x + i * nblocks];
-            }
-            *dst++ = make_block_iq4_nlx16(dst_tmp, interleave_block);
-        }
-        src += nrows_interleaved * nblocks;
-    }
+    repack_interleaved_bl_parallel<nrows_interleaved>(src, dst, nrow, nblocks, data_size, interleave_block, make_block_iq4_nlx16);
     return 0;
-
-    GGML_UNUSED(data_size);
 }
 
 static block_mxfp4x4 make_block_mxfp4x4(block_mxfp4 * in, unsigned int blck_size_interleave) {
@@ -5406,10 +5336,8 @@ static int repack_mxfp4_to_mxfp4_4_bl(struct ggml_tensor * t, int interleave_blo
     const block_mxfp4   * src = (const block_mxfp4   *)data;
           block_mxfp4x4 * dst = (      block_mxfp4x4 *)t->data;
 
-    block_mxfp4 dst_tmp[4];
-
     int nrow = ggml_nrows(t);
-    int nrows_interleaved = 4;
+    constexpr int nrows_interleaved = 4;
     int nblocks = t->ne[0] / QK_MXFP4;
 
     GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_mxfp4));
@@ -5418,18 +5346,8 @@ static int repack_mxfp4_to_mxfp4_4_bl(struct ggml_tensor * t, int interleave_blo
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i = 0; i < nrows_interleaved; i++) {
-                dst_tmp[i] = src[x + i * nblocks];
-            }
-            *dst++ = make_block_mxfp4x4(dst_tmp, interleave_block);
-        }
-        src += nrows_interleaved * nblocks;
-    }
+    repack_interleaved_bl_parallel<nrows_interleaved>(src, dst, nrow, nblocks, data_size, interleave_block, make_block_mxfp4x4);
     return 0;
-
-    GGML_UNUSED(data_size);
 }
 
 static block_mxfp4x8 make_block_mxfp4x8(block_mxfp4 * in, unsigned int blck_size_interleave) {
@@ -5463,10 +5381,8 @@ static int repack_mxfp4_to_mxfp4_8_bl(struct ggml_tensor * t, int interleave_blo
     const block_mxfp4   * src = (const block_mxfp4   *)data;
           block_mxfp4x8 * dst = (      block_mxfp4x8 *)t->data;
 
-    block_mxfp4 dst_tmp[8];
-
     int nrow = ggml_nrows(t);
-    int nrows_interleaved = 8;
+    constexpr int nrows_interleaved = 8;
     int nblocks = t->ne[0] / QK_MXFP4;
 
     GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_mxfp4));
@@ -5475,18 +5391,8 @@ static int repack_mxfp4_to_mxfp4_8_bl(struct ggml_tensor * t, int interleave_blo
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i = 0; i < nrows_interleaved; i++) {
-                dst_tmp[i] = src[x + i * nblocks];
-            }
-            *dst++ = make_block_mxfp4x8(dst_tmp, interleave_block);
-        }
-        src += nrows_interleaved * nblocks;
-    }
+    repack_interleaved_bl_parallel<nrows_interleaved>(src, dst, nrow, nblocks, data_size, interleave_block, make_block_mxfp4x8);
     return 0;
-
-    GGML_UNUSED(data_size);
 }
 
 namespace ggml::cpu::repack {
@@ -7046,7 +6952,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         thread_local std::vector<uint8_t> tl_rep;
         if (!is_repacked) {
             const size_t slice_bytes = (size_t) nc * src0->nb[1];
-            if (tl_rep.size() < slice_bytes) {
+            if (!repack_in_place && tl_rep.size() < slice_bytes) {
                 tl_rep.resize(slice_bytes);
             }
             struct ggml_tensor slice = *src0;
@@ -7055,13 +6961,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             slice.ne[3] = 1;
             slice.nb[2] = slice_bytes;
             slice.nb[3] = slice_bytes;
-            slice.data  = tl_rep.data();
+            slice.data  = repack_in_place ? const_cast<char *>(vx) : (void *) tl_rep.data();
             if (ggml::cpu::repack::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>(&slice, vx, slice_bytes) != 0) {
                 return false;
             }
-            if (repack_in_place) {
-                memcpy(const_cast<char *>(vx), tl_rep.data(), slice_bytes);
-            } else {
+            if (!repack_in_place) {
                 vx = (const char *) tl_rep.data();
             }
         }
@@ -7076,6 +6980,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                    enum ggml_type src1_q_type, const int32_t * row_map, int64_t cne1,
                    float * dst_data, size_t dst_nb1, size_t dst_nb2,
                    int64_t col_start, int64_t col_end) const override {
+        GGML_UNUSED(repack_in_place);
         if (src1_q_type != PARAM_TYPE) {
             return false;
         }
@@ -7088,66 +6993,70 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         }
 
         const char * vx = (const char *) expert_data + col_start * src0->nb[1];
-        thread_local std::vector<uint8_t> tl_rep;
         if (!is_repacked) {
             const size_t slice_bytes = (size_t) nc * src0->nb[1];
-            if (tl_rep.size() < slice_bytes) {
-                tl_rep.resize(slice_bytes);
-            }
             struct ggml_tensor slice = *src0;
             slice.ne[1] = nc;
             slice.ne[2] = 1;
             slice.ne[3] = 1;
             slice.nb[2] = slice_bytes;
             slice.nb[3] = slice_bytes;
-            slice.data  = tl_rep.data();
+            slice.data  = const_cast<char *>(vx);
             if (ggml::cpu::repack::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>(&slice, vx, slice_bytes) != 0) {
                 return false;
-            }
-            if (repack_in_place) {
-                memcpy(const_cast<char *>(vx), tl_rep.data(), slice_bytes);
-            } else {
-                vx = (const char *) tl_rep.data();
             }
         }
 
         int64_t ir1 = 0;
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
-        if constexpr (PARAM_TYPE == GGML_TYPE_Q8_0 && INTER_SIZE == 8) {
-            thread_local std::vector<uint8_t> tl_vy;
-            thread_local std::vector<float>   tl_out;
-            thread_local std::vector<int32_t> tl_sums;
-            const size_t vy_stride   = (size_t) (src0->ne[0] / QK8_0) * sizeof(block_q8_0x4);
-            const size_t sums_stride = (size_t) (src0->ne[0] / QK_ZNQ);
-            const size_t dst_bs1     = dst_nb1 / sizeof(float);
-            const size_t dst_bs2     = dst_nb2 / sizeof(float);
-            const int64_t gemm_nr    = cne1 - (cne1 % 4);
+        using packed_act_t = std::conditional_t<PARAM_TYPE == GGML_TYPE_Q8_0, block_q8_0x4, block_q8_Kx4>;
+        constexpr int act_block_k = (PARAM_TYPE == GGML_TYPE_Q8_0) ? QK8_0 : QK_K;
+        thread_local std::vector<uint8_t> tl_vy;
+        thread_local std::vector<float>   tl_out;
+        thread_local std::vector<int32_t> tl_sums;
+        const size_t vy_stride   = (size_t) (src0->ne[0] / act_block_k) * sizeof(packed_act_t);
+        const size_t sums_stride = (size_t) (src0->ne[0] / QK_ZNQ);
+        const size_t dst_bs1     = dst_nb1 / sizeof(float);
+        const size_t dst_bs2     = dst_nb2 / sizeof(float);
+        const int64_t gemm_nr    = cne1 - (cne1 % 4);
 
-            if (gemm_nr >= 4) {
-                const size_t total_vy = (size_t) (gemm_nr / 4) * vy_stride;
-                if (tl_vy.size() < total_vy) {
-                    tl_vy.resize(total_vy);
+        if (gemm_nr >= 4) {
+            const size_t total_vy = (size_t) (gemm_nr / 4) * vy_stride;
+            if (tl_vy.size() < total_vy) {
+                tl_vy.resize(total_vy);
+            }
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+            if constexpr (local_znq) {
+                if (tl_sums.size() < (size_t) gemm_nr * sums_stride) {
+                    tl_sums.resize((size_t) gemm_nr * sums_stride);
+                }
+            }
+#endif
+            for (int64_t r0 = 0; r0 < gemm_nr; r0 += 4) {
+                const void * ptrs[4];
+                for (int r = 0; r < 4; ++r) {
+                    const int32_t i1  = row_map[2 * (r0 + r) + 0];
+                    const int32_t i12 = row_map[2 * (r0 + r) + 1];
+                    const int64_t i11 = i1 % ne11;
+                    ptrs[r] = (const char *) src1_q_base + i11 * nb11_q + i12 * nb12_q;
+                }
+                uint8_t * vy_chunk = tl_vy.data() + (size_t) (r0 / 4) * vy_stride;
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+                if constexpr (PARAM_TYPE == GGML_TYPE_Q8_0 && INTER_SIZE == 8) {
+                    ggml_repack_q8_0_4x8(ptrs, vy_chunk, src0->ne[0]);
+                } else {
+                    repack_activation_rows<INTER_SIZE, PARAM_TYPE>(ptrs, vy_chunk, src0->ne[0]);
                 }
                 if constexpr (local_znq) {
-                    if (tl_sums.size() < (size_t) gemm_nr * sums_stride) {
-                        tl_sums.resize((size_t) gemm_nr * sums_stride);
-                    }
+                    ggml_znq_local_prepare_sums(src0->ne[0], 4, true, vy_chunk, tl_sums.data() + (size_t) r0 * sums_stride);
                 }
-                for (int64_t r0 = 0; r0 < gemm_nr; r0 += 4) {
-                    const void * ptrs[4];
-                    for (int r = 0; r < 4; ++r) {
-                        const int32_t i1  = row_map[2 * (r0 + r) + 0];
-                        const int32_t i12 = row_map[2 * (r0 + r) + 1];
-                        const int64_t i11 = i1 % ne11;
-                        ptrs[r] = (const char *) src1_q_base + i11 * nb11_q + i12 * nb12_q;
-                    }
-                    uint8_t * vy_chunk = tl_vy.data() + (size_t) (r0 / 4) * vy_stride;
-                    ggml_repack_q8_0_4x8(ptrs, vy_chunk, src0->ne[0]);
-                    if constexpr (local_znq) {
-                        ggml_znq_local_prepare_sums(src0->ne[0], 4, true, vy_chunk, tl_sums.data() + (size_t) r0 * sums_stride);
-                    }
-                }
+#else
+                repack_activation_rows<INTER_SIZE, PARAM_TYPE>(ptrs, vy_chunk, src0->ne[0]);
+#endif
+            }
 
+            bool handled_direct = false;
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+            if constexpr (PARAM_TYPE == GGML_TYPE_Q8_0 && INTER_SIZE == 8) {
                 const bool is_znq_m = (src0->type == GGML_TYPE_ZNQ2_M || src0->type == GGML_TYPE_ZNQ3_M || src0->type == GGML_TYPE_ZNQ4_M);
                 if (local_znq || is_znq_m) {
                     float * out_tile = dst_data + col_start;
@@ -7165,26 +7074,37 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                         ggml_gemm_znq4_m_8x8_q8_0_moe((int) src0->ne[0], out_tile, dst_bs1, dst_bs2,
                                                       row_map, vx, tl_vy.data(), (int) gemm_nr, (int) nc);
                     }
-                } else {
-                    if (tl_out.size() < (size_t) (gemm_nr * nc)) {
-                        tl_out.resize((size_t) (gemm_nr * nc));
-                    }
-                    gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
-                        (int) src0->ne[0], tl_out.data(), (size_t) nc,
-                        vx, tl_vy.data(), (int) gemm_nr, (int) nc);
-                    for (int64_t r = 0; r < gemm_nr; ++r) {
-                        const int32_t i1  = row_map[2 * r + 0];
-                        const int32_t i12 = row_map[2 * r + 1];
-                        float * dst_row = (float *) ((char *) dst_data + (size_t) i1 * dst_nb1 + (size_t) i12 * dst_nb2);
-                        memcpy(dst_row + col_start, tl_out.data() + (size_t) r * (size_t) nc, (size_t) nc * sizeof(float));
-                    }
+                    handled_direct = true;
                 }
-                ir1 = gemm_nr;
             }
+#endif
+            if (!handled_direct) {
+                if (tl_out.size() < (size_t) (gemm_nr * nc)) {
+                    tl_out.resize((size_t) (gemm_nr * nc));
+                }
+                gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                    (int) src0->ne[0], tl_out.data(), (size_t) nc,
+                    vx, tl_vy.data(), (int) gemm_nr, (int) nc);
+                for (int64_t r = 0; r < gemm_nr; ++r) {
+                    const int32_t i1  = row_map[2 * r + 0];
+                    const int32_t i12 = row_map[2 * r + 1];
+                    float * dst_row = (float *) ((char *) dst_data + (size_t) i1 * dst_nb1 + (size_t) i12 * dst_nb2);
+                    memcpy(dst_row + col_start, tl_out.data() + (size_t) r * (size_t) nc, (size_t) nc * sizeof(float));
+                }
+            }
+            ir1 = gemm_nr;
+        }
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+        if constexpr (PARAM_TYPE == GGML_TYPE_Q8_0 && INTER_SIZE == 8) {
             // Multi-row tail (2 or 3 remaining rows): decode weights ONCE across all tail rows
             const int64_t tail_rows = cne1 - ir1;
-            if ((local_znq || src0->type == GGML_TYPE_ZNQ3_M) && tail_rows > 1 && nc >= 16) {
+            if (src0->type == GGML_TYPE_ZNQ3_M && ne11 == 1 && tail_rows > 1 && nc >= 16) {
+                ggml_gemv_znq3_m_8x8_q8_0_moe(
+                    (int) src0->ne[0], dst_data + col_start, dst_bs1, dst_bs2,
+                    row_map + 2 * ir1, vx, src1_q_base, (int) tail_rows, (int) nc);
+                ir1 = cne1;
+            } else if ((local_znq || src0->type == GGML_TYPE_ZNQ3_M) && tail_rows > 1 && nc >= 16) {
                 const size_t row_q8_bytes = (size_t) (src0->ne[0] / QK8_0) * sizeof(block_q8_0);
                 if (tl_vy.size() < (size_t) tail_rows * row_q8_bytes) {
                     tl_vy.resize((size_t) tail_rows * row_q8_bytes);
@@ -7199,9 +7119,16 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     const void * src1_col = (const char *) src1_q_base + i11 * nb11_q + i12 * nb12_q;
                     memcpy(tl_vy.data() + (size_t) r * row_q8_bytes, src1_col, row_q8_bytes);
                 }
-                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
-                    (int) src0->ne[0], tl_out.data(), (size_t) nc,
-                    vx, tl_vy.data(), (int) tail_rows, (int) nc);
+                if constexpr (local_znq) {
+                    if (tl_sums.size() < (size_t) tail_rows * sums_stride) {
+                        tl_sums.resize((size_t) tail_rows * sums_stride);
+                    }
+                    ggml_znq_local_prepare_sums(src0->ne[0], (int) tail_rows, false, tl_vy.data(), tl_sums.data());
+                    ggml_gemv_znq_local((int) src0->ne[0], tl_out.data(), (int) nc, vx, tl_vy.data(),
+                                        (int) tail_rows, (int) nc, local_group, tl_sums.data(), local_bits, local_selector_bits);
+                } else {
+                    ggml_gemv_znq3_m_8x8_q8_0((int) src0->ne[0], tl_out.data(), (int) nc, vx, tl_vy.data(), (int) tail_rows, (int) nc);
+                }
                 for (int64_t r = 0; r < tail_rows; ++r) {
                     const int32_t i1  = row_map[2 * (ir1 + r) + 0];
                     const int32_t i12 = row_map[2 * (ir1 + r) + 1];

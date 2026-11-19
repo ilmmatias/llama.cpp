@@ -103,7 +103,6 @@ struct prefetch_entry {
 };
 
 static constexpr size_t NVME_ALIGN = 4096;
-static constexpr int    PP_WINDOW  = 32;
 
 struct nvme_file_handle {
     int fd = -1;
@@ -133,6 +132,7 @@ struct l2_slot_meta {
     bool valid = false;
     bool repacked = false;
     bool repack_queued = false;
+    bool prewarm_untouched = false;
 };
 
 struct repack_job {
@@ -180,6 +180,7 @@ struct nvme_layer {
     std::vector<int8_t>  active_is_repacked;   // 1 if active_ptrs[*][e] is in CPU_REPACK layout
     std::vector<int8_t>  active_can_repack_in_place; // 1 if L2 slot is exclusively pinned for in-place PP repack
     std::vector<int32_t> active_experts;       // list of experts touched in this layer (for fast cleanup)
+    std::vector<int32_t> pp_miss_list;         // sorted list of missing experts in current PP layer for early prefetch
 
     // Host copy of router weights for cross-layer speculative prefetching
     int router_n_embd = 0;
@@ -213,6 +214,10 @@ struct nvme_expert_cache::impl {
     std::unordered_map<const ggml_tensor *, std::unique_ptr<nvme_tensor_info>> tensors;
     std::unordered_map<int, std::unique_ptr<nvme_layer>> layers;
 
+    // Fast-path pointer cache for the currently executing op (set by thread 0 in begin_op)
+    const nvme_tensor_info * cur_op_info = nullptr;
+    nvme_layer * cur_op_layer = nullptr;
+
     // Global L2 RAM slab pool
     std::mutex pool_mutex;
     uint8_t * l2_pool_base = nullptr;
@@ -221,6 +226,8 @@ struct nvme_expert_cache::impl {
     uint32_t l2_num_slots = 0;
     uint32_t l2_next_free = 0;
     uint32_t l2_clock_hand = 0;
+    uint32_t l2_untouched_prewarm = 0;
+    uint32_t l2_prewarm_hand = 0;
     std::vector<l2_slot_meta> l2_slots;
 
     // Background CPU_REPACK workers for newly admitted L2 slots
@@ -290,14 +297,8 @@ struct nvme_expert_cache::impl {
         }
 
 #if defined(GGML_USE_IO_URING)
-        // Use modern Linux SINGLE_ISSUER + DEFER_TASKRUN for lowest completion latency (falls back to 0)
-        struct io_uring_params up = {};
-#if defined(IORING_SETUP_SINGLE_ISSUER) && defined(IORING_SETUP_DEFER_TASKRUN)
-        up.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
-        if (io_uring_queue_init_params(256, &ring, &up) == 0) {
-            ring_ready = true;
-        } else
-#endif
+        // Use standard interrupt-driven completions (do NOT use IORING_SETUP_DEFER_TASKRUN,
+        // which defers kernel completion task_work while thread 0 is in user-space Pass 0 compute).
         if (io_uring_queue_init(256, &ring, 0) == 0) {
             ring_ready = true;
         } else {
@@ -810,11 +811,14 @@ struct nvme_expert_cache::impl {
                     m.valid = true;
                     m.repacked = layer.can_repack_all;
                     m.repack_queued = false;
+                    m.prewarm_untouched = true;
                     layer.expert_to_slot[(size_t) e] = s;
                     items.push_back({ layer.layer_id, e, s });
                 }
             }
             l2_next_free = slot_cursor;
+            l2_untouched_prewarm = slot_cursor;
+            l2_prewarm_hand = 0;
 
             const uint32_t n_pw_threads = std::min<uint32_t>(16, std::max<uint32_t>(1, std::thread::hardware_concurrency() / 2));
             std::atomic<size_t> next_item{0};
@@ -822,8 +826,6 @@ struct nvme_expert_cache::impl {
             pw_threads.reserve(n_pw_threads);
             for (uint32_t ti = 0; ti < n_pw_threads; ++ti) {
                 pw_threads.emplace_back([&]() {
-                    void * bounce = nullptr;
-                    size_t bounce_cap = 0;
                     for (;;) {
                         const size_t idx = next_item.fetch_add(8, std::memory_order_relaxed);
                         if (idx >= items.size()) break;
@@ -837,33 +839,18 @@ struct nvme_expert_cache::impl {
                                 uint64_t aoff = 0; size_t alen = 0; size_t pad = 0;
                                 calc_aligned_read(info, it.expert, aoff, alen, pad);
                                 uint8_t * dst_part = slot_base + layer.part_slot_offsets[p];
+                                size_t done = 0;
+                                while (done < alen) {
+                                    ssize_t r = pread(info.fd, dst_part + done, alen - done, (off_t) (aoff + done));
+                                    if (r <= 0) { if (r < 0 && errno == EINTR) continue; break; }
+                                    done += (size_t) r;
+                                }
                                 if (layer.can_repack_all) {
-                                    if (bounce_cap < alen) {
-                                        free(bounce);
-                                        if (posix_memalign(&bounce, NVME_ALIGN, alen) != 0) {
-                                            bounce = nullptr; bounce_cap = 0; break;
-                                        }
-                                        bounce_cap = alen;
-                                    }
-                                    size_t done = 0;
-                                    while (done < alen) {
-                                        ssize_t r = pread(info.fd, (uint8_t *) bounce + done, alen - done, (off_t) (aoff + done));
-                                        if (r <= 0) { if (r < 0 && errno == EINTR) continue; break; }
-                                        done += (size_t) r;
-                                    }
-                                    ggml_cpu_nvme_repack_expert(info.tensor, (const uint8_t *) bounce + pad, dst_part + pad, info.expert_bytes);
-                                } else {
-                                    size_t done = 0;
-                                    while (done < alen) {
-                                        ssize_t r = pread(info.fd, dst_part + done, alen - done, (off_t) (aoff + done));
-                                        if (r <= 0) { if (r < 0 && errno == EINTR) continue; break; }
-                                        done += (size_t) r;
-                                    }
+                                    ggml_cpu_nvme_repack_expert(info.tensor, dst_part + pad, dst_part + pad, info.expert_bytes);
                                 }
                             }
                         }
                     }
-                    free(bounce);
                 });
             }
             for (auto & t : pw_threads) {
@@ -897,7 +884,21 @@ struct nvme_expert_cache::impl {
         int32_t slot = -1;
         if (l2_next_free < l2_num_slots) {
             slot = (int32_t) l2_next_free++;
-        } else if (!free_only) {
+        } else if (!free_only && l2_untouched_prewarm > 0) {
+            for (uint32_t scanned = 0; scanned < l2_num_slots; ++scanned) {
+                const uint32_t idx = l2_prewarm_hand;
+                l2_prewarm_hand = (l2_prewarm_hand + 1) % l2_num_slots;
+                auto & m = l2_slots[idx];
+                if (m.ref_count == 0 && m.prewarm_untouched) {
+                    slot = (int32_t) idx;
+                    break;
+                }
+            }
+            if (slot < 0) {
+                l2_untouched_prewarm = 0;
+            }
+        }
+        if (slot < 0 && !free_only) {
             // Aging-LFU Clock sweep: hot experts (high second_chance up to 15) survive multiple sweeps
             const uint32_t max_scans = l2_num_slots * 16;
             for (uint32_t scanned = 0; scanned < max_scans; ++scanned) {
@@ -920,6 +921,12 @@ struct nvme_expert_cache::impl {
         }
 
         auto & m = l2_slots[(size_t) slot];
+        if (m.prewarm_untouched) {
+            m.prewarm_untouched = false;
+            if (l2_untouched_prewarm > 0) {
+                l2_untouched_prewarm--;
+            }
+        }
         if (m.valid && m.layer_id >= 0 && m.expert >= 0) {
             auto lit = layers.find(m.layer_id);
             if (lit != layers.end() && lit->second->expert_to_slot[(size_t) m.expert] == slot) {
@@ -1152,6 +1159,25 @@ struct nvme_expert_cache::impl {
         }
     }
 
+    inline bool resolve_op(const ggml_tensor * op, const nvme_tensor_info *& info_out, nvme_layer *& layer_out) {
+        if (cur_op_info != nullptr && cur_op_info->tensor == op->src[0] && cur_op_layer != nullptr) {
+            info_out = cur_op_info;
+            layer_out = cur_op_layer;
+            return true;
+        }
+        auto tit = tensors.find(op->src[0]);
+        if (tit == tensors.end()) {
+            return false;
+        }
+        auto lit = layers.find(tit->second->layer_id);
+        if (lit == layers.end()) {
+            return false;
+        }
+        info_out = tit->second.get();
+        layer_out = lit->second.get();
+        return true;
+    }
+
     bool begin_op(const ggml_tensor * op, const uint64_t * l1_ready_masks) {
         if (!valid || !op || !op->src[0] || !op->src[2]) {
             return false;
@@ -1162,8 +1188,9 @@ struct nvme_expert_cache::impl {
         }
         ensure_pool_initialized();
 
-        const auto & info = *tit->second;
-        auto & layer = *layers[info.layer_id];
+        cur_op_info = tit->second.get();
+        cur_op_layer = layers.find(cur_op_info->layer_id)->second.get();
+        auto & layer = *cur_op_layer;
         const ggml_tensor * ids = op->src[2];
 
         // If this layer is already active with the same ids (e.g. up/down after gate_up/gate):
@@ -1172,6 +1199,8 @@ struct nvme_expert_cache::impl {
         if (layer.active && layer.active_ids == ids) {
             if (!layer.pp_mode) {
                 reap_completions(/*block=*/ false);
+            } else if (!layer.pp_miss_list.empty()) {
+                pp_submit_window(layer, cur_op_info->part_idx, layer.pp_miss_list.data(), 0, (int) layer.pp_miss_list.size());
             }
             return true;
         }
@@ -1216,6 +1245,12 @@ struct nvme_expert_cache::impl {
                 auto & m = l2_slots[(size_t) slot];
                 m.ref_count++;
                 if ((uint64_t) hit_freq[(size_t) e] * (uint64_t) layer.n_expert >= avg_thresh) {
+                    if (m.prewarm_untouched) {
+                        m.prewarm_untouched = false;
+                        if (l2_untouched_prewarm > 0) {
+                            l2_untouched_prewarm--;
+                        }
+                    }
                     m.second_chance = (uint8_t) std::min<int>(15, (int) m.second_chance + 2);
                 } else {
                     m.second_chance >>= 1;
@@ -1272,6 +1307,12 @@ struct nvme_expert_cache::impl {
                             if (slot < 0 && cold_idx < cold_layer_slots.size()) {
                                 slot = cold_layer_slots[cold_idx++];
                                 auto & m = l2_slots[(size_t) slot];
+                                if (m.prewarm_untouched) {
+                                    m.prewarm_untouched = false;
+                                    if (l2_untouched_prewarm > 0) {
+                                        l2_untouched_prewarm--;
+                                    }
+                                }
                                 if (m.valid && m.layer_id >= 0 && m.expert >= 0) {
                                     auto lit = layers.find(m.layer_id);
                                     if (lit != layers.end() && lit->second->expert_to_slot[(size_t) m.expert] == slot) {
@@ -1297,6 +1338,17 @@ struct nvme_expert_cache::impl {
                         }
                     }
                 }
+            }
+            // Collect missing experts in ascending disk offset order and immediately kick off io_uring reads
+            // before the 16 CPU threads run from_float (F32 -> Q8_0) and matrix_row_counts!
+            layer.pp_miss_list.clear();
+            for (int32_t e = 0; e < layer.n_expert; ++e) {
+                if (miss_freq[(size_t) e] > 0) {
+                    layer.pp_miss_list.push_back(e);
+                }
+            }
+            if (!layer.pp_miss_list.empty()) {
+                pp_submit_window(layer, cur_op_info->part_idx, layer.pp_miss_list.data(), 0, (int) layer.pp_miss_list.size());
             }
             return true;
         }
@@ -1335,6 +1387,12 @@ struct nvme_expert_cache::impl {
                 if (slot >= 0 && l2_slots[(size_t) slot].valid) {
                     auto & m = l2_slots[(size_t) slot];
                     m.ref_count++;
+                    if (m.prewarm_untouched) {
+                        m.prewarm_untouched = false;
+                        if (l2_untouched_prewarm > 0) {
+                            l2_untouched_prewarm--;
+                        }
+                    }
                     m.second_chance = (uint8_t) std::min<int>(15, (int) m.second_chance + 2);
                     layer.active_l2_slots[(size_t) e] = slot;
                     const bool is_rep = m.repacked;
@@ -1360,7 +1418,7 @@ struct nvme_expert_cache::impl {
                 } else {
                     stat_l3_misses++;
                     stat_dec_misses++;
-                    const bool has_free = (l2_next_free < l2_num_slots);
+                    const bool has_free = (l2_next_free < l2_num_slots) || (l2_untouched_prewarm > 0);
                     const bool recent = (admit_window == 0) ||
                         ((layer.step - layer.last_seen_step[(size_t) e]) <= (int64_t) admit_window);
 
@@ -1446,12 +1504,13 @@ struct nvme_expert_cache::impl {
     }
 
     const void * get_expert(const ggml_tensor * op, int32_t expert, bool wait) {
-        auto tit = tensors.find(op->src[0]);
-        if (tit == tensors.end()) {
+        const nvme_tensor_info * info_ptr = nullptr;
+        nvme_layer * layer_ptr = nullptr;
+        if (!resolve_op(op, info_ptr, layer_ptr)) {
             return nullptr;
         }
-        const auto & info = *tit->second;
-        auto & layer = *layers[info.layer_id];
+        const auto & info = *info_ptr;
+        auto & layer = *layer_ptr;
 
         if (expert < 0) {
             if (wait && ring_in_flight > 0) {
@@ -1470,7 +1529,7 @@ struct nvme_expert_cache::impl {
             } else {
                 reap_completions(/*block=*/ false);
             }
-            return nullptr;
+            return ring_in_flight > 0 ? (const void *) (uintptr_t) 1 : nullptr;
         }
 
         if (!wait) {
@@ -1500,16 +1559,13 @@ struct nvme_expert_cache::impl {
     }
 
     int is_expert_repacked(const ggml_tensor * op, int32_t expert) {
-        auto tit = tensors.find(op->src[0]);
-        if (tit == tensors.end()) {
+        const nvme_tensor_info * info_ptr = nullptr;
+        nvme_layer * layer_ptr = nullptr;
+        if (!resolve_op(op, info_ptr, layer_ptr) || expert < 0 || expert >= layer_ptr->n_expert) {
             return 0;
         }
-        const auto & info = *tit->second;
-        auto lit = layers.find(info.layer_id);
-        if (lit == layers.end() || expert < 0 || expert >= lit->second->n_expert) {
-            return 0;
-        }
-        auto & layer = *lit->second;
+        const auto & info = *info_ptr;
+        auto & layer = *layer_ptr;
         const int l2_hit_flag = (layer.active_l2_slots[(size_t) expert] >= 0 && !layer.active_admit_l2[(size_t) expert]) ? 4 : 0;
         if (layer.active_is_repacked[(size_t) expert] != 0) {
             return l2_hit_flag | 1;
@@ -1521,24 +1577,21 @@ struct nvme_expert_cache::impl {
         return l2_hit_flag;
     }
 
-    const void * pp_prepare_expert(const ggml_tensor * op, const int32_t * active_experts, int active_idx, int n_active) {
-        auto tit = tensors.find(op->src[0]);
-        if (tit == tensors.end()) {
-            return nullptr;
-        }
-        const auto & info = *tit->second;
-        auto & layer = *layers[info.layer_id];
-        const int p = info.part_idx;
-
+    void pp_submit_window(nvme_layer & layer, int p, const int32_t * active_experts, int start_k, int n_active) {
+        reap_completions(/*block=*/ false);
         bool any_submitted = false;
-        const int start_k = std::max(0, active_idx);
-        const int win_end = std::min(n_active, start_k + PP_WINDOW);
-        for (int k = start_k; k < win_end; ++k) {
+        bool no_scratch = false;
+        for (int k = std::max(0, start_k); k < n_active; ++k) {
+#if defined(GGML_USE_IO_URING)
+            if (ring_ready && ring_in_flight >= 192) {
+                break;
+            }
+#endif
             const int32_t e = active_experts[k];
             if (layer.active_ptrs[(size_t) p][(size_t) e] != nullptr) {
                 continue; // L2 hit or already submitted!
             }
-            // If this expert was selected for PP L2 warming, read directly into its claimed L2 slot!
+            // If this expert was selected for PP L2 warming, read directly into its claimed L2 slot (uses 0 scratch slots!)
             if (layer.active_l2_slots[(size_t) e] >= 0 && layer.active_admit_l2[(size_t) e]) {
                 uint8_t * dst = l2_pool_base + (size_t) layer.active_l2_slots[(size_t) e] * l2_slot_stride +
                                 layer.part_slot_offsets[(size_t) p];
@@ -1548,9 +1601,13 @@ struct nvme_expert_cache::impl {
                 any_submitted = true;
                 continue;
             }
+            if (no_scratch) {
+                continue;
+            }
             const int32_t sc = alloc_scratch_slot();
             if (sc < 0) {
-                break;
+                no_scratch = true;
+                continue;
             }
             layer.active_scratch_slots[(size_t) e] = sc;
             stat_l3_misses++;
@@ -1561,6 +1618,19 @@ struct nvme_expert_cache::impl {
         if (any_submitted) {
             flush_ring_submissions();
         }
+    }
+
+    const void * pp_prepare_expert(const ggml_tensor * op, const int32_t * active_experts, int active_idx, int n_active) {
+        const nvme_tensor_info * info_ptr = nullptr;
+        nvme_layer * layer_ptr = nullptr;
+        if (!resolve_op(op, info_ptr, layer_ptr)) {
+            return nullptr;
+        }
+        const auto & info = *info_ptr;
+        auto & layer = *layer_ptr;
+        const int p = info.part_idx;
+
+        pp_submit_window(layer, p, active_experts, std::max(0, active_idx), n_active);
         if (active_idx < 0) {
             return nullptr;
         }
@@ -1570,12 +1640,13 @@ struct nvme_expert_cache::impl {
     }
 
     void pp_release_expert(const ggml_tensor * op, int32_t expert) {
-        auto tit = tensors.find(op->src[0]);
-        if (tit == tensors.end()) {
+        const nvme_tensor_info * info_ptr = nullptr;
+        nvme_layer * layer_ptr = nullptr;
+        if (!resolve_op(op, info_ptr, layer_ptr)) {
             return;
         }
-        const auto & info = *tit->second;
-        auto & layer = *layers[info.layer_id];
+        const auto & info = *info_ptr;
+        auto & layer = *layer_ptr;
 
         const int32_t sc = layer.active_scratch_slots[(size_t) expert];
         if (sc >= 0) {
@@ -1589,12 +1660,13 @@ struct nvme_expert_cache::impl {
         if (!valid || !op || !op->src[0]) {
             return;
         }
-        auto tit = tensors.find(op->src[0]);
-        if (tit == tensors.end()) {
+        const nvme_tensor_info * info_ptr = nullptr;
+        nvme_layer * layer_ptr = nullptr;
+        if (!resolve_op(op, info_ptr, layer_ptr)) {
             return;
         }
-        const auto & info = *tit->second;
-        auto & layer = *layers[info.layer_id];
+        const auto & info = *info_ptr;
+        auto & layer = *layer_ptr;
         if (!layer.active) {
             return;
         }
@@ -1613,6 +1685,11 @@ struct nvme_expert_cache::impl {
                 std::fill(layer.active_scratch_slots.begin(), layer.active_scratch_slots.end(), -1);
                 std::fill(layer.active_part_pending[(size_t) info.part_idx].begin(),
                           layer.active_part_pending[(size_t) info.part_idx].end(), 0);
+                // Immediately prefetch the next part (e.g. ffn_down_exps) while the CPU/GPU runs
+                // ggml_swiglu_split and quantizes the 8,192 ffn_down input rows (from_float)!
+                if (info.part_idx + 1 < (int) layer.parts.size() && !layer.pp_miss_list.empty()) {
+                    pp_submit_window(layer, info.part_idx + 1, layer.pp_miss_list.data(), 0, (int) layer.pp_miss_list.size());
+                }
             }
             return;
         }

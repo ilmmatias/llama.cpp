@@ -1961,7 +1961,8 @@ static void ggml_compute_forward_mul_mat_id(
                             }
                         }
                         while (ready_id < 0) {
-                            ggml_backend_cpu_expert_cache_nvme_get_expert(params->expert_cache, dst, -1, true);
+                            const bool more_in_flight =
+                                ggml_backend_cpu_expert_cache_nvme_get_expert(params->expert_cache, dst, -1, true) != NULL;
                             for (uint64_t m = rem_mask; m != 0; m &= m - 1) {
                                 const int cand_id = __builtin_ctzll(m);
                                 const int32_t cand_a = *(const int32_t *) ((const char *) ids->data + cand_id*ids->nb[0]);
@@ -1970,7 +1971,7 @@ static void ggml_compute_forward_mul_mat_id(
                                     break;
                                 }
                             }
-                            if (ready_id < 0) {
+                            if (ready_id < 0 && !more_in_flight) {
                                 const int first_id = __builtin_ctzll(rem_mask);
                                 const int32_t first_a = *(const int32_t *) ((const char *) ids->data + first_id*ids->nb[0]);
                                 ggml_backend_cpu_expert_cache_nvme_get_expert(params->expert_cache, dst, first_a, true);
@@ -2142,6 +2143,10 @@ static void ggml_compute_forward_mul_mat_id(
                     src1_base, nb11_q, nb12_q, ne11, vec_dot_type,
                     (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), cne1,
                     (float *) dst->data, nb1, nb2, 0, ne01);
+            if (ith == 0 && nvme_n_miss > 0) {
+                ggml_backend_cpu_expert_cache_nvme_pp_prepare(
+                        params->expert_cache, dst, nvme_active_list + nvme_n_hits, -1, nvme_n_miss);
+            }
         }
     }
 
