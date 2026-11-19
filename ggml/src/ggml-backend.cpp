@@ -1190,6 +1190,7 @@ struct ggml_backend_sched_split {
     struct ggml_tensor ** inputs;
     int n_inputs;
     int inputs_capacity;
+    bool can_overlap_prev_cpu;
     // graph view of this split
     struct ggml_cgraph graph;
 };
@@ -1750,6 +1751,140 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ASSERT(*cur_backend_id != -1);
     }
 
+    // Pass 4.5: immediately after a synchronous CPU split, hoist independent GPU nodes
+    // (for example shared MoE experts) ahead of the CPU-dependent join so the scheduler
+    // can launch them asynchronously on GPU while CPU executes the synchronous split.
+    std::vector<bool> force_split_before((size_t) graph->n_nodes, false);
+    std::vector<bool> mark_overlap_prefix((size_t) graph->n_nodes, false);
+    if (sched->n_copies == 1 && !sched->callback_eval && !sched->callback_copy && graph->n_nodes > 0) {
+        std::vector<uint32_t> blocked_epoch(sched->hash_set.size, 0);
+        std::vector<struct ggml_tensor *> hoisted;
+        std::vector<struct ggml_tensor *> unhoisted;
+        uint32_t cur_epoch = 0;
+
+        auto is_sync_cpu = [&](int bid) -> bool {
+            return bid >= 0 && sched->backends[bid]->iface.event_wait == NULL;
+        };
+
+        int i = 0;
+        while (i < graph->n_nodes) {
+            if (ggml_is_view_op(graph->nodes[i]->op)) {
+                ++i;
+                continue;
+            }
+            const int bid = tensor_backend_id(graph->nodes[i]);
+            if (!is_sync_cpu(bid)) {
+                ++i;
+                continue;
+            }
+            const int cpu_start = i;
+            while (i < graph->n_nodes) {
+                struct ggml_tensor * n = graph->nodes[i];
+                if (!ggml_is_view_op(n->op) && tensor_backend_id(n) != bid) {
+                    break;
+                }
+                ++i;
+            }
+            if (i >= graph->n_nodes) {
+                break;
+            }
+            const int gpu_bid = tensor_backend_id(graph->nodes[i]);
+            if (is_sync_cpu(gpu_bid)) {
+                continue;
+            }
+            const int gpu_start = i;
+            const int gpu_limit = std::min(graph->n_nodes, gpu_start + 64);
+
+            ++cur_epoch;
+            for (int p = cpu_start; p < gpu_start; ++p) {
+                blocked_epoch[hash_id(graph->nodes[p])] = cur_epoch;
+            }
+
+            hoisted.clear();
+            unhoisted.clear();
+            int n_compute_hoisted = 0;
+            int scan_end = gpu_start;
+            for (; scan_end < gpu_limit; ++scan_end) {
+                struct ggml_tensor * node = graph->nodes[scan_end];
+                if (!ggml_is_view_op(node->op) && tensor_backend_id(node) != gpu_bid) {
+                    break;
+                }
+                const size_t nid = hash_id(node);
+                if (node->op == GGML_OP_CPY || node->op == GGML_OP_SET || node->op == GGML_OP_SET_ROWS ||
+                        (node->view_src != NULL && !ggml_is_view_op(node->op))) {
+                    break;
+                }
+                bool can_hoist = (node->op != GGML_OP_NONE) &&
+                                 ((node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0);
+
+                // Preserve [MUL, ADD, ADD] shared-expert fusion adjacency (`shared_mul_add_f32`).
+                if (can_hoist && node->op == GGML_OP_MUL &&
+                        scan_end + 2 < graph->n_nodes &&
+                        graph->nodes[scan_end + 1]->op == GGML_OP_ADD &&
+                        graph->nodes[scan_end + 2]->op == GGML_OP_ADD &&
+                        (graph->nodes[scan_end + 1]->src[0] == node || graph->nodes[scan_end + 1]->src[1] == node)) {
+                    can_hoist = false;
+                }
+
+                if (can_hoist && node->view_src != NULL && blocked_epoch[hash_id(node->view_src)] == cur_epoch) {
+                    can_hoist = false;
+                }
+                if (can_hoist) {
+                    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                        struct ggml_tensor * src = node->src[s];
+                        if (src == NULL) {
+                            continue;
+                        }
+                        if (blocked_epoch[hash_id(src)] == cur_epoch) {
+                            can_hoist = false;
+                            break;
+                        }
+                        const int src_bid = tensor_backend_id(src);
+                        if (src_bid != gpu_bid && !ggml_backend_sched_buffer_supported(sched, src, gpu_bid)) {
+                            can_hoist = false;
+                            break;
+                        }
+                    }
+                }
+                if (can_hoist) {
+                    hoisted.push_back(node);
+                    if (!ggml_is_view_op(node->op)) {
+                        ++n_compute_hoisted;
+                    }
+                } else {
+                    blocked_epoch[nid] = cur_epoch;
+                    if (node->view_src != NULL) {
+                        blocked_epoch[hash_id(node->view_src)] = cur_epoch;
+                    }
+                    unhoisted.push_back(node);
+                }
+            }
+
+            if (n_compute_hoisted >= 2 && !unhoisted.empty()) {
+                int first_hoist_compute = -1;
+                int first_unhoist_compute = -1;
+                int write = gpu_start;
+                for (struct ggml_tensor * n : hoisted) {
+                    if (first_hoist_compute < 0 && !ggml_is_view_op(n->op)) {
+                        first_hoist_compute = write;
+                    }
+                    graph->nodes[write++] = n;
+                }
+                for (struct ggml_tensor * n : unhoisted) {
+                    if (first_unhoist_compute < 0 && !ggml_is_view_op(n->op)) {
+                        first_unhoist_compute = write;
+                    }
+                    graph->nodes[write++] = n;
+                }
+                if (first_hoist_compute >= 0 && first_unhoist_compute >= 0) {
+                    mark_overlap_prefix[first_hoist_compute] = true;
+                    force_split_before[first_unhoist_compute] = true;
+                }
+            }
+            i = scan_end;
+        }
+    }
+
     // pass 5: split graph, find tensors that need to be copied
     {
         int i_split = 0;
@@ -1765,6 +1900,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         split->i_start = 0;
         split->n_inputs = 0;
+        split->can_overlap_prev_cpu = false;
         int cur_backend_id = split->backend_id;
         bool split_has_nodes = false;
         for (; i < graph->n_nodes; i++) {
@@ -1780,8 +1916,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             // check if we should start a new split based on the sources of the current node
             // this also applies to a split without inputs, e.g. one that follows a split that only writes to a host buffer
-            bool need_new_split = false;
-            if (node_backend_id == cur_backend_id && split_has_nodes) {
+            bool need_new_split = force_split_before[i];
+            if (!need_new_split && node_backend_id == cur_backend_id && split_has_nodes) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
                     if (src == NULL) {
@@ -1816,6 +1952,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->backend_id = node_backend_id;
                 split->i_start = i;
                 split->n_inputs = 0;
+                split->can_overlap_prev_cpu = mark_overlap_prefix[i];
                 cur_backend_id = node_backend_id;
             }
             split_has_nodes = true;
@@ -1862,6 +1999,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         split->i_end = graph->n_nodes;
         sched->n_splits = i_split + 1;
+
+        for (int s = 0; s < sched->n_splits; ++s) {
+            if (sched->splits[s].can_overlap_prev_cpu) {
+                const bool prev_is_sync_cpu = s > 0 && sched->backends[sched->splits[s - 1].backend_id]->iface.synchronize == NULL;
+                if (!prev_is_sync_cpu || sched->splits[s].n_inputs != 0) {
+                    sched->splits[s].can_overlap_prev_cpu = false;
+                }
+            }
+        }
     }
 
     if (sched->debug) {
@@ -2064,7 +2210,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     // set ids for all splits
     for (int i = 0; i < sched->n_splits; ++i) {
-        sched->splits[i].graph.uid = ggml_graph_next_uid();
+        sched->splits[i].graph.uid           = ggml_graph_next_uid();
+        sched->splits[i].graph.uid_immutable = true;
     }
 }
 
@@ -2418,6 +2565,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_sched_complete_upload(pending_upload);
         }
 
+        bool overlapped_next = false;
+        int next_overlap_backend_id = -1;
+        ggml_backend_t next_overlap_backend = NULL;
+        if (!sched->callback_eval &&
+                split_backend->iface.synchronize == NULL &&
+                split_id + 1 < sched->n_splits &&
+                splits[split_id + 1].can_overlap_prev_cpu &&
+                splits[split_id + 1].n_inputs == 0 &&
+                pending_upload == NULL) {
+            struct ggml_backend_sched_split * next_split = &splits[split_id + 1];
+            next_overlap_backend_id = next_split->backend_id;
+            next_overlap_backend = sched->backends[next_overlap_backend_id];
+            if (next_overlap_backend->iface.synchronize != NULL &&
+                    prev_backend_id == next_overlap_backend_id) {
+                enum ggml_status next_ec = ggml_backend_graph_compute_async(next_overlap_backend, &next_split->graph);
+                if (next_ec != GGML_STATUS_SUCCESS) {
+                    return next_ec;
+                }
+                overlapped_next = true;
+            }
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -2463,6 +2632,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+        }
+        if (overlapped_next) {
+            if (sched->events[next_overlap_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_record(sched->events[next_overlap_backend_id][sched->cur_copy], next_overlap_backend);
+            }
+            ++split_id;
         }
 
         prev_backend_id = split_backend_id;
