@@ -7239,6 +7239,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 CUDA_CHECK(cudaGraphExecDestroy(graph->instances[i]));
             }
             graph->instances.resize(n_chunks);
+            if (!graph->instances.empty()) {
+                graph->uid = cgraph->uid;
+            }
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -7349,23 +7352,36 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 rtc_graph = cuda_ctx->cuda_graph(graph_key);
             }
         }
-        const bool ready = ggml_cuda_rtc_fusion_prepare(*cuda_ctx, cgraph, rtc_graph,
-                                                       ggml_cuda_graph_check_compability(cgraph));
-        if (ready && !rtc_graph) {
-            rtc_graph = cuda_ctx->cuda_graph(graph_key);
-            ggml_cuda_rtc_fusion_record(*cuda_ctx, rtc_graph);
-        }
-        if (rtc_graph) {
-            const bool changed = !ready || ggml_cuda_graph_pool_flushed(rtc_graph);
-            if (changed) {
-                if (!rtc_graph->instances.empty()) {
-                    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
-                }
+        if (rtc_graph && cgraph->uid != 0 && cgraph->uid_immutable && cgraph->uid == rtc_graph->uid &&
+            rtc_graph->is_enabled() && !rtc_graph->instances.empty() &&
+            ggml_cuda_rtc_fusion_can_fast_reuse(*cuda_ctx, rtc_graph)) {
+            if (ggml_cuda_graph_pool_flushed(rtc_graph)) {
+                CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
                 rtc_graph->reset();
             } else {
                 rtc_graph->warmup_complete = true;
                 use_cuda_graph = true;
-                cuda_graph_update_required = rtc_graph->instances.empty();
+                cuda_graph_update_required = false;
+            }
+        } else {
+            const bool ready = ggml_cuda_rtc_fusion_prepare(*cuda_ctx, cgraph, rtc_graph,
+                                                           ggml_cuda_graph_check_compability(cgraph));
+            if (ready && !rtc_graph) {
+                rtc_graph = cuda_ctx->cuda_graph(graph_key);
+                ggml_cuda_rtc_fusion_record(*cuda_ctx, rtc_graph);
+            }
+            if (rtc_graph) {
+                const bool changed = !ready || ggml_cuda_graph_pool_flushed(rtc_graph);
+                if (changed) {
+                    if (!rtc_graph->instances.empty()) {
+                        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                    }
+                    rtc_graph->reset();
+                } else {
+                    rtc_graph->warmup_complete = true;
+                    use_cuda_graph = true;
+                    cuda_graph_update_required = rtc_graph->instances.empty();
+                }
             }
         }
     } else {

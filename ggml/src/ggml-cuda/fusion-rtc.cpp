@@ -971,7 +971,7 @@ struct ggml_cuda_rtc_plan {
     }
 };
 
-static constexpr size_t RTC_PLAN_BYTES = 32 * 1024 * 1024;
+static constexpr size_t RTC_PLAN_BYTES = 128 * 1024 * 1024;
 
 struct rtc_compiler_program {
     hiprtcProgram program = nullptr;
@@ -1372,6 +1372,35 @@ bool ggml_cuda_rtc_fusion_prepare(ggml_backend_cuda_context & ctx, const ggml_cg
     GGML_UNUSED(graph);
     GGML_UNUSED(capture_graph);
     GGML_UNUSED(graph_compatible);
+    return false;
+#endif
+}
+
+bool ggml_cuda_rtc_fusion_can_fast_reuse(const ggml_backend_cuda_context & ctx, const ggml_cuda_graph * capture_graph) {
+#ifdef USE_CUDA_GRAPH
+    if (!ggml_cuda_rtc_fusion_enabled() || ctx.curr_stream_no != 0 || !ctx.rtc_fusion || !ctx.rtc_fusion->ready) {
+        return false;
+    }
+    if (!capture_graph || !capture_graph->rtc_plan || capture_graph->instances.empty()) {
+        return false;
+    }
+    const auto & state = *ctx.rtc_fusion;
+    const auto & plan = *capture_graph->rtc_plan;
+    for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+        if (plan.scratch[stream] && plan.scratch[stream] != state.partial[stream]) {
+            return false;
+        }
+    }
+    if (plan.retry) {
+        return false;
+    }
+    return std::none_of(plan.pending.begin(), plan.pending.end(),
+                        [](const std::shared_ptr<const rtc_artifact> & artifact) {
+                            return artifact->state.load(std::memory_order_acquire) == GGML_CUDA_RTC_COMPILE_READY;
+                        });
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(capture_graph);
     return false;
 #endif
 }

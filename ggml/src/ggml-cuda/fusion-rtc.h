@@ -11,6 +11,7 @@ bool ggml_cuda_rtc_fusion_enabled();
 
 bool ggml_cuda_rtc_fusion_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph,
                                   ggml_cuda_graph * capture_graph, bool graph_compatible);
+bool ggml_cuda_rtc_fusion_can_fast_reuse(const ggml_backend_cuda_context & ctx, const ggml_cuda_graph * capture_graph);
 void ggml_cuda_rtc_fusion_record(ggml_backend_cuda_context & ctx, ggml_cuda_graph * capture_graph);
 void ggml_cuda_rtc_fusion_alloc_deps(const ggml_cgraph * graph, ggml_backend_graph_optimize_params * params);
 

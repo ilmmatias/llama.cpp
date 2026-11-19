@@ -262,6 +262,7 @@ struct ggml_cuda_graph {
         instances.clear();
 
         warmup_complete = false;
+        uid = 0;
 #ifdef GGML_HIP_RTC
         rtc_plan.reset();
 #endif
