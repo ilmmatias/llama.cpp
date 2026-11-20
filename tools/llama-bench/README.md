@@ -65,6 +65,7 @@ test parameters:
   -ecs, --expert-cache-slots <n>            (default: 0)
   -eca, --expert-cache-admit-window <n>     (default: 0)
   -ecw, --expert-cache-workers <n>          (default: 1)
+  -erc, --expert-ram-cache <mib>            (default: 0)
   -sm, --split-mode <none|layer|row|tensor> (default: layer)
   -mg, --main-gpu <i>                       (default: 0)
   -nkvo, --no-kv-offload <0|1>              (default: 0)

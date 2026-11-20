@@ -359,6 +359,7 @@ struct cmd_params {
     std::vector<int>                 expert_cache_slots;
     std::vector<int>                 expert_cache_admit_window;
     std::vector<int>                 expert_cache_workers;
+    std::vector<int>                 expert_ram_cache;
     std::vector<llama_split_mode>    split_mode;
     std::vector<llama_load_mode>     load_mode;
     std::vector<llama_lazy_mode>     lazy_mode;
@@ -410,6 +411,7 @@ static const cmd_params cmd_params_defaults = {
     /* expert_cache_slots   */ { 0 },
     /* expert_cache_admit_window */ { 0 },
     /* expert_cache_workers */ { 1 },
+    /* expert_ram_cache     */ { 0 },
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* load_mode            */ { LLAMA_LOAD_MODE_AUTO },
     /* lazy_mode            */ { LLAMA_LAZY_MODE_AUTO },
@@ -490,6 +492,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ecs, --expert-cache-slots <n>                    (default: %s)\n", join(cmd_params_defaults.expert_cache_slots, ",").c_str());
     printf("  -eca, --expert-cache-admit-window <n>             (default: %s)\n", join(cmd_params_defaults.expert_cache_admit_window, ",").c_str());
     printf("  -ecw, --expert-cache-workers <n>                  (default: %s)\n", join(cmd_params_defaults.expert_cache_workers, ",").c_str());
+    printf("  -erc, --expert-ram-cache <mib>                    (default: %s)\n", join(cmd_params_defaults.expert_ram_cache, ",").c_str());
     printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
@@ -791,6 +794,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.expert_cache_workers.insert(params.expert_cache_workers.end(), p.begin(), p.end());
+            } else if (arg == "-erc" || arg == "--expert-ram-cache") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                params.expert_ram_cache.insert(params.expert_ram_cache.end(), p.begin(), p.end());
             } else if (llama_supports_rpc() && (arg == "-rpc" || arg == "--rpc")) {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1212,6 +1222,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.expert_cache_workers.empty()) {
         params.expert_cache_workers = cmd_params_defaults.expert_cache_workers;
     }
+    if (params.expert_ram_cache.empty()) {
+        params.expert_ram_cache = cmd_params_defaults.expert_ram_cache;
+    }
     if (params.split_mode.empty()) {
         params.split_mode = cmd_params_defaults.split_mode;
     }
@@ -1296,6 +1309,7 @@ struct cmd_params_instance {
     int                expert_cache_slots;
     int                expert_cache_admit_window;
     int                expert_cache_workers;
+    int                expert_ram_cache;
     llama_split_mode   split_mode;
     llama_load_mode    load_mode;
     llama_lazy_mode    lazy_mode;
@@ -1327,6 +1341,9 @@ struct cmd_params_instance {
         mparams.no_host       = no_host;
         mparams.use_extra_bufts = repack;
         mparams.expert_cache   = expert_cache_slots > 0;
+        if (expert_ram_cache > 0) {
+            mparams.expert_ram_cache_size = (size_t) expert_ram_cache * 1024ull * 1024ull;
+        }
 
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {
@@ -1379,6 +1396,7 @@ struct cmd_params_instance {
         return model == other.model && shards == other.shards && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
                // when enabled, the expert cache forces the routed experts to CPU when loading the model
                (expert_cache_slots > 0) == (other.expert_cache_slots > 0) &&
+               expert_ram_cache == other.expert_ram_cache &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
@@ -1418,6 +1436,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & nl : params.n_gpu_layers)
     for (const auto & ncmoe : params.n_cpu_moe)
     for (const auto & ecs : params.expert_cache_slots)
+    for (const auto & erc : params.expert_ram_cache)
     for (const auto & sm : params.split_mode)
     for (const auto & lm : params.load_mode)
     for (const auto & lzm : params.lazy_mode)
@@ -1467,6 +1486,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .expert_cache_slots        = */ ecs,
                 /* .expert_cache_admit_window = */ eca,
                 /* .expert_cache_workers      = */ ecw,
+                /* .expert_ram_cache          = */ erc,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1510,6 +1530,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .expert_cache_slots        = */ ecs,
                 /* .expert_cache_admit_window = */ eca,
                 /* .expert_cache_workers      = */ ecw,
+                /* .expert_ram_cache          = */ erc,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1553,6 +1574,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .expert_cache_slots        = */ ecs,
                 /* .expert_cache_admit_window = */ eca,
                 /* .expert_cache_workers      = */ ecw,
+                /* .expert_ram_cache          = */ erc,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1600,6 +1622,7 @@ struct test {
     int                      expert_cache_slots;
     int                      expert_cache_admit_window;
     int                      expert_cache_workers;
+    int                      expert_ram_cache;
     llama_split_mode         split_mode;
     llama_load_mode          load_mode;
     llama_lazy_mode          lazy_mode;
@@ -1645,6 +1668,7 @@ struct test {
         expert_cache_slots        = inst.expert_cache_slots;
         expert_cache_admit_window = inst.expert_cache_admit_window;
         expert_cache_workers      = inst.expert_cache_workers;
+        expert_ram_cache          = inst.expert_ram_cache;
         split_mode     = inst.split_mode;
         load_mode      = inst.load_mode;
         lazy_mode      = inst.lazy_mode;
@@ -1715,7 +1739,7 @@ struct test {
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "n_threads_batch", "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",
-            "expert_cache_slots", "expert_cache_admit_window", "expert_cache_workers",
+            "expert_cache_slots", "expert_cache_admit_window", "expert_cache_workers", "expert_ram_cache",
             "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
@@ -1735,6 +1759,7 @@ struct test {
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
             field == "expert_cache_slots" || field == "expert_cache_admit_window" || field == "expert_cache_workers" ||
+            field == "expert_ram_cache" ||
             field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
             return INT;
         }
@@ -1811,6 +1836,7 @@ struct test {
                                             std::to_string(expert_cache_slots),
                                             std::to_string(expert_cache_admit_window),
                                             std::to_string(expert_cache_workers),
+                                            std::to_string(expert_ram_cache),
                                             split_mode_str(split_mode),
                                             std::to_string(main_gpu),
                                             std::to_string(no_kv_offload),
@@ -2026,6 +2052,9 @@ struct markdown_printer : public printer {
         if (field == "expert_cache_workers") {
             return 4;
         }
+        if (field == "expert_ram_cache") {
+            return 6;
+        }
         if (field == "repack") {
             return 3;
         }
@@ -2093,6 +2122,9 @@ struct markdown_printer : public printer {
         if (field == "expert_cache_workers") {
             return "ecw";
         }
+        if (field == "expert_ram_cache") {
+            return "erc";
+        }
         return field;
     }
 
@@ -2119,6 +2151,9 @@ struct markdown_printer : public printer {
         }
         if (params.expert_cache_workers.size() > 1 || params.expert_cache_workers != cmd_params_defaults.expert_cache_workers) {
             fields.emplace_back("expert_cache_workers");
+        }
+        if (params.expert_ram_cache.size() > 1 || params.expert_ram_cache != cmd_params_defaults.expert_ram_cache) {
+            fields.emplace_back("expert_ram_cache");
         }
         if (params.n_threads.size() > 1 || params.n_threads != cmd_params_defaults.n_threads || is_cpu_backend) {
             fields.emplace_back("n_threads");
