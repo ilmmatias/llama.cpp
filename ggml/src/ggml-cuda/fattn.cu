@@ -129,9 +129,10 @@ static __global__ void flash_attn_prepare_selected_indices(
     indices  += list*n_selected;
 
     int32_t rows[items_per_thread];
+    // Load in blocked order so we can detect already-sorted QSA top-k outputs in O(1) and skip BlockRadixSort.
 #pragma unroll
     for (int j = 0; j < items_per_thread; ++j) {
-        const int i   = tid + j*256;
+        const int i   = tid * items_per_thread + j;
         index_t   row = i < n_selected ? selected[i] : INT_MAX;
         if (row < 0 || row >= n_kv || (positions ?
                 !ggml_qsa_is_visible(positions, n_kv, row, blockIdx.x) : !isfinite(__half2float(mask[row])))) {
@@ -140,11 +141,25 @@ static __global__ void flash_attn_prepare_selected_indices(
         rows[j] = int32_t(row);
     }
 
-    // Keep INT_MAX above every valid row in the sorted bit range.
-    const int end_bit = 32 - __clz(uint32_t(n_kv));
-    sort_t(temp.sort).Sort(rows, 0, end_bit);
     last[tid] = rows[items_per_thread - 1];
     __syncthreads();
+
+    bool already_sorted = true;
+#pragma unroll
+    for (int j = 0; j < items_per_thread; ++j) {
+        const int prev = j > 0 ? rows[j - 1] : (tid > 0 ? last[tid - 1] : -1);
+        if (rows[j] < prev) {
+            already_sorted = false;
+        }
+    }
+
+    if (!__syncthreads_and(already_sorted)) {
+        // Keep INT_MAX above every valid row in the sorted bit range.
+        const int end_bit = 32 - __clz(uint32_t(n_kv));
+        sort_t(temp.sort).Sort(rows, 0, end_bit);
+        last[tid] = rows[items_per_thread - 1];
+        __syncthreads();
+    }
 
     bool keep[items_per_thread];
     int  count = 0;
