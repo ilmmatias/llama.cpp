@@ -2797,8 +2797,8 @@ static bool ggml_cuda_mul_mat_q_fusion_matches(const ggml_tensor * up, const ggm
         return false;
     }
 
-    // NVIDIA only: the fused write-back relies on the MMA accumulator layout.
-    return turing_mma_available(ggml_cuda_info().devices[device].cc);
+    const int cc = ggml_cuda_info().devices[device].cc;
+    return turing_mma_available(cc) || GGML_CUDA_CC_IS_RDNA2(cc);
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu,

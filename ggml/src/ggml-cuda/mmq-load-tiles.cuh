@@ -564,9 +564,11 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
     }
 }
 
-template <ggml_type type, int J, bool fallback, int bits> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_znq(
+template <ggml_type type, int J, bool fallback, int bits, bool has_fusion = false> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_znq(
         const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
-    GGML_UNUSED(x_gate);
+    if constexpr (!has_fusion) {
+        GGML_UNUSED(x_gate);
+    }
 
     constexpr int group = znq_group_cuda(type);
     constexpr int selector_bits = znq_selector_bits_cuda(type);
@@ -610,7 +612,15 @@ template <ggml_type type, int J, bool fallback, int bits> static __device__ __fo
             i = min(i, i_max);
         }
 
-        const uint8_t * bxi = (const uint8_t *) x + (kbx0 + i*stride + kbx) * block_size;
+        const uint8_t * bxi = nullptr;
+        if constexpr (has_fusion) {
+            constexpr int R = GGML_CUDA_MMQ_FUSION_ROWS;
+            const char * x_src = (i / R) % 2 == 0 ? x : x_gate;
+            const int src_row  = (i / (2 * R)) * R + (i % R);
+            bxi = (const uint8_t *) x_src + (kbx0 + src_row*stride + kbx) * block_size;
+        } else {
+            bxi = (const uint8_t *) x + (kbx0 + i*stride + kbx) * block_size;
+        }
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_qs[i*sram_stride + 0             + txi] = znq_pack4_cuda<bits, false, group, selector_bits>(bxi, 4*kqsx);
@@ -655,7 +665,15 @@ template <ggml_type type, int J, bool fallback, int bits> static __device__ __fo
                 i = min(i, i_max);
             }
 
-            const uint8_t * bxi = (const uint8_t *) x + (kbx0 + i*stride + kbxd) * block_size;
+            const uint8_t * bxi = nullptr;
+            if constexpr (has_fusion) {
+                constexpr int R = GGML_CUDA_MMQ_FUSION_ROWS;
+                const char * x_src = (i / R) % 2 == 0 ? x : x_gate;
+                const int src_row  = (i / (2 * R)) * R + (i % R);
+                bxi = (const uint8_t *) x_src + (kbx0 + src_row*stride + kbxd) * block_size;
+            } else {
+                bxi = (const uint8_t *) x + (kbx0 + i*stride + kbxd) * block_size;
+            }
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
             x_df[i*sram_stride                           + kbxd] = znq_scale_cuda(bxi[0]);

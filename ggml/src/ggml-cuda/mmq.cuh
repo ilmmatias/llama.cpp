@@ -487,7 +487,7 @@ static __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config
 // Weight types with a fused gate/up/GLU path (see ggml_cuda_mmq_get_util_funcs).
 static constexpr __host__ __device__ bool ggml_cuda_mmq_fusion_supported(const ggml_type type) {
     return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_XS ||
-        type == GGML_TYPE_NVFP4;
+        type == GGML_TYPE_NVFP4 || znq_bits_cuda(type) != 0;
 }
 
 // Fused gate/up/GLU: the weight tile alternates chunks of this many up and gate rows, so rows r and r + 8 of an MMA tile (same thread) pair up.
@@ -510,11 +510,14 @@ static __device__ __forceinline__ const block_t * ggml_cuda_mmq_x_row(
 #include "mmq-load-tiles.cuh"
 #include "mmq-vec-dot.cuh"
 
-template <ggml_type type, int J, bool fallback, ggml_prec prec_src1> static __device__ __forceinline__ void ggml_cuda_mmq_write_back_dp4a(
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion = false> static __device__ __forceinline__ void ggml_cuda_mmq_write_back_dp4a(
         const float * __restrict__ sum, const int32_t * __restrict__ ids_dst, float * __restrict__ dst,
         const float * __restrict__ y_scale, const int stride, const int i_max, const int j_sup,
         const ggml_glu_op glu_op, const float glu_limit, const float * __restrict__ x_scale, const float * __restrict__ gate_scale) {
-    GGML_UNUSED_VARS(glu_op, glu_limit, gate_scale);
+    GGML_UNUSED_VARS(gate_scale);
+    if constexpr (!has_fusion) {
+        GGML_UNUSED_VARS(glu_op, glu_limit);
+    }
 
     // NVFP4 weight scale of a fused MUL (per tensor, or of the expert of this tile), 1 without.
     const float scale = type == GGML_TYPE_NVFP4 && x_scale ? *x_scale : 1.0f;
@@ -523,6 +526,7 @@ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1> static __de
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback, prec_src1);
     static_assert(I % warp_size == 0, "DP4A MMQ tile height must be a multiple of the physical warp size");
+    static_assert(!has_fusion || (warp_size % (2 * GGML_CUDA_MMQ_FUSION_ROWS) == 0), "DP4A fusion requires warp_size divisible by 2*FUSION_ROWS");
 
     const bool y_scale_used = type == GGML_TYPE_NVFP4 && y_scale != nullptr;
 
@@ -550,7 +554,17 @@ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1> static __de
             } else {
                 GGML_UNUSED(y_scale_used);
             }
-            dst[ids_dst[j]*stride + i] = value * scale;
+            if constexpr (has_fusion) {
+                constexpr int R = GGML_CUDA_MMQ_FUSION_ROWS;
+                // Lanes with (threadIdx.x & R) == 0 hold 'up'; lane ^ R holds the paired 'gate' row.
+                const float other = ggml_cuda_shfl_xor(value, R, warp_size);
+                if ((threadIdx.x & R) == 0) {
+                    const int out_i = (i0 / 2) + ((threadIdx.x / (2 * R)) * R) + (threadIdx.x % R);
+                    dst[ids_dst[j]*stride + out_i] = ggml_cuda_op_glu_single(glu_op, other, value, glu_limit);
+                }
+            } else {
+                dst[ids_dst[j]*stride + i] = value * scale;
+            }
         }
     }
 }
@@ -689,9 +703,9 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
             case GGML_TYPE_Q8_0:
                 return ggml_cuda_mmq_util_funcs(
                     VDR_Q8_0_Q8_1_MMQ,
-                    ggml_cuda_mmq_load_tiles_q8_0<type, J, fallback, false>,
+                    ggml_cuda_mmq_load_tiles_q8_0<type, J, fallback, has_fusion>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
-                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1, has_fusion>);
 // ---------------------------------------------------------------------------------------------
             case GGML_TYPE_Q2_K:
                 return ggml_cuda_mmq_util_funcs(
@@ -708,21 +722,21 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
             case GGML_TYPE_Q4_K:
                 return ggml_cuda_mmq_util_funcs(
                     VDR_Q4_K_Q8_1_MMQ,
-                    ggml_cuda_mmq_load_tiles_q4_K<type, J, fallback, false>,
+                    ggml_cuda_mmq_load_tiles_q4_K<type, J, fallback, has_fusion>,
                     ggml_cuda_mmq_vec_dot_q4_K_q8_1_dp4a<type, J, fallback>,
-                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1, has_fusion>);
             case GGML_TYPE_Q5_K:
                 return ggml_cuda_mmq_util_funcs(
                     VDR_Q5_K_Q8_1_MMQ,
-                    ggml_cuda_mmq_load_tiles_q5_K<type, J, fallback, false>,
+                    ggml_cuda_mmq_load_tiles_q5_K<type, J, fallback, has_fusion>,
                     ggml_cuda_mmq_vec_dot_q5_K_q8_1_dp4a<type, J, fallback>,
-                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1, has_fusion>);
             case GGML_TYPE_Q6_K:
                 return ggml_cuda_mmq_util_funcs(
                     VDR_Q6_K_Q8_1_MMQ,
-                    ggml_cuda_mmq_load_tiles_q6_K<type, J, fallback, false>,
+                    ggml_cuda_mmq_load_tiles_q6_K<type, J, fallback, has_fusion>,
                     ggml_cuda_mmq_vec_dot_q6_K_q8_1_dp4a<type, J, fallback>,
-                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1, has_fusion>);
 // ---------------------------------------------------------------------------------------------
             case GGML_TYPE_IQ1_S:
                 return ggml_cuda_mmq_util_funcs(
@@ -763,78 +777,78 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
             case GGML_TYPE_IQ4_XS:
                 return ggml_cuda_mmq_util_funcs(
                     VDR_IQ4_XS_Q8_1_MMQ,
-                    ggml_cuda_mmq_load_tiles_iq4_xs<type, J, fallback, false>,
+                    ggml_cuda_mmq_load_tiles_iq4_xs<type, J, fallback, has_fusion>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
-                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1, has_fusion>);
             case GGML_TYPE_ZNQ2_S:
             case GGML_TYPE_ZNQ2_SM:
                 return ggml_cuda_mmq_util_funcs(
                     4,
-                    ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 1>,
+                    ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 1, has_fusion>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
-                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1, has_fusion>);
             case GGML_TYPE_ZNQ2_M:
             case GGML_TYPE_ZNQ2_L:
             case GGML_TYPE_ZNQ3_S:
             case GGML_TYPE_ZNQ3_SM:
                 return ggml_cuda_mmq_util_funcs(
                     4,
-                    ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 2>,
+                    ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 2, has_fusion>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
-                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1, has_fusion>);
             case GGML_TYPE_ZNQ3_M:
             case GGML_TYPE_ZNQ3_L:
             case GGML_TYPE_ZNQ4_S:
             case GGML_TYPE_ZNQ4_SM:
                 return ggml_cuda_mmq_util_funcs(
                     4,
-                    ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 3>,
+                    ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 3, has_fusion>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
-                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1, has_fusion>);
             case GGML_TYPE_ZNQ4_M:
             case GGML_TYPE_ZNQ4_L:
             case GGML_TYPE_ZNQ5_S:
             case GGML_TYPE_ZNQ5_SM:
                 return ggml_cuda_mmq_util_funcs(
                     4,
-                    ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 4>,
+                    ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 4, has_fusion>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
-                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1, has_fusion>);
             case GGML_TYPE_ZNQ5_M:
             case GGML_TYPE_ZNQ5_L:
             case GGML_TYPE_ZNQ6_S:
             case GGML_TYPE_ZNQ6_SM:
                 return ggml_cuda_mmq_util_funcs(
                     4,
-                    ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 5>,
+                    ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 5, has_fusion>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
-                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1, has_fusion>);
             case GGML_TYPE_ZNQ6_M:
             case GGML_TYPE_ZNQ6_L:
                 return ggml_cuda_mmq_util_funcs(
                     4,
-                    ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 6>,
+                    ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 6, has_fusion>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
-                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1, has_fusion>);
             case GGML_TYPE_ZNQ7_S:
             case GGML_TYPE_ZNQ7_SM:
                 return ggml_cuda_mmq_util_funcs(
                     4,
-                    ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 6>,
+                    ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 6, has_fusion>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
-                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1, has_fusion>);
             case GGML_TYPE_ZNQ7_M:
                 return ggml_cuda_mmq_util_funcs(
                     4,
-                    ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 7>,
+                    ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 7, has_fusion>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
-                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1, has_fusion>);
             case GGML_TYPE_ZNQ7_L:
                 return ggml_cuda_mmq_util_funcs(
                     4,
-                    ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 7>,
+                    ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 7, has_fusion>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
-                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1, has_fusion>);
             case GGML_TYPE_IQ4_NL:
                 return ggml_cuda_mmq_util_funcs(
                     VDR_IQ4_NL_Q8_1_MMQ,
@@ -1009,71 +1023,71 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
         case GGML_TYPE_ZNQ2_SM:
             return ggml_cuda_mmq_util_funcs(
                 -1,
-                ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 1>,
+                ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 1, has_fusion>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, has_fusion>);
         case GGML_TYPE_ZNQ2_M:
         case GGML_TYPE_ZNQ2_L:
         case GGML_TYPE_ZNQ3_S:
         case GGML_TYPE_ZNQ3_SM:
             return ggml_cuda_mmq_util_funcs(
                 -1,
-                ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 2>,
+                ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 2, has_fusion>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, has_fusion>);
         case GGML_TYPE_ZNQ3_M:
         case GGML_TYPE_ZNQ3_L:
         case GGML_TYPE_ZNQ4_S:
         case GGML_TYPE_ZNQ4_SM:
             return ggml_cuda_mmq_util_funcs(
                 -1,
-                ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 3>,
+                ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 3, has_fusion>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, has_fusion>);
         case GGML_TYPE_ZNQ4_M:
         case GGML_TYPE_ZNQ4_L:
         case GGML_TYPE_ZNQ5_S:
         case GGML_TYPE_ZNQ5_SM:
             return ggml_cuda_mmq_util_funcs(
                 -1,
-                ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 4>,
+                ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 4, has_fusion>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, has_fusion>);
         case GGML_TYPE_ZNQ5_M:
         case GGML_TYPE_ZNQ5_L:
         case GGML_TYPE_ZNQ6_S:
         case GGML_TYPE_ZNQ6_SM:
             return ggml_cuda_mmq_util_funcs(
                 -1,
-                ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 5>,
+                ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 5, has_fusion>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, has_fusion>);
         case GGML_TYPE_ZNQ6_M:
         case GGML_TYPE_ZNQ6_L:
             return ggml_cuda_mmq_util_funcs(
                 -1,
-                ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 6>,
+                ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 6, has_fusion>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, has_fusion>);
         case GGML_TYPE_ZNQ7_S:
         case GGML_TYPE_ZNQ7_SM:
             return ggml_cuda_mmq_util_funcs(
                 -1,
-                ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 6>,
+                ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 6, has_fusion>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, has_fusion>);
         case GGML_TYPE_ZNQ7_M:
             return ggml_cuda_mmq_util_funcs(
                 -1,
-                ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 7>,
+                ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 7, has_fusion>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, has_fusion>);
         case GGML_TYPE_ZNQ7_L:
             return ggml_cuda_mmq_util_funcs(
                 -1,
-                ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 7>,
+                ggml_cuda_mmq_load_tiles_znq<type, J, fallback, 7, has_fusion>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, has_fusion>);
         case GGML_TYPE_IQ4_NL:
             return ggml_cuda_mmq_util_funcs(
                 -1,
@@ -1217,11 +1231,11 @@ static __global__ void mul_mat_q(
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const uint3 ntj) {
 
-#ifdef TURING_MMA_AVAILABLE
+#if defined(TURING_MMA_AVAILABLE) || (defined(GGML_USE_HIP) && defined(RDNA2))
     constexpr bool fusion_available = true;
 #else
     constexpr bool fusion_available = false;
-#endif // TURING_MMA_AVAILABLE
+#endif // defined(TURING_MMA_AVAILABLE) || (defined(GGML_USE_HIP) && defined(RDNA2))
 #ifdef BLACKWELL_MMA_AVAILABLE
     constexpr bool native_fp4_available = true;
 #else
